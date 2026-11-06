@@ -1,6 +1,7 @@
 import { loadConfig } from '../config.ts';
 import { Repository } from '../db/repository.ts';
 import { InstagramActionClient } from './instagramActionClient.ts';
+import { parseDuration, formatTimeRemaining } from '../utils/duration.ts';
 import type { SavedReel } from '../types.ts';
 
 export class TelegramBotService {
@@ -8,6 +9,7 @@ export class TelegramBotService {
   private isPolling = false;
   private lastUpdateId = 0;
   private activeChatId: string | null = null;
+  private customDefaultIntervalMs: number | null = null;
   private actionClient = new InstagramActionClient();
 
   constructor() {
@@ -99,7 +101,7 @@ export class TelegramBotService {
       } catch (err: any) {
         if (!this.isPolling) break;
         console.error('[TelegramBot] Polling warning:', err.message);
-        await new Promise((r) => setTimeout(r, 4000));
+        await new Promise((r) => setTimeout(r, 3000));
       }
     }
   }
@@ -121,8 +123,27 @@ export class TelegramBotService {
 
     // Command: /start
     if (text.startsWith('/start')) {
-      const welcome = `👋 <b>Welcome to your Saved Reels Watch Later Bot!</b>\n\nWhenever you see a Reel on Instagram, tap <b>Share ➔ Telegram ➔ @dinosaurabh_bot</b>.\n\nI will instantly store it in your Supabase database and ping you with periodic reminders until you mark it watched!\n\n<b>Commands:</b>\n• /stats - View your library stats\n• /pending - View your Watch Later queue\n• /help - Help & instructions`;
+      const welcome = `👋 <b>Welcome to your Saved Reels Watch Later Bot!</b>\n\nWhenever you see a Reel on Instagram, tap <b>Share ➔ Telegram ➔ @dinosaurabh_bot</b> (or paste the link here).\n\n⏱️ <b>Custom Reminders:</b>\nYou can set reminders for <b>seconds, minutes, hours, or days</b>!\n• Example: send link with <code>30s</code>, <code>5m</code>, <code>2h</code>, or <code>3 days</code>\n• Or use the quick-select buttons under each Reel.\n\n<b>Commands:</b>\n• /interval &lt;time&gt; - Set default reminder (e.g. <code>/interval 5m</code> or <code>/interval 12h</code>)\n• /pending - View Watch Later queue\n• /stats - View library statistics\n• /help - Help guide`;
       await this.sendMessage(chatId, welcome);
+      return;
+    }
+
+    // Command: /interval <duration>
+    if (text.startsWith('/interval')) {
+      const parts = text.split(/\s+/).slice(1).join(' ');
+      const parsed = parseDuration(parts);
+      if (!parsed) {
+        await this.sendMessage(
+          chatId,
+          `❓ <b>How to set default interval:</b>\nType <code>/interval 30s</code>, <code>/interval 15m</code>, <code>/interval 2h</code>, or <code>/interval 2 days</code>.`
+        );
+        return;
+      }
+      this.customDefaultIntervalMs = parsed.ms;
+      await this.sendMessage(
+        chatId,
+        `⚙️ <b>Default reminder interval updated to: ${parsed.label}!</b>\nNew reels will remind you every ${parsed.label}.`
+      );
       return;
     }
 
@@ -149,6 +170,12 @@ export class TelegramBotService {
         const keyboard = {
           inline_keyboard: [
             [{ text: '✅ Mark as Watched', callback_data: `watch_${reel.id}` }],
+            [
+              { text: '⏱️ 30s', callback_data: `set_30_${reel.id}` },
+              { text: '⏱️ 5m', callback_data: `set_300_${reel.id}` },
+              { text: '⏰ 1h', callback_data: `set_3600_${reel.id}` },
+              { text: '⏰ 1d', callback_data: `set_86400_${reel.id}` },
+            ],
           ],
         };
         await this.sendMessage(chatId, msg, keyboard);
@@ -158,7 +185,7 @@ export class TelegramBotService {
 
     // Command: /help
     if (text.startsWith('/help')) {
-      const helpMsg = `📖 <b>How to Use @dinosaurabh_bot:</b>\n\n1. In Instagram, open any Reel.\n2. Tap <b>Share ➔ Share via... ➔ Telegram ➔ dinosaurabh_bot</b>.\n3. The bot saves it to your Supabase Watch Later list.\n4. You will get lock-screen reminders every 10 hours until you tap <b>"✅ Mark as Watched"</b>!`;
+      const helpMsg = `📖 <b>How to Use @dinosaurabh_bot:</b>\n\n1. In Instagram, open any Reel.\n2. Tap <b>Share ➔ Share via... ➔ Telegram ➔ dinosaurabh_bot</b>.\n3. Add custom time if you want: <code>https://instagram.com/reel/xyz 45s</code>\n4. You will get lock-screen reminders until you tap <b>"✅ Mark as Watched"</b>!`;
       await this.sendMessage(chatId, helpMsg);
       return;
     }
@@ -166,31 +193,42 @@ export class TelegramBotService {
     // Check for Instagram Reel URL in message
     const reelMatch = text.match(/https?:\/\/(?:www\.)?instagram\.com\/(?:reel|p)\/([A-Za-z0-9_-]+)/i);
     if (reelMatch) {
-      await this.handleReelShared(chatId, reelMatch[1], reelMatch[0]);
+      // Check if user also typed a custom duration in the same message (e.g. "https://... 30s" or "30 sec")
+      const remainingText = text.replace(reelMatch[0], '').trim();
+      const customDuration = parseDuration(remainingText);
+      await this.handleReelShared(chatId, reelMatch[1], reelMatch[0], customDuration);
       return;
     }
 
-    // Default response for unmatched text
+    // Default response
     await this.sendMessage(
       chatId,
-      `💡 Send me any Instagram Reel link (or tap Share from the Instagram app) and I'll add it to your Watch Later queue!`
+      `💡 Send me any Instagram Reel link with an optional time (e.g. <code>30s</code>, <code>5m</code>, <code>2h</code>) and I'll add it to your Watch Later queue!`
     );
   }
 
-  private async handleReelShared(chatId: string, shortcode: string, url: string) {
+  private async handleReelShared(
+    chatId: string,
+    shortcode: string,
+    url: string,
+    customDuration?: { ms: number; seconds: number; label: string } | null
+  ) {
     const config = loadConfig();
-    const interval = config.reminders.defaultIntervalHours;
+    const defaultMs = this.customDefaultIntervalMs || config.reminders.defaultIntervalHours * 3600 * 1000;
+    const durationMs = customDuration ? customDuration.ms : defaultMs;
+    const durationSec = Math.round(durationMs / 1000);
+    const durationLabel = customDuration ? customDuration.label : `${Math.round(durationMs / 3600000)} hours`;
 
-    console.log(`[TelegramBot] 🎬 Reel received from user: ${shortcode}`);
+    console.log(`[TelegramBot] 🎬 Reel received: ${shortcode} with reminder in ${durationLabel}`);
 
-    // Upsert Creator placeholder or known creator
+    // Upsert Creator
     const creator = await Repository.upsertCreator({
       instagram_user_id: `creator_${shortcode}`,
       username: 'instagram_creator',
       display_name: 'Instagram Creator',
     });
 
-    const nextReminder = new Date(Date.now() + interval * 60 * 60 * 1000).toISOString();
+    const nextReminder = new Date(Date.now() + durationMs).toISOString();
 
     const saved = await Repository.upsertSavedReel({
       instagram_media_id: `shortcode_${shortcode}`,
@@ -201,19 +239,28 @@ export class TelegramBotService {
       first_detected_at: new Date().toISOString(),
       save_order_rank: 1,
       watch_status: 'watch_later',
-      reminder_interval_hours: interval,
+      reminder_interval_seconds: durationSec,
       next_reminder_at: nextReminder,
       is_saved_on_instagram: true,
     });
 
-    const confirmationMsg = `🎬 <b>Added to Watch Later!</b>\n\n👉 <a href="${saved.reel_url}">Open Reel on Instagram</a>\n\n⏰ I will remind you in <b>${interval} hours</b> if unwatched.`;
+    const targetTimeStr = new Date(nextReminder).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+    const confirmationMsg = `🎬 <b>Added to Watch Later!</b>\n\n👉 <a href="${saved.reel_url}">Open Reel on Instagram</a>\n\n⏰ <b>Reminder set for:</b> ${durationLabel} (at ${targetTimeStr})\n<i>Tap below to change reminder or mark watched:</i>`;
+
     const keyboard = {
       inline_keyboard: [
-        [{ text: '✅ Mark as Watched', callback_data: `watch_${saved.id}` }],
         [
-          { text: '💤 Snooze 5h', callback_data: `snooze_5_${saved.id}` },
-          { text: '💤 Snooze 24h', callback_data: `snooze_24_${saved.id}` },
+          { text: '⏱️ 30s', callback_data: `set_30_${saved.id}` },
+          { text: '⏱️ 1m', callback_data: `set_60_${saved.id}` },
+          { text: '⏱️ 5m', callback_data: `set_300_${saved.id}` },
         ],
+        [
+          { text: '⏰ 1h', callback_data: `set_3600_${saved.id}` },
+          { text: '⏰ 10h', callback_data: `set_36000_${saved.id}` },
+          { text: '⏰ 1d', callback_data: `set_86400_${saved.id}` },
+          { text: '⏰ 2d', callback_data: `set_172800_${saved.id}` },
+        ],
+        [{ text: '✅ Mark as Watched', callback_data: `watch_${saved.id}` }],
       ],
     };
 
@@ -227,6 +274,7 @@ export class TelegramBotService {
 
     if (!data || !chatId || !messageId) return;
 
+    // 1. Mark as Watched
     if (data.startsWith('watch_')) {
       const reelId = data.replace('watch_', '');
       await Repository.updateWatchStatus(reelId, 'watched');
@@ -239,35 +287,41 @@ export class TelegramBotService {
       return;
     }
 
-    if (data.startsWith('snooze_5_')) {
-      const reelId = data.replace('snooze_5_', '');
-      const nextDate = new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString();
-      await Repository.recordReminderSent(reelId, nextDate);
-      await this.answerCallbackQuery(query.id, '💤 Snoozed for 5 hours');
-      await this.editMessageText(
-        chatId,
-        messageId,
-        `💤 <b>Snoozed!</b> I will remind you again in <b>5 hours</b>.`
-      );
-      return;
-    }
+    // 2. Set custom reminder: set_<seconds>_<reelId>
+    if (data.startsWith('set_')) {
+      const match = data.match(/^set_(\d+)_(.+)$/);
+      if (match) {
+        const sec = parseInt(match[1], 10);
+        const reelId = match[2];
+        const nextDate = new Date(Date.now() + sec * 1000).toISOString();
 
-    if (data.startsWith('snooze_24_')) {
-      const reelId = data.replace('snooze_24_', '');
-      const nextDate = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-      await Repository.recordReminderSent(reelId, nextDate);
-      await this.answerCallbackQuery(query.id, '💤 Snoozed for 24 hours');
-      await this.editMessageText(
-        chatId,
-        messageId,
-        `💤 <b>Snoozed!</b> I will remind you again tomorrow.`
-      );
-      return;
+        await Repository.updateReminderSchedule(reelId, nextDate, sec);
+        await this.answerCallbackQuery(query.id, `⏰ Reminder set for ${formatTimeRemaining(sec * 1000)}!`);
+
+        const timeStr = new Date(nextDate).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+        await this.editMessageText(
+          chatId,
+          messageId,
+          `⏰ <b>Reminder updated!</b>\nI will ping you in <b>${formatTimeRemaining(sec * 1000)}</b> (at ${timeStr}).\n\n<i>Reply to this or tap below anytime:</i>`,
+          {
+            inline_keyboard: [
+              [
+                { text: '⏱️ 30s', callback_data: `set_30_${reelId}` },
+                { text: '⏱️ 5m', callback_data: `set_300_${reelId}` },
+                { text: '⏰ 1h', callback_data: `set_3600_${reelId}` },
+                { text: '⏰ 1d', callback_data: `set_86400_${reelId}` },
+              ],
+              [{ text: '✅ Mark as Watched', callback_data: `watch_${reelId}` }],
+            ],
+          }
+        );
+        return;
+      }
     }
   }
 
   /**
-   * Dispatches a reminder message for a due Reel.
+   * Dispatches a reminder message for a due Reel with fast snooze buttons.
    */
   async sendReminder(reel: SavedReel) {
     const targetChatId = this.activeChatId || loadConfig().telegram.chatId;
@@ -278,19 +332,21 @@ export class TelegramBotService {
 
     const creatorTag = reel.creator ? `@${reel.creator.username}` : 'Instagram Reel';
     const captionPreview = reel.caption ? `\n\n<i>"${reel.caption.slice(0, 80).replace(/\n/g, ' ')}..."</i>` : '';
-    const text = `🔔 <b>Watch Later Reminder!</b>\n\n🎬 <b>${creatorTag}</b>${captionPreview}\n👉 <a href="${reel.reel_url}">Watch Reel on Instagram</a>`;
+    const text = `🔔 <b>Watch Later Reminder!</b>\n\n🎬 <b>${creatorTag}</b>${captionPreview}\n👉 <a href="${reel.reel_url}">Watch Reel on Instagram</a>\n\n<i>Tap below to mark watched or snooze:</i>`;
 
     const keyboard = {
       inline_keyboard: [
         [{ text: '✅ Mark as Watched', callback_data: `watch_${reel.id}` }],
         [
-          { text: '💤 Snooze 5h', callback_data: `snooze_5_${reel.id}` },
-          { text: '💤 Snooze 24h', callback_data: `snooze_24_${reel.id}` },
+          { text: '⏱️ Snooze 30s', callback_data: `set_30_${reel.id}` },
+          { text: '⏱️ Snooze 5m', callback_data: `set_300_${reel.id}` },
+          { text: '⏰ Snooze 1h', callback_data: `set_3600_${reel.id}` },
+          { text: '⏰ Snooze 1d', callback_data: `set_86400_${reel.id}` },
         ],
       ],
     };
 
-    console.log(`[TelegramBot] Dispatching reminder for ${reel.shortcode} to Telegram chat ${targetChatId}...`);
+    console.log(`[TelegramBot] 🔔 Dispatching reminder for ${reel.shortcode} to Telegram chat ${targetChatId}...`);
     await this.sendMessage(targetChatId, text, keyboard);
   }
 }

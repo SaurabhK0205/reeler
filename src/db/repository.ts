@@ -332,6 +332,7 @@ export class Repository {
     watch_status?: WatchStatus;
     duration_seconds?: number | null;
     reminder_interval_hours?: number | null;
+    reminder_interval_seconds?: number | null;
     next_reminder_at?: string | null;
     is_saved_on_instagram?: boolean;
   }): Promise<SavedReel> {
@@ -340,6 +341,7 @@ export class Repository {
     }
 
     const supabase = getSupabase();
+    const intervalSeconds = data.reminder_interval_seconds ?? (data.reminder_interval_hours ? data.reminder_interval_hours * 3600 : 36000);
     const { data: reel, error } = await supabase
       .from('saved_reels')
       .upsert(
@@ -356,7 +358,8 @@ export class Repository {
           save_order_rank: data.save_order_rank,
           watch_status: data.watch_status || 'unwatched',
           duration_seconds: data.duration_seconds,
-          reminder_interval_hours: data.reminder_interval_hours ?? 10,
+          reminder_interval_hours: Math.round(intervalSeconds / 3600),
+          reminder_interval_seconds: intervalSeconds,
           next_reminder_at: data.next_reminder_at,
           is_saved_on_instagram: data.is_saved_on_instagram ?? true,
           updated_at: new Date().toISOString(),
@@ -394,6 +397,34 @@ export class Repository {
     }
 
     return (data || []) as SavedReel[];
+  }
+
+  static async updateReminderSchedule(id: string, nextReminderAt: string, intervalSeconds?: number): Promise<void> {
+    const now = new Date().toISOString();
+    if (!isSupabaseConfigured()) {
+      const reel = memoryStore.reels.get(id);
+      if (reel) {
+        reel.next_reminder_at = nextReminderAt;
+        if (intervalSeconds) {
+          reel.reminder_interval_seconds = intervalSeconds;
+          reel.reminder_interval_hours = Math.round(intervalSeconds / 3600);
+        }
+      }
+      return;
+    }
+
+    const supabase = getSupabase();
+    const updatePayload: Record<string, any> = {
+      next_reminder_at: nextReminderAt,
+      watch_status: 'watch_later',
+      updated_at: now,
+    };
+    if (intervalSeconds) {
+      updatePayload.reminder_interval_seconds = intervalSeconds;
+      updatePayload.reminder_interval_hours = Math.round(intervalSeconds / 3600);
+    }
+
+    await supabase.from('saved_reels').update(updatePayload).eq('id', id);
   }
 
   static async recordReminderSent(id: string, nextReminderAt: string): Promise<void> {

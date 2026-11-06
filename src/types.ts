@@ -26,6 +26,7 @@ export interface SavedReel {
   watch_status: WatchStatus;
   duration_seconds?: number | null;
   reminder_interval_hours?: number | null;
+  reminder_interval_seconds?: number | null;
   reminders_sent_count?: number;
   last_reminded_at?: string | null;
   next_reminder_at?: string | null;

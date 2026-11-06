@@ -39,11 +39,11 @@ export class ReminderWorker {
       this.pollInboundDMs().catch((err) => console.error('[ReminderWorker] DM poll error:', err.message));
     }, config.reminders.dmPollingIntervalMs);
 
-    // 2. Loop for dispatching due reminders
+    // 2. Loop for dispatching due reminders (every 3 seconds for high-precision seconds/minutes reminders)
     this.checkDueReminders();
     this.reminderInterval = setInterval(() => {
       this.checkDueReminders().catch((err) => console.error('[ReminderWorker] Reminder dispatch error:', err.message));
-    }, config.reminders.reminderCheckIntervalMs);
+    }, 3000);
   }
 
   stop() {
