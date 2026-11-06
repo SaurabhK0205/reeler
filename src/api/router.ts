@@ -1,10 +1,11 @@
-import { Router, Request, Response } from 'express';
+import express from 'express';
+import type { Request, Response } from 'express';
 import { Repository } from '../db/repository.ts';
 import { SyncService } from '../services/syncService.ts';
 import { loadConfig } from '../config.ts';
 import type { ReelQueryFilters, WatchStatus, DateFilterPreset } from '../types.ts';
 
-export const apiRouter = Router();
+export const apiRouter = express.Router();
 const syncService = new SyncService();
 
 // Health check and configuration status
