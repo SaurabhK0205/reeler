@@ -10,6 +10,12 @@ export interface AppConfig {
     csrfToken?: string;
     userAgent: string;
     isConfigured: boolean;
+    adminUsername?: string;
+  };
+  reminders: {
+    defaultIntervalHours: number;
+    dmPollingIntervalMs: number;
+    reminderCheckIntervalMs: number;
   };
   server: {
     port: number;
@@ -23,9 +29,13 @@ export function loadConfig(): AppConfig {
   const sessionId = process.env.INSTAGRAM_SESSION_ID?.trim();
   const userId = process.env.INSTAGRAM_USER_ID?.trim();
   const csrfToken = process.env.INSTAGRAM_CSRF_TOKEN?.trim();
+  const adminUsername = process.env.ADMIN_USERNAME?.trim()?.replace(/^@/, '');
   const userAgent = process.env.USER_AGENT?.trim() || 
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+  const defaultIntervalHours = Number(process.env.DEFAULT_REMINDER_HOURS) || 10;
+  const dmPollingIntervalMs = (Number(process.env.DM_POLLING_SECONDS) || 15) * 1000;
+  const reminderCheckIntervalMs = (Number(process.env.REMINDER_CHECK_SECONDS) || 60) * 1000;
   const port = Number(process.env.PORT) || 3000;
 
   return {
@@ -39,7 +49,13 @@ export function loadConfig(): AppConfig {
       userId,
       csrfToken,
       userAgent,
+      adminUsername,
       isConfigured: Boolean(sessionId && userId && csrfToken),
+    },
+    reminders: {
+      defaultIntervalHours,
+      dmPollingIntervalMs,
+      reminderCheckIntervalMs,
     },
     server: {
       port,

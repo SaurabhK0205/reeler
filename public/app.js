@@ -193,6 +193,9 @@ function renderReels() {
     const dateFormatted = formatRelativeDate(reel.taken_at);
     const statusClass = `status-${reel.watch_status}`;
     const statusLabel = formatStatusLabel(reel.watch_status);
+    const reminderBadge = reel.watch_status === 'watch_later' 
+      ? `<span class="reminder-pill" title="Next reminder scheduled">⏰ ${reel.reminder_interval_hours || 10}h Reminder</span>` 
+      : '';
 
     card.innerHTML = `
       <div class="reel-thumb-container">
@@ -206,6 +209,7 @@ function renderReels() {
         <div class="reel-creator-row">
           <img class="creator-avatar" src="${avatarUrl}" alt="${creatorName}" onerror="this.src='https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=60'">
           <a class="creator-handle" href="${reel.reel_url}" target="_blank">@${creatorName}</a>
+          ${reminderBadge}
         </div>
         <div class="reel-caption">${escapeHtml(reel.caption || '(No caption provided)')}</div>
         <div class="reel-meta-row">

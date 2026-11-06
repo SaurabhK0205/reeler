@@ -25,6 +25,11 @@ export interface SavedReel {
   save_order_rank: number;
   watch_status: WatchStatus;
   duration_seconds?: number | null;
+  reminder_interval_hours?: number | null;
+  reminders_sent_count?: number;
+  last_reminded_at?: string | null;
+  next_reminder_at?: string | null;
+  is_saved_on_instagram?: boolean;
   is_unavailable: boolean;
   created_at: string;
   updated_at: string;

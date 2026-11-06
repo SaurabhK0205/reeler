@@ -3,12 +3,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, redactSecret } from './config.ts';
 import { apiRouter } from './api/router.ts';
+import { ReminderWorker } from './services/reminderWorker.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const config = loadConfig();
+const reminderWorker = new ReminderWorker();
 
 app.use(express.json());
 
@@ -31,5 +33,8 @@ app.listen(PORT, () => {
   console.log('================================================================');
   console.log(`- Database:    ${config.supabase.isConfigured ? 'Supabase (' + config.supabase.url + ')' : 'In-Memory (Development/Demo Mode)'}`);
   console.log(`- Instagram:   ${config.instagram.isConfigured ? 'Connected (' + redactSecret(config.instagram.sessionId) + ')' : 'Not configured (add cookies to .env to sync)'}`);
+  console.log(`- Reminders:   Default interval: ${config.reminders.defaultIntervalHours} hours`);
   console.log('================================================================\n');
+
+  reminderWorker.start();
 });

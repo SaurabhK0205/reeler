@@ -62,6 +62,9 @@ class InMemoryStore {
     save_order_rank: number;
     watch_status?: WatchStatus;
     duration_seconds?: number | null;
+    reminder_interval_hours?: number | null;
+    next_reminder_at?: string | null;
+    is_saved_on_instagram?: boolean;
   }): Promise<SavedReel> {
     let existing: SavedReel | undefined;
     for (const r of this.reels.values()) {
@@ -76,6 +79,9 @@ class InMemoryStore {
       existing.caption = data.caption ?? existing.caption;
       existing.thumbnail_url = data.thumbnail_url ?? existing.thumbnail_url;
       existing.save_order_rank = data.save_order_rank;
+      if (data.watch_status) existing.watch_status = data.watch_status;
+      if (data.next_reminder_at) existing.next_reminder_at = data.next_reminder_at;
+      if (data.reminder_interval_hours) existing.reminder_interval_hours = data.reminder_interval_hours;
       existing.updated_at = now;
       return existing;
     }
@@ -94,6 +100,10 @@ class InMemoryStore {
       save_order_rank: data.save_order_rank,
       watch_status: data.watch_status || 'unwatched',
       duration_seconds: data.duration_seconds,
+      reminder_interval_hours: data.reminder_interval_hours ?? 10,
+      reminders_sent_count: 0,
+      next_reminder_at: data.next_reminder_at,
+      is_saved_on_instagram: data.is_saved_on_instagram ?? true,
       is_unavailable: false,
       created_at: now,
       updated_at: now,
@@ -321,6 +331,9 @@ export class Repository {
     save_order_rank: number;
     watch_status?: WatchStatus;
     duration_seconds?: number | null;
+    reminder_interval_hours?: number | null;
+    next_reminder_at?: string | null;
+    is_saved_on_instagram?: boolean;
   }): Promise<SavedReel> {
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertSavedReel(data);
@@ -343,6 +356,9 @@ export class Repository {
           save_order_rank: data.save_order_rank,
           watch_status: data.watch_status || 'unwatched',
           duration_seconds: data.duration_seconds,
+          reminder_interval_hours: data.reminder_interval_hours ?? 10,
+          next_reminder_at: data.next_reminder_at,
+          is_saved_on_instagram: data.is_saved_on_instagram ?? true,
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'instagram_media_id' }
@@ -355,6 +371,58 @@ export class Repository {
     }
 
     return reel as SavedReel;
+  }
+
+  static async getReelsDueForReminder(): Promise<SavedReel[]> {
+    const now = new Date().toISOString();
+
+    if (!isSupabaseConfigured()) {
+      return Array.from(memoryStore.reels.values())
+        .filter(r => r.watch_status === 'watch_later' && r.next_reminder_at && r.next_reminder_at <= now)
+        .map(r => ({ ...r, creator: memoryStore.creators.get(r.creator_id) }));
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('watch_status', 'watch_later')
+      .lte('next_reminder_at', now);
+
+    if (error) {
+      throw new Error(`Failed to fetch reminder due reels: ${error.message}`);
+    }
+
+    return (data || []) as SavedReel[];
+  }
+
+  static async recordReminderSent(id: string, nextReminderAt: string): Promise<void> {
+    const now = new Date().toISOString();
+
+    if (!isSupabaseConfigured()) {
+      const reel = memoryStore.reels.get(id);
+      if (reel) {
+        reel.reminders_sent_count = (reel.reminders_sent_count || 0) + 1;
+        reel.last_reminded_at = now;
+        reel.next_reminder_at = nextReminderAt;
+      }
+      return;
+    }
+
+    const supabase = getSupabase();
+    // fetch current count
+    const { data: current } = await supabase.from('saved_reels').select('reminders_sent_count').eq('id', id).single();
+    const newCount = (current?.reminders_sent_count || 0) + 1;
+
+    await supabase
+      .from('saved_reels')
+      .update({
+        reminders_sent_count: newCount,
+        last_reminded_at: now,
+        next_reminder_at: nextReminderAt,
+        updated_at: now,
+      })
+      .eq('id', id);
   }
 
   static async getReels(filters: ReelQueryFilters): Promise<{ reels: SavedReel[]; total: number; page: number; limit: number }> {
