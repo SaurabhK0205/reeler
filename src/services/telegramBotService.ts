@@ -2,6 +2,7 @@ import { loadConfig } from '../config.ts';
 import { Repository } from '../db/repository.ts';
 import { InstagramActionClient } from './instagramActionClient.ts';
 import { parseDuration, formatTimeRemaining } from '../utils/duration.ts';
+import { fetchReelMetadata } from './reelMetadataResolver.ts';
 import type { SavedReel } from '../types.ts';
 
 export class TelegramBotService {
@@ -294,11 +295,17 @@ export class TelegramBotService {
 
     console.log(`[TelegramBot] 🎬 Reel received: ${shortcode} with reminder in ${durationLabel}`);
 
-    // Upsert Creator
+    // Resolve real metadata (creator username, display name, caption, thumbnail)
+    const meta = await fetchReelMetadata(shortcode);
+    const resolvedUsername = meta.username || 'instagram_creator';
+    const resolvedDisplayName = meta.displayName || resolvedUsername;
+
+    // Upsert Creator with real identity
     const creator = await Repository.upsertCreator({
-      instagram_user_id: `creator_${shortcode}`,
-      username: 'instagram_creator',
-      display_name: 'Instagram Creator',
+      instagram_user_id: `creator_${resolvedUsername}`,
+      username: resolvedUsername,
+      display_name: resolvedDisplayName,
+      profile_picture_url: meta.thumbnailUrl || null,
     });
 
     const nextReminder = new Date(Date.now() + durationMs).toISOString();
@@ -308,6 +315,8 @@ export class TelegramBotService {
       shortcode,
       reel_url: `https://www.instagram.com/reel/${shortcode}/`,
       creator_id: creator.id,
+      caption: meta.caption || null,
+      thumbnail_url: meta.thumbnailUrl || null,
       taken_at: new Date().toISOString(),
       first_detected_at: new Date().toISOString(),
       save_order_rank: 1,
@@ -317,8 +326,10 @@ export class TelegramBotService {
       is_saved_on_instagram: true,
     });
 
+    const creatorBadge = resolvedUsername !== 'instagram_creator' ? `by <b>@${resolvedUsername}</b>` : '';
+    const captionPreview = meta.caption ? `\n\n<i>"${meta.caption.slice(0, 80).replace(/\n/g, ' ')}..."</i>` : '';
     const targetTimeStr = new Date(nextReminder).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
-    const confirmationMsg = `🎬 <b>Added to Watch Later!</b>\n\n👉 <a href="${saved.reel_url}">Open Reel on Instagram</a>\n\n⏰ <b>Reminder set for:</b> ${durationLabel} (at ${targetTimeStr})\n<i>Tap below to change reminder or mark watched:</i>`;
+    const confirmationMsg = `🎬 <b>Added to Watch Later!</b> ${creatorBadge}${captionPreview}\n\n👉 <a href="${saved.reel_url}">Open Reel on Instagram</a>\n\n⏰ <b>Reminder set for:</b> ${durationLabel} (at ${targetTimeStr})\n<i>Tap below to change reminder or mark watched:</i>`;
 
     const keyboard = {
       inline_keyboard: [
