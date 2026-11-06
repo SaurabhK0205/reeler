@@ -2,15 +2,21 @@ import { loadConfig } from '../config.ts';
 import { Repository } from '../db/repository.ts';
 import { InstagramActionClient } from './instagramActionClient.ts';
 import type { InboundMessage } from './instagramActionClient.ts';
+import { TelegramBotService } from './telegramBotService.ts';
 
 export class ReminderWorker {
   private actionClient = new InstagramActionClient();
+  private telegramBot: TelegramBotService;
   private processedItemIds = new Set<string>();
   private isRunning = false;
   private dmInterval: NodeJS.Timeout | null = null;
   private reminderInterval: NodeJS.Timeout | null = null;
   private adminThreadId: string | null = null;
   private adminUserId: string | null = null;
+
+  constructor(telegramBot?: TelegramBotService) {
+    this.telegramBot = telegramBot || new TelegramBotService();
+  }
 
   start() {
     const config = loadConfig();
@@ -172,28 +178,31 @@ export class ReminderWorker {
     console.log(`[ReminderWorker] 🔔 Found ${dueReels.length} Reel(s) due for reminder.`);
 
     for (const reel of dueReels) {
-      if (!this.adminUserId) {
-        if (!config.instagram.adminUsername) break;
-        const threadRes = await this.actionClient.findAdminThread(config.instagram.adminUsername);
-        if (threadRes.success && threadRes.data) {
-          this.adminUserId = threadRes.data.adminUserId;
-        } else {
-          break;
+      // 1. Send via Telegram (Push notification with action buttons!)
+      if (this.telegramBot.isConfigured) {
+        await this.telegramBot.sendReminder(reel);
+      }
+
+      // 2. Also send via Instagram DM if connected
+      if (config.instagram.isConfigured && (this.adminUserId || config.instagram.adminUsername)) {
+        if (!this.adminUserId && config.instagram.adminUsername) {
+          const threadRes = await this.actionClient.findAdminThread(config.instagram.adminUsername);
+          if (threadRes.success && threadRes.data) {
+            this.adminUserId = threadRes.data.adminUserId;
+          }
+        }
+
+        if (this.adminUserId) {
+          const creatorTag = reel.creator ? `@${reel.creator.username}` : 'Instagram Reel';
+          const captionPreview = reel.caption ? `"${reel.caption.slice(0, 70).replace(/\n/g, ' ')}..."\n` : '';
+          const reminderText = `🔔 Watch Later Reminder:\n${creatorTag}: ${captionPreview}👉 ${reel.reel_url}\n\n(Reply "done" to mark as watched)`;
+          await this.actionClient.sendDirectMessage(this.adminUserId, reminderText);
         }
       }
 
-      const creatorTag = reel.creator ? `@${reel.creator.username}` : 'Instagram Reel';
-      const captionPreview = reel.caption ? `"${reel.caption.slice(0, 70).replace(/\n/g, ' ')}..."\n` : '';
-      const reminderText = `🔔 Watch Later Reminder:\n${creatorTag}: ${captionPreview}👉 ${reel.reel_url}\n\n(Reply "done" to mark as watched)`;
-
-      console.log(`[ReminderWorker] Sending reminder for ${reel.shortcode} to admin...`);
-      const sendRes = await this.actionClient.sendDirectMessage(this.adminUserId, reminderText);
-
-      if (sendRes.success) {
-        // Schedule next reminder in intervalHours
-        const nextDate = new Date(Date.now() + intervalHours * 60 * 60 * 1000).toISOString();
-        await Repository.recordReminderSent(reel.id, nextDate);
-      }
+      // Bump next_reminder_at
+      const nextDate = new Date(Date.now() + intervalHours * 60 * 60 * 1000).toISOString();
+      await Repository.recordReminderSent(reel.id, nextDate);
     }
   }
 }

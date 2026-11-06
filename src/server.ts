@@ -4,13 +4,15 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, redactSecret } from './config.ts';
 import { apiRouter } from './api/router.ts';
 import { ReminderWorker } from './services/reminderWorker.ts';
+import { TelegramBotService } from './services/telegramBotService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const config = loadConfig();
-const reminderWorker = new ReminderWorker();
+const telegramBot = new TelegramBotService();
+const reminderWorker = new ReminderWorker(telegramBot);
 
 app.use(express.json());
 
@@ -33,8 +35,10 @@ app.listen(PORT, () => {
   console.log('================================================================');
   console.log(`- Database:    ${config.supabase.isConfigured ? 'Supabase (' + config.supabase.url + ')' : 'In-Memory (Development/Demo Mode)'}`);
   console.log(`- Instagram:   ${config.instagram.isConfigured ? 'Connected (' + redactSecret(config.instagram.sessionId) + ')' : 'Not configured (add cookies to .env to sync)'}`);
+  console.log(`- Telegram:    ${config.telegram.isConfigured ? 'Connected (@dinosaurabh_bot)' : 'Not configured'}`);
   console.log(`- Reminders:   Default interval: ${config.reminders.defaultIntervalHours} hours`);
   console.log('================================================================\n');
 
+  telegramBot.start();
   reminderWorker.start();
 });
