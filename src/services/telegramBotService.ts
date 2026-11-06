@@ -1,9 +1,18 @@
 import { loadConfig } from '../config.ts';
 import { Repository } from '../db/repository.ts';
-import { InstagramActionClient } from './instagramActionClient.ts';
 import { parseDuration, formatTimeRemaining } from '../utils/duration.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
 import type { SavedReel } from '../types.ts';
+
+export function escapeHtml(str?: string | null): string {
+  if (!str) return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
 
 export class TelegramBotService {
   private botToken: string;
@@ -11,7 +20,6 @@ export class TelegramBotService {
   private lastUpdateId = 0;
   private activeChatId: string | null = null;
   private customDefaultIntervalMs: number | null = null;
-  private actionClient = new InstagramActionClient();
 
   constructor() {
     const config = loadConfig();
@@ -108,148 +116,172 @@ export class TelegramBotService {
   }
 
   private async handleUpdate(update: any) {
-    // 1. Handle Button Clicks (Callback Query)
-    if (update.callback_query) {
-      await this.handleCallbackQuery(update.callback_query);
-      return;
-    }
+    try {
+      // 1. Handle Button Clicks (Callback Query)
+      if (update.callback_query) {
+        await this.handleCallbackQuery(update.callback_query);
+        return;
+      }
 
-    // 2. Handle Incoming Messages
-    const message = update.message;
-    if (!message || !message.text) return;
+      // 2. Handle Incoming Messages
+      const message = update.message;
+      if (!message || !message.text) return;
 
-    const chatId = String(message.chat.id);
-    this.activeChatId = chatId;
-    const text = message.text.trim();
+      const chatId = String(message.chat.id);
+      this.activeChatId = chatId;
+      const text = message.text.trim();
 
-    // Command: /start
-    if (text.startsWith('/start')) {
-      const welcome = `👋 <b>Welcome to your Saved Reels Watch Later Bot!</b>\n\nWhenever you see a Reel on Instagram, tap <b>Share ➔ Telegram ➔ @dinosaurabh_bot</b> (or paste the link here).\n\n⏱️ <b>Custom Reminders:</b>\nYou can set reminders for <b>seconds, minutes, hours, or days</b>!\n• Example: send link with <code>30s</code>, <code>5m</code>, <code>2h</code>, or <code>3 days</code>\n• Or use the quick-select buttons under each Reel.\n\n<b>Commands:</b>\n• /interval &lt;time&gt; - Set default reminder (e.g. <code>/interval 5m</code> or <code>/interval 12h</code>)\n• /pending - View Watch Later queue\n• /stats - View library statistics\n• /help - Help guide`;
-      await this.sendMessage(chatId, welcome);
-      return;
-    }
+      console.log(`[TelegramBot] 📩 Incoming message from chat ${chatId}: "${text}"`);
 
-    // Command: /interval <duration>
-    if (text.startsWith('/interval')) {
-      const parts = text.split(/\s+/).slice(1).join(' ');
-      const parsed = parseDuration(parts);
-      if (!parsed) {
+      // Command: /start
+      if (text.startsWith('/start')) {
+        const welcome = `👋 <b>Welcome to your Saved Reels Watch Later Bot!</b>\n\nWhenever you see a Reel on Instagram, tap <b>Share ➔ Telegram ➔ @dinosaurabh_bot</b> (or paste the link here).\n\n⏱️ <b>Custom Reminders:</b>\nYou can set reminders for <b>seconds, minutes, hours, or days</b>!\n• Example: send link with <code>30s</code>, <code>5m</code>, <code>2h</code>, or <code>3 days</code>\n• Or use the quick-select buttons under each Reel.\n\n<b>Commands:</b>\n• /interval &lt;time&gt; - Set default reminder (e.g. <code>/interval 5m</code> or <code>/interval 12h</code>)\n• /creators - View top saved creators\n• /pending - View Watch Later queue\n• /stats - View library statistics\n• /help - Help guide`;
+        await this.sendMessage(chatId, welcome);
+        return;
+      }
+
+      // Command: /interval <duration>
+      if (text.startsWith('/interval')) {
+        const parts = text.split(/\s+/).slice(1).join(' ');
+        const parsed = parseDuration(parts);
+        if (!parsed) {
+          await this.sendMessage(
+            chatId,
+            `❓ <b>How to set default interval:</b>\nType <code>/interval 30s</code>, <code>/interval 15m</code>, <code>/interval 2h</code>, or <code>/interval 2 days</code>.`
+          );
+          return;
+        }
+        this.customDefaultIntervalMs = parsed.ms;
         await this.sendMessage(
           chatId,
-          `❓ <b>How to set default interval:</b>\nType <code>/interval 30s</code>, <code>/interval 15m</code>, <code>/interval 2h</code>, or <code>/interval 2 days</code>.`
+          `⚙️ <b>Default reminder interval updated to: ${escapeHtml(parsed.label)}!</b>\nNew reels will remind you every ${escapeHtml(parsed.label)}.`
         );
         return;
       }
-      this.customDefaultIntervalMs = parsed.ms;
+
+      // Command: /stats
+      if (text.startsWith('/stats')) {
+        const stats = await Repository.getStats();
+        const statsMsg = `📊 <b>Your Saved Reels Library:</b>\n\n• <b>Total Reels:</b> ${stats.totalReels}\n• <b>Unique Creators:</b> ${stats.totalCreators}\n• <b>Saved This Week:</b> ${stats.savedThisWeek}\n• <b>⏰ Watch Later:</b> ${stats.watchLaterCount}\n• <b>✅ Watched:</b> ${stats.watchedCount}`;
+        await this.sendMessage(chatId, statsMsg);
+        return;
+      }
+
+      // Command: /creators (List top creators)
+      if (text.startsWith('/creators')) {
+        await this.sendCreatorsList(chatId);
+        return;
+      }
+
+      // Creator Search: @username or /creator username or /user username
+      const creatorCmdMatch = text.match(/^(?:\/creator|\/user)\s+@?([a-zA-Z0-9._]+)$/i);
+      const directHandleMatch = text.match(/^@([a-zA-Z0-9._]+)$/);
+      if (creatorCmdMatch || directHandleMatch) {
+        const targetUsername = (creatorCmdMatch ? creatorCmdMatch[1] : directHandleMatch![1]).toLowerCase();
+        await this.handleCreatorReelsRequest(chatId, targetUsername);
+        return;
+      }
+
+      // Command: /pending
+      if (text.startsWith('/pending')) {
+        const res = await Repository.getReels({ watchStatus: 'watch_later', limit: 5 });
+        if (res.reels.length === 0) {
+          await this.sendMessage(chatId, '🎉 <b>All caught up!</b> No pending reels in Watch Later right now.');
+          return;
+        }
+
+        await this.sendMessage(chatId, `⏰ <b>Your Watch Later Queue (${res.total} total):</b>`);
+        for (const reel of res.reels) {
+          const creator = reel.creator ? `@${escapeHtml(reel.creator.username)}` : 'Instagram Reel';
+          const msg = `🎬 <b>${creator}</b>\n👉 ${escapeHtml(reel.reel_url)}`;
+          const keyboard = {
+            inline_keyboard: [
+              [{ text: '✅ Mark as Watched', callback_data: `watch_${reel.id}` }],
+              [
+                { text: '⏱️ 30s', callback_data: `set_30_${reel.id}` },
+                { text: '⏱️ 5m', callback_data: `set_300_${reel.id}` },
+                { text: '⏰ 1h', callback_data: `set_3600_${reel.id}` },
+                { text: '⏰ 1d', callback_data: `set_86400_${reel.id}` },
+              ],
+            ],
+          };
+          await this.sendMessage(chatId, msg, keyboard);
+        }
+        return;
+      }
+
+      // Command: /help
+      if (text.startsWith('/help')) {
+        const helpMsg = `📖 <b>How to Use @dinosaurabh_bot:</b>\n\n1. In Instagram, open any Reel.\n2. Tap <b>Share ➔ Share via... ➔ Telegram ➔ dinosaurabh_bot</b> (or paste the Reel link here).\n3. Add custom time if you want: <code>https://instagram.com/reel/xyz 45s</code>\n4. You will get lock-screen reminders until you tap <b>"✅ Mark as Watched"</b>!\n\n🔍 <b>Searching Creators:</b>\n• Type any username like <code>@thefilmmemes</code> or <code>heysiri_jan</code> to get all saved reels from that account!`;
+        await this.sendMessage(chatId, helpMsg);
+        return;
+      }
+
+      // Check for Instagram Reel URL in message
+      const reelMatch = text.match(/https?:\/\/(?:www\.)?instagram\.com\/(?:reel|p)\/([A-Za-z0-9_-]+)/i);
+      if (reelMatch) {
+        // Check if user also typed a custom duration in the same message (e.g. "https://... 30s" or "30 sec")
+        const remainingText = text.replace(reelMatch[0], '').trim();
+        const customDuration = parseDuration(remainingText);
+        await this.handleReelShared(chatId, reelMatch[1], reelMatch[0], customDuration);
+        return;
+      }
+
+      // Single-word lookup: user typed username without @ (e.g. "thefilmmemes" or "heysiri_jan")
+      if (/^[a-zA-Z0-9._]{2,30}$/.test(text) && !text.startsWith('/')) {
+        await this.handleCreatorReelsRequest(chatId, text);
+        return;
+      }
+
+      // Default response
       await this.sendMessage(
         chatId,
-        `⚙️ <b>Default reminder interval updated to: ${parsed.label}!</b>\nNew reels will remind you every ${parsed.label}.`
+        `💡 <b>Quick Tips:</b>\n• Send any Reel link to add it to Watch Later (with optional time like <code>30s</code> or <code>5m</code>)\n• Type <b>@username</b> (e.g. <code>@thefilmmemes</code>) to get all reels saved from that account!\n• Type <b>/creators</b> to see your top saved creators.`
       );
-      return;
-    }
-
-    // Command: /stats
-    if (text.startsWith('/stats')) {
-      const stats = await Repository.getStats();
-      const statsMsg = `📊 <b>Your Saved Reels Library:</b>\n\n• <b>Total Reels:</b> ${stats.totalReels}\n• <b>Unique Creators:</b> ${stats.totalCreators}\n• <b>Saved This Week:</b> ${stats.savedThisWeek}\n• <b>⏰ Watch Later:</b> ${stats.watchLaterCount}\n• <b>✅ Watched:</b> ${stats.watchedCount}`;
-      await this.sendMessage(chatId, statsMsg);
-      return;
-    }
-
-    // Command: /creators (List top creators)
-    if (text.startsWith('/creators')) {
-      const creators = await Repository.getCreators();
-      if (creators.length === 0) {
-        await this.sendMessage(chatId, 'No saved creators found yet.');
-        return;
-      }
-      const topList = creators.slice(0, 15).map((c, i) => `${i + 1}. <b>@${c.username}</b> (${c.saved_count || 0} reels)`).join('\n');
-      const msg = `👥 <b>Top Saved Creators:</b>\n\n${topList}\n\n<i>Type any username like <code>@thefilmmemes</code> to get all their saved reels in sequence!</i>`;
-      await this.sendMessage(chatId, msg);
-      return;
-    }
-
-    // Creator Search: @username or /creator username or /user username
-    const creatorCmdMatch = text.match(/^(?:\/creator|\/user)\s+@?([a-zA-Z0-9._]+)$/i);
-    const directHandleMatch = text.match(/^@([a-zA-Z0-9._]+)$/);
-    if (creatorCmdMatch || directHandleMatch) {
-      const targetUsername = (creatorCmdMatch ? creatorCmdMatch[1] : directHandleMatch![1]).toLowerCase();
-      await this.handleCreatorReelsRequest(chatId, targetUsername);
-      return;
-    }
-
-    // Command: /pending
-    if (text.startsWith('/pending')) {
-      const res = await Repository.getReels({ watchStatus: 'watch_later', limit: 5 });
-      if (res.reels.length === 0) {
-        await this.sendMessage(chatId, '🎉 <b>All caught up!</b> No pending reels in Watch Later right now.');
-        return;
-      }
-
-      await this.sendMessage(chatId, `⏰ <b>Your Watch Later Queue (${res.total} total):</b>`);
-      for (const reel of res.reels) {
-        const creator = reel.creator ? `@${reel.creator.username}` : 'Instagram Reel';
-        const msg = `🎬 <b>${creator}</b>\n👉 ${reel.reel_url}`;
-        const keyboard = {
-          inline_keyboard: [
-            [{ text: '✅ Mark as Watched', callback_data: `watch_${reel.id}` }],
-            [
-              { text: '⏱️ 30s', callback_data: `set_30_${reel.id}` },
-              { text: '⏱️ 5m', callback_data: `set_300_${reel.id}` },
-              { text: '⏰ 1h', callback_data: `set_3600_${reel.id}` },
-              { text: '⏰ 1d', callback_data: `set_86400_${reel.id}` },
-            ],
-          ],
-        };
-        await this.sendMessage(chatId, msg, keyboard);
-      }
-      return;
-    }
-
-    // Command: /help
-    if (text.startsWith('/help')) {
-      const helpMsg = `📖 <b>How to Use @dinosaurabh_bot:</b>\n\n1. In Instagram, open any Reel.\n2. Tap <b>Share ➔ Share via... ➔ Telegram ➔ dinosaurabh_bot</b>.\n3. Add custom time if you want: <code>https://instagram.com/reel/xyz 45s</code>\n4. You will get lock-screen reminders until you tap <b>"✅ Mark as Watched"</b>!`;
-      await this.sendMessage(chatId, helpMsg);
-      return;
-    }
-
-    // Check for Instagram Reel URL in message
-    const reelMatch = text.match(/https?:\/\/(?:www\.)?instagram\.com\/(?:reel|p)\/([A-Za-z0-9_-]+)/i);
-    if (reelMatch) {
-      // Check if user also typed a custom duration in the same message (e.g. "https://... 30s" or "30 sec")
-      const remainingText = text.replace(reelMatch[0], '').trim();
-      const customDuration = parseDuration(remainingText);
-      await this.handleReelShared(chatId, reelMatch[1], reelMatch[0], customDuration);
-      return;
-    }
-
-    // Single-word lookup: user may have typed username without @ (e.g. "thefilmmemes")
-    if (/^[a-zA-Z0-9._]{2,30}$/.test(text)) {
-      const found = await this.handleCreatorReelsRequest(chatId, text, true);
-      if (found) return;
-    }
-
-    // Default response
-    await this.sendMessage(
-      chatId,
-      `💡 <b>Quick Tips:</b>\n• Send any Reel link to add it to Watch Later (with optional time like <code>30s</code> or <code>5m</code>)\n• Type <b>@username</b> (e.g. <code>@thefilmmemes</code>) to get all reels saved from that account!\n• Type <b>/creators</b> to see your top creators.`
-    );
-  }
-
-  private async handleCreatorReelsRequest(chatId: string, username: string, silentIfNotFound = false): Promise<boolean> {
-    const { creator, reels } = await Repository.getReelsByCreatorUsername(username);
-
-    if (!creator || reels.length === 0) {
-      if (!silentIfNotFound) {
+    } catch (err: any) {
+      console.error('[TelegramBot] Error handling update:', err);
+      const chatId = update.message?.chat?.id || this.activeChatId;
+      if (chatId) {
         await this.sendMessage(
           chatId,
-          `🔍 No saved reels found from <b>@${username}</b>.\nType /creators to see all your saved creators!`
+          `⚠️ <b>Notice:</b> Could not process request. (${escapeHtml(err.message || 'Unknown error')})`
         );
       }
+    }
+  }
+
+  private async sendCreatorsList(chatId: string) {
+    const creators = await Repository.getCreators();
+    if (creators.length === 0) {
+      await this.sendMessage(chatId, 'No saved creators found yet. Share a Reel link to start tracking!');
+      return;
+    }
+    const topList = creators.slice(0, 15).map((c, i) => `${i + 1}. <b>@${escapeHtml(c.username)}</b> (${c.saved_count || 0} reels)`).join('\n');
+    const msg = `👥 <b>Top Saved Creators:</b>\n\n${topList}\n\n<i>Type any username like <code>@thefilmmemes</code> to get all their saved reels in sequence!</i>`;
+    await this.sendMessage(chatId, msg);
+  }
+
+  private async handleCreatorReelsRequest(chatId: string, username: string): Promise<boolean> {
+    const cleanUsername = username.replace(/^@/, '').trim();
+    const { creator, reels } = await Repository.getReelsByCreatorUsername(cleanUsername);
+
+    if (!creator || reels.length === 0) {
+      const msg = `🔍 <b>No saved reels found from @${escapeHtml(cleanUsername)} yet!</b>\n\n` +
+        `💡 <b>How to track reels from this creator (Zero cookies required!):</b>\n` +
+        `1. In Instagram, open any Reel by <b>@${escapeHtml(cleanUsername)}</b>\n` +
+        `2. Tap <b>Share ➔ Share via... ➔ Telegram ➔ dinosaurabh_bot</b> (or paste the Reel link here)\n` +
+        `3. I'll automatically save it, detect @${escapeHtml(cleanUsername)}, and remind you!\n\n` +
+        `<i>Tap below to view the creators you've already saved:</i>`;
+
+      await this.sendMessage(chatId, msg, {
+        inline_keyboard: [
+          [{ text: '👥 View Saved Creators', callback_data: 'list_creators' }],
+        ],
+      });
       return false;
     }
 
-    let msg = `🎬 <b>Saved Reels from @${creator.username}</b>\n`;
+    let msg = `🎬 <b>Saved Reels from @${escapeHtml(creator.username)}</b>\n`;
     msg += `<i>Total: ${reels.length} reel(s) · Ordered latest to oldest</i>\n\n`;
 
     const itemsToShow = reels.slice(0, 10);
@@ -257,10 +289,11 @@ export class TelegramBotService {
       const reel = itemsToShow[i];
       const rank = i + 1;
       const statusIcon = reel.watch_status === 'watched' ? '✅' : reel.watch_status === 'watch_later' ? '⏰' : '👁️';
-      const snippet = reel.caption ? `"${reel.caption.slice(0, 55).replace(/\n/g, ' ')}..."` : '(No caption)';
+      const rawCaption = reel.caption ? reel.caption.slice(0, 60).replace(/\n/g, ' ') : '';
+      const cleanSnippet = rawCaption ? `"${escapeHtml(rawCaption)}..."` : '(No caption)';
       
-      msg += `<b>${rank}.</b> ${statusIcon} <a href="${reel.reel_url}">Watch Reel</a>\n`;
-      msg += `   ${snippet}\n\n`;
+      msg += `<b>${rank}.</b> ${statusIcon} <a href="${escapeHtml(reel.reel_url)}">Watch Reel</a>\n`;
+      msg += `   ${cleanSnippet}\n\n`;
     }
 
     if (reels.length > 10) {
@@ -293,7 +326,7 @@ export class TelegramBotService {
     const durationSec = Math.round(durationMs / 1000);
     const durationLabel = customDuration ? customDuration.label : `${Math.round(durationMs / 3600000)} hours`;
 
-    console.log(`[TelegramBot] 🎬 Reel received: ${shortcode} with reminder in ${durationLabel}`);
+    console.log(`[TelegramBot] 🎬 Reel received from ${chatId}: ${shortcode} with reminder in ${durationLabel}`);
 
     // Resolve real metadata (creator username, display name, caption, thumbnail)
     const meta = await fetchReelMetadata(shortcode);
@@ -324,12 +357,13 @@ export class TelegramBotService {
       reminder_interval_seconds: durationSec,
       next_reminder_at: nextReminder,
       is_saved_on_instagram: true,
+      telegram_chat_id: chatId,
     });
 
-    const creatorBadge = resolvedUsername !== 'instagram_creator' ? `by <b>@${resolvedUsername}</b>` : '';
-    const captionPreview = meta.caption ? `\n\n<i>"${meta.caption.slice(0, 80).replace(/\n/g, ' ')}..."</i>` : '';
+    const creatorBadge = resolvedUsername !== 'instagram_creator' ? `by <b>@${escapeHtml(resolvedUsername)}</b>` : '';
+    const captionPreview = meta.caption ? `\n\n<i>"${escapeHtml(meta.caption.slice(0, 80).replace(/\n/g, ' '))}..."</i>` : '';
     const targetTimeStr = new Date(nextReminder).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
-    const confirmationMsg = `🎬 <b>Added to Watch Later!</b> ${creatorBadge}${captionPreview}\n\n👉 <a href="${saved.reel_url}">Open Reel on Instagram</a>\n\n⏰ <b>Reminder set for:</b> ${durationLabel} (at ${targetTimeStr})\n<i>Tap below to change reminder or mark watched:</i>`;
+    const confirmationMsg = `🎬 <b>Added to Watch Later!</b> ${creatorBadge}${captionPreview}\n\n👉 <a href="${escapeHtml(saved.reel_url)}">Open Reel on Instagram</a>\n\n⏰ <b>Reminder set for:</b> ${escapeHtml(durationLabel)} (at ${targetTimeStr})\n<i>Tap below to change reminder or mark watched:</i>`;
 
     const keyboard = {
       inline_keyboard: [
@@ -356,7 +390,16 @@ export class TelegramBotService {
     const chatId = query.message?.chat?.id;
     const messageId = query.message?.message_id;
 
-    if (!data || !chatId || !messageId) return;
+    if (!data || !chatId) return;
+
+    // List creators button
+    if (data === 'list_creators') {
+      await this.answerCallbackQuery(query.id);
+      await this.sendCreatorsList(chatId);
+      return;
+    }
+
+    if (!messageId) return;
 
     // 1. Mark as Watched
     if (data.startsWith('watch_')) {
@@ -386,7 +429,7 @@ export class TelegramBotService {
         await this.editMessageText(
           chatId,
           messageId,
-          `⏰ <b>Reminder updated!</b>\nI will ping you in <b>${formatTimeRemaining(sec * 1000)}</b> (at ${timeStr}).\n\n<i>Reply to this or tap below anytime:</i>`,
+          `⏰ <b>Reminder updated!</b>\nI will ping you in <b>${escapeHtml(formatTimeRemaining(sec * 1000))}</b> (at ${timeStr}).\n\n<i>Reply to this or tap below anytime:</i>`,
           {
             inline_keyboard: [
               [
@@ -408,15 +451,16 @@ export class TelegramBotService {
    * Dispatches a reminder message for a due Reel with fast snooze buttons.
    */
   async sendReminder(reel: SavedReel) {
-    const targetChatId = this.activeChatId || loadConfig().telegram.chatId;
+    const targetChatId = reel.telegram_chat_id || this.activeChatId || loadConfig().telegram.chatId;
     if (!targetChatId) {
       console.log('[TelegramBot] No active chat ID yet. User needs to send /start to @dinosaurabh_bot first.');
       return;
     }
 
-    const creatorTag = reel.creator ? `@${reel.creator.username}` : 'Instagram Reel';
-    const captionPreview = reel.caption ? `\n\n<i>"${reel.caption.slice(0, 80).replace(/\n/g, ' ')}..."</i>` : '';
-    const text = `🔔 <b>Watch Later Reminder!</b>\n\n🎬 <b>${creatorTag}</b>${captionPreview}\n👉 <a href="${reel.reel_url}">Watch Reel on Instagram</a>\n\n<i>Tap below to mark watched or snooze:</i>`;
+    const creatorTag = reel.creator ? `@${escapeHtml(reel.creator.username)}` : 'Instagram Reel';
+    const rawCaption = reel.caption ? reel.caption.slice(0, 80).replace(/\n/g, ' ') : '';
+    const captionPreview = rawCaption ? `\n\n<i>"${escapeHtml(rawCaption)}..."</i>` : '';
+    const text = `🔔 <b>Watch Later Reminder!</b>\n\n🎬 <b>${creatorTag}</b>${captionPreview}\n👉 <a href="${escapeHtml(reel.reel_url)}">Watch Reel on Instagram</a>\n\n<i>Tap below to mark watched or snooze:</i>`;
 
     const keyboard = {
       inline_keyboard: [

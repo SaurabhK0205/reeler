@@ -200,8 +200,9 @@ export class ReminderWorker {
         }
       }
 
-      // Bump next_reminder_at
-      const nextDate = new Date(Date.now() + intervalHours * 60 * 60 * 1000).toISOString();
+      // Bump next_reminder_at based on custom seconds/hours or default
+      const intervalSec = reel.reminder_interval_seconds ?? (reel.reminder_interval_hours ? reel.reminder_interval_hours * 3600 : intervalHours * 3600);
+      const nextDate = new Date(Date.now() + intervalSec * 1000).toISOString();
       await Repository.recordReminderSent(reel.id, nextDate);
     }
   }

@@ -65,6 +65,7 @@ class InMemoryStore {
     reminder_interval_hours?: number | null;
     next_reminder_at?: string | null;
     is_saved_on_instagram?: boolean;
+    telegram_chat_id?: string | null;
   }): Promise<SavedReel> {
     let existing: SavedReel | undefined;
     for (const r of this.reels.values()) {
@@ -104,6 +105,7 @@ class InMemoryStore {
       reminders_sent_count: 0,
       next_reminder_at: data.next_reminder_at,
       is_saved_on_instagram: data.is_saved_on_instagram ?? true,
+      telegram_chat_id: data.telegram_chat_id,
       is_unavailable: false,
       created_at: now,
       updated_at: now,
@@ -335,6 +337,7 @@ export class Repository {
     reminder_interval_seconds?: number | null;
     next_reminder_at?: string | null;
     is_saved_on_instagram?: boolean;
+    telegram_chat_id?: string | null;
   }): Promise<SavedReel> {
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertSavedReel(data);
@@ -362,6 +365,7 @@ export class Repository {
           reminder_interval_seconds: intervalSeconds,
           next_reminder_at: data.next_reminder_at,
           is_saved_on_instagram: data.is_saved_on_instagram ?? true,
+          telegram_chat_id: data.telegram_chat_id,
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'instagram_media_id' }
@@ -542,34 +546,56 @@ export class Repository {
   }
 
   static async getReelsByCreatorUsername(username: string): Promise<{ creator: Creator | null; reels: SavedReel[] }> {
-    const cleanUsername = username.replace(/^@/, '').trim();
+    const cleanUsername = username.replace(/^@/, '').trim().toLowerCase();
+    if (!cleanUsername) return { creator: null, reels: [] };
 
     if (!isSupabaseConfigured()) {
       let creator: Creator | undefined;
       for (const c of memoryStore.creators.values()) {
-        if (c.username.toLowerCase() === cleanUsername.toLowerCase()) {
+        if (c.username.toLowerCase() === cleanUsername) {
           creator = c;
           break;
+        }
+      }
+      if (!creator) {
+        for (const c of memoryStore.creators.values()) {
+          if (c.username.toLowerCase().includes(cleanUsername)) {
+            creator = c;
+            break;
+          }
         }
       }
       if (!creator) return { creator: null, reels: [] };
 
       const reels = Array.from(memoryStore.reels.values())
         .filter(r => r.creator_id === creator!.id)
-        .sort((a, b) => a.save_order_rank - b.save_order_rank)
+        .sort((a, b) => a.save_order_rank - b.save_order_rank || new Date(b.first_detected_at).getTime() - new Date(a.first_detected_at).getTime())
         .map(r => ({ ...r, creator }));
 
       return { creator, reels };
     }
 
     const supabase = getSupabase();
-    const { data: creator, error: cErr } = await supabase
+    // 1. Try exact match first
+    let { data: creator } = await supabase
       .from('creators')
       .select('*')
       .ilike('username', cleanUsername)
+      .limit(1)
       .maybeSingle();
 
-    if (cErr || !creator) {
+    // 2. If not found, try partial match
+    if (!creator) {
+      const { data: partialCreator } = await supabase
+        .from('creators')
+        .select('*')
+        .ilike('username', `%${cleanUsername}%`)
+        .limit(1)
+        .maybeSingle();
+      creator = partialCreator;
+    }
+
+    if (!creator) {
       return { creator: null, reels: [] };
     }
 
@@ -577,10 +603,12 @@ export class Repository {
       .from('saved_reels')
       .select('*, creator:creators(*)')
       .eq('creator_id', creator.id)
-      .order('save_order_rank', { ascending: true });
+      .order('save_order_rank', { ascending: true })
+      .order('first_detected_at', { ascending: false });
 
     if (rErr) {
-      throw new Error(`Failed to fetch reels for creator: ${rErr.message}`);
+      console.error(`[Repository] Error fetching reels for creator ${creator.id}:`, rErr.message);
+      return { creator: creator as Creator, reels: [] };
     }
 
     return { creator: creator as Creator, reels: (reels || []) as SavedReel[] };

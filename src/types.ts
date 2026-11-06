@@ -31,6 +31,7 @@ export interface SavedReel {
   last_reminded_at?: string | null;
   next_reminder_at?: string | null;
   is_saved_on_instagram?: boolean;
+  telegram_chat_id?: string | null;
   is_unavailable: boolean;
   created_at: string;
   updated_at: string;
