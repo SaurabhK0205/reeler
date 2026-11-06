@@ -155,6 +155,28 @@ export class TelegramBotService {
       return;
     }
 
+    // Command: /creators (List top creators)
+    if (text.startsWith('/creators')) {
+      const creators = await Repository.getCreators();
+      if (creators.length === 0) {
+        await this.sendMessage(chatId, 'No saved creators found yet.');
+        return;
+      }
+      const topList = creators.slice(0, 15).map((c, i) => `${i + 1}. <b>@${c.username}</b> (${c.saved_count || 0} reels)`).join('\n');
+      const msg = `👥 <b>Top Saved Creators:</b>\n\n${topList}\n\n<i>Type any username like <code>@thefilmmemes</code> to get all their saved reels in sequence!</i>`;
+      await this.sendMessage(chatId, msg);
+      return;
+    }
+
+    // Creator Search: @username or /creator username or /user username
+    const creatorCmdMatch = text.match(/^(?:\/creator|\/user)\s+@?([a-zA-Z0-9._]+)$/i);
+    const directHandleMatch = text.match(/^@([a-zA-Z0-9._]+)$/);
+    if (creatorCmdMatch || directHandleMatch) {
+      const targetUsername = (creatorCmdMatch ? creatorCmdMatch[1] : directHandleMatch![1]).toLowerCase();
+      await this.handleCreatorReelsRequest(chatId, targetUsername);
+      return;
+    }
+
     // Command: /pending
     if (text.startsWith('/pending')) {
       const res = await Repository.getReels({ watchStatus: 'watch_later', limit: 5 });
@@ -200,11 +222,62 @@ export class TelegramBotService {
       return;
     }
 
+    // Single-word lookup: user may have typed username without @ (e.g. "thefilmmemes")
+    if (/^[a-zA-Z0-9._]{2,30}$/.test(text)) {
+      const found = await this.handleCreatorReelsRequest(chatId, text, true);
+      if (found) return;
+    }
+
     // Default response
     await this.sendMessage(
       chatId,
-      `💡 Send me any Instagram Reel link with an optional time (e.g. <code>30s</code>, <code>5m</code>, <code>2h</code>) and I'll add it to your Watch Later queue!`
+      `💡 <b>Quick Tips:</b>\n• Send any Reel link to add it to Watch Later (with optional time like <code>30s</code> or <code>5m</code>)\n• Type <b>@username</b> (e.g. <code>@thefilmmemes</code>) to get all reels saved from that account!\n• Type <b>/creators</b> to see your top creators.`
     );
+  }
+
+  private async handleCreatorReelsRequest(chatId: string, username: string, silentIfNotFound = false): Promise<boolean> {
+    const { creator, reels } = await Repository.getReelsByCreatorUsername(username);
+
+    if (!creator || reels.length === 0) {
+      if (!silentIfNotFound) {
+        await this.sendMessage(
+          chatId,
+          `🔍 No saved reels found from <b>@${username}</b>.\nType /creators to see all your saved creators!`
+        );
+      }
+      return false;
+    }
+
+    let msg = `🎬 <b>Saved Reels from @${creator.username}</b>\n`;
+    msg += `<i>Total: ${reels.length} reel(s) · Ordered latest to oldest</i>\n\n`;
+
+    const itemsToShow = reels.slice(0, 10);
+    for (let i = 0; i < itemsToShow.length; i++) {
+      const reel = itemsToShow[i];
+      const rank = i + 1;
+      const statusIcon = reel.watch_status === 'watched' ? '✅' : reel.watch_status === 'watch_later' ? '⏰' : '👁️';
+      const snippet = reel.caption ? `"${reel.caption.slice(0, 55).replace(/\n/g, ' ')}..."` : '(No caption)';
+      
+      msg += `<b>${rank}.</b> ${statusIcon} <a href="${reel.reel_url}">Watch Reel</a>\n`;
+      msg += `   ${snippet}\n\n`;
+    }
+
+    if (reels.length > 10) {
+      msg += `<i>...and ${reels.length - 10} more in your dashboard!</i>\n`;
+    }
+
+    // Action buttons for top reels
+    const keyboardRows = [];
+    for (let i = 0; i < Math.min(3, reels.length); i++) {
+      const r = reels[i];
+      keyboardRows.push([
+        { text: `Reel #${i + 1} 👉 Open`, url: r.reel_url },
+        { text: r.watch_status === 'watched' ? '✅ Watched' : '👁️ Mark Watched', callback_data: `watch_${r.id}` },
+      ]);
+    }
+
+    await this.sendMessage(chatId, msg, { inline_keyboard: keyboardRows });
+    return true;
   }
 
   private async handleReelShared(

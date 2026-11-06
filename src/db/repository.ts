@@ -541,6 +541,51 @@ export class Repository {
     return result;
   }
 
+  static async getReelsByCreatorUsername(username: string): Promise<{ creator: Creator | null; reels: SavedReel[] }> {
+    const cleanUsername = username.replace(/^@/, '').trim();
+
+    if (!isSupabaseConfigured()) {
+      let creator: Creator | undefined;
+      for (const c of memoryStore.creators.values()) {
+        if (c.username.toLowerCase() === cleanUsername.toLowerCase()) {
+          creator = c;
+          break;
+        }
+      }
+      if (!creator) return { creator: null, reels: [] };
+
+      const reels = Array.from(memoryStore.reels.values())
+        .filter(r => r.creator_id === creator!.id)
+        .sort((a, b) => a.save_order_rank - b.save_order_rank)
+        .map(r => ({ ...r, creator }));
+
+      return { creator, reels };
+    }
+
+    const supabase = getSupabase();
+    const { data: creator, error: cErr } = await supabase
+      .from('creators')
+      .select('*')
+      .ilike('username', cleanUsername)
+      .maybeSingle();
+
+    if (cErr || !creator) {
+      return { creator: null, reels: [] };
+    }
+
+    const { data: reels, error: rErr } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('creator_id', creator.id)
+      .order('save_order_rank', { ascending: true });
+
+    if (rErr) {
+      throw new Error(`Failed to fetch reels for creator: ${rErr.message}`);
+    }
+
+    return { creator: creator as Creator, reels: (reels || []) as SavedReel[] };
+  }
+
   static async getStats(): Promise<LibraryStats> {
     if (!isSupabaseConfigured()) {
       return memoryStore.getStats();
