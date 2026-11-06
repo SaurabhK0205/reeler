@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Saved Reels Tracker & Discovery</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="logo-icon">🎬</div>
+        <div>
+          <h1>Saved Reels Tracker</h1>
+          <p class="subtitle">Search, filter, and rediscover your saved Instagram Reels</p>
+        </div>
+      </div>
+      <div class="header-right">
+        <span id="db-badge" class="badge badge-neutral">Checking DB...</span>
+        <button id="sync-btn" class="btn btn-primary">
+          <span class="btn-icon">🔄</span> Sync Saved Reels
+        </button>
+      </div>
+    </header>
+
+    <!-- Stats Dashboard -->
+    <section class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Total Saved Reels</div>
+        <div class="stat-value" id="stat-total">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Unique Creators</div>
+        <div class="stat-value" id="stat-creators">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Saved This Week</div>
+        <div class="stat-value" id="stat-week">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Watch Later</div>
+        <div class="stat-value text-accent" id="stat-watch-later">0</div>
+      </div>
+    </section>
+
+    <!-- Controls: Search & Primary Filters -->
+    <section class="filter-controls">
+      <!-- Search Bar -->
+      <div class="search-box">
+        <span class="search-icon">🔍</span>
+        <input type="text" id="search-input" placeholder="Search keywords in captions or creators..." autocomplete="off">
+        <button id="clear-search" class="clear-btn" style="display: none;">✕</button>
+      </div>
+
+      <div class="dropdown-row">
+        <!-- Date Filter -->
+        <div class="control-group">
+          <label for="date-preset">Date Saved:</label>
+          <select id="date-preset">
+            <option value="all">All Time</option>
+            <option value="today">Today</option>
+            <option value="yesterday">Yesterday</option>
+            <option value="7d">Last 7 Days</option>
+            <option value="30d">Last 30 Days</option>
+            <option value="3m">Last 3 Months</option>
+            <option value="6m">Last 6 Months</option>
+            <option value="year">This Year</option>
+          </select>
+        </div>
+
+        <!-- Watch Status -->
+        <div class="control-group">
+          <label for="watch-filter">Status:</label>
+          <select id="watch-filter">
+            <option value="all">All Statuses</option>
+            <option value="unwatched">Unwatched</option>
+            <option value="watch_later">Watch Later</option>
+            <option value="watched">Watched</option>
+          </select>
+        </div>
+
+        <!-- Sort By -->
+        <div class="control-group">
+          <label for="sort-by">Sort By:</label>
+          <select id="sort-by">
+            <option value="newest_saved">Newest Saved First</option>
+            <option value="oldest_saved">Oldest Saved First</option>
+            <option value="newest_published">Newest Published First</option>
+            <option value="oldest_published">Oldest Published First</option>
+          </select>
+        </div>
+      </div>
+    </section>
+
+    <!-- Creator Quick-Filter Bar -->
+    <section class="creator-bar-container">
+      <div class="creator-bar-header">
+        <span class="section-title">Filter by Creator</span>
+        <button id="reset-creator-btn" class="reset-link" style="display: none;">Show All Creators</button>
+      </div>
+      <div class="creator-pills" id="creator-pills-list">
+        <div class="creator-pill active" data-creator-id="">All Creators</div>
+      </div>
+    </section>
+
+    <!-- Main Reels Grid -->
+    <main class="reels-section">
+      <div class="reels-header">
+        <div id="results-count" class="results-count">Loading reels...</div>
+      </div>
+
+      <div class="reels-grid" id="reels-grid">
+        <!-- Rendered by app.js -->
+      </div>
+
+      <!-- Pagination -->
+      <div class="pagination-bar" id="pagination-bar" style="display: none;">
+        <button id="prev-page-btn" class="btn btn-secondary">← Previous</button>
+        <span id="page-indicator" class="page-indicator">Page 1 of 1</span>
+        <button id="next-page-btn" class="btn btn-secondary">Next →</button>
+      </div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

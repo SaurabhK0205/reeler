@@ -1,0 +1,20 @@
+{
+  "name": "instagram-saved-reels",
+  "version": "1.0.0",
+  "description": "Intelligent Saved Reels Tracker, Filter & Discovery Dashboard for Instagram",
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-strip-types --env-file-if-exists=.env src/server.ts",
+    "dev": "node --experimental-strip-types --watch --env-file-if-exists=.env src/server.ts",
+    "sync": "node --experimental-strip-types --env-file-if-exists=.env scripts/test-sync.ts",
+    "seed": "node --experimental-strip-types --env-file-if-exists=.env scripts/seed-demo.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.48.1",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.13.4"
+  }
+}

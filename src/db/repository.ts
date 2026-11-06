@@ -1,0 +1,504 @@
+import type {
+  Creator,
+  SavedReel,
+  ReelQueryFilters,
+  LibraryStats,
+  WatchStatus,
+  DateFilterPreset
+} from '../types.ts';
+import { getSupabase, isSupabaseConfigured } from './client.ts';
+
+// In-Memory store for offline/demo/development fallback
+class InMemoryStore {
+  creators: Map<string, Creator> = new Map();
+  reels: Map<string, SavedReel> = new Map();
+
+  async upsertCreator(data: {
+    instagram_user_id: string;
+    username: string;
+    display_name?: string | null;
+    profile_picture_url?: string | null;
+  }): Promise<Creator> {
+    let existing: Creator | undefined;
+    for (const c of this.creators.values()) {
+      if (c.instagram_user_id === data.instagram_user_id) {
+        existing = c;
+        break;
+      }
+    }
+
+    const now = new Date().toISOString();
+    if (existing) {
+      existing.username = data.username;
+      existing.display_name = data.display_name ?? existing.display_name;
+      existing.profile_picture_url = data.profile_picture_url ?? existing.profile_picture_url;
+      existing.updated_at = now;
+      return existing;
+    }
+
+    const newCreator: Creator = {
+      id: `creator_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      instagram_user_id: data.instagram_user_id,
+      username: data.username,
+      display_name: data.display_name,
+      profile_picture_url: data.profile_picture_url,
+      created_at: now,
+      updated_at: now,
+    };
+    this.creators.set(newCreator.id, newCreator);
+    return newCreator;
+  }
+
+  async upsertSavedReel(data: {
+    instagram_media_id: string;
+    shortcode: string;
+    reel_url: string;
+    creator_id: string;
+    caption?: string | null;
+    thumbnail_url?: string | null;
+    taken_at: string;
+    saved_at?: string | null;
+    first_detected_at: string;
+    save_order_rank: number;
+    watch_status?: WatchStatus;
+    duration_seconds?: number | null;
+  }): Promise<SavedReel> {
+    let existing: SavedReel | undefined;
+    for (const r of this.reels.values()) {
+      if (r.instagram_media_id === data.instagram_media_id || r.shortcode === data.shortcode) {
+        existing = r;
+        break;
+      }
+    }
+
+    const now = new Date().toISOString();
+    if (existing) {
+      existing.caption = data.caption ?? existing.caption;
+      existing.thumbnail_url = data.thumbnail_url ?? existing.thumbnail_url;
+      existing.save_order_rank = data.save_order_rank;
+      existing.updated_at = now;
+      return existing;
+    }
+
+    const newReel: SavedReel = {
+      id: `reel_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      instagram_media_id: data.instagram_media_id,
+      shortcode: data.shortcode,
+      reel_url: data.reel_url,
+      creator_id: data.creator_id,
+      caption: data.caption,
+      thumbnail_url: data.thumbnail_url,
+      taken_at: data.taken_at,
+      saved_at: data.saved_at,
+      first_detected_at: data.first_detected_at,
+      save_order_rank: data.save_order_rank,
+      watch_status: data.watch_status || 'unwatched',
+      duration_seconds: data.duration_seconds,
+      is_unavailable: false,
+      created_at: now,
+      updated_at: now,
+      creator: this.creators.get(data.creator_id),
+    };
+
+    this.reels.set(newReel.id, newReel);
+    return newReel;
+  }
+
+  async getReels(filters: ReelQueryFilters) {
+    let list = Array.from(this.reels.values()).map(r => ({
+      ...r,
+      creator: this.creators.get(r.creator_id)
+    }));
+
+    // Filter by Creator
+    if (filters.creatorId) {
+      list = list.filter(r => r.creator_id === filters.creatorId);
+    }
+
+    // Filter by Watch Status
+    if (filters.watchStatus && filters.watchStatus !== 'all') {
+      list = list.filter(r => r.watch_status === filters.watchStatus);
+    }
+
+    // Filter by Date Preset or Range
+    const { startDate, endDate } = resolveDateRange(filters.datePreset, filters.startDate, filters.endDate);
+    if (startDate) {
+      const startMs = new Date(startDate).getTime();
+      list = list.filter(r => new Date(r.first_detected_at).getTime() >= startMs);
+    }
+    if (endDate) {
+      const endMs = new Date(endDate).getTime();
+      list = list.filter(r => new Date(r.first_detected_at).getTime() <= endMs);
+    }
+
+    // Search query
+    if (filters.search?.trim()) {
+      const q = filters.search.toLowerCase().trim();
+      list = list.filter(r => {
+        const captionMatch = r.caption?.toLowerCase().includes(q) ?? false;
+        const usernameMatch = r.creator?.username.toLowerCase().includes(q) ?? false;
+        const nameMatch = r.creator?.display_name?.toLowerCase().includes(q) ?? false;
+        return captionMatch || usernameMatch || nameMatch;
+      });
+    }
+
+    // Sorting
+    const sort = filters.sortBy || 'newest_saved';
+    list.sort((a, b) => {
+      if (sort === 'newest_saved') return a.save_order_rank - b.save_order_rank; // 1 = newest
+      if (sort === 'oldest_saved') return b.save_order_rank - a.save_order_rank;
+      if (sort === 'newest_published') return new Date(b.taken_at).getTime() - new Date(a.taken_at).getTime();
+      if (sort === 'oldest_published') return new Date(a.taken_at).getTime() - new Date(b.taken_at).getTime();
+      return 0;
+    });
+
+    const total = list.length;
+    const page = Math.max(1, filters.page || 1);
+    const limit = Math.max(1, Math.min(100, filters.limit || 24));
+    const offset = (page - 1) * limit;
+    const paged = list.slice(offset, offset + limit);
+
+    return { reels: paged, total, page, limit };
+  }
+
+  async getCreators(): Promise<Creator[]> {
+    const counts = new Map<string, number>();
+    for (const r of this.reels.values()) {
+      counts.set(r.creator_id, (counts.get(r.creator_id) || 0) + 1);
+    }
+
+    const list = Array.from(this.creators.values()).map(c => ({
+      ...c,
+      saved_count: counts.get(c.id) || 0
+    }));
+
+    list.sort((a, b) => (b.saved_count || 0) - (a.saved_count || 0));
+    return list;
+  }
+
+  async getStats(): Promise<LibraryStats> {
+    const allReels = Array.from(this.reels.values());
+    const now = Date.now();
+    const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
+    const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
+
+    let savedThisWeek = 0;
+    let savedThisMonth = 0;
+    let unwatchedCount = 0;
+    let watchedCount = 0;
+    let watchLaterCount = 0;
+
+    for (const r of allReels) {
+      const detectedMs = new Date(r.first_detected_at).getTime();
+      if (detectedMs >= sevenDaysAgo) savedThisWeek++;
+      if (detectedMs >= thirtyDaysAgo) savedThisMonth++;
+
+      if (r.watch_status === 'unwatched') unwatchedCount++;
+      else if (r.watch_status === 'watched') watchedCount++;
+      else if (r.watch_status === 'watch_later') watchLaterCount++;
+    }
+
+    const creators = await this.getCreators();
+    const topCreators = creators.slice(0, 5).map(c => ({
+      id: c.id,
+      username: c.username,
+      display_name: c.display_name,
+      profile_picture_url: c.profile_picture_url,
+      count: c.saved_count || 0
+    }));
+
+    return {
+      totalReels: allReels.length,
+      totalCreators: this.creators.size,
+      savedThisWeek,
+      savedThisMonth,
+      unwatchedCount,
+      watchedCount,
+      watchLaterCount,
+      topCreators
+    };
+  }
+
+  async updateWatchStatus(id: string, status: WatchStatus): Promise<SavedReel | null> {
+    const reel = this.reels.get(id);
+    if (!reel) return null;
+    reel.watch_status = status;
+    reel.updated_at = new Date().toISOString();
+    return { ...reel, creator: this.creators.get(reel.creator_id) };
+  }
+}
+
+const memoryStore = new InMemoryStore();
+
+function resolveDateRange(preset?: DateFilterPreset, customStart?: string, customEnd?: string) {
+  if (preset === 'custom' || (!preset && (customStart || customEnd))) {
+    return { startDate: customStart, endDate: customEnd };
+  }
+
+  if (!preset || preset === 'all') {
+    return { startDate: undefined, endDate: undefined };
+  }
+
+  const now = new Date();
+  const start = new Date(now);
+
+  switch (preset) {
+    case 'today':
+      start.setHours(0, 0, 0, 0);
+      break;
+    case 'yesterday': {
+      start.setDate(now.getDate() - 1);
+      start.setHours(0, 0, 0, 0);
+      const end = new Date(start);
+      end.setHours(23, 59, 59, 999);
+      return { startDate: start.toISOString(), endDate: end.toISOString() };
+    }
+    case '7d':
+      start.setDate(now.getDate() - 7);
+      break;
+    case '30d':
+      start.setDate(now.getDate() - 30);
+      break;
+    case '3m':
+      start.setMonth(now.getMonth() - 3);
+      break;
+    case '6m':
+      start.setMonth(now.getMonth() - 6);
+      break;
+    case 'year':
+      start.setFullYear(now.getFullYear(), 0, 1);
+      start.setHours(0, 0, 0, 0);
+      break;
+  }
+
+  return { startDate: start.toISOString(), endDate: undefined };
+}
+
+export class Repository {
+  static async upsertCreator(data: {
+    instagram_user_id: string;
+    username: string;
+    display_name?: string | null;
+    profile_picture_url?: string | null;
+  }): Promise<Creator> {
+    if (!isSupabaseConfigured()) {
+      return memoryStore.upsertCreator(data);
+    }
+
+    const supabase = getSupabase();
+    const { data: creator, error } = await supabase
+      .from('creators')
+      .upsert(
+        {
+          instagram_user_id: data.instagram_user_id,
+          username: data.username,
+          display_name: data.display_name,
+          profile_picture_url: data.profile_picture_url,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'instagram_user_id' }
+      )
+      .select()
+      .single();
+
+    if (error || !creator) {
+      throw new Error(`Supabase upsertCreator failed: ${error?.message || 'unknown error'}`);
+    }
+
+    return creator as Creator;
+  }
+
+  static async upsertSavedReel(data: {
+    instagram_media_id: string;
+    shortcode: string;
+    reel_url: string;
+    creator_id: string;
+    caption?: string | null;
+    thumbnail_url?: string | null;
+    taken_at: string;
+    saved_at?: string | null;
+    first_detected_at: string;
+    save_order_rank: number;
+    watch_status?: WatchStatus;
+    duration_seconds?: number | null;
+  }): Promise<SavedReel> {
+    if (!isSupabaseConfigured()) {
+      return memoryStore.upsertSavedReel(data);
+    }
+
+    const supabase = getSupabase();
+    const { data: reel, error } = await supabase
+      .from('saved_reels')
+      .upsert(
+        {
+          instagram_media_id: data.instagram_media_id,
+          shortcode: data.shortcode,
+          reel_url: data.reel_url,
+          creator_id: data.creator_id,
+          caption: data.caption,
+          thumbnail_url: data.thumbnail_url,
+          taken_at: data.taken_at,
+          saved_at: data.saved_at,
+          first_detected_at: data.first_detected_at,
+          save_order_rank: data.save_order_rank,
+          watch_status: data.watch_status || 'unwatched',
+          duration_seconds: data.duration_seconds,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'instagram_media_id' }
+      )
+      .select('*, creator:creators(*)')
+      .single();
+
+    if (error || !reel) {
+      throw new Error(`Supabase upsertSavedReel failed: ${error?.message || 'unknown error'}`);
+    }
+
+    return reel as SavedReel;
+  }
+
+  static async getReels(filters: ReelQueryFilters): Promise<{ reels: SavedReel[]; total: number; page: number; limit: number }> {
+    if (!isSupabaseConfigured()) {
+      return memoryStore.getReels(filters);
+    }
+
+    const supabase = getSupabase();
+    const page = Math.max(1, filters.page || 1);
+    const limit = Math.max(1, Math.min(100, filters.limit || 24));
+    const offset = (page - 1) * limit;
+
+    let query = supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)', { count: 'exact' });
+
+    if (filters.creatorId) {
+      query = query.eq('creator_id', filters.creatorId);
+    }
+
+    if (filters.watchStatus && filters.watchStatus !== 'all') {
+      query = query.eq('watch_status', filters.watchStatus);
+    }
+
+    const { startDate, endDate } = resolveDateRange(filters.datePreset, filters.startDate, filters.endDate);
+    if (startDate) {
+      query = query.gte('first_detected_at', startDate);
+    }
+    if (endDate) {
+      query = query.lte('first_detected_at', endDate);
+    }
+
+    if (filters.search?.trim()) {
+      const q = filters.search.trim();
+      query = query.ilike('caption', `%${q}%`);
+    }
+
+    const sort = filters.sortBy || 'newest_saved';
+    if (sort === 'newest_saved') query = query.order('save_order_rank', { ascending: true });
+    else if (sort === 'oldest_saved') query = query.order('save_order_rank', { ascending: false });
+    else if (sort === 'newest_published') query = query.order('taken_at', { ascending: false });
+    else if (sort === 'oldest_published') query = query.order('taken_at', { ascending: true });
+
+    query = query.range(offset, offset + limit - 1);
+
+    const { data, count, error } = await query;
+    if (error) {
+      throw new Error(`Supabase getReels failed: ${error.message}`);
+    }
+
+    return {
+      reels: (data || []) as SavedReel[],
+      total: count || 0,
+      page,
+      limit,
+    };
+  }
+
+  static async getCreators(): Promise<Creator[]> {
+    if (!isSupabaseConfigured()) {
+      return memoryStore.getCreators();
+    }
+
+    const supabase = getSupabase();
+    const { data: creators, error } = await supabase
+      .from('creators')
+      .select('*, saved_reels(count)');
+
+    if (error) {
+      throw new Error(`Supabase getCreators failed: ${error.message}`);
+    }
+
+    const result: Creator[] = (creators || []).map((c: any) => ({
+      id: c.id,
+      instagram_user_id: c.instagram_user_id,
+      username: c.username,
+      display_name: c.display_name,
+      profile_picture_url: c.profile_picture_url,
+      created_at: c.created_at,
+      updated_at: c.updated_at,
+      saved_count: c.saved_reels?.[0]?.count || 0,
+    }));
+
+    result.sort((a, b) => (b.saved_count || 0) - (a.saved_count || 0));
+    return result;
+  }
+
+  static async getStats(): Promise<LibraryStats> {
+    if (!isSupabaseConfigured()) {
+      return memoryStore.getStats();
+    }
+
+    const supabase = getSupabase();
+    const now = new Date();
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    const [totalReelsRes, creatorsRes, weekRes, monthRes, unwatchedRes, watchedRes, watchLaterRes] = await Promise.all([
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }),
+      Repository.getCreators(),
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('first_detected_at', sevenDaysAgo),
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('first_detected_at', thirtyDaysAgo),
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'unwatched'),
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'watched'),
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'watch_later'),
+    ]);
+
+    const topCreators = creatorsRes.slice(0, 5).map(c => ({
+      id: c.id,
+      username: c.username,
+      display_name: c.display_name,
+      profile_picture_url: c.profile_picture_url,
+      count: c.saved_count || 0
+    }));
+
+    return {
+      totalReels: totalReelsRes.count || 0,
+      totalCreators: creatorsRes.length,
+      savedThisWeek: weekRes.count || 0,
+      savedThisMonth: monthRes.count || 0,
+      unwatchedCount: unwatchedRes.count || 0,
+      watchedCount: watchedRes.count || 0,
+      watchLaterCount: watchLaterRes.count || 0,
+      topCreators,
+    };
+  }
+
+  static async updateWatchStatus(id: string, status: WatchStatus): Promise<SavedReel | null> {
+    if (!isSupabaseConfigured()) {
+      return memoryStore.updateWatchStatus(id, status);
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .update({ watch_status: status, updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .select('*, creator:creators(*)')
+      .single();
+
+    if (error || !data) {
+      throw new Error(`Failed to update watch status: ${error?.message}`);
+    }
+
+    return data as SavedReel;
+  }
+}
