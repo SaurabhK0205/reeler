@@ -101,11 +101,11 @@ export class MetaInstagramBotService {
 
           const text = event.message?.text || '';
           
-          // Check for attachments (e.g. shared Reel clip)
+          // Check for attachments (e.g. shared Reel clip, ig_reel, share, video)
           let reelUrl: string | null = null;
           if (event.message?.attachments) {
             for (const att of event.message.attachments) {
-              if (att.type === 'share' && att.payload?.url) {
+              if (att.payload?.url) {
                 reelUrl = att.payload.url;
                 break;
               }
@@ -168,16 +168,50 @@ export class MetaInstagramBotService {
         reminder_interval_seconds: durationSec,
         next_reminder_at: nextReminder,
         is_saved_on_instagram: true,
+        instagram_sender_id: senderId,
       });
 
-      const targetTimeStr = new Date(nextReminder).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-      const reply = `🎬 Added to your Watch Later!\nCreator: @${resolvedUsername}\n\n⏰ Reminder set for: ${durationLabel} (at ${targetTimeStr})\n\nReply "watched" when done, or "snooze 1h" to delay!`;
+      const targetTimeStr = new Date(nextReminder).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+      const reply = `🎬 Added to your Watch Later!\nCreator: @${resolvedUsername}\n\n⏰ Reminder set for: ${durationLabel} (at ${targetTimeStr})\n\nReply e.g. "5s", "10m", or "watched" when done!`;
 
       await this.sendDirectMessage(senderId, reply);
       return;
     }
 
     const lower = text.toLowerCase().trim();
+
+    // 1. Mark as watched command
+    if (['done', 'watched', 'mark watched', 'seen'].includes(lower)) {
+      const lastReel = await Repository.getLastReelForInstagramSender(senderId);
+      if (lastReel) {
+        await Repository.updateWatchStatus(lastReel.id, 'watched');
+        await this.sendDirectMessage(senderId, `✅ Marked "${lastReel.shortcode}" as watched! Reminders stopped.`);
+      } else {
+        await this.sendDirectMessage(senderId, `👍 All set! No pending reels right now.`);
+      }
+      return;
+    }
+
+    // 2. Custom duration command (e.g. "5s", "5 secs", "remind me in 5 secs", "34 mins", "5. hours")
+    const customDuration = parseDuration(text);
+    if (customDuration) {
+      const lastReel = await Repository.getLastReelForInstagramSender(senderId);
+      if (lastReel) {
+        const nextDate = new Date(Date.now() + customDuration.ms).toISOString();
+        await Repository.updateReminderSchedule(lastReel.id, nextDate, customDuration.seconds);
+        const timeStr = new Date(nextDate).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+        await this.sendDirectMessage(
+          senderId,
+          `⏰ Reminder updated to: ${customDuration.label}!\nI will ping you at ${timeStr}.`
+        );
+      } else {
+        await this.sendDirectMessage(
+          senderId,
+          `⏰ Got it! Duration set to ${customDuration.label}. Share any Reel to track it!`
+        );
+      }
+      return;
+    }
 
     // Check for creator search (e.g. "@heysiri_jan" or "heysiri_jan")
     if (/^@?[a-zA-Z0-9._]{2,30}$/.test(lower) && !lower.startsWith('/')) {

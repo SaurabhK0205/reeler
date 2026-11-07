@@ -9,10 +9,12 @@ export interface ParsedDuration {
  */
 export function parseDuration(text: string): ParsedDuration | null {
   if (!text) return null;
-  const cleaned = text.toLowerCase().trim().replace(/^in\s+/, '');
+  const cleaned = text.toLowerCase().trim()
+    .replace(/^(?:remind\s+(?:me\s+)?(?:in\s+)?|snooze\s+(?:for\s+|in\s+)?|set\s+reminder\s+(?:for\s+)?|in\s+)/i, '')
+    .trim();
 
-  // Regex patterns
-  const match = cleaned.match(/^(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks)?$/i);
+  // Regex patterns (supporting e.g. 5s, 5. hours, 34 mins)
+  const match = cleaned.match(/^(\d+(?:\.\d*)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks)?$/i);
   if (!match) return null;
 
   const value = parseFloat(match[1]);

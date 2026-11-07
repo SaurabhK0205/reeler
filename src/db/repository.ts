@@ -66,6 +66,7 @@ class InMemoryStore {
     next_reminder_at?: string | null;
     is_saved_on_instagram?: boolean;
     telegram_chat_id?: string | null;
+    instagram_sender_id?: string | null;
   }): Promise<SavedReel> {
     let existing: SavedReel | undefined;
     for (const r of this.reels.values()) {
@@ -106,6 +107,7 @@ class InMemoryStore {
       next_reminder_at: data.next_reminder_at,
       is_saved_on_instagram: data.is_saved_on_instagram ?? true,
       telegram_chat_id: data.telegram_chat_id,
+      instagram_sender_id: data.instagram_sender_id,
       is_unavailable: false,
       created_at: now,
       updated_at: now,
@@ -338,6 +340,7 @@ export class Repository {
     next_reminder_at?: string | null;
     is_saved_on_instagram?: boolean;
     telegram_chat_id?: string | null;
+    instagram_sender_id?: string | null;
   }): Promise<SavedReel> {
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertSavedReel(data);
@@ -366,6 +369,7 @@ export class Repository {
           next_reminder_at: data.next_reminder_at,
           is_saved_on_instagram: data.is_saved_on_instagram ?? true,
           telegram_chat_id: data.telegram_chat_id,
+          instagram_sender_id: data.instagram_sender_id,
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'instagram_media_id' }
@@ -429,6 +433,37 @@ export class Repository {
     }
 
     await supabase.from('saved_reels').update(updatePayload).eq('id', id);
+  }
+
+  static async getLastReelForInstagramSender(senderId: string): Promise<SavedReel | null> {
+    if (!isSupabaseConfigured()) {
+      const match = Array.from(memoryStore.reels.values())
+        .filter(r => r.instagram_sender_id === senderId)
+        .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+      return match || null;
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('instagram_sender_id', senderId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error || !data) {
+      // Fallback: return the most recent reel overall
+      const { data: fallback } = await supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      return fallback as SavedReel || null;
+    }
+
+    return data as SavedReel;
   }
 
   static async recordReminderSent(id: string, nextReminderAt: string): Promise<void> {

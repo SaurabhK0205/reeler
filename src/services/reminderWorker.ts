@@ -3,10 +3,12 @@ import { Repository } from '../db/repository.ts';
 import { InstagramActionClient } from './instagramActionClient.ts';
 import type { InboundMessage } from './instagramActionClient.ts';
 import { TelegramBotService } from './telegramBotService.ts';
+import { MetaInstagramBotService } from './metaInstagramBotService.ts';
 
 export class ReminderWorker {
   private actionClient = new InstagramActionClient();
   private telegramBot: TelegramBotService;
+  private metaBot = new MetaInstagramBotService();
   private processedItemIds = new Set<string>();
   private isRunning = false;
   private dmInterval: NodeJS.Timeout | null = null;
@@ -179,25 +181,18 @@ export class ReminderWorker {
 
     for (const reel of dueReels) {
       // 1. Send via Telegram (Push notification with action buttons!)
-      if (this.telegramBot.isConfigured) {
+      if (this.telegramBot.isConfigured && reel.telegram_chat_id) {
         await this.telegramBot.sendReminder(reel);
       }
 
-      // 2. Also send via Instagram DM if connected
-      if (config.instagram.isConfigured && (this.adminUserId || config.instagram.adminUsername)) {
-        if (!this.adminUserId && config.instagram.adminUsername) {
-          const threadRes = await this.actionClient.findAdminThread(config.instagram.adminUsername);
-          if (threadRes.success && threadRes.data) {
-            this.adminUserId = threadRes.data.adminUserId;
-          }
-        }
-
-        if (this.adminUserId) {
-          const creatorTag = reel.creator ? `@${reel.creator.username}` : 'Instagram Reel';
-          const captionPreview = reel.caption ? `"${reel.caption.slice(0, 70).replace(/\n/g, ' ')}..."\n` : '';
-          const reminderText = `🔔 Watch Later Reminder:\n${creatorTag}: ${captionPreview}👉 ${reel.reel_url}\n\n(Reply "done" to mark as watched)`;
-          await this.actionClient.sendDirectMessage(this.adminUserId, reminderText);
-        }
+      // 2. Send via Official Meta Instagram DM if user saved via Instagram!
+      if (reel.instagram_sender_id && this.metaBot.isConfigured) {
+        const creatorTag = reel.creator ? `@${reel.creator.username}` : 'Instagram Reel';
+        const rawCaption = reel.caption ? reel.caption.slice(0, 70).replace(/\n/g, ' ') : '';
+        const captionPreview = rawCaption ? `"${rawCaption}..."\n` : '';
+        const reminderText = `🔔 Watch Later Reminder!\n\n🎬 ${creatorTag}\n${captionPreview}👉 ${reel.reel_url}\n\nReply "watched" when done, or reply e.g. "5m" or "snooze 1h" to delay!`;
+        console.log(`[ReminderWorker] 🔔 Dispatching Instagram DM reminder to ${reel.instagram_sender_id}...`);
+        await this.metaBot.sendDirectMessage(reel.instagram_sender_id, reminderText);
       }
 
       // Bump next_reminder_at based on custom seconds/hours or default
