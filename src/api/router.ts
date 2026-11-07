@@ -3,10 +3,39 @@ import type { Request, Response } from 'express';
 import { Repository } from '../db/repository.ts';
 import { SyncService } from '../services/syncService.ts';
 import { loadConfig } from '../config.ts';
+import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
 import type { ReelQueryFilters, WatchStatus, DateFilterPreset } from '../types.ts';
 
 export const apiRouter = express.Router();
 const syncService = new SyncService();
+const metaBotService = new MetaInstagramBotService();
+
+// Instagram Webhook Verification (Meta calls this once when setting up)
+apiRouter.get('/instagram/webhook', (req: Request, res: Response) => {
+  const mode = req.query['hub.mode'] as string;
+  const token = req.query['hub.verify_token'] as string;
+  const challenge = req.query['hub.challenge'] as string;
+
+  const verified = metaBotService.verifyWebhook(mode, token, challenge);
+  if (verified) {
+    console.log('[MetaIG] Webhook verification succeeded!');
+    res.status(200).send(challenge);
+  } else {
+    console.warn('[MetaIG] Webhook verification failed. Tokens mismatch.');
+    res.sendStatus(403);
+  }
+});
+
+// Instagram Webhook Event Handler (Meta or ManyChat sends incoming DMs here)
+apiRouter.post('/instagram/webhook', async (req: Request, res: Response) => {
+  try {
+    // Acknowledge immediately to prevent timeouts from Meta
+    res.status(200).send('EVENT_RECEIVED');
+    await metaBotService.handleWebhookPayload(req.body);
+  } catch (err: any) {
+    console.error('[MetaIG] Error handling webhook payload:', err.message);
+  }
+});
 
 // Health check and configuration status
 apiRouter.get('/health', (_req: Request, res: Response) => {
