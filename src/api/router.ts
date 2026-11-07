@@ -19,6 +19,7 @@ apiRouter.get('/instagram/webhook', (req: Request, res: Response) => {
   const verified = metaBotService.verifyWebhook(mode, token, challenge);
   if (verified) {
     console.log('[MetaIG] Webhook verification succeeded!');
+    res.setHeader('Content-Type', 'text/plain');
     res.status(200).send(challenge);
   } else {
     console.warn('[MetaIG] Webhook verification failed. Tokens mismatch.');

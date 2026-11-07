@@ -64,11 +64,27 @@ export class MetaInstagramBotService {
    * Handles incoming webhook event payload from Meta or ManyChat
    */
   async handleWebhookPayload(body: any): Promise<void> {
-    // 1. ManyChat Webhook Bridge format (if using ManyChat)
-    if (body.custom_user_id || body.manychat_user_id) {
-      const userId = String(body.custom_user_id || body.manychat_user_id);
-      const text = String(body.text || body.message || '');
-      await this.processIncomingText(userId, text);
+    console.log('[MetaIG] 📥 Webhook received body:', JSON.stringify(body, null, 2));
+
+    // 1. ManyChat Webhook Bridge format (supports custom JSON and Full Contact Data)
+    if (body.custom_user_id || body.manychat_user_id || body.id || body.user_id || body.last_input_text || body.text) {
+      const userId = String(
+        body.custom_user_id ||
+        body.manychat_user_id ||
+        body.id ||
+        body.user_id ||
+        'instagram_user'
+      );
+      const text = String(
+        body.text ||
+        body.last_input_text ||
+        body.last_text_input ||
+        body.message ||
+        ''
+      );
+      if (text) {
+        await this.processIncomingText(userId, text);
+      }
       return;
     }
 
