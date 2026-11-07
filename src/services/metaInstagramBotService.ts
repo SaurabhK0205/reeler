@@ -67,7 +67,7 @@ export class MetaInstagramBotService {
     console.log('[MetaIG] 📥 Webhook received body:', JSON.stringify(body, null, 2));
 
     // 1. ManyChat Webhook Bridge format (supports custom JSON and Full Contact Data)
-    if (body.custom_user_id || body.manychat_user_id || body.id || body.user_id || body.last_input_text || body.text) {
+    if (body.custom_user_id || body.manychat_user_id || body.last_input_text) {
       const userId = String(
         body.custom_user_id ||
         body.manychat_user_id ||
@@ -88,9 +88,10 @@ export class MetaInstagramBotService {
       return;
     }
 
-    // 2. Official Meta Graph API Webhook format
-    if (body.object === 'instagram' && Array.isArray(body.entry)) {
+    // 2. Official Meta Graph API Webhook format (handles both 'instagram' and 'page' objects)
+    if ((body.object === 'instagram' || body.object === 'page') && Array.isArray(body.entry)) {
       for (const entry of body.entry) {
+        // A. Standard messaging events
         const messaging = entry.messaging || [];
         for (const event of messaging) {
           const senderId = event.sender?.id;
@@ -115,6 +116,30 @@ export class MetaInstagramBotService {
           const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
           if (combinedText) {
             await this.processIncomingText(senderId, combinedText);
+          }
+        }
+
+        // B. Changes events (some webhook subscriptions dispatch via changes)
+        const changes = entry.changes || [];
+        for (const change of changes) {
+          if (change.field === 'messages' && change.value) {
+            const val = change.value;
+            const senderId = val.sender?.id;
+            if (!senderId || val.message?.is_echo) continue;
+            const text = val.message?.text || '';
+            let reelUrl: string | null = null;
+            if (val.message?.attachments) {
+              for (const att of val.message.attachments) {
+                if (att.payload?.url) {
+                  reelUrl = att.payload.url;
+                  break;
+                }
+              }
+            }
+            const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
+            if (combinedText) {
+              await this.processIncomingText(senderId, combinedText);
+            }
           }
         }
       }
@@ -180,12 +205,14 @@ export class MetaInstagramBotService {
 
     const lower = text.toLowerCase().trim();
 
-    // 1. Mark as watched command
-    if (['done', 'watched', 'mark watched', 'seen'].includes(lower)) {
-      const lastReel = await Repository.getLastReelForInstagramSender(senderId);
-      if (lastReel) {
-        await Repository.updateWatchStatus(lastReel.id, 'watched');
-        await this.sendDirectMessage(senderId, `✅ Marked "${lastReel.shortcode}" as watched! Reminders stopped.`);
+    // 1. Mark as watched / stop command
+    // Handles: "watched", "watched!", "watched.", "done", "seen", "stop", "i watched it", "done with it", "cancel", "clear", etc.
+    const isWatchedOrStop = /\b(watched|watch|done|seen|finish|finished|stop|cancel|halt|unsub|quit)\b/i.test(lower);
+    if (isWatchedOrStop) {
+      const updatedReels = await Repository.markWatchedForInstagramSender(senderId);
+      if (updatedReels.length > 0) {
+        const title = updatedReels[0].shortcode ? `"${updatedReels[0].shortcode}"` : 'your reel';
+        await this.sendDirectMessage(senderId, `✅ Marked ${title} as watched! Reminders stopped.`);
       } else {
         await this.sendDirectMessage(senderId, `👍 All set! No pending reels right now.`);
       }

@@ -237,6 +237,9 @@ class InMemoryStore {
     const reel = this.reels.get(id);
     if (!reel) return null;
     reel.watch_status = status;
+    if (status === 'watched') {
+      reel.next_reminder_at = null;
+    }
     reel.updated_at = new Date().toISOString();
     return { ...reel, creator: this.creators.get(reel.creator_id) };
   }
@@ -466,7 +469,7 @@ export class Repository {
     return data as SavedReel;
   }
 
-  static async recordReminderSent(id: string, nextReminderAt: string): Promise<void> {
+  static async recordReminderSent(id: string, nextReminderAt: string | null): Promise<void> {
     const now = new Date().toISOString();
 
     if (!isSupabaseConfigured()) {
@@ -695,9 +698,17 @@ export class Repository {
     }
 
     const supabase = getSupabase();
+    const updatePayload: Record<string, any> = {
+      watch_status: status,
+      updated_at: new Date().toISOString(),
+    };
+    if (status === 'watched') {
+      updatePayload.next_reminder_at = null;
+    }
+
     const { data, error } = await supabase
       .from('saved_reels')
-      .update({ watch_status: status, updated_at: new Date().toISOString() })
+      .update(updatePayload)
       .eq('id', id)
       .select('*, creator:creators(*)')
       .single();
@@ -707,5 +718,65 @@ export class Repository {
     }
 
     return data as SavedReel;
+  }
+
+  static async markWatchedForInstagramSender(senderId: string): Promise<SavedReel[]> {
+    const now = new Date().toISOString();
+    if (!isSupabaseConfigured()) {
+      const updated: SavedReel[] = [];
+      for (const reel of memoryStore.reels.values()) {
+        if (reel.watch_status === 'watch_later' && (!senderId || reel.instagram_sender_id === senderId)) {
+          reel.watch_status = 'watched';
+          reel.next_reminder_at = null;
+          reel.updated_at = now;
+          updated.push({ ...reel, creator: memoryStore.creators.get(reel.creator_id) });
+        }
+      }
+      return updated;
+    }
+
+    const supabase = getSupabase();
+    // 1. Try finding reels explicitly matching instagram_sender_id
+    const { data: activeReels } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('instagram_sender_id', senderId)
+      .eq('watch_status', 'watch_later');
+
+    if (activeReels && activeReels.length > 0) {
+      await supabase
+        .from('saved_reels')
+        .update({
+          watch_status: 'watched',
+          next_reminder_at: null,
+          updated_at: now,
+        })
+        .eq('instagram_sender_id', senderId)
+        .eq('watch_status', 'watch_later');
+      return activeReels as SavedReel[];
+    }
+
+    // 2. Fallback: match any active watch_later reel
+    const { data: latest } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('watch_status', 'watch_later')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (latest) {
+      await supabase
+        .from('saved_reels')
+        .update({
+          watch_status: 'watched',
+          next_reminder_at: null,
+          updated_at: now,
+        })
+        .eq('id', latest.id);
+      return [latest as SavedReel];
+    }
+
+    return [];
   }
 }

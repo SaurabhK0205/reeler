@@ -150,19 +150,15 @@ export class ReminderWorker {
     // Case 2: Text command (e.g. "done", "watched", "remind in 5h")
     if (msg.text) {
       const lower = msg.text.toLowerCase().trim();
-      if (lower === 'done' || lower === 'watched') {
-        // Mark the most recent watch_later reel as watched
-        const dueReels = await Repository.getReelsDueForReminder();
-        if (dueReels.length > 0) {
-          await Repository.updateWatchStatus(dueReels[0].id, 'watched');
-          if (this.adminUserId) {
-            await this.actionClient.sendDirectMessage(this.adminUserId, `✅ Marked "${dueReels[0].shortcode}" as watched! Reminders stopped.`);
-          }
-        } else {
-          if (this.adminUserId) {
-            await this.actionClient.sendDirectMessage(this.adminUserId, `👍 All set! No pending watch-later reminders right now.`);
-          }
+      const isWatched = /\b(watched|watch|done|seen|finish|finished|stop|cancel|halt)\b/i.test(lower);
+      if (isWatched) {
+        const updated = await Repository.markWatchedForInstagramSender(this.adminUserId || '');
+        if (updated.length > 0 && this.adminUserId) {
+          await this.actionClient.sendDirectMessage(this.adminUserId, `✅ Marked "${updated[0].shortcode}" as watched! Reminders stopped.`);
+        } else if (this.adminUserId) {
+          await this.actionClient.sendDirectMessage(this.adminUserId, `👍 All set! No pending watch-later reminders right now.`);
         }
+        return;
       }
     }
   }
@@ -195,9 +191,20 @@ export class ReminderWorker {
         await this.metaBot.sendDirectMessage(reel.instagram_sender_id, reminderText);
       }
 
-      // Bump next_reminder_at based on custom seconds/hours or default
+      // Calculate next reminder date:
+      // A short interval (< 1 hour, like 5s, 30s, 10m) is a one-time reminder: DO NOT repeat automatically!
+      // Setting next_reminder_at to null prevents spamming every 5 seconds.
+      // If the user wants another reminder, they can reply e.g. "5m" or "1h" to snooze it.
       const intervalSec = reel.reminder_interval_seconds ?? (reel.reminder_interval_hours ? reel.reminder_interval_hours * 3600 : intervalHours * 3600);
-      const nextDate = new Date(Date.now() + intervalSec * 1000).toISOString();
+      let nextDate: string | null = null;
+      if (intervalSec >= 3600) {
+        // For long intervals (>= 1 hour), send a gentle daily reminder (24h later) rather than tight loops
+        nextDate = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+      } else {
+        // One-time reminder delivered! Stop until explicitly snoozed by the user.
+        nextDate = null;
+      }
+
       await Repository.recordReminderSent(reel.id, nextDate);
     }
   }
