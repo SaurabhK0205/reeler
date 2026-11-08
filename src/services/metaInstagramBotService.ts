@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { loadConfig } from '../config.ts';
 import { Repository } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
@@ -7,14 +8,59 @@ import { extractCreatorQuery } from '../utils/creatorQuery.ts';
 export class MetaInstagramBotService {
   private accessToken: string;
   private verifyToken: string;
+  private appSecret: string;
 
   constructor() {
     this.accessToken = process.env.META_PAGE_ACCESS_TOKEN || '';
     this.verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN || 'rea_instagram_saved_token';
+    this.appSecret = process.env.META_APP_SECRET || '';
   }
 
   get isConfigured(): boolean {
     return Boolean(this.accessToken);
+  }
+
+  /**
+   * Validates Meta X-Hub-Signature-256 header using SHA-256 HMAC
+   */
+  verifySignature(rawBody: Buffer | string | undefined, signatureHeader?: string): boolean {
+    if (!this.appSecret) {
+      // Insecure bypass is strictly opt-in and forbidden in production
+      const allowInsecure = process.env.ALLOW_INSECURE_WEBHOOK === 'true' && process.env.NODE_ENV !== 'production';
+      if (allowInsecure) {
+        console.warn('[MetaBot] WARNING: Webhook signature verification bypassed via ALLOW_INSECURE_WEBHOOK=true in non-production.');
+        return true;
+      }
+      console.error('[MetaBot] Webhook rejected: META_APP_SECRET is not configured. Set META_APP_SECRET or explicit ALLOW_INSECURE_WEBHOOK=true for local dev.');
+      return false;
+    }
+
+    if (!signatureHeader || !rawBody) {
+      return false;
+    }
+
+    const parts = signatureHeader.split('=');
+    if (parts.length !== 2 || parts[0] !== 'sha256') {
+      return false;
+    }
+
+    const providedSignature = parts[1];
+    const hmac = crypto.createHmac('sha256', this.appSecret);
+    hmac.update(rawBody);
+    const expectedSignature = hmac.digest('hex');
+
+    if (providedSignature.length !== expectedSignature.length) {
+      return false;
+    }
+
+    try {
+      return crypto.timingSafeEqual(
+        Buffer.from(providedSignature, 'hex'),
+        Buffer.from(expectedSignature, 'hex')
+      );
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -33,7 +79,7 @@ export class MetaInstagramBotService {
   }
 
   /**
-   * Sends a message to a user via Meta Graph API
+   * Sends a message to a user via Meta Graph API (automatically splits into safe chunks <= 950 chars)
    */
   async sendDirectMessage(recipientId: string, text: string): Promise<boolean> {
     if (!this.accessToken) {
@@ -41,29 +87,128 @@ export class MetaInstagramBotService {
       return false;
     }
 
-    try {
-      const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${this.accessToken}`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          recipient: { id: recipientId },
-          message: { text },
-        }),
-      });
+    const chunks = this.splitMessageIntoChunks(text, 950);
+    let allSuccess = true;
 
-      const data = await res.json() as any;
-      if (!res.ok) {
-        console.error('[MetaIG] Failed to send DM:', data);
-        return false;
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      try {
+        const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${this.accessToken}`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            recipient: { id: recipientId },
+            message: { text: chunk },
+          }),
+          signal: AbortSignal.timeout(10000),
+        });
+
+        const data = await res.json() as any;
+        if (!res.ok) {
+          console.error('[MetaIG] Failed to send DM:', data);
+          allSuccess = false;
+          // Stop sending subsequent chunks on failure to avoid out-of-order partial messages
+          break;
+        } else {
+          console.log(`[MetaIG] DM sent to ${recipientId}: "${chunk.slice(0, 40)}..."`);
+        }
+      } catch (e: any) {
+        console.error('[MetaIG] Error calling Meta messages API:', e.message);
+        allSuccess = false;
+        // Stop sending on network or timeout exceptions
+        break;
       }
 
-      console.log(`[MetaIG] DM sent to ${recipientId}: "${text.slice(0, 40)}..."`);
-      return true;
-    } catch (e: any) {
-      console.error('[MetaIG] Error calling Meta messages API:', e.message);
-      return false;
+      // Apply inter-chunk delay only between consecutive chunks, never after the final chunk
+      if (i < chunks.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
     }
+
+    return allSuccess;
+  }
+
+  /**
+   * Splits a single continuous block of text into chunks of <= maxLen,
+   * breaking on newline or space where possible, without emitting empty chunks
+   * and handling leading whitespace safely.
+   */
+  private splitSingleBlock(text: string, maxLen: number): string[] {
+    const result: string[] = [];
+    let remaining = text.trim();
+
+    while (remaining.length > 0) {
+      if (remaining.length <= maxLen) {
+        if (remaining.trim()) {
+          result.push(remaining);
+        }
+        break;
+      }
+
+      let splitIdx = remaining.lastIndexOf('\n', maxLen);
+      if (splitIdx === -1 || splitIdx < maxLen / 2) {
+        splitIdx = remaining.lastIndexOf(' ', maxLen);
+      }
+      if (splitIdx <= 0) {
+        splitIdx = maxLen;
+      }
+
+      const chunk = remaining.slice(0, splitIdx).trim();
+      if (chunk) {
+        result.push(chunk);
+      }
+
+      remaining = remaining.slice(splitIdx).replace(/^[\r\n\t ]+/, '');
+    }
+
+    return result;
+  }
+
+  /**
+   * Splits message text into chunks of at most maxLen characters (default 950),
+   * respecting paragraph boundaries where possible to fit Meta Graph API DM limits.
+   */
+  public splitMessageIntoChunks(text: string, maxLen = 950): string[] {
+    if (!text) return [];
+    if (text.length <= maxLen) return [text];
+
+    const chunks: string[] = [];
+    const paragraphs = text.split('\n\n');
+    let current = '';
+
+    const flushCurrent = () => {
+      if (!current) return;
+      if (current.length <= maxLen) {
+        chunks.push(current);
+      } else {
+        chunks.push(...this.splitSingleBlock(current, maxLen));
+      }
+      current = '';
+    };
+
+    for (const rawPara of paragraphs) {
+      const para = rawPara.trim();
+      if (!para) continue;
+
+      if (para.length > maxLen) {
+        flushCurrent();
+        chunks.push(...this.splitSingleBlock(para, maxLen));
+        continue;
+      }
+
+      if (!current) {
+        current = para;
+      } else if (current.length + 2 + para.length <= maxLen) {
+        current += '\n\n' + para;
+      } else {
+        flushCurrent();
+        current = para;
+      }
+    }
+
+    flushCurrent();
+    return chunks.length > 0 ? chunks : [text.slice(0, maxLen)];
   }
 
   /**
@@ -271,7 +416,7 @@ export class MetaInstagramBotService {
       const countLabel = totalCount === 1 ? '1 saved reel' : `${totalCount} saved reels`;
       let reply = `🎬 Saved Reels from @${creator.username} (${countLabel}, latest to oldest):\n\n`;
 
-      const limit = Math.min(reels.length, 10);
+      const limit = Math.min(reels.length, 5);
       for (let i = 0; i < limit; i++) {
         const r = reels[i];
         let statusBadge = '👀 Unwatched';
@@ -283,7 +428,7 @@ export class MetaInstagramBotService {
       }
 
       if (reels.length > limit) {
-        reply += `... and ${reels.length - limit} more reels in your library!`;
+        reply += `... and ${reels.length - limit} more reels in your library! Search "@${creator.username}" on your web dashboard to see all.`;
       }
 
       await this.sendDirectMessage(senderId, reply.trim());
