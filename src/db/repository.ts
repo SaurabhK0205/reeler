@@ -617,68 +617,75 @@ export class Repository {
     if (!cleanUsername) return { creator: null, reels: [] };
 
     if (!isSupabaseConfigured()) {
-      let creator: Creator | undefined;
-      for (const c of memoryStore.creators.values()) {
-        if (c.username.toLowerCase() === cleanUsername) {
-          creator = c;
-          break;
-        }
+      let matchedCreators = Array.from(memoryStore.creators.values()).filter(
+        c => c.username.toLowerCase() === cleanUsername
+      );
+      if (matchedCreators.length === 0) {
+        matchedCreators = Array.from(memoryStore.creators.values()).filter(
+          c => c.username.toLowerCase().includes(cleanUsername) || (c.display_name && c.display_name.toLowerCase().includes(cleanUsername))
+        );
       }
-      if (!creator) {
-        for (const c of memoryStore.creators.values()) {
-          if (c.username.toLowerCase().includes(cleanUsername)) {
-            creator = c;
-            break;
-          }
-        }
-      }
-      if (!creator) return { creator: null, reels: [] };
+      if (matchedCreators.length === 0) return { creator: null, reels: [] };
+
+      const creatorIds = new Set(matchedCreators.map(c => c.id));
+      const primaryCreator = matchedCreators.find(c => c.display_name && c.profile_picture_url)
+        || matchedCreators.find(c => c.display_name)
+        || matchedCreators[0];
 
       const reels = Array.from(memoryStore.reels.values())
-        .filter(r => r.creator_id === creator!.id)
-        .sort((a, b) => a.save_order_rank - b.save_order_rank || new Date(b.first_detected_at).getTime() - new Date(a.first_detected_at).getTime())
-        .map(r => ({ ...r, creator }));
+        .filter(r => creatorIds.has(r.creator_id))
+        .sort((a, b) => new Date(b.created_at || b.first_detected_at).getTime() - new Date(a.created_at || a.first_detected_at).getTime())
+        .map(r => ({ ...r, creator: primaryCreator }));
 
-      return { creator, reels };
+      return { creator: primaryCreator, reels };
     }
 
     const supabase = getSupabase();
-    // 1. Try exact match first
-    let { data: creator } = await supabase
+    // 1. Try exact match first across all creator records with this username
+    let { data: creators } = await supabase
       .from('creators')
       .select('*')
-      .ilike('username', cleanUsername)
-      .limit(1)
-      .maybeSingle();
+      .ilike('username', cleanUsername);
 
-    // 2. If not found, try partial match
-    if (!creator) {
-      const { data: partialCreator } = await supabase
+    // 2. If no exact match, try partial match on username or display_name
+    if (!creators || creators.length === 0) {
+      const { data: partialCreators } = await supabase
         .from('creators')
         .select('*')
-        .ilike('username', `%${cleanUsername}%`)
-        .limit(1)
-        .maybeSingle();
-      creator = partialCreator;
+        .or(`username.ilike.%${cleanUsername}%,display_name.ilike.%${cleanUsername}%`)
+        .limit(10);
+      creators = partialCreators || [];
     }
 
-    if (!creator) {
+    if (!creators || creators.length === 0) {
       return { creator: null, reels: [] };
     }
 
+    // Pick best primary creator record for display information
+    const primaryCreator = creators.find(c => c.display_name && c.profile_picture_url)
+      || creators.find(c => c.display_name)
+      || creators[0];
+
+    const creatorIds = creators.map(c => c.id);
+
+    // Fetch all reels linked to any matching creator ID, sorted freshest first
     const { data: reels, error: rErr } = await supabase
       .from('saved_reels')
       .select('*, creator:creators(*)')
-      .eq('creator_id', creator.id)
-      .order('save_order_rank', { ascending: true })
-      .order('first_detected_at', { ascending: false });
+      .in('creator_id', creatorIds)
+      .order('created_at', { ascending: false });
 
     if (rErr) {
-      console.error(`[Repository] Error fetching reels for creator ${creator.id}:`, rErr.message);
-      return { creator: creator as Creator, reels: [] };
+      console.error(`[Repository] Error fetching reels for creator ${primaryCreator.id}:`, rErr.message);
+      return { creator: primaryCreator as Creator, reels: [] };
     }
 
-    return { creator: creator as Creator, reels: (reels || []) as SavedReel[] };
+    const mappedReels = (reels || []).map(r => ({
+      ...r,
+      creator: r.creator || primaryCreator,
+    })) as SavedReel[];
+
+    return { creator: primaryCreator as Creator, reels: mappedReels };
   }
 
   static async getStats(): Promise<LibraryStats> {
