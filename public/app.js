@@ -3,6 +3,11 @@
 // Dual View (Poster Grid + Dense Table) & Fullscreen Snap Reels Feed
 // ==============================================================================
 
+/**
+ * Safely reads the stored view mode preference ('grid' | 'list') from localStorage.
+ * Normalizes invalid values to 'grid' and handles restricted storage exceptions.
+ * @returns {'grid' | 'list'}
+ */
 function readViewMode() {
   try {
     const v = localStorage.getItem('reeler_view_mode');
@@ -12,6 +17,10 @@ function readViewMode() {
   }
 }
 
+/**
+ * Safely writes the view mode preference to localStorage.
+ * @param {'grid' | 'list'} mode
+ */
 function saveViewMode(mode) {
   try {
     localStorage.setItem('reeler_view_mode', mode);
@@ -76,6 +85,10 @@ const feedArrowDown = document.getElementById('feed-arrow-down');
 const feedCloseBtn = document.getElementById('feed-close-btn');
 
 // --- Initialization ---
+
+/**
+ * Initializes the vault application, binds events, and loads data.
+ */
 async function init() {
   applyViewMode(state.viewMode);
   setupEventListeners();
@@ -83,6 +96,10 @@ async function init() {
   await Promise.all([loadStats(), loadCreators(), fetchReels()]);
 }
 
+/**
+ * Applies grid or list view mode to the UI and updates button states.
+ * @param {'grid' | 'list'} mode
+ */
 function applyViewMode(mode) {
   state.viewMode = mode;
   saveViewMode(mode);
@@ -100,6 +117,9 @@ function applyViewMode(mode) {
   }
 }
 
+/**
+ * Checks server and database connectivity, updating the status indicator badge.
+ */
 async function checkHealth() {
   try {
     const res = await fetch('/api/health');
@@ -117,6 +137,9 @@ async function checkHealth() {
   }
 }
 
+/**
+ * Fetches summary statistics from the server and populates metric cards.
+ */
 async function loadStats() {
   try {
     const res = await fetch('/api/stats');
@@ -132,6 +155,9 @@ async function loadStats() {
   }
 }
 
+/**
+ * Fetches unique creators and populates the filter strip.
+ */
 async function loadCreators() {
   try {
     const res = await fetch('/api/creators');
@@ -143,6 +169,9 @@ async function loadCreators() {
   }
 }
 
+/**
+ * Renders the horizontal list of creator filter chips with counts.
+ */
 function renderCreatorStrip() {
   creatorPillsList.innerHTML = '';
 
@@ -183,6 +212,10 @@ function renderCreatorStrip() {
   resetCreatorBtn.style.display = state.filters.creatorId ? 'inline' : 'none';
 }
 
+/**
+ * Selects a creator for filtering and resets pagination to page 1.
+ * @param {string} id
+ */
 function selectCreator(id) {
   state.filters.creatorId = id;
   state.filters.page = 1;
@@ -190,6 +223,9 @@ function selectCreator(id) {
   fetchReels();
 }
 
+/**
+ * Queries reels matching active filters, pagination, and search terms.
+ */
 async function fetchReels() {
   resultsCount.textContent = 'Querying vault...';
   reelsGrid.innerHTML = '';
@@ -220,6 +256,9 @@ async function fetchReels() {
   }
 }
 
+/**
+ * Renders reel poster cards in grid view and table rows in list view.
+ */
 function renderReels() {
   reelsGrid.innerHTML = '';
   reelsTableBody.innerHTML = '';
@@ -404,7 +443,11 @@ function renderReels() {
   }
 }
 
-// Update Reel Status
+/**
+ * Sends status update to the server and refreshes local state optimistically.
+ * @param {string} reelId
+ * @param {'unwatched' | 'watch_later' | 'watched'} newStatus
+ */
 async function updateReelStatus(reelId, newStatus) {
   try {
     const res = await fetch(`/api/reels/${reelId}/status`, {
@@ -426,6 +469,11 @@ async function updateReelStatus(reelId, newStatus) {
   }
 }
 
+/**
+ * Cycles a reel through unwatched -> watch_later -> watched states.
+ * @param {string} reelId
+ * @param {string} currentStatus
+ */
 async function cycleStatus(reelId, currentStatus) {
   const map = {
     unwatched: 'watch_later',
@@ -441,6 +489,9 @@ async function cycleStatus(reelId, currentStatus) {
 
 let feedIntersectionObserver = null;
 
+/**
+ * Constructs 100vh reel slides for the vertical snap feed.
+ */
 function renderFeedSlides() {
   feedScrollTrack.innerHTML = '';
 
@@ -574,6 +625,9 @@ function renderFeedSlides() {
   setupFeedIntersectionObserver();
 }
 
+/**
+ * Sets up an IntersectionObserver to dynamically mount and unmount video iframes.
+ */
 function setupFeedIntersectionObserver() {
   if (feedIntersectionObserver) {
     feedIntersectionObserver.disconnect();
@@ -623,6 +677,10 @@ function setupFeedIntersectionObserver() {
   slides.forEach((slide) => feedIntersectionObserver.observe(slide));
 }
 
+/**
+ * Opens the fullscreen Reels snap-feed scrolled to the selected reel.
+ * @param {object} startReel
+ */
 function openReelsFeed(startReel) {
   state.previouslyFocusedElement = document.activeElement;
   renderFeedSlides();
@@ -641,6 +699,9 @@ function openReelsFeed(startReel) {
   feedCloseBtn.focus();
 }
 
+/**
+ * Closes the fullscreen Reels snap-feed, halts audio, and restores focus.
+ */
 function closeReelsFeed() {
   if (feedIntersectionObserver) {
     feedIntersectionObserver.disconnect();
@@ -662,6 +723,10 @@ function closeReelsFeed() {
   }
 }
 
+/**
+ * Scrolls the feed track up (-1) or down (+1) by one reel slide.
+ * @param {number} direction
+ */
 function scrollFeedBy(direction) {
   const targetIndex = state.currentFeedIndex + direction;
   if (targetIndex >= 0 && targetIndex < state.reels.length) {
@@ -672,6 +737,11 @@ function scrollFeedBy(direction) {
   }
 }
 
+/**
+ * Synchronizes active status styling on the action rail for a specific reel.
+ * @param {string} reelId
+ * @param {string} newStatus
+ */
 function syncFeedSlideStatus(reelId, newStatus) {
   const slide = feedScrollTrack.querySelector(`[data-reel-id="${reelId}"]`);
   if (!slide) return;
@@ -691,6 +761,12 @@ function syncFeedSlideStatus(reelId, newStatus) {
   }
 }
 
+/**
+ * Updates pagination indicator text and enables/disables navigation buttons.
+ * @param {number} page
+ * @param {number} limit
+ * @param {number} total
+ */
 function updatePagination(page, limit, total) {
   const totalPages = Math.ceil(total / limit) || 1;
   paginationBar.style.display = total > limit ? 'flex' : 'none';
@@ -700,12 +776,23 @@ function updatePagination(page, limit, total) {
 }
 
 // Helpers
+
+/**
+ * Formats an ISO date string into a localized short date (e.g., Nov 8, 2026).
+ * @param {string} isoDate
+ * @returns {string}
+ */
 function formatRelativeDate(isoDate) {
   if (!isoDate) return 'Unknown';
   const d = new Date(isoDate);
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+/**
+ * Converts raw status tokens into user-friendly display labels.
+ * @param {string} status
+ * @returns {string}
+ */
 function formatStatusLabel(status) {
   switch (status) {
     case 'watch_later': return 'Watch Later';
@@ -714,11 +801,20 @@ function formatStatusLabel(status) {
   }
 }
 
+/**
+ * Escapes raw strings for safe insertion into HTML templates.
+ * @param {string} str
+ * @returns {string}
+ */
 function escapeHtml(str) {
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 // Event Listeners
+
+/**
+ * Binds UI controls, search debounce, key listeners, and file import handlers.
+ */
 function setupEventListeners() {
   // View mode switcher
   viewModeGridBtn.addEventListener('click', () => applyViewMode('grid'));
