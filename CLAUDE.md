@@ -37,14 +37,15 @@ Last updated: November 8, 2026
    - Open a Pull Request into `staging` (and sync to `main` via PR with zero divergence).
 7. **CodeRabbit Review Gate (MANDATORY & BLOCKING)**:
    - When opening a Pull Request, **NEVER merge immediately**.
-   - **ALWAYS wait for CodeRabbit AI review to run and complete** before merging.
+   - **ALWAYS wait for CodeRabbit AI review to run and complete** on the current PR head commit before merging.
    - **NEVER merge while CodeRabbit review findings remain open or unaddressed**.
    - Whenever CodeRabbit posts review comments or findings:
      1. Inspect each finding thoroughly (bugs, security, architecture, performance, edge cases).
-     2. Implement fixes on the topic branch and verify unit tests (`npm test`).
-     3. Push the fix to the PR branch.
-     4. Reply to each CodeRabbit review comment thread explaining the resolution.
-   - Only merge after CodeRabbit completes its review and all findings are confirmed resolved and verified.
+     2. For valid findings on topic branches: implement fixes on the branch, verify unit tests (`npm test`), and push.
+     3. For promotion PRs (e.g. `staging` -> `main`): route fixes through a separate topic-branch PR into `staging`, rather than pushing directly to `staging`.
+     4. For invalid findings or false positives: reply to the review thread with an evidence-based explanation and documented reasoning.
+     5. Reply to each CodeRabbit review comment thread explaining the resolution.
+   - Recheck review status after every push. Only merge after CodeRabbit completes its review on the final head commit and all findings are confirmed resolved and verified.
    - **NO tight polling loops**: Never run tight sleep loops polling GitHub or CodeRabbit status.
 
 ---

@@ -12,12 +12,12 @@ See [CLAUDE.md](./CLAUDE.md) for the complete, canonical rules and conventions g
 7. **Workspace Isolation**: Work strictly within `/Users/thismac/projects/instagram-saved-reels/`. Do not touch `/Users/thismac/rea/`.
 8. **CodeRabbit Review Gate (MANDATORY & BLOCKING)**:
    - **NEVER merge a Pull Request immediately.**
-   - **ALWAYS wait for CodeRabbit AI review to run and complete** on every opened PR before merging.
+   - **ALWAYS wait for CodeRabbit AI review to run and complete** on the current head commit of every opened PR before merging.
    - **NEVER merge while CodeRabbit findings remain open or unaddressed.**
-   - Whenever CodeRabbit comments or points out any issues (bugs, regressions, security, edge cases, or code improvements):
+   - Whenever CodeRabbit comments or points out any issues (bugs, regressions, security, edge cases, architecture, or code improvements):
      1. Inspect each finding thoroughly.
-     2. Fix the code on the topic branch and verify tests (`npm test`).
-     3. Push the fix to the PR branch.
+     2. For valid findings: implement fixes on the topic branch (or a dedicated topic branch if the PR is a promotion branch), verify tests (`npm test`), and push.
+     3. For invalid findings or false positives: provide an evidence-based explanation and documented reasoning in the review reply.
      4. Reply to each CodeRabbit review comment thread explaining the resolution.
-   - Only merge after CodeRabbit completes its review and all findings are confirmed resolved and verified.
+   - Recheck review status after every push. Only merge after CodeRabbit completes its review on the final head commit and all findings are confirmed resolved and verified.
    - **No tight polling loops**: Never run tight sleep loops polling GitHub or CodeRabbit status.
