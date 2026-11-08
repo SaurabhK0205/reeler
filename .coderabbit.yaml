@@ -25,7 +25,11 @@ reviews:
       - "^release/.*$"
 
   auto_approvals:
-    enabled: false
+    enabled: true
+    max_merge_risk: "low"
+    max_security_risk: "minimal"
+    overrides:
+      - enabled: false
 
   tools:
     actionlint:
@@ -41,6 +45,9 @@ reviews:
     - "!dist/**"
     - "!build/**"
     - "!package-lock.json"
+    - "!pnpm-lock.yaml"
+    - "!yarn.lock"
+    - "!bun.lockb"
     - "!.git/**"
 
   path_instructions:
@@ -95,8 +102,8 @@ reviews:
 knowledge_base:
   code_guidelines:
     filePatterns:
-      - "CLAUDE.md"
-      - "AGENTS.md"
+      - "**/CLAUDE.md"
+      - "**/AGENTS.md"
 
 chat:
   auto_reply: true
