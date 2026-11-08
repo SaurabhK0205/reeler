@@ -68,7 +68,8 @@ async function runTests() {
   console.log('Test 3: Idempotent re-import of existing reel');
   const res3 = await ArchiveImportService.importArchive(officialExportPayload);
   assert.equal(res3.status, 'success');
-  assert.equal(res3.reelsImported, 1);
+  assert.equal(res3.reelsImported, 0, 'Re-imported reel should not count as newly imported');
+  assert.equal(res3.alreadyPresent, 1, 'Re-imported reel should be counted as already present');
 
   // Test 4: Completely empty export payload returns 'empty' status with actionable error
   console.log('Test 4: Empty export payload');

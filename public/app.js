@@ -386,15 +386,16 @@ function setupEventListeners() {
         return;
       }
 
-      if (data && data.reelsImported === 0 && data.errors && data.errors.length > 0) {
+      if (data && data.reelsImported === 0 && (data.alreadyPresent ?? 0) === 0 && data.errors && data.errors.length > 0) {
         alert(`Import failed: No reels could be imported.\n\nErrors:\n${data.errors.join('\n')}`);
         return;
       }
 
       const importedCount = data?.reelsImported ?? 0;
+      const alreadyPresentCount = data?.alreadyPresent ?? 0;
       const creatorsCount = data?.creatorsAdded ?? 0;
       const totalScanned = data?.totalProcessed ?? 0;
-      let msg = `🎉 Archive imported successfully!\n\n• Reels imported: ${importedCount}\n• Creators added: ${creatorsCount}\n• Total scanned: ${totalScanned}`;
+      let msg = `🎉 Archive processed successfully!\n\n• New reels imported: ${importedCount}\n• Already in library: ${alreadyPresentCount}\n• Creators added: ${creatorsCount}\n• Total scanned: ${totalScanned}`;
       if (data?.errors && data.errors.length > 0) {
         msg += `\n\nWarnings/Errors:\n${data.errors.join('\n')}`;
       }

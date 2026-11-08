@@ -12,8 +12,16 @@ const app = express();
 const config = loadConfig();
 const reminderWorker = new ReminderWorker();
 
-// Trust reverse proxy (e.g. Cloudflare / nginx) for accurate req.ip rate limiting
-app.set('trust proxy', 1);
+// Reverse proxy trust: configurable via TRUST_PROXY env var (e.g. '1', 'loopback', 'true', or 'false' for direct exposure)
+const trustProxyEnv = process.env.TRUST_PROXY?.trim().toLowerCase();
+if (trustProxyEnv === 'false' || trustProxyEnv === '0') {
+  app.set('trust proxy', false);
+} else if (trustProxyEnv === 'true' || trustProxyEnv === '1' || !trustProxyEnv) {
+  // Default to 1 hop (standard for Cloudflare Tunnel or single reverse proxy)
+  app.set('trust proxy', 1);
+} else {
+  app.set('trust proxy', process.env.TRUST_PROXY!.trim());
+}
 
 // Concurrency & rate-limiting guard for large payload import endpoint
 let activeImports = 0;

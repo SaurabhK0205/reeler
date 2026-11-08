@@ -14,6 +14,7 @@ export type ArchiveImportStatus = 'success' | 'empty' | 'failed' | 'partial';
 export interface ArchiveImportResult {
   totalProcessed: number;
   reelsImported: number;
+  alreadyPresent: number;
   creatorsAdded: number;
   skipped: number;
   errors: string[];
@@ -40,6 +41,7 @@ export class ArchiveImportService {
         return {
           totalProcessed: 0,
           reelsImported: 0,
+          alreadyPresent: 0,
           creatorsAdded: 0,
           skipped: 0,
           errors: ['Failed to parse JSON file: malformed JSON format.'],
@@ -86,6 +88,7 @@ export class ArchiveImportService {
       return {
         totalProcessed: 0,
         reelsImported: 0,
+        alreadyPresent: 0,
         creatorsAdded: 0,
         skipped: 0,
         errors: ['No saved media items found in the provided export file.'],
@@ -109,14 +112,6 @@ export class ArchiveImportService {
     }
 
     const candidatesByShortcode = new Map<string, ParsedCandidate>();
-    const creatorsToUpsert = new Map<string, { instagram_user_id: string; username: string; display_name: string | null }>();
-
-    // Ensure default sentinel creator is in the upsert list
-    creatorsToUpsert.set(UNKNOWN_CREATOR_HANDLE, {
-      instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
-      username: UNKNOWN_CREATOR_HANDLE,
-      display_name: null,
-    });
 
     for (const rawItem of rawItems) {
       if (!rawItem || typeof rawItem !== 'object') {
@@ -280,19 +275,30 @@ export class ArchiveImportService {
           candidatesByShortcode.set(shortcode, candidate);
         }
       }
-
-      if (!creatorsToUpsert.has(creatorHandle)) {
-        creatorsToUpsert.set(creatorHandle, {
-          instagram_user_id: `creator_${creatorHandle}`,
-          username: creatorHandle,
-          display_name: creatorDisplayName || (creatorHandle !== UNKNOWN_CREATOR_HANDLE ? creatorHandle : null),
-        });
-      }
     }
 
     let reelsImported = 0;
+    let alreadyPresent = 0;
     const creatorsSeen = new Set<string>();
     const parsedCandidates = Array.from(candidatesByShortcode.values());
+
+    // Build creatorsToUpsert exclusively from deduplicated surviving candidates
+    const creatorsToUpsert = new Map<string, { instagram_user_id: string; username: string; display_name: string | null }>();
+    creatorsToUpsert.set(UNKNOWN_CREATOR_HANDLE, {
+      instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
+      username: UNKNOWN_CREATOR_HANDLE,
+      display_name: null,
+    });
+
+    for (const c of parsedCandidates) {
+      if (!creatorsToUpsert.has(c.creatorHandle)) {
+        creatorsToUpsert.set(c.creatorHandle, {
+          instagram_user_id: `creator_${c.creatorHandle}`,
+          username: c.creatorHandle,
+          display_name: c.creatorDisplayName || (c.creatorHandle !== UNKNOWN_CREATOR_HANDLE ? c.creatorHandle : null),
+        });
+      }
+    }
 
     if (parsedCandidates.length > 0) {
       try {
@@ -367,13 +373,17 @@ export class ArchiveImportService {
                 is_saved_on_instagram: true,
                 instagram_sender_id: senderId || null,
               });
+            } else {
+              errors.push(`Failed to resolve fallback unattributed creator for reel ${c.shortcode}`);
+              continue;
             }
           }
         }
 
         // Batch upsert saved reels
         const batchResult = await Repository.upsertSavedReelsBatch(reelsPayload, { ignoreDuplicates: true });
-        reelsImported = batchResult.newlyImported + batchResult.alreadyPresent;
+        reelsImported = batchResult.newlyImported;
+        alreadyPresent = batchResult.alreadyPresent;
 
         if (batchResult.failedShortcodes.length > 0) {
           for (const sc of batchResult.failedShortcodes) {
@@ -386,8 +396,9 @@ export class ArchiveImportService {
       }
     }
 
+    const totalRecognized = reelsImported + alreadyPresent;
     let status: ArchiveImportStatus = 'success';
-    if (reelsImported === 0) {
+    if (totalRecognized === 0) {
       status = totalProcessed === 0 || errors.length === 0 ? 'empty' : 'failed';
       if (status === 'empty' && errors.length === 0) {
         errors.push(
@@ -403,8 +414,9 @@ export class ArchiveImportService {
     return {
       totalProcessed,
       reelsImported,
+      alreadyPresent,
       creatorsAdded: creatorsSeen.size,
-      skipped: totalProcessed - reelsImported,
+      skipped: totalProcessed - totalRecognized,
       errors: errors.slice(0, 5),
       status,
     };

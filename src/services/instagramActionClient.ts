@@ -20,8 +20,8 @@ export interface InboundMessage {
 
 export class InstagramActionClient {
   private baseUrl = 'https://www.instagram.com';
-  private igAppId = '936619743392459';
-  private static readonly REQUEST_TIMEOUT_MS = 10000; // Instagram Web Client App ID
+  private igAppId = '936619743392459'; // Instagram Web Client App ID
+  private static readonly REQUEST_TIMEOUT_MS = 10000;
 
   private getHeaders(): Record<string, string> {
     const config = loadConfig();
