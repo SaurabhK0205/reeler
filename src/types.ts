@@ -111,3 +111,10 @@ export function ok<T>(data: T): Result<T, never> {
 export function err<E>(error: E): Result<never, E> {
   return { success: false, error };
 }
+
+export interface BatchReelsResult {
+  newlyImported: number;
+  alreadyPresent: number;
+  failedCount: number;
+  failedShortcodes: string[];
+}

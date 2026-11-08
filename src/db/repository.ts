@@ -4,7 +4,8 @@ import type {
   ReelQueryFilters,
   LibraryStats,
   WatchStatus,
-  DateFilterPreset
+  DateFilterPreset,
+  BatchReelsResult
 } from '../types.ts';
 import { getSupabase, isSupabaseConfigured } from './client.ts';
 
@@ -156,13 +157,36 @@ class InMemoryStore {
     awaiting_reminder_choice_until?: string | null;
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
-  }>, options?: { ignoreDuplicates?: boolean }): Promise<number> {
-    let count = 0;
+  }>, options?: { ignoreDuplicates?: boolean }): Promise<BatchReelsResult> {
+    let newlyImported = 0;
+    let alreadyPresent = 0;
+    let failedCount = 0;
+    const failedShortcodes: string[] = [];
+
     for (const r of reels) {
-      await this.upsertSavedReel(r, { ignoreDuplicates: options?.ignoreDuplicates, skipReturn: true });
-      count++;
+      try {
+        let existing: SavedReel | undefined;
+        for (const existingReel of this.reels.values()) {
+          if (existingReel.instagram_media_id === r.instagram_media_id || existingReel.shortcode === r.shortcode) {
+            existing = existingReel;
+            break;
+          }
+        }
+
+        if (existing && options?.ignoreDuplicates) {
+          alreadyPresent++;
+          continue;
+        }
+
+        await this.upsertSavedReel(r, { ignoreDuplicates: options?.ignoreDuplicates, skipReturn: true });
+        newlyImported++;
+      } catch (err: any) {
+        failedCount++;
+        failedShortcodes.push(r.shortcode);
+      }
     }
-    return count;
+
+    return { newlyImported, alreadyPresent, failedCount, failedShortcodes };
   }
 
   async getReels(filters: ReelQueryFilters) {
@@ -538,22 +562,51 @@ export class Repository {
     awaiting_reminder_choice_until?: string | null;
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
-  }>, options?: { ignoreDuplicates?: boolean }): Promise<number> {
+  }>, options?: { ignoreDuplicates?: boolean }): Promise<BatchReelsResult> {
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertSavedReelsBatch(reels, options);
     }
 
     const supabase = getSupabase();
-    let imported = 0;
+    let newlyImported = 0;
+    let alreadyPresent = 0;
+    let failedCount = 0;
+    const failedShortcodes: string[] = [];
 
-    const { data: existingRows } = await supabase.from('saved_reels').select('shortcode');
-    const existingShortcodes = new Set((existingRows || []).map(r => r.shortcode));
+    let reelsToInsert = reels;
 
-    const reelsToInsert = options?.ignoreDuplicates
-      ? reels.filter(r => !existingShortcodes.has(r.shortcode))
-      : reels;
+    if (options?.ignoreDuplicates) {
+      const existingShortcodes = new Set<string>();
+      const allShortcodes = Array.from(new Set(reels.map(r => r.shortcode)));
+      const LOOKUP_CHUNK = 500;
 
-    imported += reels.length - reelsToInsert.length;
+      for (let i = 0; i < allShortcodes.length; i += LOOKUP_CHUNK) {
+        const slice = allShortcodes.slice(i, i + LOOKUP_CHUNK);
+        const { data: matched, error } = await supabase
+          .from('saved_reels')
+          .select('shortcode')
+          .in('shortcode', slice);
+
+        if (error) {
+          throw new Error(`Failed to query existing shortcodes: ${error.message}`);
+        }
+        if (matched) {
+          for (const row of matched) {
+            existingShortcodes.add(row.shortcode);
+          }
+        }
+      }
+
+      const freshReels: typeof reels = [];
+      for (const r of reels) {
+        if (existingShortcodes.has(r.shortcode)) {
+          alreadyPresent++;
+        } else {
+          freshReels.push(r);
+        }
+      }
+      reelsToInsert = freshReels;
+    }
 
     const CHUNK_SIZE = 300;
     for (let i = 0; i < reelsToInsert.length; i += CHUNK_SIZE) {
@@ -591,17 +644,19 @@ export class Repository {
         for (const item of chunk) {
           try {
             await this.upsertSavedReel(item, { ignoreDuplicates: options?.ignoreDuplicates, skipReturn: true });
-            imported++;
+            newlyImported++;
           } catch (itemErr: any) {
             console.error(`[Repository] Failed to upsert reel ${item.shortcode}:`, itemErr.message);
+            failedCount++;
+            failedShortcodes.push(item.shortcode);
           }
         }
       } else {
-        imported += chunk.length;
+        newlyImported += chunk.length;
       }
     }
 
-    return imported;
+    return { newlyImported, alreadyPresent, failedCount, failedShortcodes };
   }
 
   static async getReelsDueForReminder(): Promise<SavedReel[]> {

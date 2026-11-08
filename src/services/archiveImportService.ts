@@ -108,7 +108,7 @@ export class ArchiveImportService {
       rank: number;
     }
 
-    const parsedCandidates: ParsedCandidate[] = [];
+    const candidatesByShortcode = new Map<string, ParsedCandidate>();
     const creatorsToUpsert = new Map<string, { instagram_user_id: string; username: string; display_name: string | null }>();
 
     // Ensure default sentinel creator is in the upsert list
@@ -130,7 +130,15 @@ export class ArchiveImportService {
       let caption: string | null = typeof item.caption === 'string' && item.caption.trim() ? item.caption.trim() : null;
       let creatorHandle = UNKNOWN_CREATOR_HANDLE;
       let creatorDisplayName: string | null = null;
-      let mediaId: string | null = (typeof (item as any).fbid === 'string' || typeof (item as any).fbid === 'number') ? String((item as any).fbid) : null;
+
+      // Validate fbid: must be a positive numeric ID (1-30 digits)
+      const rawFbid = (item as any).fbid;
+      let mediaId: string | null = null;
+      if (typeof rawFbid === 'string' && /^\d{1,30}$/.test(rawFbid.trim())) {
+        mediaId = rawFbid.trim();
+      } else if (typeof rawFbid === 'number' && Number.isFinite(rawFbid) && rawFbid > 0) {
+        mediaId = String(rawFbid);
+      }
 
       // 1. Modern Instagram Account Center export format (label_values array)
       if (Array.isArray((item as any).label_values)) {
@@ -144,6 +152,7 @@ export class ArchiveImportService {
             for (const d of lv.dict) {
               if (d && Array.isArray(d.dict)) {
                 for (const sub of d.dict) {
+                  if (!sub || typeof sub !== 'object') continue;
                   if (sub.label === 'Username' && typeof sub.value === 'string' && sub.value.trim()) {
                     const clean = sub.value.trim().replace(/^@/, '');
                     if (INSTAGRAM_HANDLE_REGEX.test(clean)) {
@@ -246,7 +255,7 @@ export class ArchiveImportService {
       }
       const recordDate = savedAtIso || new Date().toISOString();
 
-      parsedCandidates.push({
+      const candidate: ParsedCandidate = {
         mediaId,
         shortcode,
         reel_url,
@@ -256,7 +265,21 @@ export class ArchiveImportService {
         recordDate,
         savedAtIso,
         rank: totalProcessed,
-      });
+      };
+
+      // Deduplicate candidates by shortcode, preferring known creator then non-empty caption
+      const existing = candidatesByShortcode.get(shortcode);
+      if (!existing) {
+        candidatesByShortcode.set(shortcode, candidate);
+      } else {
+        const existingHasCreator = existing.creatorHandle !== UNKNOWN_CREATOR_HANDLE;
+        const candidateHasCreator = candidate.creatorHandle !== UNKNOWN_CREATOR_HANDLE;
+        if (!existingHasCreator && candidateHasCreator) {
+          candidatesByShortcode.set(shortcode, candidate);
+        } else if (existingHasCreator === candidateHasCreator && !existing.caption && candidate.caption) {
+          candidatesByShortcode.set(shortcode, candidate);
+        }
+      }
 
       if (!creatorsToUpsert.has(creatorHandle)) {
         creatorsToUpsert.set(creatorHandle, {
@@ -269,6 +292,7 @@ export class ArchiveImportService {
 
     let reelsImported = 0;
     const creatorsSeen = new Set<string>();
+    const parsedCandidates = Array.from(candidatesByShortcode.values());
 
     if (parsedCandidates.length > 0) {
       try {
@@ -277,7 +301,6 @@ export class ArchiveImportService {
 
         const fallbackCreator = creatorMap.get(UNKNOWN_CREATOR_HANDLE);
         if (!fallbackCreator) {
-          // Safety ensure default creator exists in map
           const createdFallback = await Repository.upsertCreator({
             instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
             username: UNKNOWN_CREATOR_HANDLE,
@@ -287,30 +310,76 @@ export class ArchiveImportService {
         }
 
         // Prepare reels payload with resolved creator IDs
-        const reelsPayload = parsedCandidates.map((c) => {
-          const creator = creatorMap.get(c.creatorHandle) || creatorMap.get(UNKNOWN_CREATOR_HANDLE)!;
-          if (c.creatorHandle !== UNKNOWN_CREATOR_HANDLE && creator?.id) {
+        const reelsPayload: Array<{
+          instagram_media_id: string;
+          shortcode: string;
+          reel_url: string;
+          creator_id: string;
+          caption: string | null;
+          thumbnail_url: string | null;
+          taken_at: string;
+          saved_at: string | null;
+          first_detected_at: string;
+          save_order_rank: number;
+          watch_status: 'unwatched';
+          is_saved_on_instagram: boolean;
+          instagram_sender_id: string | null;
+        }> = [];
+
+        for (const c of parsedCandidates) {
+          if (c.creatorHandle !== UNKNOWN_CREATOR_HANDLE) {
+            const creator = creatorMap.get(c.creatorHandle);
+            if (!creator?.id) {
+              errors.push(`Failed to resolve creator @${c.creatorHandle} for reel ${c.shortcode}`);
+              continue;
+            }
             creatorsSeen.add(creator.id);
+            reelsPayload.push({
+              instagram_media_id: c.mediaId,
+              shortcode: c.shortcode,
+              reel_url: c.reel_url,
+              creator_id: creator.id,
+              caption: c.caption,
+              thumbnail_url: null,
+              taken_at: c.recordDate,
+              saved_at: c.savedAtIso,
+              first_detected_at: c.recordDate,
+              save_order_rank: c.rank,
+              watch_status: 'unwatched',
+              is_saved_on_instagram: true,
+              instagram_sender_id: senderId || null,
+            });
+          } else {
+            const fallback = creatorMap.get(UNKNOWN_CREATOR_HANDLE) || fallbackCreator;
+            if (fallback?.id) {
+              reelsPayload.push({
+                instagram_media_id: c.mediaId,
+                shortcode: c.shortcode,
+                reel_url: c.reel_url,
+                creator_id: fallback.id,
+                caption: c.caption,
+                thumbnail_url: null,
+                taken_at: c.recordDate,
+                saved_at: c.savedAtIso,
+                first_detected_at: c.recordDate,
+                save_order_rank: c.rank,
+                watch_status: 'unwatched',
+                is_saved_on_instagram: true,
+                instagram_sender_id: senderId || null,
+              });
+            }
           }
-          return {
-            instagram_media_id: c.mediaId,
-            shortcode: c.shortcode,
-            reel_url: c.reel_url,
-            creator_id: creator.id,
-            caption: c.caption,
-            thumbnail_url: null,
-            taken_at: c.recordDate,
-            saved_at: c.savedAtIso,
-            first_detected_at: c.recordDate,
-            save_order_rank: c.rank,
-            watch_status: 'unwatched' as const,
-            is_saved_on_instagram: true,
-            instagram_sender_id: senderId || null,
-          };
-        });
+        }
 
         // Batch upsert saved reels
-        reelsImported = await Repository.upsertSavedReelsBatch(reelsPayload, { ignoreDuplicates: true });
+        const batchResult = await Repository.upsertSavedReelsBatch(reelsPayload, { ignoreDuplicates: true });
+        reelsImported = batchResult.newlyImported + batchResult.alreadyPresent;
+
+        if (batchResult.failedShortcodes.length > 0) {
+          for (const sc of batchResult.failedShortcodes) {
+            errors.push(`Failed to import reel with shortcode ${sc}`);
+          }
+        }
       } catch (batchErr: any) {
         console.error('[ArchiveImport] Batch import error, attempting recovery:', batchErr.message);
         errors.push(`Batch import error: ${batchErr.message || 'unknown error'}`);
