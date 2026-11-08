@@ -2,6 +2,7 @@ import { loadConfig } from '../config.ts';
 import { Repository } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
 import { parseDuration, formatTargetTime } from '../utils/duration.ts';
+import { extractCreatorQuery } from '../utils/creatorQuery.ts';
 
 export class MetaInstagramBotService {
   private accessToken: string;
@@ -276,25 +277,38 @@ export class MetaInstagramBotService {
       return;
     }
 
-    // Check for creator search (e.g. "@heysiri_jan" or "heysiri_jan")
-    if (/^@?[a-zA-Z0-9._]{2,30}$/.test(lower) && !lower.startsWith('/')) {
-      const { creator, reels } = await Repository.getReelsByCreatorUsername(lower);
+    // 3. Creator reels search (e.g. "@who.bhartiiiii", "who.bhartiiiii", "reels by @who.bhartiiiii", "show who.bhartiiiii")
+    const creatorQuery = extractCreatorQuery(text);
+    if (creatorQuery) {
+      const { creator, reels } = await Repository.getReelsByCreatorUsername(creatorQuery);
       if (!creator || reels.length === 0) {
         await this.sendDirectMessage(
           senderId,
-          `🔍 No saved reels from @${lower.replace(/^@/, '')} yet!\nShare any Reel link from them to start tracking.`
+          `🔍 No saved reels found from @${creatorQuery.replace(/^@/, '')} yet!\n\nShare any Reel link from them here to start tracking.`
         );
         return;
       }
 
-      let reply = `🎬 Saved Reels from @${creator.username} (${reels.length} total, latest to oldest):\n\n`;
-      const sample = reels.slice(0, 5);
-      sample.forEach((r, i) => {
-        const snippet = r.caption ? `"${r.caption.slice(0, 40).replace(/\n/g, ' ')}..."` : '';
-        reply += `${i + 1}. https://instagram.com/reel/${r.shortcode}/ ${snippet}\n`;
-      });
+      const totalCount = reels.length;
+      const countLabel = totalCount === 1 ? '1 saved reel' : `${totalCount} saved reels`;
+      let reply = `🎬 Saved Reels from @${creator.username} (${countLabel}, latest to oldest):\n\n`;
 
-      await this.sendDirectMessage(senderId, reply);
+      const limit = Math.min(reels.length, 10);
+      for (let i = 0; i < limit; i++) {
+        const r = reels[i];
+        let statusBadge = '👀 Unwatched';
+        if (r.watch_status === 'watched') statusBadge = '✅ Watched';
+        else if (r.watch_status === 'watch_later') statusBadge = '⏰ Watch Later';
+
+        const captionSnippet = r.caption ? ` • "${r.caption.slice(0, 45).replace(/\n/g, ' ')}..."` : '';
+        reply += `${i + 1}. https://www.instagram.com/reel/${r.shortcode}/\n   ${statusBadge}${captionSnippet}\n\n`;
+      }
+
+      if (reels.length > limit) {
+        reply += `... and ${reels.length - limit} more reels in your library!`;
+      }
+
+      await this.sendDirectMessage(senderId, reply.trim());
       return;
     }
 
