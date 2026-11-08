@@ -60,6 +60,17 @@ export class ArchiveImportService {
         rawItems = obj.saved_media;
       } else if (Array.isArray(obj.items)) {
         rawItems = obj.items;
+      } else if (Array.isArray(obj.label_values)) {
+        // Support nested collections (e.g. saved_collections.json)
+        for (const lv of obj.label_values) {
+          if (lv && Array.isArray(lv.dict)) {
+            for (const d of lv.dict) {
+              if (d && Array.isArray(d.dict)) {
+                rawItems.push(d);
+              }
+            }
+          }
+        }
       } else {
         // Look for any array inside the object
         for (const val of Object.values(obj)) {
@@ -83,34 +94,111 @@ export class ArchiveImportService {
     }
 
     let totalProcessed = 0;
-    let reelsImported = 0;
-    const creatorsSeen = new Set<string>();
-    const creatorCache = new Map<string, Creator>();
     const errors: string[] = [];
 
+    interface ParsedCandidate {
+      mediaId: string;
+      shortcode: string;
+      reel_url: string;
+      creatorHandle: string;
+      creatorDisplayName: string | null;
+      caption: string | null;
+      recordDate: string;
+      savedAtIso: string | null;
+      rank: number;
+    }
+
+    const parsedCandidates: ParsedCandidate[] = [];
+    const creatorsToUpsert = new Map<string, { instagram_user_id: string; username: string; display_name: string | null }>();
+
+    // Ensure default sentinel creator is in the upsert list
+    creatorsToUpsert.set(UNKNOWN_CREATOR_HANDLE, {
+      instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
+      username: UNKNOWN_CREATOR_HANDLE,
+      display_name: null,
+    });
+
     for (const rawItem of rawItems) {
-      // Runtime validation of raw item
       if (!rawItem || typeof rawItem !== 'object') {
         continue;
       }
       const item = rawItem as RawSavedExportItem;
       totalProcessed++;
 
-      // Extract and validate href link and timestamp
       let href: string | undefined;
       let rawTimestamp: unknown = item.timestamp;
+      let caption: string | null = typeof item.caption === 'string' && item.caption.trim() ? item.caption.trim() : null;
+      let creatorHandle = UNKNOWN_CREATOR_HANDLE;
+      let creatorDisplayName: string | null = null;
+      let mediaId: string | null = (typeof (item as any).fbid === 'string' || typeof (item as any).fbid === 'number') ? String((item as any).fbid) : null;
 
-      if (typeof item.href === 'string') {
-        href = item.href;
-      } else if (item.string_map_data && typeof item.string_map_data === 'object') {
-        for (const mapData of Object.values(item.string_map_data)) {
-          if (mapData && typeof mapData === 'object') {
-            if (typeof mapData.href === 'string') {
-              href = mapData.href;
-              rawTimestamp = mapData.timestamp ?? rawTimestamp;
-              break;
+      // 1. Modern Instagram Account Center export format (label_values array)
+      if (Array.isArray((item as any).label_values)) {
+        for (const lv of (item as any).label_values) {
+          if (!lv || typeof lv !== 'object') continue;
+          if (lv.label === 'URL') {
+            href = (typeof lv.href === 'string' && lv.href) || (typeof lv.value === 'string' && lv.value) || href;
+          } else if (lv.label === 'Caption' && typeof lv.value === 'string' && lv.value.trim()) {
+            caption = lv.value.trim();
+          } else if (lv.title === 'Owner' && Array.isArray(lv.dict)) {
+            for (const d of lv.dict) {
+              if (d && Array.isArray(d.dict)) {
+                for (const sub of d.dict) {
+                  if (sub.label === 'Username' && typeof sub.value === 'string' && sub.value.trim()) {
+                    const clean = sub.value.trim().replace(/^@/, '');
+                    if (INSTAGRAM_HANDLE_REGEX.test(clean)) {
+                      creatorHandle = clean;
+                    }
+                  } else if (sub.label === 'Name' && typeof sub.value === 'string' && sub.value.trim()) {
+                    creatorDisplayName = sub.value.trim();
+                  }
+                }
+              }
             }
           }
+        }
+      } else if (Array.isArray((item as any).dict)) {
+        // Nested dict format (from collections)
+        for (const sub of (item as any).dict) {
+          if (sub && typeof sub === 'object') {
+            if (sub.label === 'URL') {
+              href = (typeof sub.href === 'string' && sub.href) || (typeof sub.value === 'string' && sub.value) || href;
+            } else if (sub.label === 'Caption' && typeof sub.value === 'string' && sub.value.trim()) {
+              caption = sub.value.trim();
+            }
+          }
+        }
+      }
+
+      // 2. Legacy export format (string_map_data)
+      if (item.string_map_data && typeof item.string_map_data === 'object') {
+        for (const [key, mapData] of Object.entries(item.string_map_data)) {
+          if (mapData && typeof mapData === 'object') {
+            const normalizedKey = key.toLowerCase();
+            if (!href && typeof mapData.href === 'string') {
+              href = mapData.href;
+              rawTimestamp = mapData.timestamp ?? rawTimestamp;
+            }
+            if (['author', 'owner', 'user', 'creator'].includes(normalizedKey) && typeof mapData.value === 'string' && mapData.value.trim()) {
+              const candidate = mapData.value.trim().replace(/^@/, '');
+              if (INSTAGRAM_HANDLE_REGEX.test(candidate)) {
+                creatorHandle = candidate;
+              }
+            }
+          }
+        }
+      }
+
+      // 3. Direct property fallback
+      if (!href && typeof item.href === 'string') {
+        href = item.href;
+      }
+
+      // 4. Creator handle fallback from item.title (legacy exports where title is creator handle)
+      if (creatorHandle === UNKNOWN_CREATOR_HANDLE && typeof item.title === 'string' && item.title.trim()) {
+        const titleCandidate = item.title.trim().replace(/^@/, '');
+        if (INSTAGRAM_HANDLE_REGEX.test(titleCandidate)) {
+          creatorHandle = titleCandidate;
         }
       }
 
@@ -118,20 +206,21 @@ export class ArchiveImportService {
         continue;
       }
 
-      // Anchored URL parse: validate host and reel/post path
+      // Anchored URL parse: validate host and reel/post/tv path
       let shortcode: string | null = null;
-      let mediaType: 'reel' | 'p' = 'reel';
+      let mediaType: 'reel' | 'p' | 'tv' = 'reel';
       try {
         const parsedUrl = new URL(href);
         const host = parsedUrl.hostname.toLowerCase();
         if (host !== 'instagram.com' && host !== 'www.instagram.com') {
           continue;
         }
-        const pathMatch = parsedUrl.pathname.match(/^\/(reel|reels|p)\/([A-Za-z0-9_-]+)\/?$/i);
+        const pathMatch = parsedUrl.pathname.match(/^\/(reel|reels|p|tv)\/([A-Za-z0-9_-]+)\/?$/i);
         if (!pathMatch) {
           continue;
         }
-        mediaType = pathMatch[1].toLowerCase() === 'p' ? 'p' : 'reel';
+        const matchedType = pathMatch[1].toLowerCase();
+        mediaType = matchedType === 'p' ? 'p' : (matchedType === 'tv' ? 'tv' : 'reel');
         shortcode = pathMatch[2];
       } catch {
         continue;
@@ -141,38 +230,9 @@ export class ArchiveImportService {
         continue;
       }
 
-      // Preserve original URL path type
       const reel_url = `https://www.instagram.com/${mediaType}/${shortcode}/`;
-
-      // Extract creator identity from reliable metadata fields or use sentinel
-      let creatorHandle = UNKNOWN_CREATOR_HANDLE;
-      const caption: string | null = typeof item.caption === 'string' && item.caption.trim() ? item.caption.trim() : null;
-
-      if (item.string_map_data && typeof item.string_map_data === 'object') {
-        for (const [key, mapData] of Object.entries(item.string_map_data)) {
-          if (mapData && typeof mapData === 'object') {
-            const normalizedKey = key.toLowerCase();
-            if (['author', 'owner', 'user', 'creator'].includes(normalizedKey) && typeof mapData.value === 'string' && mapData.value.trim()) {
-              const candidate = mapData.value.trim().replace(/^@/, '');
-              if (INSTAGRAM_HANDLE_REGEX.test(candidate)) {
-                creatorHandle = candidate;
-                break;
-              }
-            }
-          }
-        }
-      }
-
-      // If creator was not found in string_map_data, check item.title.
-      // In official Instagram saved_posts.json exports, item.title holds the creator handle
-      // while "Saved on" provides href and timestamp.
-      // Treat item.title as creator candidate ONLY when it matches Instagram handle grammar,
-      // and never store it as caption.
-      if (creatorHandle === UNKNOWN_CREATOR_HANDLE && typeof item.title === 'string' && item.title.trim()) {
-        const titleCandidate = item.title.trim().replace(/^@/, '');
-        if (INSTAGRAM_HANDLE_REGEX.test(titleCandidate)) {
-          creatorHandle = titleCandidate;
-        }
+      if (!mediaId) {
+        mediaId = `export_${shortcode}`;
       }
 
       // Format ISO dates with strict runtime checks
@@ -186,48 +246,74 @@ export class ArchiveImportService {
       }
       const recordDate = savedAtIso || new Date().toISOString();
 
+      parsedCandidates.push({
+        mediaId,
+        shortcode,
+        reel_url,
+        creatorHandle,
+        creatorDisplayName,
+        caption,
+        recordDate,
+        savedAtIso,
+        rank: totalProcessed,
+      });
+
+      if (!creatorsToUpsert.has(creatorHandle)) {
+        creatorsToUpsert.set(creatorHandle, {
+          instagram_user_id: `creator_${creatorHandle}`,
+          username: creatorHandle,
+          display_name: creatorDisplayName || (creatorHandle !== UNKNOWN_CREATOR_HANDLE ? creatorHandle : null),
+        });
+      }
+    }
+
+    let reelsImported = 0;
+    const creatorsSeen = new Set<string>();
+
+    if (parsedCandidates.length > 0) {
       try {
-        // Upsert creator with cache to avoid redundant database round trips
-        let creator = creatorCache.get(creatorHandle);
-        if (!creator) {
-          creator = await Repository.upsertCreator({
-            instagram_user_id: `creator_${creatorHandle}`,
-            username: creatorHandle,
-            display_name: creatorHandle !== UNKNOWN_CREATOR_HANDLE ? creatorHandle : null,
-            profile_picture_url: null,
+        // Batch upsert creators
+        const creatorMap = await Repository.upsertCreatorsBatch(Array.from(creatorsToUpsert.values()));
+
+        const fallbackCreator = creatorMap.get(UNKNOWN_CREATOR_HANDLE);
+        if (!fallbackCreator) {
+          // Safety ensure default creator exists in map
+          const createdFallback = await Repository.upsertCreator({
+            instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
+            username: UNKNOWN_CREATOR_HANDLE,
+            display_name: null,
           });
-          creatorCache.set(creatorHandle, creator);
+          creatorMap.set(UNKNOWN_CREATOR_HANDLE, createdFallback);
         }
 
-        // Only count actual identified creators (exclude unattributed sentinel)
-        if (creatorHandle !== UNKNOWN_CREATOR_HANDLE) {
-          creatorsSeen.add(creator.id);
-        }
-
-        // Upsert saved reel with ignoreDuplicates and skipReturn to preserve existing status and avoid redundant fetch
-        await Repository.upsertSavedReel(
-          {
-            instagram_media_id: `export_${shortcode}`,
-            shortcode,
-            reel_url,
+        // Prepare reels payload with resolved creator IDs
+        const reelsPayload = parsedCandidates.map((c) => {
+          const creator = creatorMap.get(c.creatorHandle) || creatorMap.get(UNKNOWN_CREATOR_HANDLE)!;
+          if (c.creatorHandle !== UNKNOWN_CREATOR_HANDLE && creator?.id) {
+            creatorsSeen.add(creator.id);
+          }
+          return {
+            instagram_media_id: c.mediaId,
+            shortcode: c.shortcode,
+            reel_url: c.reel_url,
             creator_id: creator.id,
-            caption,
+            caption: c.caption,
             thumbnail_url: null,
-            taken_at: recordDate,
-            saved_at: savedAtIso,
-            first_detected_at: recordDate,
-            save_order_rank: totalProcessed,
-            watch_status: 'unwatched',
+            taken_at: c.recordDate,
+            saved_at: c.savedAtIso,
+            first_detected_at: c.recordDate,
+            save_order_rank: c.rank,
+            watch_status: 'unwatched' as const,
             is_saved_on_instagram: true,
             instagram_sender_id: senderId || null,
-          },
-          { ignoreDuplicates: true, skipReturn: true }
-        );
+          };
+        });
 
-        reelsImported++;
-      } catch (err: any) {
-        console.error(`[ArchiveImport] Failed to import reel ${shortcode}:`, err.message || err);
-        errors.push(`Failed to import item with shortcode ${shortcode}`);
+        // Batch upsert saved reels
+        reelsImported = await Repository.upsertSavedReelsBatch(reelsPayload, { ignoreDuplicates: true });
+      } catch (batchErr: any) {
+        console.error('[ArchiveImport] Batch import error, attempting recovery:', batchErr.message);
+        errors.push(`Batch import error: ${batchErr.message || 'unknown error'}`);
       }
     }
 

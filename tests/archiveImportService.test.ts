@@ -94,6 +94,49 @@ async function runTests() {
   assert.ok(res5.errors.length > 0, 'Errors must contain actionable message when all items skipped');
   assert.match(res5.errors[0], /No valid Instagram reel links found/);
 
+  // Test 6: Modern Meta Account Center export format (label_values with Owner dict)
+  console.log('Test 6: Modern Meta Account Center format (label_values)');
+  const modernExportPayload = [
+    {
+      timestamp: 1794138985,
+      fbid: '18084562202346176',
+      label_values: [
+        {
+          label: 'URL',
+          value: 'https://www.instagram.com/reel/Dcdva79zKqT/',
+          href: 'https://www.instagram.com/reel/Dcdva79zKqT/',
+        },
+        {
+          label: 'Caption',
+          value: 'Ajeeb.',
+        },
+        {
+          title: 'Owner',
+          dict: [
+            {
+              dict: [
+                { label: 'Username', value: 'bhaavyaa____' },
+                { label: 'Name', value: 'Bhaavya Tiwari' },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ];
+
+  const res6 = await ArchiveImportService.importArchive(modernExportPayload);
+  assert.equal(res6.status, 'success');
+  assert.equal(res6.reelsImported, 1);
+  assert.equal(res6.creatorsAdded, 1);
+
+  const { reels: list6 } = await Repository.getReels({ limit: 10 });
+  const reel6 = list6.find((r) => r.shortcode === 'Dcdva79zKqT');
+  assert.ok(reel6, 'Reel Dcdva79zKqT should exist');
+  assert.equal(reel6.creator?.username, 'bhaavyaa____', 'Creator username must be parsed from Owner.Username');
+  assert.equal(reel6.caption, 'Ajeeb.', 'Caption should be parsed from Caption label');
+  assert.equal(reel6.instagram_media_id, '18084562202346176', 'Media ID should be fbid');
+
   console.log('✅ All ArchiveImportService tests passed successfully!');
 }
 
