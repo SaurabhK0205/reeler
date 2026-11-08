@@ -79,7 +79,7 @@ export class MetaInstagramBotService {
   }
 
   /**
-   * Sends a message to a user via Meta Graph API
+   * Sends a message to a user via Meta Graph API (automatically splits into safe chunks <= 950 chars)
    */
   async sendDirectMessage(recipientId: string, text: string): Promise<boolean> {
     if (!this.accessToken) {
@@ -87,30 +87,84 @@ export class MetaInstagramBotService {
       return false;
     }
 
-    try {
-      const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${this.accessToken}`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          recipient: { id: recipientId },
-          message: { text },
-        }),
-        signal: AbortSignal.timeout(10000),
-      });
+    const chunks = this.splitMessageIntoChunks(text, 950);
+    let allSuccess = true;
 
-      const data = await res.json() as any;
-      if (!res.ok) {
-        console.error('[MetaIG] Failed to send DM:', data);
-        return false;
+    for (const chunk of chunks) {
+      try {
+        const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${this.accessToken}`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            recipient: { id: recipientId },
+            message: { text: chunk },
+          }),
+          signal: AbortSignal.timeout(10000),
+        });
+
+        const data = await res.json() as any;
+        if (!res.ok) {
+          console.error('[MetaIG] Failed to send DM:', data);
+          allSuccess = false;
+        } else {
+          console.log(`[MetaIG] DM sent to ${recipientId}: "${chunk.slice(0, 40)}..."`);
+        }
+      } catch (e: any) {
+        console.error('[MetaIG] Error calling Meta messages API:', e.message);
+        allSuccess = false;
       }
 
-      console.log(`[MetaIG] DM sent to ${recipientId}: "${text.slice(0, 40)}..."`);
-      return true;
-    } catch (e: any) {
-      console.error('[MetaIG] Error calling Meta messages API:', e.message);
-      return false;
+      if (chunks.length > 1) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
     }
+
+    return allSuccess;
+  }
+
+  private splitMessageIntoChunks(text: string, maxLen = 950): string[] {
+    if (text.length <= maxLen) return [text];
+
+    const chunks: string[] = [];
+    const paragraphs = text.split('\n\n');
+    let current = '';
+
+    for (const para of paragraphs) {
+      if (!current) {
+        current = para;
+      } else if (current.length + 2 + para.length <= maxLen) {
+        current += '\n\n' + para;
+      } else {
+        chunks.push(current);
+        current = para;
+      }
+    }
+
+    if (current) {
+      if (current.length > maxLen) {
+        let remaining = current;
+        while (remaining.length > 0) {
+          if (remaining.length <= maxLen) {
+            chunks.push(remaining);
+            break;
+          }
+          let splitIdx = remaining.lastIndexOf('\n', maxLen);
+          if (splitIdx === -1 || splitIdx < maxLen / 2) {
+            splitIdx = remaining.lastIndexOf(' ', maxLen);
+          }
+          if (splitIdx === -1) {
+            splitIdx = maxLen;
+          }
+          chunks.push(remaining.slice(0, splitIdx).trim());
+          remaining = remaining.slice(splitIdx).trim();
+        }
+      } else {
+        chunks.push(current);
+      }
+    }
+
+    return chunks;
   }
 
   /**
@@ -318,7 +372,7 @@ export class MetaInstagramBotService {
       const countLabel = totalCount === 1 ? '1 saved reel' : `${totalCount} saved reels`;
       let reply = `🎬 Saved Reels from @${creator.username} (${countLabel}, latest to oldest):\n\n`;
 
-      const limit = Math.min(reels.length, 10);
+      const limit = Math.min(reels.length, 5);
       for (let i = 0; i < limit; i++) {
         const r = reels[i];
         let statusBadge = '👀 Unwatched';
@@ -330,7 +384,7 @@ export class MetaInstagramBotService {
       }
 
       if (reels.length > limit) {
-        reply += `... and ${reels.length - limit} more reels in your library!`;
+        reply += `... and ${reels.length - limit} more reels in your library! Search "@${creator.username}" on your web dashboard to see all.`;
       }
 
       await this.sendDirectMessage(senderId, reply.trim());
