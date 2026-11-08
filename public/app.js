@@ -1,6 +1,6 @@
 // ==============================================================================
-// REELER — CINEMATIC VAULT FRONTEND LOGIC
-// High-performance media curator & cinema theater modal. Zero AI slop.
+// REELER — LINEAR MONOCHROME VAULT APPLICATION LOGIC
+// Dual View (Poster Grid + Dense Table) & Native Instagram Embed Playback
 // ==============================================================================
 
 const state = {
@@ -13,14 +13,15 @@ const state = {
     page: 1,
     limit: 24,
   },
+  viewMode: localStorage.getItem('reeler_view_mode') || 'grid',
   total: 0,
   reels: [],
   creators: [],
   stats: null,
-  currentTheaterReelId: null,
+  currentModalReelId: null,
 };
 
-// DOM Elements
+// DOM References
 const dbBadge = document.getElementById('db-badge');
 const importBtn = document.getElementById('import-btn');
 const archiveFileInput = document.getElementById('archive-file-input');
@@ -36,32 +37,56 @@ const sortBySelect = document.getElementById('sort-by');
 const creatorPillsList = document.getElementById('creator-pills-list');
 const resetCreatorBtn = document.getElementById('reset-creator-btn');
 const reelsGrid = document.getElementById('reels-grid');
+const reelsTableContainer = document.getElementById('reels-table-container');
+const reelsTableBody = document.getElementById('reels-table-body');
 const resultsCount = document.getElementById('results-count');
 const paginationBar = document.getElementById('pagination-bar');
 const prevPageBtn = document.getElementById('prev-page-btn');
 const nextPageBtn = document.getElementById('next-page-btn');
 const pageIndicator = document.getElementById('page-indicator');
+const viewModeGridBtn = document.getElementById('view-mode-grid');
+const viewModeListBtn = document.getElementById('view-mode-list');
 
-// Cinema Theater Modal Elements
-const theaterModal = document.getElementById('theater-modal');
-const theaterBackdrop = document.getElementById('theater-backdrop');
-const theaterCloseBtn = document.getElementById('theater-close-btn');
-const theaterPlayerContainer = document.getElementById('theater-player-container');
-const theaterAvatar = document.getElementById('theater-avatar');
-const theaterCreatorName = document.getElementById('theater-creator-name');
-const theaterDate = document.getElementById('theater-date');
-const theaterCaption = document.getElementById('theater-caption');
-const theaterExternalLink = document.getElementById('theater-external-link');
-const theaterRank = document.getElementById('theater-rank');
-const theaterStatusUnwatched = document.getElementById('theater-status-unwatched');
-const theaterStatusLater = document.getElementById('theater-status-later');
-const theaterStatusWatched = document.getElementById('theater-status-watched');
+// Playback Modal References
+const playbackModal = document.getElementById('playback-modal');
+const playbackBackdrop = document.getElementById('playback-backdrop');
+const playbackCloseBtn = document.getElementById('playback-close-btn');
+const playbackRankKicker = document.getElementById('playback-rank-kicker');
+const playbackShortcodeTag = document.getElementById('playback-shortcode-tag');
+const playbackMediaContainer = document.getElementById('playback-media-container');
+const playbackCreatorAvatar = document.getElementById('playback-creator-avatar');
+const playbackCreatorHandle = document.getElementById('playback-creator-handle');
+const playbackSavedDate = document.getElementById('playback-saved-date');
+const playbackDirectIgLink = document.getElementById('playback-direct-ig-link');
+const playbackFullCaption = document.getElementById('playback-full-caption');
+const copyCaptionBtn = document.getElementById('copy-caption-btn');
+const statusChoiceUnwatched = document.getElementById('status-choice-unwatched');
+const statusChoiceLater = document.getElementById('status-choice-later');
+const statusChoiceWatched = document.getElementById('status-choice-watched');
 
 // --- Initialization ---
 async function init() {
+  applyViewMode(state.viewMode);
   setupEventListeners();
   await checkHealth();
   await Promise.all([loadStats(), loadCreators(), fetchReels()]);
+}
+
+function applyViewMode(mode) {
+  state.viewMode = mode;
+  localStorage.setItem('reeler_view_mode', mode);
+
+  if (mode === 'grid') {
+    viewModeGridBtn.classList.add('active');
+    viewModeListBtn.classList.remove('active');
+    reelsGrid.style.display = 'grid';
+    reelsTableContainer.style.display = 'none';
+  } else {
+    viewModeListBtn.classList.add('active');
+    viewModeGridBtn.classList.remove('active');
+    reelsGrid.style.display = 'none';
+    reelsTableContainer.style.display = 'block';
+  }
 }
 
 async function checkHealth() {
@@ -69,15 +94,15 @@ async function checkHealth() {
     const res = await fetch('/api/health');
     const data = await res.json();
     if (data.database === 'supabase') {
-      dbBadge.className = 'badge badge-connected';
-      dbBadge.innerHTML = '<span class="badge-dot" aria-hidden="true"></span><span class="badge-text">Supabase (Cloud)</span>';
+      dbBadge.className = 'nav-badge connected';
+      dbBadge.innerHTML = '<span class="badge-dot" aria-hidden="true"></span><span class="badge-label">Supabase (Cloud)</span>';
     } else {
-      dbBadge.className = 'badge badge-local';
-      dbBadge.innerHTML = '<span class="badge-dot" aria-hidden="true"></span><span class="badge-text">In-Memory Store</span>';
+      dbBadge.className = 'nav-badge local';
+      dbBadge.innerHTML = '<span class="badge-dot" aria-hidden="true"></span><span class="badge-label">In-Memory Store</span>';
     }
   } catch (_) {
-    dbBadge.className = 'badge';
-    dbBadge.innerHTML = '<span class="badge-dot" aria-hidden="true"></span><span class="badge-text">Offline</span>';
+    dbBadge.className = 'nav-badge';
+    dbBadge.innerHTML = '<span class="badge-dot" aria-hidden="true"></span><span class="badge-label">Offline</span>';
   }
 }
 
@@ -101,64 +126,47 @@ async function loadCreators() {
     const res = await fetch('/api/creators');
     if (!res.ok) return;
     state.creators = await res.json();
-    renderCreatorPills();
+    renderCreatorStrip();
   } catch (e) {
     console.error('Failed to load creators:', e);
   }
 }
 
-// Deterministic aesthetic color generator based on creator handle
-function getCreatorColor(name) {
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) {
-    hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  const hues = [210, 195, 260, 340, 160, 30, 280]; // cyan, teal, violet, rose, emerald, amber, purple
-  const hue = hues[Math.abs(hash) % hues.length];
-  return {
-    bg: `hsl(${hue}, 60%, 18%)`,
-    border: `hsl(${hue}, 70%, 45%)`,
-    accent: `hsl(${hue}, 85%, 65%)`,
-  };
-}
-
-function renderCreatorPills() {
+function renderCreatorStrip() {
   creatorPillsList.innerHTML = '';
 
-  // "All Creators" button
   const allBtn = document.createElement('button');
-  allBtn.className = `creator-pill ${!state.filters.creatorId ? 'active' : ''}`;
+  allBtn.className = `creator-chip ${!state.filters.creatorId ? 'active' : ''}`;
   allBtn.textContent = 'All Creators';
   allBtn.onclick = () => selectCreator('');
   creatorPillsList.appendChild(allBtn);
 
-  // Top creators from server
   for (const c of state.creators) {
-    const pill = document.createElement('button');
-    pill.className = `creator-pill ${state.filters.creatorId === c.id ? 'active' : ''}`;
+    const chip = document.createElement('button');
+    chip.className = `creator-chip ${state.filters.creatorId === c.id ? 'active' : ''}`;
 
     if (c.profile_picture_url) {
       const img = document.createElement('img');
       img.src = c.profile_picture_url;
-      img.className = 'creator-avatar-mini';
+      img.className = 'creator-chip-img';
       img.alt = c.username;
       img.onerror = () => { img.style.display = 'none'; };
-      pill.appendChild(img);
+      chip.appendChild(img);
     }
 
     const name = document.createElement('span');
     name.textContent = `@${c.username}`;
-    pill.appendChild(name);
+    chip.appendChild(name);
 
     if (c.saved_count) {
-      const count = document.createElement('span');
-      count.className = 'creator-count';
-      count.textContent = c.saved_count;
-      pill.appendChild(count);
+      const counter = document.createElement('span');
+      counter.className = 'chip-counter';
+      counter.textContent = c.saved_count;
+      chip.appendChild(counter);
     }
 
-    pill.onclick = () => selectCreator(c.id);
-    creatorPillsList.appendChild(pill);
+    chip.onclick = () => selectCreator(c.id);
+    creatorPillsList.appendChild(chip);
   }
 
   resetCreatorBtn.style.display = state.filters.creatorId ? 'inline' : 'none';
@@ -167,13 +175,14 @@ function renderCreatorPills() {
 function selectCreator(id) {
   state.filters.creatorId = id;
   state.filters.page = 1;
-  renderCreatorPills();
+  renderCreatorStrip();
   fetchReels();
 }
 
 async function fetchReels() {
-  resultsCount.textContent = 'Searching vault...';
+  resultsCount.textContent = 'Querying vault...';
   reelsGrid.innerHTML = '';
+  reelsTableBody.innerHTML = '';
 
   const params = new URLSearchParams();
   if (state.filters.creatorId) params.set('creatorId', state.filters.creatorId);
@@ -196,27 +205,24 @@ async function fetchReels() {
     updatePagination(data.page, data.limit, data.total);
   } catch (e) {
     console.error('Failed to fetch reels:', e);
-    resultsCount.textContent = 'Failed to load reels. Please try again.';
+    resultsCount.textContent = 'Failed to load reels. Please retry.';
   }
 }
 
 function renderReels() {
   reelsGrid.innerHTML = '';
+  reelsTableBody.innerHTML = '';
 
   if (state.reels.length === 0) {
     resultsCount.textContent = '0 reels found';
-    reelsGrid.innerHTML = `
-      <div class="empty-state">
-        <div class="empty-icon">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="11" cy="11" r="8"></circle>
-            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-          </svg>
-        </div>
-        <div class="empty-title">No Saved Reels Found</div>
-        <div class="empty-subtitle">Try adjusting your filters, clearing search keywords, or importing reels.</div>
+    const emptyMarkup = `
+      <div class="vault-empty-state">
+        <div class="empty-title-text">No Matching Saved Reels</div>
+        <div class="empty-desc-text">Try adjusting filters, clearing keywords, or importing new reels.</div>
       </div>
     `;
+    reelsGrid.innerHTML = emptyMarkup;
+    reelsTableBody.innerHTML = `<tr><td colspan="6" style="padding:0;">${emptyMarkup}</td></tr>`;
     return;
   }
 
@@ -224,110 +230,158 @@ function renderReels() {
   const rangeEnd = Math.min(state.filters.page * state.filters.limit, state.total);
   resultsCount.textContent = `Showing ${rangeStart}–${rangeEnd} of ${state.total} saved reel(s)`;
 
+  // Render both Grid and Table DOM nodes
   for (const reel of state.reels) {
+    const creatorName = reel.creator?.username || 'instagram_user';
+    const safeCreator = escapeHtml(creatorName);
+    const initial = (creatorName.replace(/[^a-zA-Z0-9]/g, '')[0] || 'R').toUpperCase();
+    const dateFormatted = formatRelativeDate(reel.taken_at || reel.saved_at);
+    const isWatchLater = reel.watch_status === 'watch_later';
+    const hasRealThumbnail = reel.thumbnail_url && !reel.thumbnail_url.includes('photo-1618005182384');
+
+    // 1. Render Grid Poster Card
     const card = document.createElement('div');
-    card.className = 'reel-card';
+    card.className = 'vault-poster-card';
     card.setAttribute('data-id', reel.id);
 
-    const creatorName = reel.creator?.username || 'instagram_user';
-    const safeCreatorName = escapeHtml(creatorName);
-    const creatorColor = getCreatorColor(creatorName);
-    const monogram = (creatorName.replace(/[^a-zA-Z0-9]/g, '')[0] || 'R').toUpperCase();
-    const dateFormatted = formatRelativeDate(reel.taken_at || reel.saved_at);
-    const statusLabel = formatStatusLabel(reel.watch_status);
-    const isWatchLater = reel.watch_status === 'watch_later';
-
-    // Poster visuals: either real imported thumbnail or our generative film poster frame
-    const hasRealThumbnail = reel.thumbnail_url && !reel.thumbnail_url.includes('photo-1618005182384');
-    let posterMediaHtml = '';
-
+    let posterArtHtml = '';
     if (hasRealThumbnail) {
-      posterMediaHtml = `
-        <img class="reel-thumb-img" src="${reel.thumbnail_url}" alt="Reel poster" loading="lazy" />
-        <div class="poster-scrim-top"></div>
-        <div class="poster-scrim-bottom"></div>
+      posterArtHtml = `
+        <img class="poster-actual-img" src="${reel.thumbnail_url}" alt="Reel thumbnail" loading="lazy" />
+        <div class="poster-top-scrim"></div>
+        <div class="poster-bottom-scrim"></div>
       `;
     } else {
-      posterMediaHtml = `
-        <div class="generative-poster">
-          <div class="gen-poster-header">
-            <span class="gen-film-strip-badge">REEL #${reel.save_order_rank || '—'}</span>
+      posterArtHtml = `
+        <div class="monochrome-poster-art">
+          <div class="art-top-row">
+            <span class="art-reel-id">REEL #${reel.save_order_rank || '—'}</span>
           </div>
-          <div class="gen-poster-body">
-            <div class="gen-monogram" style="background: ${creatorColor.bg}; border-color: ${creatorColor.border};">
-              ${monogram}
-            </div>
-            <div class="gen-creator-name">@${safeCreatorName}</div>
-            <div class="gen-caption-preview">${escapeHtml(reel.caption || 'Saved Instagram Reel')}</div>
+          <div class="art-center-block">
+            <div class="art-monogram-circle">${initial}</div>
+            <div class="art-creator-text">@${safeCreator}</div>
+            <div class="art-caption-quote">${escapeHtml(reel.caption || 'Saved Instagram Reel')}</div>
           </div>
-          <div class="poster-scrim-bottom"></div>
+          <div class="poster-bottom-scrim"></div>
         </div>
       `;
     }
 
     card.innerHTML = `
-      <div class="reel-poster-frame">
-        ${posterMediaHtml}
-        <div class="poster-top-bar">
-          <span class="reel-rank-pill">#${reel.save_order_rank || '—'}</span>
-          <button class="watch-later-quick-btn ${isWatchLater ? 'active' : ''}" title="${isWatchLater ? 'Remove from Watch Later' : 'Add to Watch Later'}" aria-label="Toggle Watch Later">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <div class="poster-media-box">
+        ${posterArtHtml}
+        <div class="card-header-overlay">
+          <span class="rank-tag">#${reel.save_order_rank || '—'}</span>
+          <button class="card-bookmark-btn ${isWatchLater ? 'active' : ''}" title="${isWatchLater ? 'In Watch Later' : 'Add to Watch Later'}" aria-label="Toggle Watch Later">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
               <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path>
             </svg>
           </button>
         </div>
-        <div class="poster-play-trigger" aria-label="Open Reel Theater">
-          <div class="play-bubble">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+        <div class="play-hover-trigger" aria-label="Play Reel in Theater">
+          <div class="play-icon-box">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
               <polygon points="5 3 19 12 5 21 5 3"></polygon>
             </svg>
           </div>
         </div>
       </div>
-      <div class="reel-content">
-        <div class="reel-creator-row">
-          <div class="creator-avatar" style="background: ${creatorColor.bg}; border-color: ${creatorColor.border}; display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:700;">
-            ${monogram}
-          </div>
-          <a class="creator-handle" href="${reel.reel_url}" target="_blank" rel="noopener noreferrer">@${safeCreatorName}</a>
+      <div class="card-details-box">
+        <div class="card-creator-row">
+          <a class="card-handle-link" href="${reel.reel_url}" target="_blank" rel="noopener noreferrer">@${safeCreator}</a>
         </div>
-        <div class="reel-caption-line">${escapeHtml(reel.caption || '(No caption provided)')}</div>
-        <div class="reel-footer-row">
-          <span class="reel-date">${dateFormatted}</span>
-          <button class="status-badge-btn status-badge-${reel.watch_status}" data-id="${reel.id}" data-status="${reel.watch_status}">
-            ${statusLabel}
+        <div class="card-caption-line">${escapeHtml(reel.caption || '(No caption provided)')}</div>
+        <div class="card-footer-meta">
+          <span class="card-date-label">${dateFormatted}</span>
+          <button class="status-pill-toggle status-pill-${reel.watch_status}" data-id="${reel.id}">
+            ${formatStatusLabel(reel.watch_status)}
           </button>
         </div>
       </div>
     `;
 
-    // Click card to open Cinema Theater modal
+    // Click card opens playback theater
     card.addEventListener('click', (e) => {
-      // Don't open theater if clicking direct Instagram link
-      if (e.target.closest('a')) return;
-      openTheaterModal(reel);
+      if (e.target.closest('a') || e.target.closest('.card-bookmark-btn') || e.target.closest('.status-pill-toggle')) return;
+      openPlaybackModal(reel);
     });
 
-    // Quick Watch Later bookmark button
-    const bookmarkBtn = card.querySelector('.watch-later-quick-btn');
-    bookmarkBtn.addEventListener('click', (e) => {
+    const cardBookmark = card.querySelector('.card-bookmark-btn');
+    cardBookmark.addEventListener('click', (e) => {
       e.stopPropagation();
-      const newStatus = reel.watch_status === 'watch_later' ? 'unwatched' : 'watch_later';
-      updateReelStatus(reel.id, newStatus);
+      const nextStatus = reel.watch_status === 'watch_later' ? 'unwatched' : 'watch_later';
+      updateReelStatus(reel.id, nextStatus);
     });
 
-    // Status badge click (cycles unwatched -> watch_later -> watched -> unwatched)
-    const statusBtn = card.querySelector('.status-badge-btn');
-    statusBtn.addEventListener('click', (e) => {
+    const cardStatusBtn = card.querySelector('.status-pill-toggle');
+    cardStatusBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      cycleWatchStatus(reel.id, reel.watch_status);
+      cycleStatus(reel.id, reel.watch_status);
     });
 
     reelsGrid.appendChild(card);
+
+    // 2. Render Table Row (for List/Table View)
+    const row = document.createElement('tr');
+    row.className = 'table-row';
+    row.setAttribute('data-id', reel.id);
+
+    row.innerHTML = `
+      <td class="table-rank">#${reel.save_order_rank || '—'}</td>
+      <td>
+        <div class="table-creator-cell">
+          <div class="table-creator-avatar">${initial}</div>
+          <a class="table-handle" href="${reel.reel_url}" target="_blank" rel="noopener noreferrer">@${safeCreator}</a>
+        </div>
+      </td>
+      <td class="table-caption-cell">${escapeHtml(reel.caption || '(No caption)')}</td>
+      <td class="table-date-cell">${dateFormatted}</td>
+      <td>
+        <button class="status-pill-toggle status-pill-${reel.watch_status}" data-id="${reel.id}">
+          ${formatStatusLabel(reel.watch_status)}
+        </button>
+      </td>
+      <td>
+        <div class="table-actions-cell">
+          <button class="table-action-icon-btn btn-table-play" title="Play Reel in Theater">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+          </button>
+          <button class="table-action-icon-btn btn-table-bookmark ${isWatchLater ? 'active' : ''}" title="Toggle Watch Later">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+          </button>
+          <a class="table-action-icon-btn" href="${reel.reel_url}" target="_blank" rel="noopener noreferrer" title="Open on Instagram">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+          </a>
+        </div>
+      </td>
+    `;
+
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('a') || e.target.closest('button')) return;
+      openPlaybackModal(reel);
+    });
+
+    row.querySelector('.btn-table-play').addEventListener('click', (e) => {
+      e.stopPropagation();
+      openPlaybackModal(reel);
+    });
+
+    row.querySelector('.btn-table-bookmark').addEventListener('click', (e) => {
+      e.stopPropagation();
+      const nextStatus = reel.watch_status === 'watch_later' ? 'unwatched' : 'watch_later';
+      updateReelStatus(reel.id, nextStatus);
+    });
+
+    row.querySelector('.status-pill-toggle').addEventListener('click', (e) => {
+      e.stopPropagation();
+      cycleStatus(reel.id, reel.watch_status);
+    });
+
+    reelsTableBody.appendChild(row);
   }
 }
 
-// Update single reel status in backend & refresh stats/cards
+// Update Reel Status
 async function updateReelStatus(reelId, newStatus) {
   try {
     const res = await fetch(`/api/reels/${reelId}/status`, {
@@ -337,13 +391,11 @@ async function updateReelStatus(reelId, newStatus) {
     });
 
     if (res.ok) {
-      // Update in state
       const target = state.reels.find((r) => r.id === reelId);
-      if (target) {
-        target.watch_status = newStatus;
-      }
-      if (state.currentTheaterReelId === reelId) {
-        updateTheaterStatusButtons(newStatus);
+      if (target) target.watch_status = newStatus;
+
+      if (state.currentModalReelId === reelId) {
+        updateModalStatusButtons(newStatus);
       }
       renderReels();
       loadStats();
@@ -353,86 +405,93 @@ async function updateReelStatus(reelId, newStatus) {
   }
 }
 
-async function cycleWatchStatus(reelId, currentStatus) {
-  const nextStatusMap = {
+async function cycleStatus(reelId, currentStatus) {
+  const map = {
     unwatched: 'watch_later',
     watch_later: 'watched',
     watched: 'unwatched',
   };
-  const nextStatus = nextStatusMap[currentStatus] || 'unwatched';
-  await updateReelStatus(reelId, nextStatus);
+  await updateReelStatus(reelId, map[currentStatus] || 'unwatched');
 }
 
 // ==============================================================================
-// CINEMA THEATER MODAL LOGIC
+// PLAYBACK THEATER MODAL (Official Instagram Embed.js Integration)
 // ==============================================================================
 
-function openTheaterModal(reel) {
-  state.currentTheaterReelId = reel.id;
+function openPlaybackModal(reel) {
+  state.currentModalReelId = reel.id;
   const creatorName = reel.creator?.username || 'instagram_user';
-  const safeCreatorName = escapeHtml(creatorName);
-  const creatorColor = getCreatorColor(creatorName);
-  const monogram = (creatorName.replace(/[^a-zA-Z0-9]/g, '')[0] || 'R').toUpperCase();
+  const safeCreator = escapeHtml(creatorName);
+  const initial = (creatorName.replace(/[^a-zA-Z0-9]/g, '')[0] || 'R').toUpperCase();
 
-  // Populate creator info
-  theaterAvatar.style.background = creatorColor.bg;
-  theaterAvatar.style.borderColor = creatorColor.border;
-  theaterAvatar.textContent = monogram;
-  theaterCreatorName.textContent = `@${safeCreatorName}`;
-  theaterCreatorName.href = `https://www.instagram.com/${creatorName}/`;
-  theaterDate.textContent = `Saved ${formatRelativeDate(reel.taken_at || reel.saved_at)}`;
-  theaterExternalLink.href = reel.reel_url;
-  theaterRank.textContent = `Vault Record #${reel.save_order_rank || '—'}`;
-  theaterCaption.textContent = reel.caption || 'No caption provided with this reel.';
+  // Populate Inspector Meta
+  playbackRankKicker.textContent = `REEL #${reel.save_order_rank || '—'}`;
+  playbackShortcodeTag.textContent = `ID: ${reel.shortcode}`;
+  playbackCreatorAvatar.textContent = initial;
+  playbackCreatorHandle.textContent = `@${safeCreator}`;
+  playbackCreatorHandle.href = `https://www.instagram.com/${creatorName}/`;
+  playbackSavedDate.textContent = `Saved ${formatRelativeDate(reel.taken_at || reel.saved_at)}`;
+  playbackDirectIgLink.href = reel.reel_url;
+  playbackFullCaption.textContent = reel.caption || 'No caption available for this reel.';
 
-  updateTheaterStatusButtons(reel.watch_status);
+  updateModalStatusButtons(reel.watch_status);
 
-  // Embed Instagram Player iframe or clean player container
-  theaterPlayerContainer.innerHTML = `
-    <iframe
-      src="https://www.instagram.com/p/${reel.shortcode}/embed/"
-      title="Instagram Reel Player"
-      loading="lazy"
-      allowtransparency="true"
-      allow="autoplay; clipboard-write; encrypted-media; picture-in-picture; web-share"
-      sandbox="allow-scripts allow-same-origin allow-popups">
-    </iframe>
+  // Native Instagram Embed Blockquote
+  playbackMediaContainer.innerHTML = `
+    <blockquote
+      class="instagram-media"
+      data-instgrm-captioned
+      data-instgrm-permalink="${reel.reel_url}"
+      data-instgrm-version="14"
+      style="background:#000; border:1px solid #1e2025; border-radius:8px; margin:0 auto; width:100%; max-width:380px;">
+      <div style="padding:40px 16px; text-align:center;">
+        <div style="font-size:13px; font-weight:600; color:#fff; margin-bottom:10px;">Loading Instagram Reel (${reel.shortcode})...</div>
+        <a href="${reel.reel_url}" target="_blank" rel="noopener noreferrer" style="display:inline-block; padding:8px 14px; background:#fff; color:#010102; font-size:12px; font-weight:600; border-radius:4px; text-decoration:none;">
+          Open on Instagram ↗
+        </a>
+      </div>
+    </blockquote>
   `;
 
-  theaterModal.classList.add('active');
-  theaterModal.setAttribute('aria-hidden', 'false');
+  // Trigger Instagram embed parser if available
+  if (window.instgrm && window.instgrm.Embeds) {
+    try {
+      window.instgrm.Embeds.process();
+    } catch (err) {
+      console.warn('Instagram embeds process notice:', err);
+    }
+  }
+
+  playbackModal.classList.add('active');
+  playbackModal.setAttribute('aria-hidden', 'false');
   document.body.style.overflow = 'hidden';
 }
 
-function closeTheaterModal() {
-  state.currentTheaterReelId = null;
-  theaterPlayerContainer.innerHTML = ''; // Stop video audio immediately
-  theaterModal.classList.remove('active');
-  theaterModal.setAttribute('aria-hidden', 'true');
+function closePlaybackModal() {
+  state.currentModalReelId = null;
+  playbackMediaContainer.innerHTML = ''; // Stop video audio immediately
+  playbackModal.classList.remove('active');
+  playbackModal.setAttribute('aria-hidden', 'true');
   document.body.style.overflow = '';
 }
 
-function updateTheaterStatusButtons(status) {
-  [theaterStatusUnwatched, theaterStatusLater, theaterStatusWatched].forEach((btn) => {
+function updateModalStatusButtons(status) {
+  [statusChoiceUnwatched, statusChoiceLater, statusChoiceWatched].forEach((btn) => {
     btn.classList.remove('selected');
   });
-  if (status === 'watched') {
-    theaterStatusWatched.classList.add('selected');
-  } else if (status === 'watch_later') {
-    theaterStatusLater.classList.add('selected');
-  } else {
-    theaterStatusUnwatched.classList.add('selected');
-  }
+  if (status === 'watched') statusChoiceWatched.classList.add('selected');
+  else if (status === 'watch_later') statusChoiceLater.classList.add('selected');
+  else statusChoiceUnwatched.classList.add('selected');
 }
 
-function navigateTheater(direction) {
-  if (!state.currentTheaterReelId || state.reels.length === 0) return;
-  const currentIndex = state.reels.findIndex((r) => r.id === state.currentTheaterReelId);
-  if (currentIndex === -1) return;
+function navigateModal(direction) {
+  if (!state.currentModalReelId || state.reels.length === 0) return;
+  const idx = state.reels.findIndex((r) => r.id === state.currentModalReelId);
+  if (idx === -1) return;
 
-  const nextIndex = currentIndex + direction;
-  if (nextIndex >= 0 && nextIndex < state.reels.length) {
-    openTheaterModal(state.reels[nextIndex]);
+  const nextIdx = idx + direction;
+  if (nextIdx >= 0 && nextIdx < state.reels.length) {
+    openPlaybackModal(state.reels[nextIdx]);
   }
 }
 
@@ -446,7 +505,7 @@ function updatePagination(page, limit, total) {
 
 // Helpers
 function formatRelativeDate(isoDate) {
-  if (!isoDate) return 'Unknown date';
+  if (!isoDate) return 'Unknown';
   const d = new Date(isoDate);
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
@@ -465,31 +524,41 @@ function escapeHtml(str) {
 
 // Event Listeners
 function setupEventListeners() {
-  // Theater modal close handlers
-  theaterCloseBtn.addEventListener('click', closeTheaterModal);
-  theaterBackdrop.addEventListener('click', closeTheaterModal);
+  // View mode switcher
+  viewModeGridBtn.addEventListener('click', () => applyViewMode('grid'));
+  viewModeListBtn.addEventListener('click', () => applyViewMode('list'));
 
-  // Theater modal status buttons
-  theaterStatusUnwatched.addEventListener('click', () => {
-    if (state.currentTheaterReelId) updateReelStatus(state.currentTheaterReelId, 'unwatched');
+  // Playback modal close handlers
+  playbackCloseBtn.addEventListener('click', closePlaybackModal);
+  playbackBackdrop.addEventListener('click', closePlaybackModal);
+
+  // Status buttons inside modal
+  statusChoiceUnwatched.addEventListener('click', () => {
+    if (state.currentModalReelId) updateReelStatus(state.currentModalReelId, 'unwatched');
   });
-  theaterStatusLater.addEventListener('click', () => {
-    if (state.currentTheaterReelId) updateReelStatus(state.currentTheaterReelId, 'watch_later');
+  statusChoiceLater.addEventListener('click', () => {
+    if (state.currentModalReelId) updateReelStatus(state.currentModalReelId, 'watch_later');
   });
-  theaterStatusWatched.addEventListener('click', () => {
-    if (state.currentTheaterReelId) updateReelStatus(state.currentTheaterReelId, 'watched');
+  statusChoiceWatched.addEventListener('click', () => {
+    if (state.currentModalReelId) updateReelStatus(state.currentModalReelId, 'watched');
   });
 
-  // Global keyboard shortcuts (Esc to close theater, Left/Right arrow to navigate)
-  window.addEventListener('keydown', (e) => {
-    if (!theaterModal.classList.contains('active')) return;
-    if (e.key === 'Escape') {
-      closeTheaterModal();
-    } else if (e.key === 'ArrowLeft') {
-      navigateTheater(-1);
-    } else if (e.key === 'ArrowRight') {
-      navigateTheater(1);
+  // Copy caption button
+  copyCaptionBtn.addEventListener('click', () => {
+    const text = playbackFullCaption.textContent;
+    if (text) {
+      navigator.clipboard.writeText(text);
+      copyCaptionBtn.textContent = 'Copied!';
+      setTimeout(() => { copyCaptionBtn.textContent = 'Copy'; }, 1500);
     }
+  });
+
+  // Keyboard navigation (Esc to close, Left/Right arrow to navigate)
+  window.addEventListener('keydown', (e) => {
+    if (!playbackModal.classList.contains('active')) return;
+    if (e.key === 'Escape') closePlaybackModal();
+    else if (e.key === 'ArrowLeft') navigateModal(-1);
+    else if (e.key === 'ArrowRight') navigateModal(1);
   });
 
   // Search input with debounce
@@ -502,7 +571,7 @@ function setupEventListeners() {
       state.filters.search = val;
       state.filters.page = 1;
       fetchReels();
-    }, 250);
+    }, 220);
   });
 
   clearSearchBtn.addEventListener('click', () => {
@@ -547,7 +616,7 @@ function setupEventListeners() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   });
 
-  // Archive Import Button
+  // Import Archive
   importBtn.addEventListener('click', () => {
     archiveFileInput.click();
   });
@@ -556,26 +625,19 @@ function setupEventListeners() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+    const MAX_FILE_SIZE = 50 * 1024 * 1024;
     if (file.size > MAX_FILE_SIZE) {
-      alert(`File is too large (${(file.size / (1024 * 1024)).toFixed(1)}MB). Maximum allowed size is 50MB.`);
+      alert(`File is too large (${(file.size / (1024 * 1024)).toFixed(1)}MB). Max allowed size is 50MB.`);
       archiveFileInput.value = '';
       return;
     }
 
     const originalContent = importBtn.innerHTML;
-    importBtn.innerHTML = `
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="spin">
-        <circle cx="12" cy="12" r="10" stroke-opacity="0.25"></circle>
-        <path d="M12 2a10 10 0 0 1 10 10"></path>
-      </svg>
-      <span>Importing...</span>
-    `;
+    importBtn.innerHTML = '<span>Importing...</span>';
     importBtn.disabled = true;
 
     try {
       const text = await file.text();
-
       const res = await fetch('/api/archive/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -583,35 +645,17 @@ function setupEventListeners() {
       });
 
       let data = null;
-      const contentType = res.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        try {
-          data = await res.json();
-        } catch (_) {
-          data = null;
-        }
-      }
+      try { data = await res.json(); } catch (_) { data = null; }
 
       if (!res.ok) {
-        const errorMsg = data?.error || data?.errors?.join('\n') || (res.status === 413 ? 'File too large for server limit (50MB)' : `Server responded with status ${res.status}`);
+        const errorMsg = data?.error || data?.errors?.join('\n') || `Server responded with status ${res.status}`;
         alert(`Import error: ${errorMsg}`);
         return;
       }
 
-      if (data && data.reelsImported === 0 && (data.alreadyPresent ?? 0) === 0 && data.errors && data.errors.length > 0) {
-        alert(`Import failed: No reels could be imported.\n\nErrors:\n${data.errors.join('\n')}`);
-        return;
-      }
-
-      const importedCount = data?.reelsImported ?? 0;
-      const alreadyPresentCount = data?.alreadyPresent ?? 0;
-      const creatorsCount = data?.creatorsAdded ?? 0;
-      const totalScanned = data?.totalProcessed ?? 0;
-      let msg = `Archive processed successfully!\n\n• New reels imported: ${importedCount}\n• Already in vault: ${alreadyPresentCount}\n• Creators added: ${creatorsCount}\n• Total scanned: ${totalScanned}`;
-      if (data?.errors && data.errors.length > 0) {
-        msg += `\n\nWarnings/Errors:\n${data.errors.join('\n')}`;
-      }
-      alert(msg);
+      const imported = data?.reelsImported ?? 0;
+      const alreadyIn = data?.alreadyPresent ?? 0;
+      alert(`Archive processed!\n\n• New reels imported: ${imported}\n• Already present: ${alreadyIn}`);
       await Promise.all([loadStats(), loadCreators(), fetchReels()]);
     } catch (err) {
       alert(`Import failed: ${err.message}`);
