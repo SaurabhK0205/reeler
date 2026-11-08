@@ -1,0 +1,105 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+# ==============================================================================
+# CodeRabbit Configuration — Reeler (Production-Grade Standards)
+# ==============================================================================
+
+language: "en-US"
+early_access: false
+
+tone_instructions: "Act as chief systems architect reviewing for millions of users. Be relentlessly assertive and skeptical. Flag concurrency bugs, race conditions, memory leaks, payload limits, missing error boundaries, and credential leaks. Block regressions."
+
+reviews:
+  profile: "assertive"
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "^main$"
+      - "^staging$"
+      - "^release/.*$"
+
+  auto_approvals:
+    enabled: false
+
+  tools:
+    actionlint:
+      enabled: true
+    ast-grep:
+      enabled: true
+      essential_rules: true
+    biome:
+      enabled: true
+
+  path_filters:
+    - "!node_modules/**"
+    - "!dist/**"
+    - "!build/**"
+    - "!package-lock.json"
+    - "!pnpm-lock.yaml"
+    - "!yarn.lock"
+    - "!bun.lockb"
+    - "!.git/**"
+
+  path_instructions:
+    # 1. API & Webhook Layer
+    - path: "src/api/**"
+      instructions: |
+        - CRITICAL ARCHITECTURAL BOUNDARY: Endpoints must contain ZERO business logic and ZERO raw database queries.
+        - All database access MUST be delegated to `Repository` methods in `src/db/repository.ts`.
+        - All operations must enforce strict request validation (payload size limits, malformed JSON, invalid types).
+        - Webhook endpoints must acknowledge Meta webhooks immediately (< 5s) to avoid delivery retries, dispatching processing safely.
+        - Ensure proper HTTP status codes (200, 400, 404, 500) and structured, sanitized error responses that never leak stack traces.
+
+    # 2. Services & Workers Layer
+    - path: "src/services/**"
+      instructions: |
+        - RELIABILITY & ERROR BOUNDARIES: No uncaught promise rejections or unhandled errors that could crash the Node runtime.
+        - INSTAGRAM IN-APP UX: Direct message replies MUST NEVER format creator links as web URLs (`https://instagram.com/...`). Creator handles must strictly use clean in-app `@username` mentions so users stay inside the native mobile app.
+        - PAYLOAD LIMITS: Instagram Graph API has a strict 1000-character ceiling per direct message. Validate that message formatting and reel lists strictly truncate and remain safely below 1000 characters under all permutations.
+        - BACKGROUND WORKERS: Scrutinize polling intervals, timer cancellations, and memory retention in `ReminderWorker`. Ensure Sets/Maps do not grow unbounded over months of continuous operation.
+        - RACE CONDITIONS: Check for race conditions in reminder scheduling and awaiting choice expiration windows.
+
+    # 3. Database Layer & Repository
+    - path: "src/db/**"
+      instructions: |
+        - INJECTION DEFENSE: All database queries must be strictly parameterized via the Supabase query builder. String concatenation in queries is strictly forbidden.
+        - PERFORMANCE & INDEXES: Every query filtering or sorting on columns (e.g. `creator_id`, `watch_status`, `instagram_sender_id`, `next_reminder_at`, `awaiting_reminder_choice_until`, `created_at`) must align with database indexes.
+        - QUERY EFFICIENCY: Reject N+1 query patterns. Consolidate multi-row operations using `.in()` or bulk operations rather than loops of sequential single-row queries.
+        - DATA CONSISTENCY: Ensure `updated_at` timestamps are always refreshed on record updates.
+
+    # 4. Utilities & Parsers
+    - path: "src/utils/**"
+      instructions: |
+        - DURATION & DATE REUSE: All natural language duration and date calculations must strictly use `src/utils/duration.ts` (`parseDurationOrDateInput`). Flag and reject any redundant or ad-hoc date parsing.
+        - CREATOR EXTRACTION: Username extraction from chat must strictly use `src/utils/creatorQuery.ts` (`extractCreatorQuery`). Ensure reserved words (greetings, durations, commands) are not falsely parsed as creator handles.
+        - DETERMINISM: Utility functions must be pure, deterministic, and handle malformed, empty, or unexpected input safely without throwing unhandled exceptions.
+
+    # 5. Database Schema & Migrations
+    - path: "supabase/migrations/**"
+      instructions: |
+        - MIGRATION STANDARDS: Every schema change must follow the sequential numbering convention (`XXX_<description>.sql`).
+        - IDEMPOTENCY: Migrations must be safely executable and idempotent where applicable (`IF NOT EXISTS`, `ON CONFLICT`).
+        - REFERENTIAL INTEGRITY: Every foreign key relation must have an explicit `ON DELETE` behavior defined (e.g. `CASCADE` or `SET NULL`).
+        - TYPE SYNC: Flag if a database column is added or altered in a migration without the corresponding interface being updated in `src/types.ts`.
+
+    # 6. Secrets & Environment Configuration
+    - path: "**"
+      instructions: |
+        - ABSOLUTE SECURITY BLOCK: Never permit any secrets, private keys, access tokens (Meta tokens, GitHub PATs, Supabase service keys), passwords, or credentials to be committed.
+        - Ensure `.env` and sensitive credential files remain strictly git-ignored.
+        - Verify that whenever an environment variable is introduced or modified, `.env.example` is updated with a dummy sanitized placeholder.
+
+knowledge_base:
+  code_guidelines:
+    filePatterns:
+      - "**/CLAUDE.md"
+      - "**/AGENTS.md"
+
+chat:
+  auto_reply: true
