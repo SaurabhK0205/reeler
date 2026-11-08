@@ -1,13 +1,12 @@
 import express from 'express';
 import type { Request, Response } from 'express';
 import { Repository } from '../db/repository.ts';
-import { SyncService } from '../services/syncService.ts';
+import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
 import type { ReelQueryFilters, WatchStatus, DateFilterPreset } from '../types.ts';
 
 export const apiRouter = express.Router();
-const syncService = new SyncService();
 const metaBotService = new MetaInstagramBotService();
 
 // Instagram Webhook Verification (Meta calls this once when setting up)
@@ -27,7 +26,7 @@ apiRouter.get('/instagram/webhook', (req: Request, res: Response) => {
   }
 });
 
-// Instagram Webhook Event Handler (Meta or ManyChat sends incoming DMs here)
+// Instagram Webhook Event Handler (Official Meta Graph API webhook)
 apiRouter.post('/instagram/webhook', async (req: Request, res: Response) => {
   try {
     // Acknowledge immediately to prevent timeouts from Meta
@@ -113,26 +112,17 @@ apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
   }
 });
 
-// Trigger synchronization
-apiRouter.post('/sync', async (req: Request, res: Response) => {
+// Import official Instagram data export (saved_posts.json)
+apiRouter.post('/archive/import', async (req: Request, res: Response) => {
   try {
-    const config = loadConfig();
-    if (!config.instagram.isConfigured) {
-      res.status(400).json({
-        error: 'Instagram session is not configured. Add your cookies to .env first.',
-      });
+    const rawData = req.body;
+    if (!rawData) {
+      res.status(400).json({ error: 'No data payload provided for import' });
       return;
     }
 
-    const maxPages = Number(req.body?.maxPages) || 5;
-    const result = await syncService.syncSavedReels(maxPages);
-
-    if (!result.success) {
-      res.status(500).json({ error: result.error.message });
-      return;
-    }
-
-    res.json({ success: true, ...result.data });
+    const result = await ArchiveImportService.importArchive(rawData);
+    res.json({ success: true, ...result });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

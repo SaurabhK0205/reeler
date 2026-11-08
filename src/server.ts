@@ -1,20 +1,18 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, redactSecret } from './config.ts';
+import { loadConfig } from './config.ts';
 import { apiRouter } from './api/router.ts';
 import { ReminderWorker } from './services/reminderWorker.ts';
-import { TelegramBotService } from './services/telegramBotService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const config = loadConfig();
-const telegramBot = new TelegramBotService();
-const reminderWorker = new ReminderWorker(telegramBot);
+const reminderWorker = new ReminderWorker();
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 // API Routes
 app.use('/api', apiRouter);
@@ -31,14 +29,11 @@ app.get('*', (_req, res) => {
 const PORT = config.server.port;
 app.listen(PORT, () => {
   console.log('================================================================');
-  console.log(` 🚀 Instagram Saved Reels Tracker running on http://localhost:${PORT}`);
+  console.log(` 🚀 Reeler (Instagram Saved Reels Tracker) running on http://localhost:${PORT}`);
   console.log('================================================================');
   console.log(`- Database:    ${config.supabase.isConfigured ? 'Supabase (' + config.supabase.url + ')' : 'In-Memory (Development/Demo Mode)'}`);
-  console.log(`- Instagram:   ${config.instagram.isConfigured ? 'Connected (' + redactSecret(config.instagram.sessionId) + ')' : 'Not configured (add cookies to .env to sync)'}`);
-  console.log(`- Telegram:    ${config.telegram.isConfigured ? 'Connected (@dinosaurabh_bot)' : 'Not configured'}`);
   console.log(`- Reminders:   Default interval: ${config.reminders.defaultIntervalHours} hours`);
   console.log('================================================================\n');
 
-  telegramBot.start();
   reminderWorker.start();
 });

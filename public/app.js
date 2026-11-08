@@ -20,7 +20,8 @@ const state = {
 
 // DOM Elements
 const dbBadge = document.getElementById('db-badge');
-const syncBtn = document.getElementById('sync-btn');
+const importBtn = document.getElementById('import-btn');
+const archiveFileInput = document.getElementById('archive-file-input');
 const statTotal = document.getElementById('stat-total');
 const statCreators = document.getElementById('stat-creators');
 const statWeek = document.getElementById('stat-week');
@@ -339,31 +340,42 @@ function setupEventListeners() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   });
 
-  // Sync Button
-  syncBtn.addEventListener('click', async () => {
-    const originalText = syncBtn.innerHTML;
-    syncBtn.innerHTML = '<span class="btn-icon">⏳</span> Syncing...';
-    syncBtn.disabled = true;
+  // Archive Import Button
+  importBtn.addEventListener('click', () => {
+    archiveFileInput.click();
+  });
+
+  archiveFileInput.addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const originalText = importBtn.innerHTML;
+    importBtn.innerHTML = '<span class="btn-icon">⏳</span> Importing...';
+    importBtn.disabled = true;
 
     try {
-      const res = await fetch('/api/sync', {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+
+      const res = await fetch('/api/archive/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ maxPages: 5 }),
+        body: JSON.stringify(parsed),
       });
 
       const data = await res.json();
       if (!res.ok) {
-        alert(`Sync warning: ${data.error}`);
+        alert(`Import error: ${data.error || 'Failed to import archive'}`);
       } else {
-        alert(`Sync complete! Processed ${data.reelsProcessed} reels (${data.newReelsCount} new).`);
+        alert(`🎉 Archive imported successfully!\n\n• Reels imported: ${data.reelsImported}\n• Creators added: ${data.creatorsAdded}\n• Total scanned: ${data.totalProcessed}`);
         await Promise.all([loadStats(), loadCreators(), fetchReels()]);
       }
-    } catch (e) {
-      alert(`Sync failed: ${e.message}`);
+    } catch (err) {
+      alert(`Import failed: ${err.message}`);
     } finally {
-      syncBtn.innerHTML = originalText;
-      syncBtn.disabled = false;
+      archiveFileInput.value = '';
+      importBtn.innerHTML = originalText;
+      importBtn.disabled = false;
     }
   });
 }

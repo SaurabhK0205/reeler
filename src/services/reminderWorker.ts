@@ -2,13 +2,11 @@ import { loadConfig } from '../config.ts';
 import { Repository } from '../db/repository.ts';
 import { InstagramActionClient } from './instagramActionClient.ts';
 import type { InboundMessage } from './instagramActionClient.ts';
-import { TelegramBotService } from './telegramBotService.ts';
 import { MetaInstagramBotService } from './metaInstagramBotService.ts';
 import { formatTargetTime } from '../utils/duration.ts';
 
 export class ReminderWorker {
   private actionClient = new InstagramActionClient();
-  private telegramBot: TelegramBotService;
   private metaBot = new MetaInstagramBotService();
   private processedItemIds = new Set<string>();
   private isRunning = false;
@@ -17,9 +15,7 @@ export class ReminderWorker {
   private adminThreadId: string | null = null;
   private adminUserId: string | null = null;
 
-  constructor(telegramBot?: TelegramBotService) {
-    this.telegramBot = telegramBot || new TelegramBotService();
-  }
+  constructor() {}
 
   start() {
     const config = loadConfig();
@@ -179,12 +175,7 @@ export class ReminderWorker {
     console.log(`[ReminderWorker] 🔔 Found ${dueReels.length} Reel(s) due for reminder.`);
 
     for (const reel of dueReels) {
-      // 1. Send via Telegram (Push notification with action buttons!)
-      if (this.telegramBot.isConfigured && reel.telegram_chat_id) {
-        await this.telegramBot.sendReminder(reel);
-      }
-
-      // 2. Send via Official Meta Instagram DM if user saved via Instagram!
+      // 1. Send via Official Meta Instagram DM
       if (reel.instagram_sender_id && this.metaBot.isConfigured) {
         const creatorTag =
           reel.creator && reel.creator.username && reel.creator.username !== 'instagram_creator'

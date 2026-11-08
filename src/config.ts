@@ -12,11 +12,6 @@ export interface AppConfig {
     isConfigured: boolean;
     adminUsername?: string;
   };
-  telegram: {
-    botToken?: string;
-    chatId?: string;
-    isConfigured: boolean;
-  };
   reminders: {
     defaultIntervalHours: number;
     dmPollingIntervalMs: number;
@@ -38,9 +33,6 @@ export function loadConfig(): AppConfig {
   const userAgent = process.env.USER_AGENT?.trim() || 
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-  const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
-  const chatId = process.env.TELEGRAM_CHAT_ID?.trim();
-
   const defaultIntervalHours = Number(process.env.DEFAULT_REMINDER_HOURS) || 10;
   const dmPollingIntervalMs = (Number(process.env.DM_POLLING_SECONDS) || 15) * 1000;
   const reminderCheckIntervalMs = (Number(process.env.REMINDER_CHECK_SECONDS) || 60) * 1000;
@@ -59,11 +51,6 @@ export function loadConfig(): AppConfig {
       userAgent,
       adminUsername,
       isConfigured: Boolean(sessionId && userId && csrfToken),
-    },
-    telegram: {
-      botToken,
-      chatId,
-      isConfigured: Boolean(botToken),
     },
     reminders: {
       defaultIntervalHours,
