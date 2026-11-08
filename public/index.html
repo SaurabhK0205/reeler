@@ -22,8 +22,9 @@
       </div>
       <div class="header-right">
         <span id="db-badge" class="badge badge-neutral">Checking DB...</span>
-        <button id="sync-btn" class="btn btn-primary">
-          <span class="btn-icon">🔄</span> Sync Saved Reels
+        <input type="file" id="archive-file-input" accept=".json" style="display: none;" />
+        <button id="import-btn" class="btn btn-primary" title="Import official Instagram saved_posts.json export">
+          <span class="btn-icon">📥</span> Import Archive
         </button>
       </div>
     </header>
