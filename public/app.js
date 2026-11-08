@@ -47,6 +47,7 @@ const state = {
   currentFeedReelId: null,
   currentFeedIndex: 0,
   previouslyFocusedElement: null,
+  previouslyFocusedReelId: null,
 };
 
 // DOM References
@@ -685,6 +686,7 @@ function setupFeedIntersectionObserver() {
  */
 function openReelsFeed(startReel) {
   state.previouslyFocusedElement = document.activeElement;
+  state.previouslyFocusedReelId = startReel?.id || null;
   renderFeedSlides();
 
   feedModal.classList.add('active');
@@ -720,9 +722,16 @@ function closeReelsFeed() {
   state.currentFeedReelId = null;
 
   // Restore previous focus
-  if (state.previouslyFocusedElement && typeof state.previouslyFocusedElement.focus === 'function') {
-    state.previouslyFocusedElement.focus();
+  const prev = state.previouslyFocusedElement;
+  const reelId = state.previouslyFocusedReelId || prev?.closest?.('[data-id]')?.getAttribute('data-id');
+  const restoreTarget = (prev && prev.isConnected)
+    ? prev
+    : (reelId ? document.querySelector(`.vault-poster-card[data-id="${CSS.escape(reelId)}"], .table-row[data-id="${CSS.escape(reelId)}"] .btn-table-play`) : null);
+  if (restoreTarget && typeof restoreTarget.focus === 'function') {
+    restoreTarget.focus();
   }
+  state.previouslyFocusedElement = null;
+  state.previouslyFocusedReelId = null;
 }
 
 /**
@@ -926,6 +935,16 @@ function setupEventListeners() {
     }, 220);
   });
 
+  // Global search shortcut: / or Cmd+K / Ctrl+K
+  window.addEventListener('keydown', (e) => {
+    if (feedModal.classList.contains('active')) return;
+    if ((e.key === '/' && document.activeElement !== searchInput) || ((e.metaKey || e.ctrlKey) && e.key === 'k')) {
+      e.preventDefault();
+      searchInput.focus();
+      searchInput.select();
+    }
+  });
+
   clearSearchBtn.addEventListener('click', () => {
     searchInput.value = '';
     clearSearchBtn.style.display = 'none';
@@ -1007,7 +1026,13 @@ function setupEventListeners() {
 
       const imported = data?.reelsImported ?? 0;
       const alreadyIn = data?.alreadyPresent ?? 0;
-      showToast(`Archive processed!\n• New reels imported: ${imported}\n• Already present: ${alreadyIn}`, 'success');
+      const errCount = data?.errors?.length ?? 0;
+      const summary = `Archive processed!\n• New reels imported: ${imported}\n• Already present: ${alreadyIn}`;
+      if (data?.status === 'partial' || errCount > 0) {
+        showToast(`${summary}\n• Items with errors: ${errCount}`, 'error');
+      } else {
+        showToast(summary, 'success');
+      }
       await Promise.all([loadStats(), loadCreators(), fetchReels()]);
     } catch (err) {
       showToast(`Import failed: ${err.message}`, 'error');

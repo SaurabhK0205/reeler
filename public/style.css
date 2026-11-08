@@ -687,6 +687,7 @@ body {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
 
 .card-bookmark-btn {
@@ -701,6 +702,7 @@ body {
   justify-content: center;
   cursor: pointer;
   backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
   transition: all 0.14s ease;
 }
 
@@ -726,6 +728,7 @@ body {
   opacity: 0;
   background: rgba(1, 1, 2, 0.3);
   backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
   transition: opacity 0.16s ease;
   z-index: 2;
 }
@@ -1033,6 +1036,7 @@ body {
   color: var(--ink-muted);
   background: rgba(255, 255, 255, 0.06);
   backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   padding: 2px 7px;
   border-radius: var(--radius-xs);
   border: 1px solid var(--hairline);
@@ -1048,6 +1052,7 @@ body {
 .feed-close-btn {
   background: rgba(20, 21, 22, 0.85);
   backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
   border: 1px solid var(--hairline-strong);
   color: var(--ink-secondary);
   cursor: pointer;
@@ -1226,6 +1231,7 @@ body {
   border-radius: 50%;
   background: rgba(20, 21, 22, 0.9);
   backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.2);
   display: flex;
   align-items: center;
@@ -1326,6 +1332,7 @@ body {
   justify-content: center;
   background: rgba(20, 21, 22, 0.85);
   backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 50%;
   width: 42px;
