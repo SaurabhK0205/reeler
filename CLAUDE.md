@@ -34,7 +34,18 @@ Last updated: November 8, 2026
    - `test(...)`: unit/integration tests
 6. **PR / Merge Workflow**:
    - Push your topic branch: `git push -u origin <branch-name>`
-   - Open a Pull Request into `main` for review/merge.
+   - Open a Pull Request into `staging` (and sync to `main` via PR with zero divergence).
+7. **CodeRabbit Review Gate (MANDATORY & BLOCKING)**:
+   - When opening a Pull Request, **NEVER merge immediately**.
+   - **ALWAYS wait for CodeRabbit AI review to run and complete** before merging.
+   - **NEVER merge while CodeRabbit review findings remain open or unaddressed**.
+   - Whenever CodeRabbit posts review comments or findings:
+     1. Inspect each finding thoroughly (bugs, security, architecture, performance, edge cases).
+     2. Implement fixes on the topic branch and verify unit tests (`npm test`).
+     3. Push the fix to the PR branch.
+     4. Reply to each CodeRabbit review comment thread explaining the resolution.
+   - Only merge after CodeRabbit completes its review and all findings are confirmed resolved and verified.
+   - **NO tight polling loops**: Never run tight sleep loops polling GitHub or CodeRabbit status.
 
 ---
 
@@ -127,6 +138,8 @@ src/
 * **Direct push to `main` branch** (strictly forbidden).
 * **Committing code directly onto `main`** instead of a topic branch.
 * **Committing any token, secret, credential, or `.env` file**.
+* **Merging a Pull Request without waiting for CodeRabbit review to complete**.
+* **Merging a Pull Request with unresolved CodeRabbit review comments or findings**.
 * **Direct database `.from(...)` query inside `src/api/` or `src/server.ts`**.
 * **Sending `https://instagram.com/...` web URLs for creator profiles in Instagram DMs**.
 * **Reinventing date/duration parsing outside `src/utils/duration.ts`**.
