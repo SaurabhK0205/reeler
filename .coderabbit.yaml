@@ -25,11 +25,7 @@ reviews:
       - "^release/.*$"
 
   auto_approvals:
-    enabled: true
-    max_merge_risk: "low"
-    max_security_risk: "minimal"
-    overrides:
-      - enabled: false
+    enabled: false
 
   tools:
     actionlint:
