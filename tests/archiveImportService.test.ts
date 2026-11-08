@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
-import { ArchiveImportService } from '../src/services/archiveImportService.ts';
-import { Repository } from '../src/db/repository.ts';
+
+// Pin test execution strictly to the in-memory store
+delete process.env.SUPABASE_URL;
+delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+delete process.env.SUPABASE_ANON_KEY;
+
+const { ArchiveImportService } = await import('../src/services/archiveImportService.ts');
+const { Repository } = await import('../src/db/repository.ts');
 
 async function runTests() {
   console.log('--- Running ArchiveImportService Regression Tests ---');

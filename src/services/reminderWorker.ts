@@ -199,7 +199,7 @@ export class ReminderWorker {
             // Supported delivery fallback for legacy or unattributed sender reels
             console.log(`[ReminderWorker] 🔔 Dispatching fallback reminder to admin (${this.adminUserId})...`);
             const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reminderText);
-            delivered = sendResult.ok && sendResult.value === true;
+            delivered = sendResult.success && sendResult.data === true;
           } else {
             console.warn(`[ReminderWorker] ⚠️ No active delivery channel or recipient found for reel ${reel.shortcode}.`);
           }

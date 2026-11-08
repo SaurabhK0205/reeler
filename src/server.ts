@@ -12,14 +12,27 @@ const app = express();
 const config = loadConfig();
 const reminderWorker = new ReminderWorker();
 
+// Trust reverse proxy (e.g. Cloudflare / nginx) for accurate req.ip rate limiting
+app.set('trust proxy', 1);
+
 // Concurrency & rate-limiting guard for large payload import endpoint
 let activeImports = 0;
 const MAX_CONCURRENT_IMPORTS = 1;
+const MAX_TRACKED_IPS = 1000;
 const importRateLimitWindowMs = 60 * 1000;
 const importIpRequests = new Map<string, { count: number; resetAt: number }>();
 
+// Periodic unref'd sweep to clean up expired rate-limit records without per-request overhead
+const ipCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of importIpRequests.entries()) {
+    if (v.resetAt <= now) importIpRequests.delete(k);
+  }
+}, importRateLimitWindowMs);
+ipCleanupInterval.unref();
+
 function archiveImportGuard(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
 
   const ipRecord = importIpRequests.get(ip);
@@ -30,13 +43,11 @@ function archiveImportGuard(req: express.Request, res: express.Response, next: e
     }
     ipRecord.count++;
   } else {
-    importIpRequests.set(ip, { count: 1, resetAt: now + importRateLimitWindowMs });
-  }
-
-  if (importIpRequests.size > 1000) {
-    for (const [k, v] of importIpRequests.entries()) {
-      if (v.resetAt <= now) importIpRequests.delete(k);
+    if (importIpRequests.size >= MAX_TRACKED_IPS) {
+      res.status(429).json({ success: false, error: 'Import rate limit capacity reached. Please retry later.' });
+      return;
     }
+    importIpRequests.set(ip, { count: 1, resetAt: now + importRateLimitWindowMs });
   }
 
   if (activeImports >= MAX_CONCURRENT_IMPORTS) {
@@ -49,6 +60,8 @@ function archiveImportGuard(req: express.Request, res: express.Response, next: e
 
   activeImports++;
   let completed = false;
+  let handlerStarted = false;
+
   const release = () => {
     if (!completed) {
       completed = true;
@@ -56,8 +69,18 @@ function archiveImportGuard(req: express.Request, res: express.Response, next: e
     }
   };
 
-  res.on('finish', release);
-  res.on('close', release);
+  (req as any).markHandlerStarted = () => {
+    handlerStarted = true;
+  };
+  (req as any).releaseImportSlot = release;
+
+  // If the connection drops before the handler begins execution, release the capacity slot
+  res.on('close', () => {
+    if (!handlerStarted) {
+      release();
+    }
+  });
+
   next();
 }
 

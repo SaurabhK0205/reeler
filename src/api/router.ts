@@ -123,6 +123,7 @@ apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
 
 // Import official Instagram data export (saved_posts.json)
 apiRouter.post('/archive/import', async (req: Request, res: Response) => {
+  (req as any).markHandlerStarted?.();
   try {
     const rawData = req.body;
     if (!rawData) {
@@ -144,5 +145,7 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('[ArchiveImport] Unexpected error in /archive/import endpoint:', error);
     res.status(500).json({ success: false, error: 'An unexpected internal error occurred during archive import.' });
+  } finally {
+    (req as any).releaseImportSlot?.();
   }
 });
