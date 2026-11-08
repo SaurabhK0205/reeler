@@ -178,7 +178,7 @@ export class MetaInstagramBotService {
       });
 
       const creatorLine = meta.username
-        ? `\nCreator: @${meta.username}\n🔗 https://instagram.com/${meta.username}`
+        ? `\nCreator: @${meta.username}`
         : (meta.displayName ? `\nCreator: ${meta.displayName}` : '');
 
       if (customDuration) {
@@ -261,7 +261,7 @@ export class MetaInstagramBotService {
         const nextDate = customDuration.targetDate.toISOString();
         await Repository.updateReminderSchedule(targetReel.id, nextDate, customDuration.seconds);
         const creatorTag = targetReel.creator?.username && targetReel.creator.username !== 'instagram_creator'
-          ? `@${targetReel.creator.username} (https://instagram.com/${targetReel.creator.username})`
+          ? `@${targetReel.creator.username}`
           : (targetReel.creator?.display_name || targetReel.shortcode);
         await this.sendDirectMessage(
           senderId,
