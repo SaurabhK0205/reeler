@@ -198,87 +198,34 @@
       </main>
     </div>
 
-    <!-- Cinema Playback Modal (Linear Obsidian Style) -->
-    <div id="playback-modal" class="playback-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Reel Playback Theater">
-      <div class="playback-backdrop" id="playback-backdrop"></div>
-      <div class="playback-panel">
-        <!-- Modal Top Bar -->
-        <div class="playback-top-bar">
-          <div class="playback-title-info">
-            <span class="playback-kicker" id="playback-rank-kicker">REEL #0</span>
-            <span class="playback-shortcode-tag" id="playback-shortcode-tag">ID: ...</span>
-          </div>
-          <button class="playback-close-trigger" id="playback-close-btn" aria-label="Close playback">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="18" y1="6" x2="6" y2="18"></line>
-              <line x1="6" y1="6" x2="18" y2="18"></line>
-            </svg>
+    <!-- Fullscreen Instagram Reels / TikTok Style Vertical Snap-Feed -->
+    <div id="reels-feed-modal" class="reels-feed-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Reels Vertical Stream">
+      <!-- Top HUD Bar -->
+      <div class="feed-top-bar">
+        <div class="feed-counter-wrap">
+          <span class="feed-counter-kicker" id="feed-counter-kicker">REEL 1 OF 1</span>
+          <span class="feed-shortcode-tag" id="feed-shortcode-tag">ID: ...</span>
+        </div>
+        <div class="feed-top-actions">
+          <button class="feed-nav-arrow-btn" id="feed-arrow-up" aria-label="Previous reel" title="Previous reel (↑ or k)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"></polyline></svg>
+          </button>
+          <button class="feed-nav-arrow-btn" id="feed-arrow-down" aria-label="Next reel" title="Next reel (↓ or j)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </button>
+          <button class="feed-close-btn" id="feed-close-btn" aria-label="Close reels feed" title="Close feed (Esc)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
           </button>
         </div>
+      </div>
 
-        <!-- Modal Body: Left = Video Embed / Player; Right = Info & Triage -->
-        <div class="playback-stage">
-          <!-- Left: Native Instagram Embed Stage -->
-          <div class="playback-media-stage" id="playback-media-container">
-            <!-- Dynamic Instagram Blockquote / Embed Injected Here -->
-          </div>
-
-          <!-- Right: Inspector & Triage -->
-          <div class="playback-inspector">
-            <!-- Creator Profile Header -->
-            <div class="inspector-creator-row">
-              <div class="inspector-avatar" id="playback-creator-avatar"></div>
-              <div class="inspector-creator-text">
-                <a class="inspector-handle" id="playback-creator-handle" href="#" target="_blank" rel="noopener noreferrer">@creator</a>
-                <span class="inspector-date" id="playback-saved-date">Saved Date</span>
-              </div>
-              <a id="playback-direct-ig-link" class="inspector-link-btn" href="#" target="_blank" rel="noopener noreferrer" title="Open directly in Instagram app or web">
-                <span>Instagram</span>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
-              </a>
-            </div>
-
-            <!-- Full Caption Reader -->
-            <div class="inspector-caption-container">
-              <div class="inspector-label-row">
-                <span class="inspector-section-label">CAPTION & LOGLINE</span>
-                <button id="copy-caption-btn" class="inspector-mini-action" title="Copy full caption to clipboard">Copy</button>
-              </div>
-              <div class="inspector-caption-body" id="playback-full-caption">
-                <!-- Caption text -->
-              </div>
-            </div>
-
-            <!-- Triage Status Switcher -->
-            <div class="inspector-triage-container">
-              <span class="inspector-section-label">MARK STATUS</span>
-              <div class="triage-status-group">
-                <button class="triage-choice-btn" data-status="unwatched" id="status-choice-unwatched">
-                  <span class="triage-dot triage-dot-unwatched"></span>
-                  <span>Unwatched</span>
-                </button>
-                <button class="triage-choice-btn" data-status="watch_later" id="status-choice-later">
-                  <span class="triage-dot triage-dot-later"></span>
-                  <span>Watch Later</span>
-                </button>
-                <button class="triage-choice-btn" data-status="watched" id="status-choice-watched">
-                  <span class="triage-dot triage-dot-watched"></span>
-                  <span>Watched</span>
-                </button>
-              </div>
-            </div>
-
-            <!-- Keyboard Navigation Shortcuts -->
-            <div class="inspector-footer-keys">
-              <span><kbd>←</kbd> <kbd>→</kbd> Navigate</span>
-              <span><kbd>Esc</kbd> Close</span>
-            </div>
-          </div>
-        </div>
+      <!-- Vertical Snap Scroll Track -->
+      <div class="feed-scroll-track" id="feed-scroll-track" tabindex="-1">
+        <!-- Rendered dynamically as .feed-reel-slide elements -->
       </div>
     </div>
   </div>
 
-  <script src="app.js?v=2.0"></script>
+  <script src="app.js?v=2.1"></script>
 </body>
 </html>

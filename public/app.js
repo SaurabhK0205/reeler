@@ -1,7 +1,24 @@
 // ==============================================================================
 // REELER — LINEAR MONOCHROME VAULT APPLICATION LOGIC
-// Dual View (Poster Grid + Dense Table) & Native Instagram Embed Playback
+// Dual View (Poster Grid + Dense Table) & Fullscreen Snap Reels Feed
 // ==============================================================================
+
+function readViewMode() {
+  try {
+    const v = localStorage.getItem('reeler_view_mode');
+    return v === 'list' ? 'list' : 'grid';
+  } catch (_) {
+    return 'grid';
+  }
+}
+
+function saveViewMode(mode) {
+  try {
+    localStorage.setItem('reeler_view_mode', mode);
+  } catch (_) {
+    /* non-fatal */
+  }
+}
 
 const state = {
   filters: {
@@ -13,12 +30,14 @@ const state = {
     page: 1,
     limit: 24,
   },
-  viewMode: localStorage.getItem('reeler_view_mode') || 'grid',
+  viewMode: readViewMode(),
   total: 0,
   reels: [],
   creators: [],
   stats: null,
-  currentModalReelId: null,
+  currentFeedReelId: null,
+  currentFeedIndex: 0,
+  previouslyFocusedElement: null,
 };
 
 // DOM References
@@ -47,22 +66,14 @@ const pageIndicator = document.getElementById('page-indicator');
 const viewModeGridBtn = document.getElementById('view-mode-grid');
 const viewModeListBtn = document.getElementById('view-mode-list');
 
-// Playback Modal References
-const playbackModal = document.getElementById('playback-modal');
-const playbackBackdrop = document.getElementById('playback-backdrop');
-const playbackCloseBtn = document.getElementById('playback-close-btn');
-const playbackRankKicker = document.getElementById('playback-rank-kicker');
-const playbackShortcodeTag = document.getElementById('playback-shortcode-tag');
-const playbackMediaContainer = document.getElementById('playback-media-container');
-const playbackCreatorAvatar = document.getElementById('playback-creator-avatar');
-const playbackCreatorHandle = document.getElementById('playback-creator-handle');
-const playbackSavedDate = document.getElementById('playback-saved-date');
-const playbackDirectIgLink = document.getElementById('playback-direct-ig-link');
-const playbackFullCaption = document.getElementById('playback-full-caption');
-const copyCaptionBtn = document.getElementById('copy-caption-btn');
-const statusChoiceUnwatched = document.getElementById('status-choice-unwatched');
-const statusChoiceLater = document.getElementById('status-choice-later');
-const statusChoiceWatched = document.getElementById('status-choice-watched');
+// Fullscreen Reels Snap-Feed References
+const feedModal = document.getElementById('reels-feed-modal');
+const feedScrollTrack = document.getElementById('feed-scroll-track');
+const feedCounterKicker = document.getElementById('feed-counter-kicker');
+const feedShortcodeTag = document.getElementById('feed-shortcode-tag');
+const feedArrowUp = document.getElementById('feed-arrow-up');
+const feedArrowDown = document.getElementById('feed-arrow-down');
+const feedCloseBtn = document.getElementById('feed-close-btn');
 
 // --- Initialization ---
 async function init() {
@@ -74,7 +85,7 @@ async function init() {
 
 function applyViewMode(mode) {
   state.viewMode = mode;
-  localStorage.setItem('reeler_view_mode', mode);
+  saveViewMode(mode);
 
   if (mode === 'grid') {
     viewModeGridBtn.classList.add('active');
@@ -243,6 +254,9 @@ function renderReels() {
     const card = document.createElement('div');
     card.className = 'vault-poster-card';
     card.setAttribute('data-id', reel.id);
+    card.tabIndex = 0;
+    card.setAttribute('role', 'button');
+    card.setAttribute('aria-label', `Play reel by @${creatorName}`);
 
     let posterArtHtml = '';
     if (hasRealThumbnail) {
@@ -278,7 +292,7 @@ function renderReels() {
             </svg>
           </button>
         </div>
-        <div class="play-hover-trigger" aria-label="Play Reel in Theater">
+        <div class="play-hover-trigger" aria-label="Play Reel in Feed">
           <div class="play-icon-box">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
               <polygon points="5 3 19 12 5 21 5 3"></polygon>
@@ -300,10 +314,19 @@ function renderReels() {
       </div>
     `;
 
-    // Click card opens playback theater
+    // Click card opens fullscreen reels snap-feed
     card.addEventListener('click', (e) => {
       if (e.target.closest('a') || e.target.closest('.card-bookmark-btn') || e.target.closest('.status-pill-toggle')) return;
-      openPlaybackModal(reel);
+      openReelsFeed(reel);
+    });
+
+    // Keyboard accessibility on card
+    card.addEventListener('keydown', (e) => {
+      if (e.target !== card) return;
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        openReelsFeed(reel);
+      }
     });
 
     const cardBookmark = card.querySelector('.card-bookmark-btn');
@@ -343,7 +366,7 @@ function renderReels() {
       </td>
       <td>
         <div class="table-actions-cell">
-          <button class="table-action-icon-btn btn-table-play" title="Play Reel in Theater">
+          <button class="table-action-icon-btn btn-table-play" title="Play Reel in Feed">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
           </button>
           <button class="table-action-icon-btn btn-table-bookmark ${isWatchLater ? 'active' : ''}" title="Toggle Watch Later">
@@ -358,12 +381,12 @@ function renderReels() {
 
     row.addEventListener('click', (e) => {
       if (e.target.closest('a') || e.target.closest('button')) return;
-      openPlaybackModal(reel);
+      openReelsFeed(reel);
     });
 
     row.querySelector('.btn-table-play').addEventListener('click', (e) => {
       e.stopPropagation();
-      openPlaybackModal(reel);
+      openReelsFeed(reel);
     });
 
     row.querySelector('.btn-table-bookmark').addEventListener('click', (e) => {
@@ -394,9 +417,7 @@ async function updateReelStatus(reelId, newStatus) {
       const target = state.reels.find((r) => r.id === reelId);
       if (target) target.watch_status = newStatus;
 
-      if (state.currentModalReelId === reelId) {
-        updateModalStatusButtons(newStatus);
-      }
+      syncFeedSlideStatus(reelId, newStatus);
       renderReels();
       loadStats();
     }
@@ -415,83 +436,258 @@ async function cycleStatus(reelId, currentStatus) {
 }
 
 // ==============================================================================
-// PLAYBACK THEATER MODAL (Official Instagram Embed.js Integration)
+// FULLSCREEN REELS VERTICAL SNAP-FEED LOGIC (Instagram / TikTok Style)
 // ==============================================================================
 
-function openPlaybackModal(reel) {
-  state.currentModalReelId = reel.id;
-  const creatorName = reel.creator?.username || 'instagram_user';
-  const safeCreator = escapeHtml(creatorName);
-  const initial = (creatorName.replace(/[^a-zA-Z0-9]/g, '')[0] || 'R').toUpperCase();
+let feedIntersectionObserver = null;
 
-  // Populate Inspector Meta
-  playbackRankKicker.textContent = `REEL #${reel.save_order_rank || '—'}`;
-  playbackShortcodeTag.textContent = `ID: ${reel.shortcode}`;
-  playbackCreatorAvatar.textContent = initial;
-  playbackCreatorHandle.textContent = `@${safeCreator}`;
-  playbackCreatorHandle.href = `https://www.instagram.com/${creatorName}/`;
-  playbackSavedDate.textContent = `Saved ${formatRelativeDate(reel.taken_at || reel.saved_at)}`;
-  playbackDirectIgLink.href = reel.reel_url;
-  playbackFullCaption.textContent = reel.caption || 'No caption available for this reel.';
+function renderFeedSlides() {
+  feedScrollTrack.innerHTML = '';
 
-  updateModalStatusButtons(reel.watch_status);
+  state.reels.forEach((reel, index) => {
+    const creatorName = reel.creator?.username || 'instagram_user';
+    const safeCreator = escapeHtml(creatorName);
+    const initial = (creatorName.replace(/[^a-zA-Z0-9]/g, '')[0] || 'R').toUpperCase();
+    const isWatchLater = reel.watch_status === 'watch_later';
+    const isWatched = reel.watch_status === 'watched';
+    const hasRealThumbnail = reel.thumbnail_url && !reel.thumbnail_url.includes('photo-1618005182384');
+    const dateFormatted = formatRelativeDate(reel.taken_at || reel.saved_at);
+    const captionText = reel.caption || 'No caption available for this reel.';
 
-  // Native Instagram Embed Blockquote
-  playbackMediaContainer.innerHTML = `
-    <blockquote
-      class="instagram-media"
-      data-instgrm-captioned
-      data-instgrm-permalink="${reel.reel_url}"
-      data-instgrm-version="14"
-      style="background:#000; border:1px solid #1e2025; border-radius:8px; margin:0 auto; width:100%; max-width:380px;">
-      <div style="padding:40px 16px; text-align:center;">
-        <div style="font-size:13px; font-weight:600; color:#fff; margin-bottom:10px;">Loading Instagram Reel (${reel.shortcode})...</div>
-        <a href="${reel.reel_url}" target="_blank" rel="noopener noreferrer" style="display:inline-block; padding:8px 14px; background:#fff; color:#010102; font-size:12px; font-weight:600; border-radius:4px; text-decoration:none;">
-          Open on Instagram ↗
-        </a>
-      </div>
-    </blockquote>
-  `;
+    const slide = document.createElement('div');
+    slide.className = 'feed-reel-slide';
+    slide.setAttribute('data-reel-id', reel.id);
+    slide.setAttribute('data-index', String(index));
 
-  // Trigger Instagram embed parser if available
-  if (window.instgrm && window.instgrm.Embeds) {
-    try {
-      window.instgrm.Embeds.process();
-    } catch (err) {
-      console.warn('Instagram embeds process notice:', err);
+    let underlayHtml = '';
+    if (hasRealThumbnail) {
+      underlayHtml = `<div class="reel-poster-underlay" style="background-image: url('${reel.thumbnail_url}');"></div>`;
+    } else {
+      underlayHtml = `
+        <div class="reel-monogram-underlay">
+          <div class="feed-monogram-circle">${initial}</div>
+          <div class="feed-monogram-handle">@${safeCreator}</div>
+        </div>
+      `;
     }
+
+    slide.innerHTML = `
+      <div class="reel-stage-wrapper">
+        <div class="reel-media-viewport">
+          ${underlayHtml}
+          <!-- Boundary-Masked Clean Iframe Container (No white Instagram card/footer) -->
+          <div class="reel-iframe-container" id="feed-iframe-box-${reel.id}"></div>
+        </div>
+
+        <!-- Overlay Details (Bottom Left) -->
+        <div class="reel-overlay-content">
+          <div class="reel-overlay-creator">
+            <div class="reel-creator-avatar">${initial}</div>
+            <div class="reel-creator-meta">
+              <a href="https://www.instagram.com/${creatorName}/" target="_blank" rel="noopener noreferrer" class="reel-creator-handle">@${safeCreator}</a>
+              <span class="reel-saved-badge">Saved ${dateFormatted}</span>
+            </div>
+          </div>
+          <div class="reel-caption-wrap" id="caption-wrap-${reel.id}">
+            <p class="reel-caption-text">${escapeHtml(captionText)}</p>
+            ${captionText.length > 90 ? '<button class="reel-caption-toggle" data-action="toggle-caption">more</button>' : ''}
+          </div>
+        </div>
+
+        <!-- Vertical Action Rail (Right Side) -->
+        <div class="reel-actions-rail">
+          <div class="rail-action-item">
+            <button class="rail-action-btn ${isWatched ? 'active-watched' : ''}" data-action="feed-toggle-watched" title="Mark Watched" aria-label="Mark Watched">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="20 6 9 17 4 12"></polyline></svg>
+            </button>
+            <span class="rail-action-sublabel">Watched</span>
+          </div>
+
+          <div class="rail-action-item">
+            <button class="rail-action-btn ${isWatchLater ? 'active-later' : ''}" data-action="feed-toggle-later" title="Watch Later" aria-label="Watch Later">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+            </button>
+            <span class="rail-action-sublabel">Later</span>
+          </div>
+
+          <div class="rail-action-item">
+            <button class="rail-action-btn" data-action="feed-copy-link" title="Copy Reel Link" aria-label="Copy Reel Link">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+            <span class="rail-action-sublabel copy-label">Copy</span>
+          </div>
+
+          <div class="rail-action-item">
+            <a href="${reel.reel_url}" target="_blank" rel="noopener noreferrer" class="rail-action-btn" title="Open directly in Instagram app or web" aria-label="Open in Instagram">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+            </a>
+            <span class="rail-action-sublabel">Open ↗</span>
+          </div>
+        </div>
+      </div>
+    `;
+
+    // Slide internal click delegator
+    slide.addEventListener('click', async (e) => {
+      const toggleCaptionBtn = e.target.closest('[data-action="toggle-caption"]');
+      if (toggleCaptionBtn) {
+        const wrap = slide.querySelector('.reel-caption-wrap');
+        const isExp = wrap.classList.toggle('expanded');
+        toggleCaptionBtn.textContent = isExp ? 'less' : 'more';
+        return;
+      }
+
+      const watchedBtn = e.target.closest('[data-action="feed-toggle-watched"]');
+      if (watchedBtn) {
+        const newStatus = reel.watch_status === 'watched' ? 'unwatched' : 'watched';
+        await updateReelStatus(reel.id, newStatus);
+        syncFeedSlideStatus(reel.id, newStatus);
+        return;
+      }
+
+      const laterBtn = e.target.closest('[data-action="feed-toggle-later"]');
+      if (laterBtn) {
+        const newStatus = reel.watch_status === 'watch_later' ? 'unwatched' : 'watch_later';
+        await updateReelStatus(reel.id, newStatus);
+        syncFeedSlideStatus(reel.id, newStatus);
+        return;
+      }
+
+      const copyBtn = e.target.closest('[data-action="feed-copy-link"]');
+      if (copyBtn) {
+        const copyLabel = slide.querySelector('.copy-label');
+        try {
+          if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable');
+          await navigator.clipboard.writeText(reel.reel_url);
+          if (copyLabel) copyLabel.textContent = 'Copied!';
+        } catch (err) {
+          console.warn('Clipboard write failed:', err);
+          if (copyLabel) copyLabel.textContent = 'Failed';
+        }
+        setTimeout(() => { if (copyLabel) copyLabel.textContent = 'Copy'; }, 1500);
+      }
+    });
+
+    feedScrollTrack.appendChild(slide);
+  });
+
+  setupFeedIntersectionObserver();
+}
+
+function setupFeedIntersectionObserver() {
+  if (feedIntersectionObserver) {
+    feedIntersectionObserver.disconnect();
   }
 
-  playbackModal.classList.add('active');
-  playbackModal.setAttribute('aria-hidden', 'false');
-  document.body.style.overflow = 'hidden';
-}
+  feedIntersectionObserver = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      const slide = entry.target;
+      const reelId = slide.getAttribute('data-reel-id');
+      const index = parseInt(slide.getAttribute('data-index') || '0', 10);
+      const reel = state.reels[index];
+      const iframeBox = slide.querySelector('.reel-iframe-container');
 
-function closePlaybackModal() {
-  state.currentModalReelId = null;
-  playbackMediaContainer.innerHTML = ''; // Stop video audio immediately
-  playbackModal.classList.remove('active');
-  playbackModal.setAttribute('aria-hidden', 'true');
-  document.body.style.overflow = '';
-}
+      if (entry.isIntersecting && entry.intersectionRatio >= 0.5) {
+        // Active Reel Slide
+        state.currentFeedIndex = index;
+        state.currentFeedReelId = reelId;
 
-function updateModalStatusButtons(status) {
-  [statusChoiceUnwatched, statusChoiceLater, statusChoiceWatched].forEach((btn) => {
-    btn.classList.remove('selected');
+        // Update Top HUD
+        feedCounterKicker.textContent = `REEL ${index + 1} OF ${state.reels.length}`;
+        feedShortcodeTag.textContent = `ID: ${reel?.shortcode || '—'}`;
+
+        // Mount Boundary-Masked Clean Iframe if not already mounted
+        if (iframeBox && !iframeBox.querySelector('iframe') && reel) {
+          const iframe = document.createElement('iframe');
+          iframe.src = `https://www.instagram.com/reel/${reel.shortcode}/embed/`;
+          iframe.className = 'reel-player-iframe';
+          iframe.setAttribute('allowfullscreen', 'true');
+          iframe.setAttribute('scrolling', 'no');
+          iframe.setAttribute('allowtransparency', 'true');
+          iframe.setAttribute('loading', 'eager');
+          iframeBox.appendChild(iframe);
+        }
+      } else if (!entry.isIntersecting || entry.intersectionRatio < 0.2) {
+        // Unmount iframe to stop video playback and audio immediately
+        if (iframeBox && iframeBox.querySelector('iframe')) {
+          iframeBox.innerHTML = '';
+        }
+      }
+    });
+  }, {
+    root: feedScrollTrack,
+    threshold: [0.2, 0.5, 0.8],
   });
-  if (status === 'watched') statusChoiceWatched.classList.add('selected');
-  else if (status === 'watch_later') statusChoiceLater.classList.add('selected');
-  else statusChoiceUnwatched.classList.add('selected');
+
+  const slides = feedScrollTrack.querySelectorAll('.feed-reel-slide');
+  slides.forEach((slide) => feedIntersectionObserver.observe(slide));
 }
 
-function navigateModal(direction) {
-  if (!state.currentModalReelId || state.reels.length === 0) return;
-  const idx = state.reels.findIndex((r) => r.id === state.currentModalReelId);
-  if (idx === -1) return;
+function openReelsFeed(startReel) {
+  state.previouslyFocusedElement = document.activeElement;
+  renderFeedSlides();
 
-  const nextIdx = idx + direction;
-  if (nextIdx >= 0 && nextIdx < state.reels.length) {
-    openPlaybackModal(state.reels[nextIdx]);
+  feedModal.classList.add('active');
+  feedModal.setAttribute('aria-hidden', 'false');
+  document.body.style.overflow = 'hidden';
+
+  // Scroll directly to target reel slide
+  const targetSlide = feedScrollTrack.querySelector(`[data-reel-id="${startReel.id}"]`);
+  if (targetSlide) {
+    targetSlide.scrollIntoView({ behavior: 'instant', block: 'start' });
+  }
+
+  // Focus close button for accessibility
+  feedCloseBtn.focus();
+}
+
+function closeReelsFeed() {
+  if (feedIntersectionObserver) {
+    feedIntersectionObserver.disconnect();
+  }
+
+  // Clear all iframes immediately to silence audio
+  const iframes = feedScrollTrack.querySelectorAll('.reel-iframe-container');
+  iframes.forEach((box) => { box.innerHTML = ''; });
+
+  feedModal.classList.remove('active');
+  feedModal.setAttribute('aria-hidden', 'true');
+  document.body.style.overflow = '';
+
+  state.currentFeedReelId = null;
+
+  // Restore previous focus
+  if (state.previouslyFocusedElement && typeof state.previouslyFocusedElement.focus === 'function') {
+    state.previouslyFocusedElement.focus();
+  }
+}
+
+function scrollFeedBy(direction) {
+  const targetIndex = state.currentFeedIndex + direction;
+  if (targetIndex >= 0 && targetIndex < state.reels.length) {
+    const nextSlide = feedScrollTrack.querySelector(`[data-index="${targetIndex}"]`);
+    if (nextSlide) {
+      nextSlide.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }
+}
+
+function syncFeedSlideStatus(reelId, newStatus) {
+  const slide = feedScrollTrack.querySelector(`[data-reel-id="${reelId}"]`);
+  if (!slide) return;
+
+  const watchedBtn = slide.querySelector('[data-action="feed-toggle-watched"]');
+  const laterBtn = slide.querySelector('[data-action="feed-toggle-later"]');
+
+  if (watchedBtn) {
+    watchedBtn.classList.toggle('active-watched', newStatus === 'watched');
+  }
+  if (laterBtn) {
+    laterBtn.classList.toggle('active-later', newStatus === 'watch_later');
+    const svgPath = laterBtn.querySelector('path');
+    if (svgPath) {
+      laterBtn.querySelector('svg').setAttribute('fill', newStatus === 'watch_later' ? 'currentColor' : 'none');
+    }
   }
 }
 
@@ -528,37 +724,25 @@ function setupEventListeners() {
   viewModeGridBtn.addEventListener('click', () => applyViewMode('grid'));
   viewModeListBtn.addEventListener('click', () => applyViewMode('list'));
 
-  // Playback modal close handlers
-  playbackCloseBtn.addEventListener('click', closePlaybackModal);
-  playbackBackdrop.addEventListener('click', closePlaybackModal);
+  // Reels Feed modal handlers
+  feedCloseBtn.addEventListener('click', closeReelsFeed);
+  feedArrowUp.addEventListener('click', () => scrollFeedBy(-1));
+  feedArrowDown.addEventListener('click', () => scrollFeedBy(1));
 
-  // Status buttons inside modal
-  statusChoiceUnwatched.addEventListener('click', () => {
-    if (state.currentModalReelId) updateReelStatus(state.currentModalReelId, 'unwatched');
-  });
-  statusChoiceLater.addEventListener('click', () => {
-    if (state.currentModalReelId) updateReelStatus(state.currentModalReelId, 'watch_later');
-  });
-  statusChoiceWatched.addEventListener('click', () => {
-    if (state.currentModalReelId) updateReelStatus(state.currentModalReelId, 'watched');
-  });
-
-  // Copy caption button
-  copyCaptionBtn.addEventListener('click', () => {
-    const text = playbackFullCaption.textContent;
-    if (text) {
-      navigator.clipboard.writeText(text);
-      copyCaptionBtn.textContent = 'Copied!';
-      setTimeout(() => { copyCaptionBtn.textContent = 'Copy'; }, 1500);
-    }
-  });
-
-  // Keyboard navigation (Esc to close, Left/Right arrow to navigate)
+  // Global keydown navigation for the Feed
   window.addEventListener('keydown', (e) => {
-    if (!playbackModal.classList.contains('active')) return;
-    if (e.key === 'Escape') closePlaybackModal();
-    else if (e.key === 'ArrowLeft') navigateModal(-1);
-    else if (e.key === 'ArrowRight') navigateModal(1);
+    if (!feedModal.classList.contains('active')) return;
+
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeReelsFeed();
+    } else if (e.key === 'ArrowDown' || e.key === 'j' || e.key === 'PageDown') {
+      e.preventDefault();
+      scrollFeedBy(1);
+    } else if (e.key === 'ArrowUp' || e.key === 'k' || e.key === 'PageUp') {
+      e.preventDefault();
+      scrollFeedBy(-1);
+    }
   });
 
   // Search input with debounce
