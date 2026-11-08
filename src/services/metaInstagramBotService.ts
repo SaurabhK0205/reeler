@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { loadConfig } from '../config.ts';
 import { Repository } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
@@ -7,14 +8,53 @@ import { extractCreatorQuery } from '../utils/creatorQuery.ts';
 export class MetaInstagramBotService {
   private accessToken: string;
   private verifyToken: string;
+  private appSecret: string;
 
   constructor() {
     this.accessToken = process.env.META_PAGE_ACCESS_TOKEN || '';
     this.verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN || 'rea_instagram_saved_token';
+    this.appSecret = process.env.META_APP_SECRET || '';
   }
 
   get isConfigured(): boolean {
     return Boolean(this.accessToken);
+  }
+
+  /**
+   * Validates Meta X-Hub-Signature-256 header using SHA-256 HMAC
+   */
+  verifySignature(rawBody: Buffer | string | undefined, signatureHeader?: string): boolean {
+    if (!this.appSecret) {
+      // If no app secret is configured, bypass verification in local development
+      return true;
+    }
+
+    if (!signatureHeader || !rawBody) {
+      return false;
+    }
+
+    const parts = signatureHeader.split('=');
+    if (parts.length !== 2 || parts[0] !== 'sha256') {
+      return false;
+    }
+
+    const providedSignature = parts[1];
+    const hmac = crypto.createHmac('sha256', this.appSecret);
+    hmac.update(rawBody);
+    const expectedSignature = hmac.digest('hex');
+
+    if (providedSignature.length !== expectedSignature.length) {
+      return false;
+    }
+
+    try {
+      return crypto.timingSafeEqual(
+        Buffer.from(providedSignature, 'hex'),
+        Buffer.from(expectedSignature, 'hex')
+      );
+    } catch {
+      return false;
+    }
   }
 
   /**

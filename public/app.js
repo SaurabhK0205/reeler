@@ -349,27 +349,56 @@ function setupEventListeners() {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+    if (file.size > MAX_FILE_SIZE) {
+      alert(`File is too large (${(file.size / (1024 * 1024)).toFixed(1)}MB). Maximum allowed size is 50MB.`);
+      archiveFileInput.value = '';
+      return;
+    }
+
     const originalText = importBtn.innerHTML;
     importBtn.innerHTML = '<span class="btn-icon">⏳</span> Importing...';
     importBtn.disabled = true;
 
     try {
       const text = await file.text();
-      const parsed = JSON.parse(text);
 
       const res = await fetch('/api/archive/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(parsed),
+        body: text,
       });
 
-      const data = await res.json();
-      if (!res.ok) {
-        alert(`Import error: ${data.error || 'Failed to import archive'}`);
-      } else {
-        alert(`🎉 Archive imported successfully!\n\n• Reels imported: ${data.reelsImported}\n• Creators added: ${data.creatorsAdded}\n• Total scanned: ${data.totalProcessed}`);
-        await Promise.all([loadStats(), loadCreators(), fetchReels()]);
+      let data = null;
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        try {
+          data = await res.json();
+        } catch (_) {
+          data = null;
+        }
       }
+
+      if (!res.ok) {
+        const errorMsg = data?.error || data?.errors?.join('\n') || (res.status === 413 ? 'File too large for server limit (50MB)' : `Server responded with status ${res.status}`);
+        alert(`Import error: ${errorMsg}`);
+        return;
+      }
+
+      if (data && data.reelsImported === 0 && data.errors && data.errors.length > 0) {
+        alert(`Import failed: No reels could be imported.\n\nErrors:\n${data.errors.join('\n')}`);
+        return;
+      }
+
+      const importedCount = data?.reelsImported ?? 0;
+      const creatorsCount = data?.creatorsAdded ?? 0;
+      const totalScanned = data?.totalProcessed ?? 0;
+      let msg = `🎉 Archive imported successfully!\n\n• Reels imported: ${importedCount}\n• Creators added: ${creatorsCount}\n• Total scanned: ${totalScanned}`;
+      if (data?.errors && data.errors.length > 0) {
+        msg += `\n\nWarnings/Errors:\n${data.errors.join('\n')}`;
+      }
+      alert(msg);
+      await Promise.all([loadStats(), loadCreators(), fetchReels()]);
     } catch (err) {
       alert(`Import failed: ${err.message}`);
     } finally {

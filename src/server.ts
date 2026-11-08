@@ -12,7 +12,19 @@ const app = express();
 const config = loadConfig();
 const reminderWorker = new ReminderWorker();
 
-app.use(express.json({ limit: '50mb' }));
+// Route-specific bounded parser for official Instagram archive imports (up to 50MB)
+app.use('/api/archive/import', express.json({ limit: '50mb' }));
+
+// Route-specific parser for Meta webhooks with raw body retention for HMAC verification (1MB)
+app.use('/api/instagram/webhook', express.json({
+  limit: '1mb',
+  verify: (req: any, _res, buf) => {
+    req.rawBody = buf;
+  },
+}));
+
+// Default bounded JSON parser for general endpoints (1MB)
+app.use(express.json({ limit: '1mb' }));
 
 // API Routes
 app.use('/api', apiRouter);

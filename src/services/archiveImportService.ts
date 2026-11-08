@@ -1,12 +1,15 @@
 import { Repository } from '../db/repository.ts';
+import type { Creator } from '../types.ts';
 
 export interface RawSavedExportItem {
   title?: string;
-  string_map_data?: Record<string, { href?: string; timestamp?: number }>;
+  string_map_data?: Record<string, { href?: string; timestamp?: number; value?: string }>;
   href?: string;
   timestamp?: number;
   caption?: string;
 }
+
+export type ArchiveImportStatus = 'success' | 'empty' | 'failed' | 'partial';
 
 export interface ArchiveImportResult {
   totalProcessed: number;
@@ -14,7 +17,10 @@ export interface ArchiveImportResult {
   creatorsAdded: number;
   skipped: number;
   errors: string[];
+  status: ArchiveImportStatus;
 }
+
+const UNKNOWN_CREATOR_HANDLE = 'unattributed';
 
 export class ArchiveImportService {
   /**
@@ -29,18 +35,20 @@ export class ArchiveImportService {
       try {
         data = JSON.parse(input);
       } catch (err: any) {
+        console.error('[ArchiveImport] JSON parse error:', err.message);
         return {
           totalProcessed: 0,
           reelsImported: 0,
           creatorsAdded: 0,
           skipped: 0,
-          errors: [`Failed to parse JSON file: ${err.message}`],
+          errors: ['Failed to parse JSON file: malformed JSON format.'],
+          status: 'empty',
         };
       }
     }
 
     // Locate the array of saved items across different Instagram export variations
-    let rawItems: RawSavedExportItem[] = [];
+    let rawItems: unknown[] = [];
     if (Array.isArray(data)) {
       rawItems = data;
     } else if (data && typeof data === 'object') {
@@ -69,28 +77,38 @@ export class ArchiveImportService {
         creatorsAdded: 0,
         skipped: 0,
         errors: ['No saved media items found in the provided export file.'],
+        status: 'empty',
       };
     }
 
     let totalProcessed = 0;
     let reelsImported = 0;
     const creatorsSeen = new Set<string>();
+    const creatorCache = new Map<string, Creator>();
     const errors: string[] = [];
-    const reelRegex = /https?:\/\/(?:www\.)?instagram\.com\/(?:reel|p)\/([A-Za-z0-9_-]+)/i;
 
-    for (const item of rawItems) {
+    for (const rawItem of rawItems) {
+      // Runtime validation of raw item
+      if (!rawItem || typeof rawItem !== 'object') {
+        continue;
+      }
+      const item = rawItem as RawSavedExportItem;
       totalProcessed++;
 
-      // Extract href link and timestamp
-      let href = item.href;
-      let timestamp = item.timestamp;
+      // Extract and validate href link and timestamp
+      let href: string | undefined;
+      let rawTimestamp: unknown = item.timestamp;
 
-      if (!href && item.string_map_data) {
+      if (typeof item.href === 'string') {
+        href = item.href;
+      } else if (item.string_map_data && typeof item.string_map_data === 'object') {
         for (const mapData of Object.values(item.string_map_data)) {
-          if (mapData.href) {
-            href = mapData.href;
-            timestamp = mapData.timestamp || timestamp;
-            break;
+          if (mapData && typeof mapData === 'object') {
+            if (typeof mapData.href === 'string') {
+              href = mapData.href;
+              rawTimestamp = mapData.timestamp ?? rawTimestamp;
+              break;
+            }
           }
         }
       }
@@ -99,67 +117,114 @@ export class ArchiveImportService {
         continue;
       }
 
-      const match = href.match(reelRegex);
-      if (!match) {
+      // Anchored URL parse: validate host and reel/post path
+      let shortcode: string | null = null;
+      let mediaType: 'reel' | 'p' = 'reel';
+      try {
+        const parsedUrl = new URL(href);
+        const host = parsedUrl.hostname.toLowerCase();
+        if (host !== 'instagram.com' && host !== 'www.instagram.com') {
+          continue;
+        }
+        const pathMatch = parsedUrl.pathname.match(/^\/(reel|reels|p)\/([A-Za-z0-9_-]+)\/?$/i);
+        if (!pathMatch) {
+          continue;
+        }
+        mediaType = pathMatch[1].toLowerCase() === 'p' ? 'p' : 'reel';
+        shortcode = pathMatch[2];
+      } catch {
         continue;
       }
 
-      const shortcode = match[1];
+      if (!shortcode) {
+        continue;
+      }
 
-      // Extract username from title if available (Instagram exports usually put creator username in title)
-      let creatorHandle = 'instagram_creator';
-      let caption: string | null = item.caption || null;
+      // Preserve original URL path type
+      const reel_url = `https://www.instagram.com/${mediaType}/${shortcode}/`;
 
-      if (item.title) {
-        const cleanedTitle = item.title.trim().replace(/^@/, '');
-        // If title looks like a username (no spaces, <= 30 chars), treat it as the creator handle
-        if (/^[a-zA-Z0-9._]{1,30}$/.test(cleanedTitle)) {
-          creatorHandle = cleanedTitle;
-        } else {
-          caption = item.title;
+      // Extract creator identity from reliable metadata fields or use sentinel
+      let creatorHandle = UNKNOWN_CREATOR_HANDLE;
+      let caption: string | null = typeof item.caption === 'string' ? item.caption : null;
+
+      if (item.string_map_data && typeof item.string_map_data === 'object') {
+        for (const [key, mapData] of Object.entries(item.string_map_data)) {
+          if (mapData && typeof mapData === 'object') {
+            const normalizedKey = key.toLowerCase();
+            if (['author', 'owner', 'user', 'creator'].includes(normalizedKey) && typeof mapData.value === 'string' && mapData.value.trim()) {
+              creatorHandle = mapData.value.trim().replace(/^@/, '');
+              break;
+            }
+          }
         }
       }
 
-      // Format ISO dates
+      // If title is present, preserve it as caption (never misinterpret title as creator identity)
+      if (typeof item.title === 'string' && item.title.trim()) {
+        caption = item.title.trim();
+      }
+
+      // Format ISO dates with strict runtime checks
       let savedAtIso: string | null = null;
-      if (timestamp) {
-        // Timestamps in Instagram exports can be in seconds or milliseconds
-        const ms = timestamp > 10000000000 ? timestamp : timestamp * 1000;
-        savedAtIso = new Date(ms).toISOString();
+      if (typeof rawTimestamp === 'number' && Number.isFinite(rawTimestamp) && rawTimestamp > 0) {
+        const ms = rawTimestamp > 10000000000 ? rawTimestamp : rawTimestamp * 1000;
+        const date = new Date(ms);
+        if (!isNaN(date.getTime())) {
+          savedAtIso = date.toISOString();
+        }
       }
       const recordDate = savedAtIso || new Date().toISOString();
 
       try {
-        // Upsert creator
-        const creator = await Repository.upsertCreator({
-          instagram_user_id: `creator_${creatorHandle}`,
-          username: creatorHandle,
-          display_name: creatorHandle !== 'instagram_creator' ? creatorHandle : null,
-          profile_picture_url: null,
-        });
-        creatorsSeen.add(creator.id);
+        // Upsert creator with cache to avoid redundant database round trips
+        let creator = creatorCache.get(creatorHandle);
+        if (!creator) {
+          creator = await Repository.upsertCreator({
+            instagram_user_id: `creator_${creatorHandle}`,
+            username: creatorHandle,
+            display_name: creatorHandle !== UNKNOWN_CREATOR_HANDLE ? creatorHandle : null,
+            profile_picture_url: null,
+          });
+          creatorCache.set(creatorHandle, creator);
+        }
 
-        // Upsert saved reel
-        await Repository.upsertSavedReel({
-          instagram_media_id: `export_${shortcode}`,
-          shortcode,
-          reel_url: `https://www.instagram.com/reel/${shortcode}/`,
-          creator_id: creator.id,
-          caption,
-          thumbnail_url: null,
-          taken_at: recordDate,
-          saved_at: savedAtIso,
-          first_detected_at: recordDate,
-          save_order_rank: totalProcessed,
-          watch_status: 'unwatched',
-          is_saved_on_instagram: true,
-          instagram_sender_id: senderId || null,
-        });
+        // Only count actual identified creators (exclude unattributed sentinel)
+        if (creatorHandle !== UNKNOWN_CREATOR_HANDLE) {
+          creatorsSeen.add(creator.id);
+        }
+
+        // Upsert saved reel with ignoreDuplicates to preserve existing status and reminders
+        await Repository.upsertSavedReel(
+          {
+            instagram_media_id: `export_${shortcode}`,
+            shortcode,
+            reel_url,
+            creator_id: creator.id,
+            caption,
+            thumbnail_url: null,
+            taken_at: recordDate,
+            saved_at: savedAtIso,
+            first_detected_at: recordDate,
+            save_order_rank: totalProcessed,
+            watch_status: 'unwatched',
+            is_saved_on_instagram: true,
+            instagram_sender_id: senderId || null,
+          },
+          { ignoreDuplicates: true }
+        );
 
         reelsImported++;
       } catch (err: any) {
-        errors.push(`Error importing reel ${shortcode}: ${err.message}`);
+        console.error(`[ArchiveImport] Failed to import reel ${shortcode}:`, err.message || err);
+        errors.push(`Failed to import item with shortcode ${shortcode}`);
       }
+    }
+
+    let status: ArchiveImportStatus = 'success';
+    if (reelsImported === 0) {
+      status = totalProcessed === 0 || errors.length === 0 ? 'empty' : 'failed';
+    } else if (errors.length > 0) {
+      status = 'partial';
     }
 
     return {
@@ -167,7 +232,8 @@ export class ArchiveImportService {
       reelsImported,
       creatorsAdded: creatorsSeen.size,
       skipped: totalProcessed - reelsImported,
-      errors: errors.slice(0, 5), // Keep only top 5 errors if any
+      errors: errors.slice(0, 5),
+      status,
     };
   }
 }

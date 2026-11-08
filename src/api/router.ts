@@ -28,6 +28,15 @@ apiRouter.get('/instagram/webhook', (req: Request, res: Response) => {
 
 // Instagram Webhook Event Handler (Official Meta Graph API webhook)
 apiRouter.post('/instagram/webhook', async (req: Request, res: Response) => {
+  const signature = req.headers['x-hub-signature-256'] as string | undefined;
+  const rawBody = (req as any).rawBody;
+
+  if (!metaBotService.verifySignature(rawBody, signature)) {
+    console.warn('[MetaIG] Webhook signature verification failed. Unauthorized request.');
+    res.status(401).send('Invalid signature');
+    return;
+  }
+
   try {
     // Acknowledge immediately to prevent timeouts from Meta
     res.status(200).send('EVENT_RECEIVED');
@@ -117,13 +126,22 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
   try {
     const rawData = req.body;
     if (!rawData) {
-      res.status(400).json({ error: 'No data payload provided for import' });
+      res.status(400).json({ success: false, error: 'No data payload provided for import' });
       return;
     }
 
     const result = await ArchiveImportService.importArchive(rawData);
-    res.json({ success: true, ...result });
+    if (result.status === 'empty') {
+      res.status(400).json({ success: false, ...result });
+      return;
+    }
+    if (result.status === 'failed') {
+      res.status(500).json({ success: false, ...result });
+      return;
+    }
+
+    res.status(200).json({ success: true, ...result });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });

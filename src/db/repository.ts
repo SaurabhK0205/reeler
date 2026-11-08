@@ -67,7 +67,7 @@ class InMemoryStore {
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
     awaiting_reminder_choice_until?: string | null;
-  }): Promise<SavedReel> {
+  }, options?: { ignoreDuplicates?: boolean }): Promise<SavedReel> {
     let existing: SavedReel | undefined;
     for (const r of this.reels.values()) {
       if (r.instagram_media_id === data.instagram_media_id || r.shortcode === data.shortcode) {
@@ -77,7 +77,11 @@ class InMemoryStore {
     }
 
     const now = new Date().toISOString();
+
     if (existing) {
+      if (options?.ignoreDuplicates) {
+        return existing;
+      }
       existing.caption = data.caption ?? existing.caption;
       existing.thumbnail_url = data.thumbnail_url ?? existing.thumbnail_url;
       existing.save_order_rank = data.save_order_rank;
@@ -345,9 +349,9 @@ export class Repository {
     awaiting_reminder_choice_until?: string | null;
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
-  }): Promise<SavedReel> {
+  }, options?: { ignoreDuplicates?: boolean }): Promise<SavedReel> {
     if (!isSupabaseConfigured()) {
-      return memoryStore.upsertSavedReel(data);
+      return memoryStore.upsertSavedReel(data, options);
     }
 
     const supabase = getSupabase();
@@ -376,13 +380,27 @@ export class Repository {
           instagram_sender_id: data.instagram_sender_id,
           updated_at: new Date().toISOString(),
         },
-        { onConflict: 'instagram_media_id' }
+        { onConflict: 'instagram_media_id', ignoreDuplicates: options?.ignoreDuplicates ?? false }
       )
       .select('*, creator:creators(*)')
-      .single();
+      .maybeSingle();
 
-    if (error || !reel) {
-      throw new Error(`Supabase upsertSavedReel failed: ${error?.message || 'unknown error'}`);
+    if (error) {
+      throw new Error(`Supabase upsertSavedReel failed: ${error.message}`);
+    }
+
+    if (!reel && options?.ignoreDuplicates) {
+      const { data: existing, error: fetchErr } = await supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .eq('instagram_media_id', data.instagram_media_id)
+        .maybeSingle();
+      if (existing) return existing as SavedReel;
+      if (fetchErr) throw new Error(`Supabase fetch existing reel failed: ${fetchErr.message}`);
+    }
+
+    if (!reel) {
+      throw new Error('Supabase upsertSavedReel returned no record');
     }
 
     return reel as SavedReel;
