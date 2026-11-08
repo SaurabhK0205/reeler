@@ -3,65 +3,89 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Saved Reels Tracker & Discovery</title>
+  <title>Reeler — Saved Reels Vault</title>
   <link rel="stylesheet" href="style.css">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
   <div class="app-container">
-    <!-- Header -->
+    <!-- Vault Header -->
     <header class="app-header">
       <div class="header-left">
-        <div class="logo-icon">🎬</div>
-        <div>
-          <h1>Saved Reels Tracker</h1>
-          <p class="subtitle">Search, filter, and rediscover your saved Instagram Reels</p>
+        <div class="brand-mark" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"></rect>
+            <line x1="7" y1="2" x2="7" y2="22"></line>
+            <line x1="17" y1="2" x2="17" y2="22"></line>
+            <line x1="2" y1="12" x2="22" y2="12"></line>
+            <line x1="2" y1="7" x2="7" y2="7"></line>
+            <line x1="2" y1="17" x2="7" y2="17"></line>
+            <line x1="17" y1="17" x2="22" y2="17"></line>
+            <line x1="17" y1="7" x2="22" y2="7"></line>
+          </svg>
+        </div>
+        <div class="brand-titles">
+          <h1>Reeler</h1>
+          <p class="subtitle">Personal Saved Reels Vault</p>
         </div>
       </div>
       <div class="header-right">
-        <span id="db-badge" class="badge badge-neutral">Checking DB...</span>
+        <div id="db-badge" class="badge badge-neutral">
+          <span class="badge-dot" aria-hidden="true"></span>
+          <span class="badge-text">Checking DB...</span>
+        </div>
         <input type="file" id="archive-file-input" accept=".json" style="display: none;" />
         <button id="import-btn" class="btn btn-primary" title="Import official Instagram saved_posts.json export">
-          <span class="btn-icon">📥</span> Import Archive
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+          <span>Import Archive</span>
         </button>
       </div>
     </header>
 
     <!-- Stats Dashboard -->
-    <section class="stats-grid">
+    <section class="stats-grid" aria-label="Library Overview">
       <div class="stat-card">
-        <div class="stat-label">Total Saved Reels</div>
+        <div class="stat-label">VAULT REELS</div>
         <div class="stat-value" id="stat-total">0</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Unique Creators</div>
+        <div class="stat-label">CREATORS</div>
         <div class="stat-value" id="stat-creators">0</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Saved This Week</div>
+        <div class="stat-label">SAVED THIS WEEK</div>
         <div class="stat-value" id="stat-week">0</div>
       </div>
-      <div class="stat-card">
-        <div class="stat-label">Watch Later</div>
+      <div class="stat-card stat-card-highlight">
+        <div class="stat-label">WATCH LATER</div>
         <div class="stat-value text-accent" id="stat-watch-later">0</div>
       </div>
     </section>
 
     <!-- Controls: Search & Primary Filters -->
-    <section class="filter-controls">
+    <section class="filter-controls" aria-label="Search and filter controls">
       <!-- Search Bar -->
       <div class="search-box">
-        <span class="search-icon">🔍</span>
+        <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
         <input type="text" id="search-input" placeholder="Search keywords in captions or creators..." autocomplete="off">
-        <button id="clear-search" class="clear-btn" style="display: none;">✕</button>
+        <button id="clear-search" class="clear-btn" aria-label="Clear search query" style="display: none;">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
       </div>
 
       <div class="dropdown-row">
         <!-- Date Filter -->
         <div class="control-group">
-          <label for="date-preset">Date Saved:</label>
+          <label for="date-preset">Date Saved</label>
           <select id="date-preset">
             <option value="all">All Time</option>
             <option value="today">Today</option>
@@ -76,7 +100,7 @@
 
         <!-- Watch Status -->
         <div class="control-group">
-          <label for="watch-filter">Status:</label>
+          <label for="watch-filter">Status</label>
           <select id="watch-filter">
             <option value="all">All Statuses</option>
             <option value="unwatched">Unwatched</option>
@@ -87,7 +111,7 @@
 
         <!-- Sort By -->
         <div class="control-group">
-          <label for="sort-by">Sort By:</label>
+          <label for="sort-by">Sort By</label>
           <select id="sort-by">
             <option value="newest_saved">Newest Saved First</option>
             <option value="oldest_saved">Oldest Saved First</option>
@@ -99,13 +123,13 @@
     </section>
 
     <!-- Creator Quick-Filter Bar -->
-    <section class="creator-bar-container">
+    <section class="creator-bar-container" aria-label="Filter by creator">
       <div class="creator-bar-header">
-        <span class="section-title">Filter by Creator</span>
+        <span class="section-title">TOP CREATORS</span>
         <button id="reset-creator-btn" class="reset-link" style="display: none;">Show All Creators</button>
       </div>
       <div class="creator-pills" id="creator-pills-list">
-        <div class="creator-pill active" data-creator-id="">All Creators</div>
+        <button class="creator-pill active" data-creator-id="">All Creators</button>
       </div>
     </section>
 
@@ -121,11 +145,76 @@
 
       <!-- Pagination -->
       <div class="pagination-bar" id="pagination-bar" style="display: none;">
-        <button id="prev-page-btn" class="btn btn-secondary">← Previous</button>
+        <button id="prev-page-btn" class="btn btn-secondary">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"></polyline></svg>
+          <span>Previous</span>
+        </button>
         <span id="page-indicator" class="page-indicator">Page 1 of 1</span>
-        <button id="next-page-btn" class="btn btn-secondary">Next →</button>
+        <button id="next-page-btn" class="btn btn-secondary">
+          <span>Next</span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"></polyline></svg>
+        </button>
       </div>
     </main>
+
+    <!-- Cinema Theater Modal -->
+    <div id="theater-modal" class="theater-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Cinema Reel Player">
+      <div class="theater-backdrop" id="theater-backdrop"></div>
+      <div class="theater-dialog">
+        <button class="theater-close-btn" id="theater-close-btn" aria-label="Close cinema modal">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+        <div class="theater-stage">
+          <div class="theater-player-pane" id="theater-player-container">
+            <!-- Dynamic player injected by app.js -->
+          </div>
+          <div class="theater-details-pane">
+            <div class="theater-creator-card">
+              <div class="theater-avatar" id="theater-avatar"></div>
+              <div class="theater-creator-info">
+                <a class="theater-creator-name" id="theater-creator-name" href="#" target="_blank" rel="noopener noreferrer">@creator</a>
+                <span class="theater-date" id="theater-date">Date</span>
+              </div>
+              <a id="theater-external-link" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-secondary theater-link-btn" title="Open on Instagram">
+                <span>Instagram</span>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+              </a>
+            </div>
+
+            <div class="theater-caption-box">
+              <div class="theater-caption-title">LOGLINE / CAPTION</div>
+              <p class="theater-caption-text" id="theater-caption"></p>
+            </div>
+
+            <div class="theater-status-section">
+              <div class="theater-caption-title">STATUS</div>
+              <div class="theater-status-row">
+                <button class="status-choice-btn" data-status="unwatched" id="theater-status-unwatched">
+                  <span class="status-choice-indicator"></span> Unwatched
+                </button>
+                <button class="status-choice-btn" data-status="watch_later" id="theater-status-later">
+                  <span class="status-choice-indicator"></span> Watch Later
+                </button>
+                <button class="status-choice-btn" data-status="watched" id="theater-status-watched">
+                  <span class="status-choice-indicator"></span> Watched
+                </button>
+              </div>
+            </div>
+
+            <div class="theater-footer-meta">
+              <div class="theater-rank" id="theater-rank">#0 in Vault</div>
+              <div class="theater-nav-keys">
+                <span><kbd>←</kbd> <kbd>→</kbd> Navigate</span>
+                <span><kbd>Esc</kbd> Close</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="app.js"></script>
