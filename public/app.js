@@ -298,32 +298,34 @@ function renderReels() {
     card.setAttribute('role', 'button');
     card.setAttribute('aria-label', `Play reel by @${creatorName}`);
 
-    let posterArtHtml = '';
+    // Base artwork: always build the monochrome monogram poster as background/fallback
+    const monogramArtHtml = `
+      <div class="monochrome-poster-art">
+        <div class="art-top-row">
+          <span class="art-reel-id">REEL #${reel.save_order_rank || '—'}</span>
+        </div>
+        <div class="art-center-block">
+          <div class="art-monogram-circle">${initial}</div>
+          <div class="art-creator-text">@${safeCreator}</div>
+          <div class="art-caption-quote">${escapeHtml(reel.caption || 'Saved Instagram Reel')}</div>
+        </div>
+        <div class="poster-bottom-scrim"></div>
+      </div>
+    `;
+
+    let imageLayerHtml = '';
     if (hasRealThumbnail) {
-      posterArtHtml = `
+      imageLayerHtml = `
         <img class="poster-actual-img" src="${cleanThumbnail}" alt="Reel thumbnail by @${safeCreator}" loading="lazy" onerror="this.style.display='none';" />
         <div class="poster-top-scrim"></div>
         <div class="poster-bottom-scrim"></div>
-      `;
-    } else {
-      posterArtHtml = `
-        <div class="monochrome-poster-art">
-          <div class="art-top-row">
-            <span class="art-reel-id">REEL #${reel.save_order_rank || '—'}</span>
-          </div>
-          <div class="art-center-block">
-            <div class="art-monogram-circle">${initial}</div>
-            <div class="art-creator-text">@${safeCreator}</div>
-            <div class="art-caption-quote">${escapeHtml(reel.caption || 'Saved Instagram Reel')}</div>
-          </div>
-          <div class="poster-bottom-scrim"></div>
-        </div>
       `;
     }
 
     card.innerHTML = `
       <div class="poster-media-box">
-        ${posterArtHtml}
+        ${monogramArtHtml}
+        ${imageLayerHtml}
         <div class="card-header-overlay">
           <span class="rank-tag">#${reel.save_order_rank || '—'}</span>
           <button class="card-bookmark-btn ${isWatchLater ? 'active' : ''}" title="${isWatchLater ? 'In Watch Later' : 'Add to Watch Later'}" aria-label="Toggle Watch Later">
@@ -821,7 +823,7 @@ function sanitizeMediaUrl(url) {
 }
 
 /**
- * Dispatches an obsidian dark-mode toast notification with auto-dismiss.
+ * Dispatches an obsidian dark-mode toast notification with auto-dismiss or manual dismiss for errors.
  * @param {string} message
  * @param {'info' | 'success' | 'error'} type
  */
@@ -835,18 +837,31 @@ function showToast(message, type = 'info') {
     toastContainer.setAttribute('aria-live', 'polite');
     document.body.appendChild(toastContainer);
   }
+  const isError = type === 'error';
   const toast = document.createElement('div');
   toast.className = `vault-toast vault-toast-${type}`;
+  toast.setAttribute('role', isError ? 'alert' : 'status');
   toast.innerHTML = `
     <span class="toast-dot" aria-hidden="true"></span>
     <span class="toast-msg">${escapeHtml(message).replace(/\n/g, '<br>')}</span>
+    ${isError ? '<button type="button" class="toast-dismiss-btn" aria-label="Dismiss error notice">✕</button>' : ''}
   `;
   toastContainer.appendChild(toast);
   requestAnimationFrame(() => toast.classList.add('visible'));
-  setTimeout(() => {
+
+  const dismiss = () => {
     toast.classList.remove('visible');
     setTimeout(() => toast.remove(), 250);
-  }, 4500);
+  };
+
+  if (isError) {
+    const dismissBtn = toast.querySelector('.toast-dismiss-btn');
+    if (dismissBtn) {
+      dismissBtn.addEventListener('click', dismiss);
+    }
+  } else {
+    setTimeout(dismiss, 4500);
+  }
 }
 
 // Event Listeners
@@ -877,17 +892,17 @@ function setupEventListeners() {
       const slideControls = activeSlide ? Array.from(activeSlide.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])')) : [];
       const focusables = [...topBarControls, ...slideControls];
       if (!focusables.length) return;
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-      if (!feedModal.contains(document.activeElement)) {
-        e.preventDefault();
-        (e.shiftKey ? last : first).focus();
-      } else if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
+
+      e.preventDefault();
+      const currentIndex = focusables.indexOf(document.activeElement);
+      if (currentIndex === -1) {
+        (e.shiftKey ? focusables[focusables.length - 1] : focusables[0]).focus();
+      } else if (e.shiftKey) {
+        const prevIndex = (currentIndex - 1 + focusables.length) % focusables.length;
+        focusables[prevIndex].focus();
+      } else {
+        const nextIndex = (currentIndex + 1) % focusables.length;
+        focusables[nextIndex].focus();
       }
     } else if (e.key === 'ArrowDown' || e.key === 'j' || e.key === 'PageDown') {
       e.preventDefault();

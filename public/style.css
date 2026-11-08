@@ -1499,3 +1499,25 @@ kbd {
 .vault-toast-error .toast-dot {
   background: #ff4757;
 }
+
+.toast-msg {
+  flex: 1;
+  word-break: break-word;
+}
+
+.toast-dismiss-btn {
+  background: transparent;
+  border: none;
+  color: var(--ink-muted);
+  cursor: pointer;
+  padding: 0 4px;
+  font-size: 13px;
+  line-height: 1;
+  margin-left: 6px;
+  border-radius: var(--radius-xs);
+  transition: color 0.14s ease;
+}
+
+.toast-dismiss-btn:hover {
+  color: var(--ink-primary);
+}
