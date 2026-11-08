@@ -27,15 +27,23 @@ async function main() {
 
   console.log('\n✅ Import Completed!');
   console.log(`- Total Items Scanned:  ${result.totalProcessed}`);
-  console.log(`- Reels Imported:       ${result.reelsImported}`);
+  console.log(`- Newly Imported Reels: ${result.reelsImported}`);
+  console.log(`- Already in Library:   ${result.alreadyPresent}`);
   console.log(`- Creators Added:       ${result.creatorsAdded}`);
   console.log(`- Skipped / Non-reels:  ${result.skipped}`);
 
   if (result.errors.length > 0) {
     console.log('\n⚠️ Errors encountered during import:');
     result.errors.forEach(e => console.log(`  • ${e}`));
+    if (result.reelsImported === 0 && result.alreadyPresent === 0) {
+      console.error('\n❌ Import failed: No reels could be imported.');
+      process.exit(1);
+    }
   }
   console.log('================================================================\n');
 }
 
-main().catch(console.error);
+main().catch(err => {
+  console.error('Fatal import error:', err);
+  process.exit(1);
+});

@@ -4,7 +4,8 @@ import type {
   ReelQueryFilters,
   LibraryStats,
   WatchStatus,
-  DateFilterPreset
+  DateFilterPreset,
+  BatchReelsResult
 } from '../types.ts';
 import { getSupabase, isSupabaseConfigured } from './client.ts';
 
@@ -67,7 +68,7 @@ class InMemoryStore {
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
     awaiting_reminder_choice_until?: string | null;
-  }): Promise<SavedReel> {
+  }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean }): Promise<SavedReel | null> {
     let existing: SavedReel | undefined;
     for (const r of this.reels.values()) {
       if (r.instagram_media_id === data.instagram_media_id || r.shortcode === data.shortcode) {
@@ -77,7 +78,11 @@ class InMemoryStore {
     }
 
     const now = new Date().toISOString();
+
     if (existing) {
+      if (options?.ignoreDuplicates) {
+        return options.skipReturn ? null : existing;
+      }
       existing.caption = data.caption ?? existing.caption;
       existing.thumbnail_url = data.thumbnail_url ?? existing.thumbnail_url;
       existing.save_order_rank = data.save_order_rank;
@@ -86,7 +91,7 @@ class InMemoryStore {
       if (data.awaiting_reminder_choice_until !== undefined) existing.awaiting_reminder_choice_until = data.awaiting_reminder_choice_until;
       if (data.reminder_interval_hours) existing.reminder_interval_hours = data.reminder_interval_hours;
       existing.updated_at = now;
-      return existing;
+      return options?.skipReturn ? null : existing;
     }
 
     const newReel: SavedReel = {
@@ -116,7 +121,72 @@ class InMemoryStore {
     };
 
     this.reels.set(newReel.id, newReel);
-    return newReel;
+    return options?.skipReturn ? null : newReel;
+  }
+
+  async upsertCreatorsBatch(creators: Array<{
+    instagram_user_id: string;
+    username: string;
+    display_name?: string | null;
+    profile_picture_url?: string | null;
+  }>): Promise<Map<string, Creator>> {
+    const result = new Map<string, Creator>();
+    for (const c of creators) {
+      const creator = await this.upsertCreator(c);
+      result.set(creator.username, creator);
+    }
+    return result;
+  }
+
+  async upsertSavedReelsBatch(reels: Array<{
+    instagram_media_id: string;
+    shortcode: string;
+    reel_url: string;
+    creator_id: string;
+    caption?: string | null;
+    thumbnail_url?: string | null;
+    taken_at: string;
+    saved_at?: string | null;
+    first_detected_at: string;
+    save_order_rank: number;
+    watch_status?: WatchStatus;
+    duration_seconds?: number | null;
+    reminder_interval_hours?: number | null;
+    reminder_interval_seconds?: number | null;
+    next_reminder_at?: string | null;
+    awaiting_reminder_choice_until?: string | null;
+    is_saved_on_instagram?: boolean;
+    instagram_sender_id?: string | null;
+  }>, options?: { ignoreDuplicates?: boolean }): Promise<BatchReelsResult> {
+    let newlyImported = 0;
+    let alreadyPresent = 0;
+    let failedCount = 0;
+    const failedShortcodes: string[] = [];
+
+    for (const r of reels) {
+      try {
+        let existing: SavedReel | undefined;
+        for (const existingReel of this.reels.values()) {
+          if (existingReel.instagram_media_id === r.instagram_media_id || existingReel.shortcode === r.shortcode) {
+            existing = existingReel;
+            break;
+          }
+        }
+
+        if (existing && options?.ignoreDuplicates) {
+          alreadyPresent++;
+          continue;
+        }
+
+        await this.upsertSavedReel(r, { ignoreDuplicates: options?.ignoreDuplicates, skipReturn: true });
+        newlyImported++;
+      } catch (err: any) {
+        failedCount++;
+        failedShortcodes.push(r.shortcode);
+      }
+    }
+
+    return { newlyImported, alreadyPresent, failedCount, failedShortcodes };
   }
 
   async getReels(filters: ReelQueryFilters) {
@@ -345,14 +415,14 @@ export class Repository {
     awaiting_reminder_choice_until?: string | null;
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
-  }): Promise<SavedReel> {
+  }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean }): Promise<SavedReel | null> {
     if (!isSupabaseConfigured()) {
-      return memoryStore.upsertSavedReel(data);
+      return memoryStore.upsertSavedReel(data, options);
     }
 
     const supabase = getSupabase();
     const intervalSeconds = data.reminder_interval_seconds ?? (data.reminder_interval_hours ? data.reminder_interval_hours * 3600 : 36000);
-    const { data: reel, error } = await supabase
+    const query = supabase
       .from('saved_reels')
       .upsert(
         {
@@ -376,16 +446,217 @@ export class Repository {
           instagram_sender_id: data.instagram_sender_id,
           updated_at: new Date().toISOString(),
         },
-        { onConflict: 'instagram_media_id' }
-      )
-      .select('*, creator:creators(*)')
-      .single();
+        { onConflict: 'instagram_media_id', ignoreDuplicates: options?.ignoreDuplicates ?? false }
+      );
 
-    if (error || !reel) {
-      throw new Error(`Supabase upsertSavedReel failed: ${error?.message || 'unknown error'}`);
+    const { data: reel, error } = options?.skipReturn
+      ? await query
+      : await query.select('*, creator:creators(*)').maybeSingle();
+
+    if (error) {
+      if (
+        options?.ignoreDuplicates &&
+        (error.code === '23505' ||
+          error.message?.includes('duplicate key') ||
+          error.message?.includes('shortcode') ||
+          error.message?.includes('instagram_media_id'))
+      ) {
+        if (options.skipReturn) {
+          return null;
+        }
+        const { data: existing, error: fetchErr } = await supabase
+          .from('saved_reels')
+          .select('*, creator:creators(*)')
+          .or(`instagram_media_id.eq.${data.instagram_media_id},shortcode.eq.${data.shortcode}`)
+          .maybeSingle();
+        if (existing) return existing as SavedReel;
+        if (fetchErr) throw new Error(`Supabase fetch conflicting reel failed: ${fetchErr.message}`);
+      }
+      throw new Error(`Supabase upsertSavedReel failed: ${error.message}`);
+    }
+
+    if (options?.skipReturn) {
+      return null;
+    }
+
+    if (!reel && options?.ignoreDuplicates) {
+      const { data: existing, error: fetchErr } = await supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .or(`instagram_media_id.eq.${data.instagram_media_id},shortcode.eq.${data.shortcode}`)
+        .maybeSingle();
+      if (existing) return existing as SavedReel;
+      if (fetchErr) throw new Error(`Supabase fetch existing reel failed: ${fetchErr.message}`);
+    }
+
+    if (!reel) {
+      throw new Error('Supabase upsertSavedReel returned no record');
     }
 
     return reel as SavedReel;
+  }
+
+  static async upsertCreatorsBatch(creators: Array<{
+    instagram_user_id: string;
+    username: string;
+    display_name?: string | null;
+    profile_picture_url?: string | null;
+  }>): Promise<Map<string, Creator>> {
+    if (!isSupabaseConfigured()) {
+      return memoryStore.upsertCreatorsBatch(creators);
+    }
+
+    const supabase = getSupabase();
+    const result = new Map<string, Creator>();
+    const CHUNK_SIZE = 400;
+
+    for (let i = 0; i < creators.length; i += CHUNK_SIZE) {
+      const chunk = creators.slice(i, i + CHUNK_SIZE).map(c => ({
+        instagram_user_id: c.instagram_user_id,
+        username: c.username,
+        display_name: c.display_name,
+        profile_picture_url: c.profile_picture_url,
+        updated_at: new Date().toISOString(),
+      }));
+
+      const { data, error } = await supabase
+        .from('creators')
+        .upsert(chunk, { onConflict: 'instagram_user_id' })
+        .select();
+
+      if (error) {
+        for (const c of chunk) {
+          try {
+            const single = await this.upsertCreator(c);
+            result.set(single.username, single);
+          } catch (err: any) {
+            console.error(`[Repository] Failed to upsert creator ${c.username}:`, err.message);
+          }
+        }
+      } else if (data) {
+        for (const c of data) {
+          result.set(c.username, c as Creator);
+        }
+      }
+    }
+
+    return result;
+  }
+
+  static async upsertSavedReelsBatch(reels: Array<{
+    instagram_media_id: string;
+    shortcode: string;
+    reel_url: string;
+    creator_id: string;
+    caption?: string | null;
+    thumbnail_url?: string | null;
+    taken_at: string;
+    saved_at?: string | null;
+    first_detected_at: string;
+    save_order_rank: number;
+    watch_status?: WatchStatus;
+    duration_seconds?: number | null;
+    reminder_interval_hours?: number | null;
+    reminder_interval_seconds?: number | null;
+    next_reminder_at?: string | null;
+    awaiting_reminder_choice_until?: string | null;
+    is_saved_on_instagram?: boolean;
+    instagram_sender_id?: string | null;
+  }>, options?: { ignoreDuplicates?: boolean }): Promise<BatchReelsResult> {
+    if (!isSupabaseConfigured()) {
+      return memoryStore.upsertSavedReelsBatch(reels, options);
+    }
+
+    const supabase = getSupabase();
+    let newlyImported = 0;
+    let alreadyPresent = 0;
+    let failedCount = 0;
+    const failedShortcodes: string[] = [];
+
+    let reelsToInsert = reels;
+
+    if (options?.ignoreDuplicates) {
+      const existingShortcodes = new Set<string>();
+      const allShortcodes = Array.from(new Set(reels.map(r => r.shortcode)));
+      const LOOKUP_CHUNK = 500;
+
+      for (let i = 0; i < allShortcodes.length; i += LOOKUP_CHUNK) {
+        const slice = allShortcodes.slice(i, i + LOOKUP_CHUNK);
+        const { data: matched, error } = await supabase
+          .from('saved_reels')
+          .select('shortcode')
+          .in('shortcode', slice);
+
+        if (error) {
+          throw new Error(`Failed to query existing shortcodes: ${error.message}`);
+        }
+        if (matched) {
+          for (const row of matched) {
+            existingShortcodes.add(row.shortcode);
+          }
+        }
+      }
+
+      const freshReels: typeof reels = [];
+      for (const r of reels) {
+        if (existingShortcodes.has(r.shortcode)) {
+          alreadyPresent++;
+        } else {
+          freshReels.push(r);
+        }
+      }
+      reelsToInsert = freshReels;
+    }
+
+    const CHUNK_SIZE = 300;
+    for (let i = 0; i < reelsToInsert.length; i += CHUNK_SIZE) {
+      const chunk = reelsToInsert.slice(i, i + CHUNK_SIZE).map(r => {
+        const intervalSeconds = r.reminder_interval_seconds ?? (r.reminder_interval_hours ? r.reminder_interval_hours * 3600 : 36000);
+        return {
+          instagram_media_id: r.instagram_media_id,
+          shortcode: r.shortcode,
+          reel_url: r.reel_url,
+          creator_id: r.creator_id,
+          caption: r.caption,
+          thumbnail_url: r.thumbnail_url,
+          taken_at: r.taken_at,
+          saved_at: r.saved_at,
+          first_detected_at: r.first_detected_at,
+          save_order_rank: r.save_order_rank,
+          watch_status: r.watch_status || 'unwatched',
+          duration_seconds: r.duration_seconds,
+          reminder_interval_hours: Math.round(intervalSeconds / 3600),
+          reminder_interval_seconds: intervalSeconds,
+          next_reminder_at: r.next_reminder_at,
+          awaiting_reminder_choice_until: r.awaiting_reminder_choice_until ?? null,
+          is_saved_on_instagram: r.is_saved_on_instagram ?? true,
+          instagram_sender_id: r.instagram_sender_id,
+          updated_at: new Date().toISOString(),
+        };
+      });
+
+      const { error } = await supabase
+        .from('saved_reels')
+        .upsert(chunk, { onConflict: 'instagram_media_id', ignoreDuplicates: options?.ignoreDuplicates ?? false });
+
+      if (error) {
+        console.warn(`[Repository] Batch upsert chunk notice (${error.message}), falling back to item-by-item...`);
+        for (const item of chunk) {
+          try {
+            await this.upsertSavedReel(item, { ignoreDuplicates: options?.ignoreDuplicates, skipReturn: true });
+            newlyImported++;
+          } catch (itemErr: any) {
+            console.error(`[Repository] Failed to upsert reel ${item.shortcode}:`, itemErr.message);
+            failedCount++;
+            failedShortcodes.push(item.shortcode);
+          }
+        }
+      } else {
+        newlyImported += chunk.length;
+      }
+    }
+
+    return { newlyImported, alreadyPresent, failedCount, failedShortcodes };
   }
 
   static async getReelsDueForReminder(): Promise<SavedReel[]> {
