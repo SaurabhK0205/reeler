@@ -5,8 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Reeler — Saved Reels Vault</title>
   <link rel="stylesheet" href="style.css?v=2.0">
-  <!-- Official Instagram Embed Script for In-App Native Reel Playback -->
-  <script async defer src="https://www.instagram.com/embed.js"></script>
 </head>
 <body>
   <div class="app-layout">
@@ -26,7 +24,7 @@
           </svg>
         </div>
         <div class="vault-identity">
-          <div class="vault-brand">REELER</div>
+          <h1 class="vault-brand">REELER</h1>
           <div class="vault-tag">Personal Saved Reels Vault</div>
         </div>
       </div>
@@ -52,6 +50,7 @@
     <div class="vault-container">
       <!-- Stats Overview Bar -->
       <section class="stats-bar" aria-label="Library Overview">
+        <h2 class="sr-only">Library Overview</h2>
         <div class="metric-cell">
           <span class="metric-label">TOTAL REELS</span>
           <span class="metric-num" id="stat-total">0</span>
@@ -145,7 +144,7 @@
       <!-- Creator Quick-Filter Strip -->
       <section class="creators-strip-container" aria-label="Filter by creator">
         <div class="strip-header">
-          <span class="strip-caption">TOP CREATORS</span>
+          <h2 class="strip-caption">TOP CREATORS</h2>
           <button id="reset-creator-btn" class="strip-reset-btn" style="display: none;">Show All</button>
         </div>
         <div class="creators-scroll-track" id="creator-pills-list">
@@ -155,8 +154,9 @@
 
       <!-- Main Reels Presentation View -->
       <main class="library-main">
+        <h2 class="sr-only">Saved Reels Catalog</h2>
         <div class="library-header-meta">
-          <div id="results-count" class="results-counter">Loading reels...</div>
+          <div id="results-count" class="results-counter" aria-live="polite">Loading reels...</div>
         </div>
 
         <!-- Visual Poster Grid Container -->
@@ -199,9 +199,10 @@
     </div>
 
     <!-- Fullscreen Instagram Reels / TikTok Style Vertical Snap-Feed -->
-    <div id="reels-feed-modal" class="reels-feed-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Reels Vertical Stream">
+    <div id="reels-feed-modal" class="reels-feed-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="feed-modal-title">
       <!-- Top HUD Bar -->
       <div class="feed-top-bar">
+        <h2 class="sr-only" id="feed-modal-title">Reels Vertical Stream</h2>
         <div class="feed-counter-wrap">
           <span class="feed-counter-kicker" id="feed-counter-kicker">REEL 1 OF 1</span>
           <span class="feed-shortcode-tag" id="feed-shortcode-tag">ID: ...</span>

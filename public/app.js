@@ -287,7 +287,8 @@ function renderReels() {
     const initial = (creatorName.replace(/[^a-zA-Z0-9]/g, '')[0] || 'R').toUpperCase();
     const dateFormatted = formatRelativeDate(reel.taken_at || reel.saved_at);
     const isWatchLater = reel.watch_status === 'watch_later';
-    const hasRealThumbnail = reel.thumbnail_url && !reel.thumbnail_url.includes('photo-1618005182384');
+    const cleanThumbnail = sanitizeMediaUrl(reel.thumbnail_url);
+    const hasRealThumbnail = cleanThumbnail && !cleanThumbnail.includes('photo-1618005182384');
 
     // 1. Render Grid Poster Card
     const card = document.createElement('div');
@@ -300,7 +301,7 @@ function renderReels() {
     let posterArtHtml = '';
     if (hasRealThumbnail) {
       posterArtHtml = `
-        <img class="poster-actual-img" src="${reel.thumbnail_url}" alt="Reel thumbnail" loading="lazy" />
+        <img class="poster-actual-img" src="${cleanThumbnail}" alt="Reel thumbnail by @${safeCreator}" loading="lazy" onerror="this.style.display='none';" />
         <div class="poster-top-scrim"></div>
         <div class="poster-bottom-scrim"></div>
       `;
@@ -501,7 +502,8 @@ function renderFeedSlides() {
     const initial = (creatorName.replace(/[^a-zA-Z0-9]/g, '')[0] || 'R').toUpperCase();
     const isWatchLater = reel.watch_status === 'watch_later';
     const isWatched = reel.watch_status === 'watched';
-    const hasRealThumbnail = reel.thumbnail_url && !reel.thumbnail_url.includes('photo-1618005182384');
+    const cleanThumbnail = sanitizeMediaUrl(reel.thumbnail_url);
+    const hasRealThumbnail = cleanThumbnail && !cleanThumbnail.includes('photo-1618005182384');
     const dateFormatted = formatRelativeDate(reel.taken_at || reel.saved_at);
     const captionText = reel.caption || 'No caption available for this reel.';
 
@@ -512,7 +514,7 @@ function renderFeedSlides() {
 
     let underlayHtml = '';
     if (hasRealThumbnail) {
-      underlayHtml = `<div class="reel-poster-underlay" style="background-image: url('${reel.thumbnail_url}');"></div>`;
+      underlayHtml = `<div class="reel-poster-underlay" style="background-image: url('${cleanThumbnail}');"></div>`;
     } else {
       underlayHtml = `
         <div class="reel-monogram-underlay">
@@ -808,6 +810,45 @@ function escapeHtml(str) {
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+/**
+ * Decodes raw &amp; HTML entities in media URLs to prevent CDN query parameter corruption.
+ * @param {string} url
+ * @returns {string}
+ */
+function sanitizeMediaUrl(url) {
+  if (!url) return '';
+  return String(url).replace(/&amp;/g, '&');
+}
+
+/**
+ * Dispatches an obsidian dark-mode toast notification with auto-dismiss.
+ * @param {string} message
+ * @param {'info' | 'success' | 'error'} type
+ */
+function showToast(message, type = 'info') {
+  let toastContainer = document.getElementById('vault-toast-container');
+  if (!toastContainer) {
+    toastContainer = document.createElement('div');
+    toastContainer.id = 'vault-toast-container';
+    toastContainer.className = 'vault-toast-container';
+    toastContainer.setAttribute('role', 'status');
+    toastContainer.setAttribute('aria-live', 'polite');
+    document.body.appendChild(toastContainer);
+  }
+  const toast = document.createElement('div');
+  toast.className = `vault-toast vault-toast-${type}`;
+  toast.innerHTML = `
+    <span class="toast-dot" aria-hidden="true"></span>
+    <span class="toast-msg">${escapeHtml(message).replace(/\n/g, '<br>')}</span>
+  `;
+  toastContainer.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add('visible'));
+  setTimeout(() => {
+    toast.classList.remove('visible');
+    setTimeout(() => toast.remove(), 250);
+  }, 4500);
+}
+
 // Event Listeners
 
 /**
@@ -831,7 +872,10 @@ function setupEventListeners() {
       e.preventDefault();
       closeReelsFeed();
     } else if (e.key === 'Tab') {
-      const focusables = feedModal.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])');
+      const activeSlide = feedScrollTrack.querySelector(`.feed-reel-slide[data-index="${state.currentFeedIndex}"]`);
+      const topBarControls = Array.from(feedModal.querySelectorAll('.feed-top-bar button:not([disabled])'));
+      const slideControls = activeSlide ? Array.from(activeSlide.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])')) : [];
+      const focusables = [...topBarControls, ...slideControls];
       if (!focusables.length) return;
       const first = focusables[0];
       const last = focusables[focusables.length - 1];
@@ -920,7 +964,7 @@ function setupEventListeners() {
 
     const MAX_FILE_SIZE = 50 * 1024 * 1024;
     if (file.size > MAX_FILE_SIZE) {
-      alert(`File is too large (${(file.size / (1024 * 1024)).toFixed(1)}MB). Max allowed size is 50MB.`);
+      showToast(`File is too large (${(file.size / (1024 * 1024)).toFixed(1)}MB). Max allowed size is 50MB.`, 'error');
       archiveFileInput.value = '';
       return;
     }
@@ -942,16 +986,16 @@ function setupEventListeners() {
 
       if (!res.ok) {
         const errorMsg = data?.error || data?.errors?.join('\n') || `Server responded with status ${res.status}`;
-        alert(`Import error: ${errorMsg}`);
+        showToast(`Import error: ${errorMsg}`, 'error');
         return;
       }
 
       const imported = data?.reelsImported ?? 0;
       const alreadyIn = data?.alreadyPresent ?? 0;
-      alert(`Archive processed!\n\n• New reels imported: ${imported}\n• Already present: ${alreadyIn}`);
+      showToast(`Archive processed!\n• New reels imported: ${imported}\n• Already present: ${alreadyIn}`, 'success');
       await Promise.all([loadStats(), loadCreators(), fetchReels()]);
     } catch (err) {
-      alert(`Import failed: ${err.message}`);
+      showToast(`Import failed: ${err.message}`, 'error');
     } finally {
       archiveFileInput.value = '';
       importBtn.innerHTML = originalContent;

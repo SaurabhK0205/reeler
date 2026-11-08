@@ -22,7 +22,8 @@
   --ink-primary: #ffffff;
   --ink-secondary: #e2e8f0;
   --ink-muted: #94a3b8;
-  --ink-subtle: #64748b;
+  --ink-subtle: #8493a8;
+  --ink: #e2e8f0;
 
   /* Semantic Accents */
   --accent-linear: #5e6ad2;
@@ -99,6 +100,19 @@ body {
   outline-offset: 1px;
 }
 
+/* Accessibility Landmark Utility */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* Top Navigation */
 .top-nav {
   height: 52px;
@@ -138,10 +152,12 @@ body {
 }
 
 .vault-brand {
+  margin: 0;
   font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.08em;
   color: #ffffff;
+  line-height: 1;
 }
 
 .vault-tag {
@@ -415,10 +431,12 @@ body {
 }
 
 .strip-caption {
+  margin: 0;
   font-size: 11px;
   font-weight: 650;
   color: var(--ink-muted);
   letter-spacing: 0.08em;
+  line-height: 1;
 }
 
 .strip-reset-btn {
@@ -1162,15 +1180,21 @@ body {
   height: 100%;
   overflow: hidden;
   background: #000000;
+  border-radius: 12px;
   z-index: 2;
 }
 
 .reel-iframe-container iframe {
+  position: absolute;
   width: 100%;
   height: 100%;
+  top: -75px;
+  left: 0;
   border: none;
   background: #000000;
   display: block;
+  transform: scale(1.42);
+  transform-origin: center top;
 }
 
 /* Bottom-Left Overlay Details */
@@ -1238,19 +1262,21 @@ body {
 
 .reel-caption-wrap {
   position: relative;
-  background: rgba(1, 1, 2, 0.75);
-  backdrop-filter: blur(14px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(1, 1, 2, 0.82);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
   max-width: 100%;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
 }
 
 .reel-caption-text {
   margin: 0;
   font-size: 12px;
   line-height: 1.45;
-  color: var(--ink);
+  color: var(--ink-secondary);
   overflow: hidden;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -1336,7 +1362,7 @@ body {
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
 }
 
-@media (max-width: 600px) {
+@media (max-width: 680px) {
   .feed-reel-slide {
     padding: 50px 8px 16px;
   }
@@ -1418,4 +1444,58 @@ kbd {
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
     gap: 10px;
   }
+}
+
+/* Obsidian Cinematic Toast Notification System */
+.vault-toast-container {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: none;
+}
+
+.vault-toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: rgba(14, 16, 23, 0.95);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
+  font-size: 13px;
+  color: var(--ink-primary);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.85);
+  opacity: 0;
+  transform: translateY(12px);
+  transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  max-width: 380px;
+}
+
+.vault-toast.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.vault-toast .toast-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-top: 5px;
+  flex-shrink: 0;
+  background: var(--accent-linear);
+}
+
+.vault-toast-success .toast-dot {
+  background: var(--status-watched);
+}
+
+.vault-toast-error .toast-dot {
+  background: #ff4757;
 }
