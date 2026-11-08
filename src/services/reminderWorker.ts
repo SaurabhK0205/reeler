@@ -14,9 +14,12 @@ export class ReminderWorker {
   private reminderInterval: NodeJS.Timeout | null = null;
   private adminThreadId: string | null = null;
   private adminUserId: string | null = null;
+  private isDispatching = false;
+  private failedReelSuppression = new Map<string, number>();
 
-  constructor() {}
-
+  /**
+   * Starts the background DM polling and reminder dispatch loops.
+   */
   start() {
     const config = loadConfig();
     if (!config.instagram.isConfigured) {
@@ -47,6 +50,9 @@ export class ReminderWorker {
     }, 3000);
   }
 
+  /**
+   * Stops background polling and interval timers cleanly.
+   */
   stop() {
     this.isRunning = false;
     if (this.dmInterval) clearInterval(this.dmInterval);
@@ -166,17 +172,38 @@ export class ReminderWorker {
    * Dispatches reminders for any Reels that are due.
    */
   async checkDueReminders() {
-    const dueReels = await Repository.getReelsDueForReminder();
-    if (dueReels.length === 0) return;
+    if (this.isDispatching) {
+      console.log('[ReminderWorker] Reminder dispatch already in progress, skipping tick.');
+      return;
+    }
+    this.isDispatching = true;
 
-    const config = loadConfig();
-    const intervalHours = config.reminders.defaultIntervalHours;
+    try {
+      const allDueReels = await Repository.getReelsDueForReminder();
+      if (allDueReels.length === 0) return;
 
-    console.log(`[ReminderWorker] 🔔 Found ${dueReels.length} Reel(s) due for reminder.`);
+      const now = Date.now();
+      // Clean up expired entries in the suppression map
+      for (const [id, expireTime] of this.failedReelSuppression.entries()) {
+        if (now >= expireTime) {
+          this.failedReelSuppression.delete(id);
+        }
+      }
 
-    for (const reel of dueReels) {
-      // 1. Send via Official Meta Instagram DM
-      if (reel.instagram_sender_id && this.metaBot.isConfigured) {
+      // Filter out temporarily suppressed reels whose persistence failed
+      const eligibleReels = allDueReels.filter((r) => !this.failedReelSuppression.has(r.id));
+      if (eligibleReels.length === 0) return;
+
+      // Limit batch size per dispatch tick to avoid unbounded execution latency
+      const BATCH_LIMIT = 10;
+      const dueReels = eligibleReels.slice(0, BATCH_LIMIT);
+
+      const config = loadConfig();
+      const intervalHours = config.reminders.defaultIntervalHours;
+
+      console.log(`[ReminderWorker] 🔔 Found ${allDueReels.length} Reel(s) due for reminder (dispatching batch of ${dueReels.length}).`);
+
+      for (const reel of dueReels) {
         const creatorTag =
           reel.creator && reel.creator.username && reel.creator.username !== 'instagram_creator'
             ? `@${reel.creator.username}`
@@ -184,25 +211,69 @@ export class ReminderWorker {
         const rawCaption = reel.caption ? reel.caption.slice(0, 70).replace(/\n/g, ' ') : '';
         const captionPreview = rawCaption ? `"${rawCaption}..."\n` : '';
         const reminderText = `🔔 Watch Later Reminder!\n\n🎬 ${creatorTag}\n${captionPreview}👉 ${reel.reel_url}\n\nReply "watched" when done, or reply e.g. "5m" or "snooze 1h" to delay!`;
-        console.log(`[ReminderWorker] 🔔 Dispatching Instagram DM reminder to ${reel.instagram_sender_id}...`);
-        await this.metaBot.sendDirectMessage(reel.instagram_sender_id, reminderText);
-      }
 
-      // Calculate next reminder date:
-      // A short interval (< 1 hour, like 5s, 30s, 10m) is a one-time reminder: DO NOT repeat automatically!
-      // Setting next_reminder_at to null prevents spamming every 5 seconds.
-      // If the user wants another reminder, they can reply e.g. "5m" or "1h" to snooze it.
-      const intervalSec = reel.reminder_interval_seconds ?? (reel.reminder_interval_hours ? reel.reminder_interval_hours * 3600 : intervalHours * 3600);
-      let nextDate: string | null = null;
-      if (intervalSec >= 3600) {
-        // For long intervals (>= 1 hour), send a gentle daily reminder (24h later) rather than tight loops
-        nextDate = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
-      } else {
-        // One-time reminder delivered! Stop until explicitly snoozed by the user.
-        nextDate = null;
-      }
+        let delivered = false;
 
-      await Repository.recordReminderSent(reel.id, nextDate);
+        try {
+          if (reel.instagram_sender_id && this.metaBot.isConfigured) {
+            console.log(`[ReminderWorker] 🔔 Dispatching Instagram DM reminder to ${reel.instagram_sender_id}...`);
+            delivered = await this.metaBot.sendDirectMessage(reel.instagram_sender_id, reminderText);
+          } else if (!reel.instagram_sender_id && this.adminUserId && config.instagram.isConfigured) {
+            // Supported delivery fallback for legacy or unattributed sender reels
+            console.log(`[ReminderWorker] 🔔 Dispatching fallback reminder to admin (${this.adminUserId})...`);
+            const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reminderText);
+            delivered = sendResult.success && sendResult.data === true;
+          } else {
+            console.warn(`[ReminderWorker] ⚠️ No active delivery channel or recipient found for reel ${reel.shortcode}.`);
+          }
+        } catch (err: any) {
+          console.error(`[ReminderWorker] Delivery error for reel ${reel.shortcode}:`, err.message || err);
+          delivered = false;
+        }
+
+        if (delivered) {
+          // Calculate next reminder date only after confirmed delivery:
+          // Short intervals (< 1 hour) are one-time reminders (next_reminder_at = null)
+          // Longer intervals (>= 1 hour) repeat with a gentle 24-hour cadence
+          const intervalSec = reel.reminder_interval_seconds ?? (reel.reminder_interval_hours ? reel.reminder_interval_hours * 3600 : intervalHours * 3600);
+          let nextDate: string | null = null;
+          if (intervalSec >= 3600) {
+            nextDate = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+          } else {
+            nextDate = null;
+          }
+
+          try {
+            await Repository.recordReminderSent(reel.id, nextDate);
+          } catch (err: any) {
+            console.error(`[ReminderWorker] Failed to record reminder for reel ${reel.shortcode}:`, err.message || err);
+            // Suppress repeated sending in memory for 5 minutes if DB recording fails
+            if (this.failedReelSuppression.size >= 1000) {
+              const firstKey = this.failedReelSuppression.keys().next().value;
+              if (firstKey) this.failedReelSuppression.delete(firstKey);
+            }
+            this.failedReelSuppression.set(reel.id, Date.now() + 5 * 60 * 1000);
+
+            // Attempt fallback backoff in DB to prevent immediate resends on next run
+            try {
+              await Repository.updateReminderSchedule(reel.id, new Date(Date.now() + 5 * 60 * 1000).toISOString());
+            } catch (fallbackErr: any) {
+              console.error(`[ReminderWorker] Fallback backoff failed for reel ${reel.shortcode}:`, fallbackErr.message || fallbackErr);
+            }
+          }
+        } else {
+          // On delivery failure, retain reminder and back off 5 minutes before retrying
+          const retryDate = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+          console.warn(`[ReminderWorker] Delivery for reel ${reel.shortcode} failed. Backing off until ${retryDate}.`);
+          try {
+            await Repository.updateReminderSchedule(reel.id, retryDate);
+          } catch (err: any) {
+            console.error(`[ReminderWorker] Failed to schedule retry for reel ${reel.shortcode}:`, err.message || err);
+          }
+        }
+      }
+    } finally {
+      this.isDispatching = false;
     }
   }
 

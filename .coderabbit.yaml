@@ -76,7 +76,7 @@ reviews:
     # 4. Utilities & Parsers
     - path: "src/utils/**"
       instructions: |
-        - DURATION & DATE REUSE: All natural language duration and date calculations must strictly use `src/utils/duration.ts` (`parseDurationOrDateInput`). Flag and reject any redundant or ad-hoc date parsing.
+        - DURATION & DATE REUSE: All natural language duration and date calculations must strictly use `src/utils/duration.ts` (`parseDuration`). Flag and reject any redundant or ad-hoc date parsing.
         - CREATOR EXTRACTION: Username extraction from chat must strictly use `src/utils/creatorQuery.ts` (`extractCreatorQuery`). Ensure reserved words (greetings, durations, commands) are not falsely parsed as creator handles.
         - DETERMINISM: Utility functions must be pure, deterministic, and handle malformed, empty, or unexpected input safely without throwing unhandled exceptions.
 

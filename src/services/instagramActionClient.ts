@@ -21,6 +21,7 @@ export interface InboundMessage {
 export class InstagramActionClient {
   private baseUrl = 'https://www.instagram.com';
   private igAppId = '936619743392459'; // Instagram Web Client App ID
+  private static readonly REQUEST_TIMEOUT_MS = 10000;
 
   private getHeaders(): Record<string, string> {
     const config = loadConfig();
@@ -59,6 +60,7 @@ export class InstagramActionClient {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         body: '',
+        signal: AbortSignal.timeout(InstagramActionClient.REQUEST_TIMEOUT_MS),
       });
 
       if (!response.ok) {
@@ -94,6 +96,7 @@ export class InstagramActionClient {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         body: params.toString(),
+        signal: AbortSignal.timeout(InstagramActionClient.REQUEST_TIMEOUT_MS),
       });
 
       if (!response.ok) {
@@ -115,6 +118,7 @@ export class InstagramActionClient {
       const url = `${this.baseUrl}/api/v1/direct_v2/threads/${threadId}/`;
       const response = await fetch(url, {
         headers: this.getHeaders(),
+        signal: AbortSignal.timeout(InstagramActionClient.REQUEST_TIMEOUT_MS),
       });
 
       if (!response.ok) {
@@ -181,6 +185,7 @@ export class InstagramActionClient {
       const url = `${this.baseUrl}/api/v1/direct_v2/inbox/?persistentBadging=true&folder=&limit=20`;
       const response = await fetch(url, {
         headers: this.getHeaders(),
+        signal: AbortSignal.timeout(InstagramActionClient.REQUEST_TIMEOUT_MS),
       });
 
       if (!response.ok) {
