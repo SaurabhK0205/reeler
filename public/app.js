@@ -592,7 +592,6 @@ function renderFeedSlides() {
       if (watchedBtn) {
         const newStatus = reel.watch_status === 'watched' ? 'unwatched' : 'watched';
         await updateReelStatus(reel.id, newStatus);
-        syncFeedSlideStatus(reel.id, newStatus);
         return;
       }
 
@@ -600,7 +599,6 @@ function renderFeedSlides() {
       if (laterBtn) {
         const newStatus = reel.watch_status === 'watch_later' ? 'unwatched' : 'watch_later';
         await updateReelStatus(reel.id, newStatus);
-        syncFeedSlideStatus(reel.id, newStatus);
         return;
       }
 
@@ -832,6 +830,21 @@ function setupEventListeners() {
     if (e.key === 'Escape') {
       e.preventDefault();
       closeReelsFeed();
+    } else if (e.key === 'Tab') {
+      const focusables = feedModal.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])');
+      if (!focusables.length) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (!feedModal.contains(document.activeElement)) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      } else if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
     } else if (e.key === 'ArrowDown' || e.key === 'j' || e.key === 'PageDown') {
       e.preventDefault();
       scrollFeedBy(1);

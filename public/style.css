@@ -964,13 +964,16 @@ body {
   flex-direction: column;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  visibility: hidden;
+  transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1), visibility 0s linear 0.2s;
   overflow: hidden;
 }
 
 .reels-feed-modal.active {
   opacity: 1;
   pointer-events: auto;
+  visibility: visible;
+  transition-delay: 0s;
 }
 
 /* Top HUD Bar */
@@ -1088,6 +1091,7 @@ body {
   width: 100%;
   max-width: 410px;
   height: min(calc(100vh - 90px), 730px);
+  height: min(calc(100dvh - 90px), 730px);
   display: flex;
   align-items: center;
   justify-content: center;
