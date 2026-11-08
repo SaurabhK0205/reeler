@@ -4,6 +4,7 @@ import { InstagramActionClient } from './instagramActionClient.ts';
 import type { InboundMessage } from './instagramActionClient.ts';
 import { TelegramBotService } from './telegramBotService.ts';
 import { MetaInstagramBotService } from './metaInstagramBotService.ts';
+import { formatTargetTime } from '../utils/duration.ts';
 
 export class ReminderWorker {
   private actionClient = new InstagramActionClient();
@@ -41,10 +42,12 @@ export class ReminderWorker {
       this.pollInboundDMs().catch((err) => console.error('[ReminderWorker] DM poll error:', err.message));
     }, config.reminders.dmPollingIntervalMs);
 
-    // 2. Loop for dispatching due reminders (every 3 seconds for high-precision seconds/minutes reminders)
+    // 2. Loop for dispatching due reminders and checking 10-minute awaiting choice windows
     this.checkDueReminders();
+    this.checkAwaitingChoices();
     this.reminderInterval = setInterval(() => {
       this.checkDueReminders().catch((err) => console.error('[ReminderWorker] Reminder dispatch error:', err.message));
+      this.checkAwaitingChoices().catch((err) => console.error('[ReminderWorker] Choice check error:', err.message));
     }, 3000);
   }
 
@@ -206,6 +209,33 @@ export class ReminderWorker {
       }
 
       await Repository.recordReminderSent(reel.id, nextDate);
+    }
+  }
+
+  /**
+   * Checks for reels whose 10-minute wait window for user reminder input has elapsed.
+   * If the user didn't specify a time within 10 minutes, automatically sets a default 10-hour reminder
+   * and notifies the user with the exact trigger time!
+   */
+  async checkAwaitingChoices() {
+    const expiredReels = await Repository.getReelsAwaitingChoiceDue();
+    if (expiredReels.length === 0) return;
+
+    const config = loadConfig();
+    const defaultHours = config.reminders.defaultIntervalHours || 10;
+
+    for (const reel of expiredReels) {
+      const { targetTime } = await Repository.activateDefaultReminder(reel.id, defaultHours);
+      const targetStr = formatTargetTime(targetTime);
+
+      const creatorTag = reel.creator ? `@${reel.creator.username}` : 'your reel';
+      const defaultNotice = `⏰ No reminder time received for ${creatorTag} — I've scheduled your reminder for ${defaultHours} hours from now (${targetStr}).\n\nReply e.g. "2h" or "tomorrow 5pm" anytime to change it, or "watched" when done!`;
+
+      console.log(`[ReminderWorker] ⏰ 10-minute wait expired for reel ${reel.shortcode}. Set default ${defaultHours}h reminder (${targetStr}).`);
+
+      if (reel.instagram_sender_id && this.metaBot.isConfigured) {
+        await this.metaBot.sendDirectMessage(reel.instagram_sender_id, defaultNotice);
+      }
     }
   }
 }

@@ -67,6 +67,7 @@ class InMemoryStore {
     is_saved_on_instagram?: boolean;
     telegram_chat_id?: string | null;
     instagram_sender_id?: string | null;
+    awaiting_reminder_choice_until?: string | null;
   }): Promise<SavedReel> {
     let existing: SavedReel | undefined;
     for (const r of this.reels.values()) {
@@ -82,7 +83,8 @@ class InMemoryStore {
       existing.thumbnail_url = data.thumbnail_url ?? existing.thumbnail_url;
       existing.save_order_rank = data.save_order_rank;
       if (data.watch_status) existing.watch_status = data.watch_status;
-      if (data.next_reminder_at) existing.next_reminder_at = data.next_reminder_at;
+      if (data.next_reminder_at !== undefined) existing.next_reminder_at = data.next_reminder_at;
+      if (data.awaiting_reminder_choice_until !== undefined) existing.awaiting_reminder_choice_until = data.awaiting_reminder_choice_until;
       if (data.reminder_interval_hours) existing.reminder_interval_hours = data.reminder_interval_hours;
       existing.updated_at = now;
       return existing;
@@ -105,6 +107,7 @@ class InMemoryStore {
       reminder_interval_hours: data.reminder_interval_hours ?? 10,
       reminders_sent_count: 0,
       next_reminder_at: data.next_reminder_at,
+      awaiting_reminder_choice_until: data.awaiting_reminder_choice_until,
       is_saved_on_instagram: data.is_saved_on_instagram ?? true,
       telegram_chat_id: data.telegram_chat_id,
       instagram_sender_id: data.instagram_sender_id,
@@ -341,6 +344,7 @@ export class Repository {
     reminder_interval_hours?: number | null;
     reminder_interval_seconds?: number | null;
     next_reminder_at?: string | null;
+    awaiting_reminder_choice_until?: string | null;
     is_saved_on_instagram?: boolean;
     telegram_chat_id?: string | null;
     instagram_sender_id?: string | null;
@@ -370,6 +374,7 @@ export class Repository {
           reminder_interval_hours: Math.round(intervalSeconds / 3600),
           reminder_interval_seconds: intervalSeconds,
           next_reminder_at: data.next_reminder_at,
+          awaiting_reminder_choice_until: data.awaiting_reminder_choice_until ?? null,
           is_saved_on_instagram: data.is_saved_on_instagram ?? true,
           telegram_chat_id: data.telegram_chat_id,
           instagram_sender_id: data.instagram_sender_id,
@@ -416,6 +421,7 @@ export class Repository {
       const reel = memoryStore.reels.get(id);
       if (reel) {
         reel.next_reminder_at = nextReminderAt;
+        reel.awaiting_reminder_choice_until = null;
         if (intervalSeconds) {
           reel.reminder_interval_seconds = intervalSeconds;
           reel.reminder_interval_hours = Math.round(intervalSeconds / 3600);
@@ -428,6 +434,7 @@ export class Repository {
     const updatePayload: Record<string, any> = {
       next_reminder_at: nextReminderAt,
       watch_status: 'watch_later',
+      awaiting_reminder_choice_until: null,
       updated_at: now,
     };
     if (intervalSeconds) {
@@ -438,11 +445,33 @@ export class Repository {
     await supabase.from('saved_reels').update(updatePayload).eq('id', id);
   }
 
+  static async getActiveAwaitingReelForSender(senderId: string): Promise<SavedReel | null> {
+    if (!isSupabaseConfigured()) {
+      const match = Array.from(memoryStore.reels.values())
+        .filter(r => r.instagram_sender_id === senderId && r.watch_status === 'watch_later' && r.awaiting_reminder_choice_until)
+        .sort((a, b) => new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime())[0];
+      return match ? { ...match, creator: memoryStore.creators.get(match.creator_id) } : null;
+    }
+
+    const supabase = getSupabase();
+    const { data } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('instagram_sender_id', senderId)
+      .eq('watch_status', 'watch_later')
+      .not('awaiting_reminder_choice_until', 'is', null)
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    return (data as SavedReel) || null;
+  }
+
   static async getLastReelForInstagramSender(senderId: string): Promise<SavedReel | null> {
     if (!isSupabaseConfigured()) {
       const match = Array.from(memoryStore.reels.values())
         .filter(r => r.instagram_sender_id === senderId)
-        .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+        .sort((a, b) => new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime())[0];
       return match || null;
     }
 
@@ -451,7 +480,7 @@ export class Repository {
       .from('saved_reels')
       .select('*, creator:creators(*)')
       .eq('instagram_sender_id', senderId)
-      .order('created_at', { ascending: false })
+      .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle();
 
@@ -460,7 +489,7 @@ export class Repository {
       const { data: fallback } = await supabase
         .from('saved_reels')
         .select('*, creator:creators(*)')
-        .order('created_at', { ascending: false })
+        .order('updated_at', { ascending: false })
         .limit(1)
         .maybeSingle();
       return fallback as SavedReel || null;
@@ -728,6 +757,7 @@ export class Repository {
         if (reel.watch_status === 'watch_later' && (!senderId || reel.instagram_sender_id === senderId)) {
           reel.watch_status = 'watched';
           reel.next_reminder_at = null;
+          reel.awaiting_reminder_choice_until = null;
           reel.updated_at = now;
           updated.push({ ...reel, creator: memoryStore.creators.get(reel.creator_id) });
         }
@@ -749,6 +779,7 @@ export class Repository {
         .update({
           watch_status: 'watched',
           next_reminder_at: null,
+          awaiting_reminder_choice_until: null,
           updated_at: now,
         })
         .eq('instagram_sender_id', senderId)
@@ -771,6 +802,7 @@ export class Repository {
         .update({
           watch_status: 'watched',
           next_reminder_at: null,
+          awaiting_reminder_choice_until: null,
           updated_at: now,
         })
         .eq('id', latest.id);
@@ -778,5 +810,64 @@ export class Repository {
     }
 
     return [];
+  }
+
+  static async getReelsAwaitingChoiceDue(): Promise<SavedReel[]> {
+    const now = new Date().toISOString();
+    if (!isSupabaseConfigured()) {
+      return Array.from(memoryStore.reels.values())
+        .filter(r => r.watch_status === 'watch_later' && r.awaiting_reminder_choice_until && r.awaiting_reminder_choice_until <= now)
+        .map(r => ({ ...r, creator: memoryStore.creators.get(r.creator_id) }));
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('watch_status', 'watch_later')
+      .not('awaiting_reminder_choice_until', 'is', null)
+      .lte('awaiting_reminder_choice_until', now);
+
+    if (error || !data) return [];
+    return data as SavedReel[];
+  }
+
+  static async activateDefaultReminder(id: string, defaultHours: number = 10): Promise<{ reel: SavedReel; targetTime: Date }> {
+    const now = new Date();
+    const targetTime = new Date(now.getTime() + defaultHours * 3600 * 1000);
+    const targetIso = targetTime.toISOString();
+
+    if (!isSupabaseConfigured()) {
+      const reel = memoryStore.reels.get(id);
+      if (reel) {
+        reel.awaiting_reminder_choice_until = null;
+        reel.reminder_interval_hours = defaultHours;
+        reel.reminder_interval_seconds = defaultHours * 3600;
+        reel.next_reminder_at = targetIso;
+        reel.updated_at = now.toISOString();
+        return { reel: { ...reel, creator: memoryStore.creators.get(reel.creator_id) }, targetTime };
+      }
+      throw new Error('Reel not found in memory store');
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .update({
+        awaiting_reminder_choice_until: null,
+        reminder_interval_hours: defaultHours,
+        reminder_interval_seconds: defaultHours * 3600,
+        next_reminder_at: targetIso,
+        updated_at: now.toISOString(),
+      })
+      .eq('id', id)
+      .select('*, creator:creators(*)')
+      .single();
+
+    if (error || !data) {
+      throw new Error(`Failed to activate default reminder: ${error?.message}`);
+    }
+
+    return { reel: data as SavedReel, targetTime };
   }
 }

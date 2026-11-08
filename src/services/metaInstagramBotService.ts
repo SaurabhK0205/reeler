@@ -1,7 +1,7 @@
 import { loadConfig } from '../config.ts';
 import { Repository } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
-import { parseDuration } from '../utils/duration.ts';
+import { parseDuration, formatTargetTime } from '../utils/duration.ts';
 
 export class MetaInstagramBotService {
   private accessToken: string;
@@ -164,10 +164,6 @@ export class MetaInstagramBotService {
       const remaining = text.replace(reelMatch[0], '').trim();
       const customDuration = parseDuration(remaining);
 
-      const durationMs = customDuration ? customDuration.ms : 10 * 3600 * 1000;
-      const durationLabel = customDuration ? customDuration.label : '10 hours';
-      const durationSec = Math.round(durationMs / 1000);
-
       // Fetch public metadata
       const meta = await fetchReelMetadata(shortcode);
       const resolvedUsername = meta.username || 'instagram_creator';
@@ -181,30 +177,56 @@ export class MetaInstagramBotService {
         profile_picture_url: meta.thumbnailUrl || null,
       });
 
-      const nextReminder = new Date(Date.now() + durationMs).toISOString();
+      if (customDuration) {
+        // User provided a specific time along with the reel!
+        const nextReminder = customDuration.targetDate.toISOString();
+        await Repository.upsertSavedReel({
+          instagram_media_id: `shortcode_${shortcode}`,
+          shortcode,
+          reel_url: `https://www.instagram.com/reel/${shortcode}/`,
+          creator_id: creator.id,
+          caption: meta.caption || null,
+          thumbnail_url: meta.thumbnailUrl || null,
+          taken_at: new Date().toISOString(),
+          first_detected_at: new Date().toISOString(),
+          save_order_rank: 1,
+          watch_status: 'watch_later',
+          reminder_interval_seconds: customDuration.seconds,
+          next_reminder_at: nextReminder,
+          awaiting_reminder_choice_until: null,
+          is_saved_on_instagram: true,
+          instagram_sender_id: senderId,
+        });
 
-      // Upsert Saved Reel linked to this Instagram user ID
-      await Repository.upsertSavedReel({
-        instagram_media_id: `shortcode_${shortcode}`,
-        shortcode,
-        reel_url: `https://www.instagram.com/reel/${shortcode}/`,
-        creator_id: creator.id,
-        caption: meta.caption || null,
-        thumbnail_url: meta.thumbnailUrl || null,
-        taken_at: new Date().toISOString(),
-        first_detected_at: new Date().toISOString(),
-        save_order_rank: 1,
-        watch_status: 'watch_later',
-        reminder_interval_seconds: durationSec,
-        next_reminder_at: nextReminder,
-        is_saved_on_instagram: true,
-        instagram_sender_id: senderId,
-      });
+        const reply = `🎬 Added to your Watch Later!\nCreator: @${resolvedUsername}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done!`;
+        await this.sendDirectMessage(senderId, reply);
+      } else {
+        // No time provided — wait up to 10 minutes for user choice before defaulting to 10 hours
+        const awaitingUntil = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+        await Repository.upsertSavedReel({
+          instagram_media_id: `shortcode_${shortcode}`,
+          shortcode,
+          reel_url: `https://www.instagram.com/reel/${shortcode}/`,
+          creator_id: creator.id,
+          caption: meta.caption || null,
+          thumbnail_url: meta.thumbnailUrl || null,
+          taken_at: new Date().toISOString(),
+          first_detected_at: new Date().toISOString(),
+          save_order_rank: 1,
+          watch_status: 'watch_later',
+          reminder_interval_seconds: null,
+          next_reminder_at: null,
+          awaiting_reminder_choice_until: awaitingUntil,
+          is_saved_on_instagram: true,
+          instagram_sender_id: senderId,
+        });
 
-      const targetTimeStr = new Date(nextReminder).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
-      const reply = `🎬 Added to your Watch Later!\nCreator: @${resolvedUsername}\n\n⏰ Reminder set for: ${durationLabel} (at ${targetTimeStr})\n\nReply e.g. "5s", "10m", or "watched" when done!`;
+        const defaultTriggerDate = new Date(Date.now() + (10 * 60 + 10 * 3600) * 1000);
+        const defaultTriggerStr = formatTargetTime(defaultTriggerDate);
 
-      await this.sendDirectMessage(senderId, reply);
+        const reply = `🎬 Added to your Watch Later!\nCreator: @${resolvedUsername}\n\n⏰ When should I remind you to watch this?\nReply with a time (e.g. "30m", "2h", "tomorrow at 5pm", or "remind me in 5 days").\n\n⏳ If you don't reply within 10 mins, I'll automatically set a reminder for 10 hours from now (${defaultTriggerStr})!`;
+        await this.sendDirectMessage(senderId, reply);
+      }
       return;
     }
 
@@ -224,22 +246,25 @@ export class MetaInstagramBotService {
       return;
     }
 
-    // 2. Custom duration command (e.g. "5s", "5 secs", "remind me in 5 secs", "34 mins", "5. hours")
+    // 2. Custom duration command (e.g. "5s", "remind me in 5 days", "tomorrow at 5pm", "12 nov", etc.)
     const customDuration = parseDuration(text);
     if (customDuration) {
-      const lastReel = await Repository.getLastReelForInstagramSender(senderId);
-      if (lastReel) {
-        const nextDate = new Date(Date.now() + customDuration.ms).toISOString();
-        await Repository.updateReminderSchedule(lastReel.id, nextDate, customDuration.seconds);
-        const timeStr = new Date(nextDate).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+      const targetReel =
+        (await Repository.getActiveAwaitingReelForSender(senderId)) ||
+        (await Repository.getLastReelForInstagramSender(senderId));
+
+      if (targetReel) {
+        const nextDate = customDuration.targetDate.toISOString();
+        await Repository.updateReminderSchedule(targetReel.id, nextDate, customDuration.seconds);
+        const creatorTag = targetReel.creator ? `@${targetReel.creator.username}` : targetReel.shortcode;
         await this.sendDirectMessage(
           senderId,
-          `⏰ Reminder updated to: ${customDuration.label}!\nI will ping you at ${timeStr}.`
+          `⏰ Reminder set for ${creatorTag}: ${customDuration.label} (${customDuration.formattedTarget})!\n\nReply "watched" when done.`
         );
       } else {
         await this.sendDirectMessage(
           senderId,
-          `⏰ Got it! Duration set to ${customDuration.label}. Share any Reel to track it!`
+          `⏰ Got it! Duration set to ${customDuration.label} (${customDuration.formattedTarget}). Share any Reel to track it!`
         );
       }
       return;
