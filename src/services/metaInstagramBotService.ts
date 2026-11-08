@@ -90,7 +90,8 @@ export class MetaInstagramBotService {
     const chunks = this.splitMessageIntoChunks(text, 950);
     let allSuccess = true;
 
-    for (const chunk of chunks) {
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
       try {
         const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${this.accessToken}`;
         const res = await fetch(url, {
@@ -107,15 +108,20 @@ export class MetaInstagramBotService {
         if (!res.ok) {
           console.error('[MetaIG] Failed to send DM:', data);
           allSuccess = false;
+          // Stop sending subsequent chunks on failure to avoid out-of-order partial messages
+          break;
         } else {
           console.log(`[MetaIG] DM sent to ${recipientId}: "${chunk.slice(0, 40)}..."`);
         }
       } catch (e: any) {
         console.error('[MetaIG] Error calling Meta messages API:', e.message);
         allSuccess = false;
+        // Stop sending on network or timeout exceptions
+        break;
       }
 
-      if (chunks.length > 1) {
+      // Apply inter-chunk delay only between consecutive chunks, never after the final chunk
+      if (i < chunks.length - 1) {
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
     }
@@ -123,48 +129,86 @@ export class MetaInstagramBotService {
     return allSuccess;
   }
 
-  private splitMessageIntoChunks(text: string, maxLen = 950): string[] {
+  /**
+   * Splits a single continuous block of text into chunks of <= maxLen,
+   * breaking on newline or space where possible, without emitting empty chunks
+   * and handling leading whitespace safely.
+   */
+  private splitSingleBlock(text: string, maxLen: number): string[] {
+    const result: string[] = [];
+    let remaining = text.trim();
+
+    while (remaining.length > 0) {
+      if (remaining.length <= maxLen) {
+        if (remaining.trim()) {
+          result.push(remaining);
+        }
+        break;
+      }
+
+      let splitIdx = remaining.lastIndexOf('\n', maxLen);
+      if (splitIdx === -1 || splitIdx < maxLen / 2) {
+        splitIdx = remaining.lastIndexOf(' ', maxLen);
+      }
+      if (splitIdx <= 0) {
+        splitIdx = maxLen;
+      }
+
+      const chunk = remaining.slice(0, splitIdx).trim();
+      if (chunk) {
+        result.push(chunk);
+      }
+
+      remaining = remaining.slice(splitIdx).replace(/^[\r\n\t ]+/, '');
+    }
+
+    return result;
+  }
+
+  /**
+   * Splits message text into chunks of at most maxLen characters (default 950),
+   * respecting paragraph boundaries where possible to fit Meta Graph API DM limits.
+   */
+  public splitMessageIntoChunks(text: string, maxLen = 950): string[] {
+    if (!text) return [];
     if (text.length <= maxLen) return [text];
 
     const chunks: string[] = [];
     const paragraphs = text.split('\n\n');
     let current = '';
 
-    for (const para of paragraphs) {
+    const flushCurrent = () => {
+      if (!current) return;
+      if (current.length <= maxLen) {
+        chunks.push(current);
+      } else {
+        chunks.push(...this.splitSingleBlock(current, maxLen));
+      }
+      current = '';
+    };
+
+    for (const rawPara of paragraphs) {
+      const para = rawPara.trim();
+      if (!para) continue;
+
+      if (para.length > maxLen) {
+        flushCurrent();
+        chunks.push(...this.splitSingleBlock(para, maxLen));
+        continue;
+      }
+
       if (!current) {
         current = para;
       } else if (current.length + 2 + para.length <= maxLen) {
         current += '\n\n' + para;
       } else {
-        chunks.push(current);
+        flushCurrent();
         current = para;
       }
     }
 
-    if (current) {
-      if (current.length > maxLen) {
-        let remaining = current;
-        while (remaining.length > 0) {
-          if (remaining.length <= maxLen) {
-            chunks.push(remaining);
-            break;
-          }
-          let splitIdx = remaining.lastIndexOf('\n', maxLen);
-          if (splitIdx === -1 || splitIdx < maxLen / 2) {
-            splitIdx = remaining.lastIndexOf(' ', maxLen);
-          }
-          if (splitIdx === -1) {
-            splitIdx = maxLen;
-          }
-          chunks.push(remaining.slice(0, splitIdx).trim());
-          remaining = remaining.slice(splitIdx).trim();
-        }
-      } else {
-        chunks.push(current);
-      }
-    }
-
-    return chunks;
+    flushCurrent();
+    return chunks.length > 0 ? chunks : [text.slice(0, maxLen)];
   }
 
   /**

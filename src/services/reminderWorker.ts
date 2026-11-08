@@ -15,7 +15,11 @@ export class ReminderWorker {
   private adminThreadId: string | null = null;
   private adminUserId: string | null = null;
   private isDispatching = false;
+  private failedReelSuppression = new Map<string, number>();
 
+  /**
+   * Starts the background DM polling and reminder dispatch loops.
+   */
   start() {
     const config = loadConfig();
     if (!config.instagram.isConfigured) {
@@ -46,6 +50,9 @@ export class ReminderWorker {
     }, 3000);
   }
 
+  /**
+   * Stops background polling and interval timers cleanly.
+   */
   stop() {
     this.isRunning = false;
     if (this.dmInterval) clearInterval(this.dmInterval);
@@ -172,13 +179,29 @@ export class ReminderWorker {
     this.isDispatching = true;
 
     try {
-      const dueReels = await Repository.getReelsDueForReminder();
-      if (dueReels.length === 0) return;
+      const allDueReels = await Repository.getReelsDueForReminder();
+      if (allDueReels.length === 0) return;
+
+      const now = Date.now();
+      // Clean up expired entries in the suppression map
+      for (const [id, expireTime] of this.failedReelSuppression.entries()) {
+        if (now >= expireTime) {
+          this.failedReelSuppression.delete(id);
+        }
+      }
+
+      // Filter out temporarily suppressed reels whose persistence failed
+      const eligibleReels = allDueReels.filter((r) => !this.failedReelSuppression.has(r.id));
+      if (eligibleReels.length === 0) return;
+
+      // Limit batch size per dispatch tick to avoid unbounded execution latency
+      const BATCH_LIMIT = 10;
+      const dueReels = eligibleReels.slice(0, BATCH_LIMIT);
 
       const config = loadConfig();
       const intervalHours = config.reminders.defaultIntervalHours;
 
-      console.log(`[ReminderWorker] 🔔 Found ${dueReels.length} Reel(s) due for reminder.`);
+      console.log(`[ReminderWorker] 🔔 Found ${allDueReels.length} Reel(s) due for reminder (dispatching batch of ${dueReels.length}).`);
 
       for (const reel of dueReels) {
         const creatorTag =
@@ -224,6 +247,19 @@ export class ReminderWorker {
             await Repository.recordReminderSent(reel.id, nextDate);
           } catch (err: any) {
             console.error(`[ReminderWorker] Failed to record reminder for reel ${reel.shortcode}:`, err.message || err);
+            // Suppress repeated sending in memory for 5 minutes if DB recording fails
+            if (this.failedReelSuppression.size >= 1000) {
+              const firstKey = this.failedReelSuppression.keys().next().value;
+              if (firstKey) this.failedReelSuppression.delete(firstKey);
+            }
+            this.failedReelSuppression.set(reel.id, Date.now() + 5 * 60 * 1000);
+
+            // Attempt fallback backoff in DB to prevent immediate resends on next run
+            try {
+              await Repository.updateReminderSchedule(reel.id, new Date(Date.now() + 5 * 60 * 1000).toISOString());
+            } catch (fallbackErr: any) {
+              console.error(`[ReminderWorker] Fallback backoff failed for reel ${reel.shortcode}:`, fallbackErr.message || fallbackErr);
+            }
           }
         } else {
           // On delivery failure, retain reminder and back off 5 minutes before retrying
