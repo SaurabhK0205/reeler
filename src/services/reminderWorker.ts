@@ -206,7 +206,7 @@ export class ReminderWorker {
       for (const reel of dueReels) {
         const creatorTag =
           reel.creator && reel.creator.username && reel.creator.username !== 'instagram_creator'
-            ? `https://www.instagram.com/${reel.creator.username}/ (@${reel.creator.username})`
+            ? `@${reel.creator.username}`
             : (reel.creator?.display_name && reel.creator.display_name !== 'instagram_creator' ? reel.creator.display_name : 'Instagram Reel');
         const rawCaption = reel.caption ? reel.caption.slice(0, 70).replace(/\n/g, ' ') : '';
         const captionPreview = rawCaption ? `"${rawCaption}..."\n` : '';
@@ -295,7 +295,7 @@ export class ReminderWorker {
 
       const creatorTag =
         reel.creator && reel.creator.username && reel.creator.username !== 'instagram_creator'
-          ? `https://www.instagram.com/${reel.creator.username}/ (@${reel.creator.username})`
+          ? `@${reel.creator.username}`
           : (reel.creator?.display_name && reel.creator.display_name !== 'instagram_creator' ? reel.creator.display_name : 'your reel');
       const defaultNotice = `⏰ No reminder time received for ${creatorTag} — I've scheduled your reminder for ${defaultHours} hours from now (${targetStr}).\n\nReply e.g. "2h" or "tomorrow 5pm" anytime to change it, or "watched" when done!`;
 
