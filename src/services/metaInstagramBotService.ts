@@ -302,7 +302,7 @@ export class MetaInstagramBotService {
       });
 
       const creatorLine = meta.username
-        ? `\nCreator: https://www.instagram.com/${meta.username}/ (@${meta.username})`
+        ? `\nCreator: @${meta.username}`
         : (meta.displayName ? `\nCreator: ${meta.displayName}` : '');
 
       if (customDuration) {
@@ -385,7 +385,7 @@ export class MetaInstagramBotService {
         const nextDate = customDuration.targetDate.toISOString();
         await Repository.updateReminderSchedule(targetReel.id, nextDate, customDuration.seconds);
         const creatorTag = targetReel.creator?.username && targetReel.creator.username !== 'instagram_creator'
-          ? `https://www.instagram.com/${targetReel.creator.username}/ (@${targetReel.creator.username})`
+          ? `@${targetReel.creator.username}`
           : (targetReel.creator?.display_name || targetReel.shortcode);
         await this.sendDirectMessage(
           senderId,
@@ -406,12 +406,11 @@ export class MetaInstagramBotService {
       const { creator, reels } = await Repository.getReelsByCreatorUsername(creatorQuery);
       const cleanHandle = creatorQuery.replace(/^@/, '').trim();
       const resolvedUsername = creator?.username || cleanHandle;
-      const profileUrl = `https://www.instagram.com/${resolvedUsername}/`;
 
       if (!creator || reels.length === 0) {
         await this.sendDirectMessage(
           senderId,
-          `🔍 No saved reels found from ${profileUrl} (@${resolvedUsername}) yet!\n\nShare any Reel link from them here to start tracking.`
+          `🔍 No saved reels found for Creator: @${resolvedUsername} yet!\n\nShare any Reel link from them here to start tracking.`
         );
         return;
       }
@@ -420,8 +419,8 @@ export class MetaInstagramBotService {
       const countLabel = totalCount === 1 ? '1 saved reel' : `${totalCount} saved reels`;
       const limit = Math.min(reels.length, 5);
 
-      // 1. Send header message with tappable Instagram profile URL
-      const headerMsg = `🎬 Found ${countLabel} from ${profileUrl} (@${creator.username})!\n\nHere are the latest ${limit} reels:`;
+      // 1. Send header message with clean @mention formatted on its own line like Watch Later confirmation
+      const headerMsg = `🎬 Saved Reels\nCreator: @${creator.username}\nFound: ${countLabel}\n\nHere are the latest ${limit} reels:`;
       const headerSent = await this.sendDirectMessage(senderId, headerMsg);
       if (!headerSent) {
         console.warn(`[MetaIG] Failed to send creator query header to ${senderId}`);
@@ -443,7 +442,7 @@ export class MetaInstagramBotService {
       if (reels.length > limit) {
         await new Promise((resolve) => setTimeout(resolve, 350));
         const remaining = reels.length - limit;
-        const footerMsg = `... and ${remaining} more reels from ${profileUrl} in your library!\n\nSearch "${creator.username}" on your web dashboard to see all.`;
+        const footerMsg = `... and ${remaining} more reels from @${creator.username} in your library!\n\nSearch "${creator.username}" on your web dashboard to see all.`;
         await this.sendDirectMessage(senderId, footerMsg);
       }
       return;
