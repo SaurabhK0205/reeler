@@ -25,8 +25,14 @@ export class MetaInstagramBotService {
    */
   verifySignature(rawBody: Buffer | string | undefined, signatureHeader?: string): boolean {
     if (!this.appSecret) {
-      // If no app secret is configured, bypass verification in local development
-      return true;
+      // Insecure bypass is strictly opt-in and forbidden in production
+      const allowInsecure = process.env.ALLOW_INSECURE_WEBHOOK === 'true' && process.env.NODE_ENV !== 'production';
+      if (allowInsecure) {
+        console.warn('[MetaBot] WARNING: Webhook signature verification bypassed via ALLOW_INSECURE_WEBHOOK=true in non-production.');
+        return true;
+      }
+      console.error('[MetaBot] Webhook rejected: META_APP_SECRET is not configured. Set META_APP_SECRET or explicit ALLOW_INSECURE_WEBHOOK=true for local dev.');
+      return false;
     }
 
     if (!signatureHeader || !rawBody) {
@@ -90,6 +96,7 @@ export class MetaInstagramBotService {
           recipient: { id: recipientId },
           message: { text },
         }),
+        signal: AbortSignal.timeout(10000),
       });
 
       const data = await res.json() as any;

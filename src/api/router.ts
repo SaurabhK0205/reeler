@@ -142,6 +142,7 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
 
     res.status(200).json({ success: true, ...result });
   } catch (error: any) {
-    res.status(500).json({ success: false, error: error.message });
+    console.error('[ArchiveImport] Unexpected error in /archive/import endpoint:', error);
+    res.status(500).json({ success: false, error: 'An unexpected internal error occurred during archive import.' });
   }
 });

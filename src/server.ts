@@ -12,8 +12,57 @@ const app = express();
 const config = loadConfig();
 const reminderWorker = new ReminderWorker();
 
-// Route-specific bounded parser for official Instagram archive imports (up to 50MB)
-app.use('/api/archive/import', express.json({ limit: '50mb' }));
+// Concurrency & rate-limiting guard for large payload import endpoint
+let activeImports = 0;
+const MAX_CONCURRENT_IMPORTS = 1;
+const importRateLimitWindowMs = 60 * 1000;
+const importIpRequests = new Map<string, { count: number; resetAt: number }>();
+
+function archiveImportGuard(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+
+  const ipRecord = importIpRequests.get(ip);
+  if (ipRecord && ipRecord.resetAt > now) {
+    if (ipRecord.count >= 5) {
+      res.status(429).json({ success: false, error: 'Too many import requests. Please wait a minute before retrying.' });
+      return;
+    }
+    ipRecord.count++;
+  } else {
+    importIpRequests.set(ip, { count: 1, resetAt: now + importRateLimitWindowMs });
+  }
+
+  if (importIpRequests.size > 1000) {
+    for (const [k, v] of importIpRequests.entries()) {
+      if (v.resetAt <= now) importIpRequests.delete(k);
+    }
+  }
+
+  if (activeImports >= MAX_CONCURRENT_IMPORTS) {
+    res.status(429).json({
+      success: false,
+      error: 'An archive import is currently in progress. Please wait for it to complete.',
+    });
+    return;
+  }
+
+  activeImports++;
+  let completed = false;
+  const release = () => {
+    if (!completed) {
+      completed = true;
+      activeImports = Math.max(0, activeImports - 1);
+    }
+  };
+
+  res.on('finish', release);
+  res.on('close', release);
+  next();
+}
+
+// Route-specific bounded parser for official Instagram archive imports (up to 50MB) protected by guard
+app.use('/api/archive/import', archiveImportGuard, express.json({ limit: '50mb' }));
 
 // Route-specific parser for Meta webhooks with raw body retention for HMAC verification (1MB)
 app.use('/api/instagram/webhook', express.json({

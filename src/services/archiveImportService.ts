@@ -21,6 +21,7 @@ export interface ArchiveImportResult {
 }
 
 const UNKNOWN_CREATOR_HANDLE = 'unattributed';
+const INSTAGRAM_HANDLE_REGEX = /^[a-zA-Z0-9._]{1,30}$/;
 
 export class ArchiveImportService {
   /**
@@ -145,23 +146,33 @@ export class ArchiveImportService {
 
       // Extract creator identity from reliable metadata fields or use sentinel
       let creatorHandle = UNKNOWN_CREATOR_HANDLE;
-      let caption: string | null = typeof item.caption === 'string' ? item.caption : null;
+      const caption: string | null = typeof item.caption === 'string' && item.caption.trim() ? item.caption.trim() : null;
 
       if (item.string_map_data && typeof item.string_map_data === 'object') {
         for (const [key, mapData] of Object.entries(item.string_map_data)) {
           if (mapData && typeof mapData === 'object') {
             const normalizedKey = key.toLowerCase();
             if (['author', 'owner', 'user', 'creator'].includes(normalizedKey) && typeof mapData.value === 'string' && mapData.value.trim()) {
-              creatorHandle = mapData.value.trim().replace(/^@/, '');
-              break;
+              const candidate = mapData.value.trim().replace(/^@/, '');
+              if (INSTAGRAM_HANDLE_REGEX.test(candidate)) {
+                creatorHandle = candidate;
+                break;
+              }
             }
           }
         }
       }
 
-      // If title is present, preserve it as caption (never misinterpret title as creator identity)
-      if (typeof item.title === 'string' && item.title.trim()) {
-        caption = item.title.trim();
+      // If creator was not found in string_map_data, check item.title.
+      // In official Instagram saved_posts.json exports, item.title holds the creator handle
+      // while "Saved on" provides href and timestamp.
+      // Treat item.title as creator candidate ONLY when it matches Instagram handle grammar,
+      // and never store it as caption.
+      if (creatorHandle === UNKNOWN_CREATOR_HANDLE && typeof item.title === 'string' && item.title.trim()) {
+        const titleCandidate = item.title.trim().replace(/^@/, '');
+        if (INSTAGRAM_HANDLE_REGEX.test(titleCandidate)) {
+          creatorHandle = titleCandidate;
+        }
       }
 
       // Format ISO dates with strict runtime checks
@@ -193,7 +204,7 @@ export class ArchiveImportService {
           creatorsSeen.add(creator.id);
         }
 
-        // Upsert saved reel with ignoreDuplicates to preserve existing status and reminders
+        // Upsert saved reel with ignoreDuplicates and skipReturn to preserve existing status and avoid redundant fetch
         await Repository.upsertSavedReel(
           {
             instagram_media_id: `export_${shortcode}`,
@@ -210,7 +221,7 @@ export class ArchiveImportService {
             is_saved_on_instagram: true,
             instagram_sender_id: senderId || null,
           },
-          { ignoreDuplicates: true }
+          { ignoreDuplicates: true, skipReturn: true }
         );
 
         reelsImported++;
@@ -223,6 +234,13 @@ export class ArchiveImportService {
     let status: ArchiveImportStatus = 'success';
     if (reelsImported === 0) {
       status = totalProcessed === 0 || errors.length === 0 ? 'empty' : 'failed';
+      if (status === 'empty' && errors.length === 0) {
+        errors.push(
+          totalProcessed === 0
+            ? 'No items found in archive export payload.'
+            : 'No valid Instagram reel links found in export (all items skipped or non-reel links).'
+        );
+      }
     } else if (errors.length > 0) {
       status = 'partial';
     }

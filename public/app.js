@@ -188,6 +188,7 @@ function renderReels() {
     card.className = 'reel-card';
 
     const creatorName = reel.creator?.username || 'instagram_user';
+    const safeCreatorName = escapeHtml(creatorName);
     const avatarUrl = reel.creator?.profile_picture_url || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=60';
     const thumbUrl = reel.thumbnail_url || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=400';
 
@@ -208,8 +209,8 @@ function renderReels() {
       </div>
       <div class="reel-content">
         <div class="reel-creator-row">
-          <img class="creator-avatar" src="${avatarUrl}" alt="${creatorName}" onerror="this.src='https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=60'">
-          <a class="creator-handle" href="${reel.reel_url}" target="_blank">@${creatorName}</a>
+          <img class="creator-avatar" src="${avatarUrl}" alt="${safeCreatorName}" onerror="this.src='https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=60'">
+          <a class="creator-handle" href="${reel.reel_url}" target="_blank">@${safeCreatorName}</a>
           ${reminderBadge}
         </div>
         <div class="reel-caption">${escapeHtml(reel.caption || '(No caption provided)')}</div>

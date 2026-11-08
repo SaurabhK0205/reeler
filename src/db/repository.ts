@@ -67,7 +67,7 @@ class InMemoryStore {
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
     awaiting_reminder_choice_until?: string | null;
-  }, options?: { ignoreDuplicates?: boolean }): Promise<SavedReel> {
+  }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean }): Promise<SavedReel | null> {
     let existing: SavedReel | undefined;
     for (const r of this.reels.values()) {
       if (r.instagram_media_id === data.instagram_media_id || r.shortcode === data.shortcode) {
@@ -80,7 +80,7 @@ class InMemoryStore {
 
     if (existing) {
       if (options?.ignoreDuplicates) {
-        return existing;
+        return options.skipReturn ? null : existing;
       }
       existing.caption = data.caption ?? existing.caption;
       existing.thumbnail_url = data.thumbnail_url ?? existing.thumbnail_url;
@@ -90,7 +90,7 @@ class InMemoryStore {
       if (data.awaiting_reminder_choice_until !== undefined) existing.awaiting_reminder_choice_until = data.awaiting_reminder_choice_until;
       if (data.reminder_interval_hours) existing.reminder_interval_hours = data.reminder_interval_hours;
       existing.updated_at = now;
-      return existing;
+      return options?.skipReturn ? null : existing;
     }
 
     const newReel: SavedReel = {
@@ -120,7 +120,7 @@ class InMemoryStore {
     };
 
     this.reels.set(newReel.id, newReel);
-    return newReel;
+    return options?.skipReturn ? null : newReel;
   }
 
   async getReels(filters: ReelQueryFilters) {
@@ -349,14 +349,14 @@ export class Repository {
     awaiting_reminder_choice_until?: string | null;
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
-  }, options?: { ignoreDuplicates?: boolean }): Promise<SavedReel> {
+  }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean }): Promise<SavedReel | null> {
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertSavedReel(data, options);
     }
 
     const supabase = getSupabase();
     const intervalSeconds = data.reminder_interval_seconds ?? (data.reminder_interval_hours ? data.reminder_interval_hours * 3600 : 36000);
-    const { data: reel, error } = await supabase
+    const query = supabase
       .from('saved_reels')
       .upsert(
         {
@@ -381,19 +381,43 @@ export class Repository {
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'instagram_media_id', ignoreDuplicates: options?.ignoreDuplicates ?? false }
-      )
-      .select('*, creator:creators(*)')
-      .maybeSingle();
+      );
+
+    const { data: reel, error } = options?.skipReturn
+      ? await query
+      : await query.select('*, creator:creators(*)').maybeSingle();
 
     if (error) {
+      if (
+        options?.ignoreDuplicates &&
+        (error.code === '23505' ||
+          error.message?.includes('duplicate key') ||
+          error.message?.includes('shortcode') ||
+          error.message?.includes('instagram_media_id'))
+      ) {
+        if (options.skipReturn) {
+          return null;
+        }
+        const { data: existing, error: fetchErr } = await supabase
+          .from('saved_reels')
+          .select('*, creator:creators(*)')
+          .or(`instagram_media_id.eq.${data.instagram_media_id},shortcode.eq.${data.shortcode}`)
+          .maybeSingle();
+        if (existing) return existing as SavedReel;
+        if (fetchErr) throw new Error(`Supabase fetch conflicting reel failed: ${fetchErr.message}`);
+      }
       throw new Error(`Supabase upsertSavedReel failed: ${error.message}`);
+    }
+
+    if (options?.skipReturn) {
+      return null;
     }
 
     if (!reel && options?.ignoreDuplicates) {
       const { data: existing, error: fetchErr } = await supabase
         .from('saved_reels')
         .select('*, creator:creators(*)')
-        .eq('instagram_media_id', data.instagram_media_id)
+        .or(`instagram_media_id.eq.${data.instagram_media_id},shortcode.eq.${data.shortcode}`)
         .maybeSingle();
       if (existing) return existing as SavedReel;
       if (fetchErr) throw new Error(`Supabase fetch existing reel failed: ${fetchErr.message}`);
