@@ -302,7 +302,7 @@ export class MetaInstagramBotService {
       });
 
       const creatorLine = meta.username
-        ? `\nCreator: @${meta.username}`
+        ? `\nCreator: https://www.instagram.com/${meta.username}/ (@${meta.username})`
         : (meta.displayName ? `\nCreator: ${meta.displayName}` : '');
 
       if (customDuration) {
@@ -385,7 +385,7 @@ export class MetaInstagramBotService {
         const nextDate = customDuration.targetDate.toISOString();
         await Repository.updateReminderSchedule(targetReel.id, nextDate, customDuration.seconds);
         const creatorTag = targetReel.creator?.username && targetReel.creator.username !== 'instagram_creator'
-          ? `@${targetReel.creator.username}`
+          ? `https://www.instagram.com/${targetReel.creator.username}/ (@${targetReel.creator.username})`
           : (targetReel.creator?.display_name || targetReel.shortcode);
         await this.sendDirectMessage(
           senderId,
@@ -400,38 +400,52 @@ export class MetaInstagramBotService {
       return;
     }
 
-    // 3. Creator reels search (e.g. "@who.bhartiiiii", "who.bhartiiiii", "reels by @who.bhartiiiii", "show who.bhartiiiii")
+    // 3. Creator reels search (e.g. "@_docthor_", "who.bhartiiiii", "reels by @_docthor_", "show @_docthor_")
     const creatorQuery = extractCreatorQuery(text);
     if (creatorQuery) {
       const { creator, reels } = await Repository.getReelsByCreatorUsername(creatorQuery);
+      const cleanHandle = creatorQuery.replace(/^@/, '').trim();
+      const resolvedUsername = creator?.username || cleanHandle;
+      const profileUrl = `https://www.instagram.com/${resolvedUsername}/`;
+
       if (!creator || reels.length === 0) {
         await this.sendDirectMessage(
           senderId,
-          `🔍 No saved reels found from @${creatorQuery.replace(/^@/, '')} yet!\n\nShare any Reel link from them here to start tracking.`
+          `🔍 No saved reels found from ${profileUrl} (@${resolvedUsername}) yet!\n\nShare any Reel link from them here to start tracking.`
         );
         return;
       }
 
       const totalCount = reels.length;
       const countLabel = totalCount === 1 ? '1 saved reel' : `${totalCount} saved reels`;
-      let reply = `🎬 Saved Reels from @${creator.username} (${countLabel}, latest to oldest):\n\n`;
-
       const limit = Math.min(reels.length, 5);
+
+      // 1. Send header message with tappable Instagram profile URL
+      const headerMsg = `🎬 Found ${countLabel} from ${profileUrl} (@${creator.username})!\n\nHere are the latest ${limit} reels:`;
+      const headerSent = await this.sendDirectMessage(senderId, headerMsg);
+      if (!headerSent) {
+        console.warn(`[MetaIG] Failed to send creator query header to ${senderId}`);
+        return;
+      }
+
+      // 2. Send each reel in a separate single message (allows Instagram client to unfurl interactive Reel cards)
       for (let i = 0; i < limit; i++) {
         const r = reels[i];
-        let statusBadge = '👀 Unwatched';
-        if (r.watch_status === 'watched') statusBadge = '✅ Watched';
-        else if (r.watch_status === 'watch_later') statusBadge = '⏰ Watch Later';
-
-        const captionSnippet = r.caption ? ` • "${r.caption.slice(0, 45).replace(/\n/g, ' ')}..."` : '';
-        reply += `${i + 1}. https://www.instagram.com/reel/${r.shortcode}/\n   ${statusBadge}${captionSnippet}\n\n`;
+        await new Promise((resolve) => setTimeout(resolve, 350));
+        const reelSent = await this.sendDirectMessage(senderId, `https://www.instagram.com/reel/${r.shortcode}/`);
+        if (!reelSent) {
+          console.warn(`[MetaIG] Failed to send reel ${r.shortcode} message to ${senderId}`);
+          break;
+        }
       }
 
+      // 3. Send footer message if additional reels exist in the user's library
       if (reels.length > limit) {
-        reply += `... and ${reels.length - limit} more reels in your library! Search "@${creator.username}" on your web dashboard to see all.`;
+        await new Promise((resolve) => setTimeout(resolve, 350));
+        const remaining = reels.length - limit;
+        const footerMsg = `... and ${remaining} more reels from ${profileUrl} in your library!\n\nSearch "${creator.username}" on your web dashboard to see all.`;
+        await this.sendDirectMessage(senderId, footerMsg);
       }
-
-      await this.sendDirectMessage(senderId, reply.trim());
       return;
     }
 
