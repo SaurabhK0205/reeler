@@ -4,38 +4,41 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Reeler — Saved Reels Vault</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=2.0">
+  <!-- Official Instagram Embed Script for In-App Native Reel Playback -->
+  <script async defer src="https://www.instagram.com/embed.js"></script>
 </head>
 <body>
-  <div class="app-container">
-    <!-- Vault Header -->
-    <header class="app-header">
-      <div class="header-left">
-        <div class="brand-mark" aria-hidden="true">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"></rect>
-            <line x1="7" y1="2" x2="7" y2="22"></line>
-            <line x1="17" y1="2" x2="17" y2="22"></line>
-            <line x1="2" y1="12" x2="22" y2="12"></line>
-            <line x1="2" y1="7" x2="7" y2="7"></line>
-            <line x1="2" y1="17" x2="7" y2="17"></line>
-            <line x1="17" y1="17" x2="22" y2="17"></line>
-            <line x1="17" y1="7" x2="22" y2="7"></line>
+  <div class="app-layout">
+    <!-- Top Command Navigation -->
+    <header class="top-nav">
+      <div class="nav-left">
+        <div class="vault-logo" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="2" width="20" height="20" rx="3"></rect>
+            <path d="M7 2v20"></path>
+            <path d="M17 2v20"></path>
+            <path d="M2 12h20"></path>
+            <path d="M2 7h5"></path>
+            <path d="M2 17h5"></path>
+            <path d="M17 17h5"></path>
+            <path d="M17 7h5"></path>
           </svg>
         </div>
-        <div class="brand-titles">
-          <h1>Reeler</h1>
-          <p class="subtitle">Personal Saved Reels Vault</p>
+        <div class="vault-identity">
+          <div class="vault-brand">REELER</div>
+          <div class="vault-tag">Personal Saved Reels Vault</div>
         </div>
       </div>
-      <div class="header-right">
-        <div id="db-badge" class="badge badge-neutral">
+
+      <div class="nav-right">
+        <div id="db-badge" class="nav-badge">
           <span class="badge-dot" aria-hidden="true"></span>
-          <span class="badge-text">Checking DB...</span>
+          <span class="badge-label">Checking DB...</span>
         </div>
         <input type="file" id="archive-file-input" accept=".json" style="display: none;" />
-        <button id="import-btn" class="btn btn-primary" title="Import official Instagram saved_posts.json export">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <button id="import-btn" class="nav-btn nav-btn-primary" title="Import official Instagram saved_posts.json export">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
             <polyline points="7 10 12 15 17 10"></polyline>
             <line x1="12" y1="15" x2="12" y2="3"></line>
@@ -45,178 +48,184 @@
       </div>
     </header>
 
-    <!-- Stats Dashboard -->
-    <section class="stats-grid" aria-label="Library Overview">
-      <div class="stat-card">
-        <div class="stat-label">VAULT REELS</div>
-        <div class="stat-value" id="stat-total">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">CREATORS</div>
-        <div class="stat-value" id="stat-creators">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">SAVED THIS WEEK</div>
-        <div class="stat-value" id="stat-week">0</div>
-      </div>
-      <div class="stat-card stat-card-highlight">
-        <div class="stat-label">WATCH LATER</div>
-        <div class="stat-value text-accent" id="stat-watch-later">0</div>
-      </div>
-    </section>
+    <!-- Main Workspace -->
+    <div class="vault-container">
+      <!-- Stats Overview Bar -->
+      <section class="stats-bar" aria-label="Library Overview">
+        <div class="metric-cell">
+          <span class="metric-label">TOTAL REELS</span>
+          <span class="metric-num" id="stat-total">0</span>
+        </div>
+        <div class="metric-cell">
+          <span class="metric-label">ACTIVE CREATORS</span>
+          <span class="metric-num" id="stat-creators">0</span>
+        </div>
+        <div class="metric-cell">
+          <span class="metric-label">SAVED THIS WEEK</span>
+          <span class="metric-num" id="stat-week">0</span>
+        </div>
+        <div class="metric-cell metric-cell-accent">
+          <span class="metric-label">WATCH LATER</span>
+          <span class="metric-num metric-accent" id="stat-watch-later">0</span>
+        </div>
+      </section>
 
-    <!-- Controls: Search & Primary Filters -->
-    <section class="filter-controls" aria-label="Search and filter controls">
-      <!-- Search Bar -->
-      <div class="search-box">
-        <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <circle cx="11" cy="11" r="8"></circle>
-          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-        </svg>
-        <input type="text" id="search-input" placeholder="Search keywords in captions or creators..." autocomplete="off">
-        <button id="clear-search" class="clear-btn" aria-label="Clear search query" style="display: none;">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="18" y1="6" x2="6" y2="18"></line>
-            <line x1="6" y1="6" x2="18" y2="18"></line>
+      <!-- Filter & Search Toolbar -->
+      <section class="toolbar-section" aria-label="Search and filter controls">
+        <div class="search-field">
+          <svg class="search-glyph" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
           </svg>
-        </button>
-      </div>
-
-      <div class="dropdown-row">
-        <!-- Date Filter -->
-        <div class="control-group">
-          <label for="date-preset">Date Saved</label>
-          <select id="date-preset">
-            <option value="all">All Time</option>
-            <option value="today">Today</option>
-            <option value="yesterday">Yesterday</option>
-            <option value="7d">Last 7 Days</option>
-            <option value="30d">Last 30 Days</option>
-            <option value="3m">Last 3 Months</option>
-            <option value="6m">Last 6 Months</option>
-            <option value="year">This Year</option>
-          </select>
+          <input type="text" id="search-input" placeholder="Search keywords in captions or creators..." autocomplete="off">
+          <button id="clear-search" class="clear-search-btn" aria-label="Clear search" style="display: none;">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
         </div>
 
-        <!-- Watch Status -->
-        <div class="control-group">
-          <label for="watch-filter">Status</label>
-          <select id="watch-filter">
-            <option value="all">All Statuses</option>
-            <option value="unwatched">Unwatched</option>
-            <option value="watch_later">Watch Later</option>
-            <option value="watched">Watched</option>
-          </select>
-        </div>
-
-        <!-- Sort By -->
-        <div class="control-group">
-          <label for="sort-by">Sort By</label>
-          <select id="sort-by">
-            <option value="newest_saved">Newest Saved First</option>
-            <option value="oldest_saved">Oldest Saved First</option>
-            <option value="newest_published">Newest Published First</option>
-            <option value="oldest_published">Oldest Published First</option>
-          </select>
-        </div>
-      </div>
-    </section>
-
-    <!-- Creator Quick-Filter Bar -->
-    <section class="creator-bar-container" aria-label="Filter by creator">
-      <div class="creator-bar-header">
-        <span class="section-title">TOP CREATORS</span>
-        <button id="reset-creator-btn" class="reset-link" style="display: none;">Show All Creators</button>
-      </div>
-      <div class="creator-pills" id="creator-pills-list">
-        <button class="creator-pill active" data-creator-id="">All Creators</button>
-      </div>
-    </section>
-
-    <!-- Main Reels Grid -->
-    <main class="reels-section">
-      <div class="reels-header">
-        <div id="results-count" class="results-count">Loading reels...</div>
-      </div>
-
-      <div class="reels-grid" id="reels-grid">
-        <!-- Rendered by app.js -->
-      </div>
-
-      <!-- Pagination -->
-      <div class="pagination-bar" id="pagination-bar" style="display: none;">
-        <button id="prev-page-btn" class="btn btn-secondary">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"></polyline></svg>
-          <span>Previous</span>
-        </button>
-        <span id="page-indicator" class="page-indicator">Page 1 of 1</span>
-        <button id="next-page-btn" class="btn btn-secondary">
-          <span>Next</span>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"></polyline></svg>
-        </button>
-      </div>
-    </main>
-
-    <!-- Cinema Theater Modal -->
-    <div id="theater-modal" class="theater-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Cinema Reel Player">
-      <div class="theater-backdrop" id="theater-backdrop"></div>
-      <div class="theater-dialog">
-        <button class="theater-close-btn" id="theater-close-btn" aria-label="Close cinema modal">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="18" y1="6" x2="6" y2="18"></line>
-            <line x1="6" y1="6" x2="18" y2="18"></line>
-          </svg>
-        </button>
-        <div class="theater-stage">
-          <div class="theater-player-pane" id="theater-player-container">
-            <!-- Dynamic player injected by app.js -->
+        <div class="filters-row">
+          <div class="select-wrapper">
+            <select id="date-preset" aria-label="Filter by date">
+              <option value="all">Date: All Time</option>
+              <option value="today">Date: Today</option>
+              <option value="yesterday">Date: Yesterday</option>
+              <option value="7d">Date: Last 7 Days</option>
+              <option value="30d">Date: Last 30 Days</option>
+              <option value="3m">Date: Last 3 Months</option>
+              <option value="6m">Date: Last 6 Months</option>
+              <option value="year">Date: This Year</option>
+            </select>
           </div>
-          <div class="theater-details-pane">
-            <div class="theater-creator-card">
-              <div class="theater-avatar" id="theater-avatar"></div>
-              <div class="theater-creator-info">
-                <a class="theater-creator-name" id="theater-creator-name" href="#" target="_blank" rel="noopener noreferrer">@creator</a>
-                <span class="theater-date" id="theater-date">Date</span>
-              </div>
-              <a id="theater-external-link" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-secondary theater-link-btn" title="Open on Instagram">
-                <span>Instagram</span>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
-              </a>
-            </div>
 
-            <div class="theater-caption-box">
-              <div class="theater-caption-title">LOGLINE / CAPTION</div>
-              <p class="theater-caption-text" id="theater-caption"></p>
-            </div>
+          <div class="select-wrapper">
+            <select id="watch-filter" aria-label="Filter by watch status">
+              <option value="all">Status: All</option>
+              <option value="unwatched">Status: Unwatched</option>
+              <option value="watch_later">Status: Watch Later</option>
+              <option value="watched">Status: Watched</option>
+            </select>
+          </div>
 
-            <div class="theater-status-section">
-              <div class="theater-caption-title">STATUS</div>
-              <div class="theater-status-row">
-                <button class="status-choice-btn" data-status="unwatched" id="theater-status-unwatched">
-                  <span class="status-choice-indicator"></span> Unwatched
-                </button>
-                <button class="status-choice-btn" data-status="watch_later" id="theater-status-later">
-                  <span class="status-choice-indicator"></span> Watch Later
-                </button>
-                <button class="status-choice-btn" data-status="watched" id="theater-status-watched">
-                  <span class="status-choice-indicator"></span> Watched
-                </button>
-              </div>
-            </div>
+          <div class="select-wrapper">
+            <select id="sort-by" aria-label="Sort reels">
+              <option value="newest_saved">Sort: Newest Saved</option>
+              <option value="oldest_saved">Sort: Oldest Saved</option>
+              <option value="newest_published">Sort: Newest Published</option>
+              <option value="oldest_published">Sort: Oldest Published</option>
+            </select>
+          </div>
 
-            <div class="theater-footer-meta">
-              <div class="theater-rank" id="theater-rank">#0 in Vault</div>
-              <div class="theater-nav-keys">
-                <span><kbd>←</kbd> <kbd>→</kbd> Navigate</span>
-                <span><kbd>Esc</kbd> Close</span>
-              </div>
-            </div>
+          <!-- View Mode Toggle: Grid vs Table -->
+          <div class="view-mode-toggle" role="group" aria-label="View Mode">
+            <button id="view-mode-grid" class="view-btn active" title="Poster Grid View" aria-label="Grid View">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="7" height="7"></rect>
+                <rect x="14" y="3" width="7" height="7"></rect>
+                <rect x="14" y="14" width="7" height="7"></rect>
+                <rect x="3" y="14" width="7" height="7"></rect>
+              </svg>
+            </button>
+            <button id="view-mode-list" class="view-btn" title="Dense Table / List View" aria-label="List View">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="8" y1="6" x2="21" y2="6"></line>
+                <line x1="8" y1="12" x2="21" y2="12"></line>
+                <line x1="8" y1="18" x2="21" y2="18"></line>
+                <line x1="3" y1="6" x2="3.01" y2="6"></line>
+                <line x1="3" y1="12" x2="3.01" y2="12"></line>
+                <line x1="3" y1="18" x2="3.01" y2="18"></line>
+              </svg>
+            </button>
           </div>
         </div>
+      </section>
+
+      <!-- Creator Quick-Filter Strip -->
+      <section class="creators-strip-container" aria-label="Filter by creator">
+        <div class="strip-header">
+          <span class="strip-caption">TOP CREATORS</span>
+          <button id="reset-creator-btn" class="strip-reset-btn" style="display: none;">Show All</button>
+        </div>
+        <div class="creators-scroll-track" id="creator-pills-list">
+          <button class="creator-chip active" data-creator-id="">All Creators</button>
+        </div>
+      </section>
+
+      <!-- Main Reels Presentation View -->
+      <main class="library-main">
+        <div class="library-header-meta">
+          <div id="results-count" class="results-counter">Loading reels...</div>
+        </div>
+
+        <!-- Visual Poster Grid Container -->
+        <div class="reels-grid-canvas" id="reels-grid">
+          <!-- Populated by app.js -->
+        </div>
+
+        <!-- Dense Table / List Container (hidden by default) -->
+        <div class="reels-table-canvas" id="reels-table-container" style="display: none;">
+          <table class="dense-table" id="reels-table">
+            <thead>
+              <tr>
+                <th style="width: 70px;">RANK</th>
+                <th style="width: 180px;">CREATOR</th>
+                <th>LOGLINE / CAPTION</th>
+                <th style="width: 120px;">SAVED DATE</th>
+                <th style="width: 120px;">STATUS</th>
+                <th style="width: 140px; text-align: right;">ACTIONS</th>
+              </tr>
+            </thead>
+            <tbody id="reels-table-body">
+              <!-- Populated by app.js -->
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Pagination Bar -->
+        <div class="pagination-footer" id="pagination-bar" style="display: none;">
+          <button id="prev-page-btn" class="nav-btn nav-btn-secondary">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"></polyline></svg>
+            <span>Previous</span>
+          </button>
+          <span id="page-indicator" class="page-count-text">Page 1 of 1</span>
+          <button id="next-page-btn" class="nav-btn nav-btn-secondary">
+            <span>Next</span>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"></polyline></svg>
+          </button>
+        </div>
+      </main>
+    </div>
+
+    <!-- Fullscreen Instagram Reels / TikTok Style Vertical Snap-Feed -->
+    <div id="reels-feed-modal" class="reels-feed-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Reels Vertical Stream">
+      <!-- Top HUD Bar -->
+      <div class="feed-top-bar">
+        <div class="feed-counter-wrap">
+          <span class="feed-counter-kicker" id="feed-counter-kicker">REEL 1 OF 1</span>
+          <span class="feed-shortcode-tag" id="feed-shortcode-tag">ID: ...</span>
+        </div>
+        <div class="feed-top-actions">
+          <button class="feed-nav-arrow-btn" id="feed-arrow-up" aria-label="Previous reel" title="Previous reel (↑ or k)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"></polyline></svg>
+          </button>
+          <button class="feed-nav-arrow-btn" id="feed-arrow-down" aria-label="Next reel" title="Next reel (↓ or j)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </button>
+          <button class="feed-close-btn" id="feed-close-btn" aria-label="Close reels feed" title="Close feed (Esc)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Vertical Snap Scroll Track -->
+      <div class="feed-scroll-track" id="feed-scroll-track" tabindex="-1">
+        <!-- Rendered dynamically as .feed-reel-slide elements -->
       </div>
     </div>
   </div>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=2.1"></script>
 </body>
 </html>
