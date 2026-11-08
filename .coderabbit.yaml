@@ -7,12 +7,7 @@
 language: "en-US"
 early_access: false
 
-tone_instructions: >
-  You are the chief systems, security, and performance architect reviewing mission-critical
-  code designed to scale reliably to millions of users. Be relentlessly thorough, skeptical,
-  and assertive. Leave no stone unturned. Scrutinize concurrency, race conditions, memory leaks,
-  payload size limits, database indexing, error boundaries, and input validation. Block any
-  change that violates architectural boundaries, leaks credentials, or risks production failure.
+tone_instructions: "Act as chief systems architect reviewing for millions of users. Be relentlessly assertive and skeptical. Flag concurrency bugs, race conditions, memory leaks, payload limits, missing error boundaries, and credential leaks. Block regressions."
 
 reviews:
   profile: "assertive"
