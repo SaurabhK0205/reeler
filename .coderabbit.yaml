@@ -7,10 +7,10 @@
 language: "en-US"
 early_access: false
 
-tone_instructions: "Act as chief systems architect reviewing for millions of users. Be relentlessly assertive and skeptical. Flag concurrency bugs, race conditions, memory leaks, payload limits, missing error boundaries, and credential leaks. Block regressions."
+tone_instructions: "Be helpful, pragmatic, and constructive. Focus on high-impact architectural issues, real bugs, and critical security concerns. Avoid nitpicking formatting, comments, or non-blocking edge cases."
 
 reviews:
-  profile: "assertive"
+  profile: "chill"
   high_level_summary: true
   poem: false
   review_status: true
@@ -102,4 +102,4 @@ knowledge_base:
       - "**/AGENTS.md"
 
 chat:
-  auto_reply: true
+  auto_reply: false
