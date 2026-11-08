@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node --experimental-strip-types --env-file-if-exists=.env src/server.ts",
     "dev": "node --experimental-strip-types --watch --env-file-if-exists=.env src/server.ts",
-    "sync": "node --experimental-strip-types --env-file-if-exists=.env scripts/test-sync.ts",
+    "import": "node --experimental-strip-types --env-file-if-exists=.env scripts/import-instagram-export.ts",
     "seed": "node --experimental-strip-types --env-file-if-exists=.env scripts/seed-demo.ts"
   },
   "dependencies": {

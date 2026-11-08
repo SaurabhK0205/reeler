@@ -67,34 +67,12 @@ export class MetaInstagramBotService {
   }
 
   /**
-   * Handles incoming webhook event payload from Meta or ManyChat
+   * Handles incoming webhook event payload from Meta Graph API
    */
   async handleWebhookPayload(body: any): Promise<void> {
     console.log('[MetaIG] 📥 Webhook received body:', JSON.stringify(body, null, 2));
 
-    // 1. ManyChat Webhook Bridge format (supports custom JSON and Full Contact Data)
-    if (body.custom_user_id || body.manychat_user_id || body.last_input_text) {
-      const userId = String(
-        body.custom_user_id ||
-        body.manychat_user_id ||
-        body.id ||
-        body.user_id ||
-        'instagram_user'
-      );
-      const text = String(
-        body.text ||
-        body.last_input_text ||
-        body.last_text_input ||
-        body.message ||
-        ''
-      );
-      if (text) {
-        await this.processIncomingText(userId, text);
-      }
-      return;
-    }
-
-    // 2. Official Meta Graph API Webhook format (handles both 'instagram' and 'page' objects)
+    // Official Meta Graph API Webhook format (handles both 'instagram' and 'page' objects)
     if ((body.object === 'instagram' || body.object === 'page') && Array.isArray(body.entry)) {
       for (const entry of body.entry) {
         // A. Standard messaging events

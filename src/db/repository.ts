@@ -65,7 +65,6 @@ class InMemoryStore {
     reminder_interval_hours?: number | null;
     next_reminder_at?: string | null;
     is_saved_on_instagram?: boolean;
-    telegram_chat_id?: string | null;
     instagram_sender_id?: string | null;
     awaiting_reminder_choice_until?: string | null;
   }): Promise<SavedReel> {
@@ -109,7 +108,6 @@ class InMemoryStore {
       next_reminder_at: data.next_reminder_at,
       awaiting_reminder_choice_until: data.awaiting_reminder_choice_until,
       is_saved_on_instagram: data.is_saved_on_instagram ?? true,
-      telegram_chat_id: data.telegram_chat_id,
       instagram_sender_id: data.instagram_sender_id,
       is_unavailable: false,
       created_at: now,
@@ -346,7 +344,6 @@ export class Repository {
     next_reminder_at?: string | null;
     awaiting_reminder_choice_until?: string | null;
     is_saved_on_instagram?: boolean;
-    telegram_chat_id?: string | null;
     instagram_sender_id?: string | null;
   }): Promise<SavedReel> {
     if (!isSupabaseConfigured()) {
@@ -376,7 +373,6 @@ export class Repository {
           next_reminder_at: data.next_reminder_at,
           awaiting_reminder_choice_until: data.awaiting_reminder_choice_until ?? null,
           is_saved_on_instagram: data.is_saved_on_instagram ?? true,
-          telegram_chat_id: data.telegram_chat_id,
           instagram_sender_id: data.instagram_sender_id,
           updated_at: new Date().toISOString(),
         },
