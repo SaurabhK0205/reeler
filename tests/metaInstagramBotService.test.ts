@@ -49,3 +49,14 @@ test('MetaInstagramBotService - splitMessageIntoChunks handles unbroken string w
     assert.strictEqual(c.length, 100);
   }
 });
+
+test('extractCreatorQuery - extracts handles accurately including underscores and actions', async () => {
+  const { extractCreatorQuery } = await import('../src/utils/creatorQuery.ts');
+
+  assert.strictEqual(extractCreatorQuery('@_docthor_'), '_docthor_');
+  assert.strictEqual(extractCreatorQuery('reels by @_docthor_'), '_docthor_');
+  assert.strictEqual(extractCreatorQuery('reels from _docthor_'), '_docthor_');
+  assert.strictEqual(extractCreatorQuery('_docthor_'), '_docthor_');
+  assert.strictEqual(extractCreatorQuery('hello'), null);
+  assert.strictEqual(extractCreatorQuery('watched'), null);
+});
