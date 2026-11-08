@@ -166,16 +166,20 @@ export class MetaInstagramBotService {
 
       // Fetch public metadata
       const meta = await fetchReelMetadata(shortcode);
-      const resolvedUsername = meta.username || 'instagram_creator';
-      const resolvedDisplayName = meta.displayName || resolvedUsername;
+      const username = meta.username || meta.displayName || 'Instagram Creator';
+      const displayName = meta.displayName || username;
 
       // Upsert Creator
       const creator = await Repository.upsertCreator({
-        instagram_user_id: `creator_${resolvedUsername}`,
-        username: resolvedUsername,
-        display_name: resolvedDisplayName,
+        instagram_user_id: `creator_${username}`,
+        username: username,
+        display_name: displayName,
         profile_picture_url: meta.thumbnailUrl || null,
       });
+
+      const creatorLine = meta.username
+        ? `\nCreator: @${meta.username}`
+        : (meta.displayName ? `\nCreator: ${meta.displayName}` : '');
 
       if (customDuration) {
         // User provided a specific time along with the reel!
@@ -198,7 +202,7 @@ export class MetaInstagramBotService {
           instagram_sender_id: senderId,
         });
 
-        const reply = `🎬 Added to your Watch Later!\nCreator: @${resolvedUsername}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done!`;
+        const reply = `🎬 Added to your Watch Later!${creatorLine}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done!`;
         await this.sendDirectMessage(senderId, reply);
       } else {
         // No time provided — wait up to 10 minutes for user choice before defaulting to 10 hours
@@ -224,7 +228,7 @@ export class MetaInstagramBotService {
         const defaultTriggerDate = new Date(Date.now() + (10 * 60 + 10 * 3600) * 1000);
         const defaultTriggerStr = formatTargetTime(defaultTriggerDate);
 
-        const reply = `🎬 Added to your Watch Later!\nCreator: @${resolvedUsername}\n\n⏰ When should I remind you to watch this?\nReply with a time (e.g. "30m", "2h", "tomorrow at 5pm", or "remind me in 5 days").\n\n⏳ If you don't reply within 10 mins, I'll automatically set a reminder for 10 hours from now (${defaultTriggerStr})!`;
+        const reply = `🎬 Added to your Watch Later!${creatorLine}\n\n⏰ When should I remind you to watch this?\nReply with a time (e.g. "30m", "2h", "tomorrow at 5pm", or "remind me in 5 days").\n\n⏳ If you don't reply within 10 mins, I'll automatically set a reminder for 10 hours from now (${defaultTriggerStr})!`;
         await this.sendDirectMessage(senderId, reply);
       }
       return;
