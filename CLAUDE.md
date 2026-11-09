@@ -121,7 +121,33 @@ src/
 
 ---
 
-## 5. Security & Boundary Rules
+## 5. Frontend Work — Impeccable Design Review (MANDATORY)
+
+Whenever you modify anything under `public/` (HTML, CSS, or JS) or any user-facing template, run Impeccable design review passes **before** committing frontend changes and opening or updating a Pull Request.
+
+### Required Passes
+
+| Pass | Slash Command | Focus Area |
+|------|--------------|------------|
+| **Critique** | `/impeccable critique` | Full audit: contrast ratios, spacing, visual hierarchy, accessibility |
+| **Layout** | `/impeccable layout` | Grid density, spacing scale, visual scanning paths |
+| **Typeset** | `/impeccable typeset` | Font hierarchy, pairings, line-height, vertical rhythm |
+| **Animate** | `/impeccable animate` | Purposeful micro-interactions, transitions, reduced-motion support |
+| **Adapt** | `/impeccable adapt` | Responsive breakpoints, mobile density (≥44px touch targets), SE/landscape |
+| **Harden** | `/impeccable harden` | Empty states, error states, long captions, offline / skeleton edge cases |
+| **Polish** | `/impeccable polish` | Final craft pass: alignment, interactive states, focus rings, hover states |
+
+### Rules
+
+1. Run the suite **before** committing frontend changes — not after a PR is already open.
+2. Run the full 7-pass suite above for feature, layout, or UI changes; for small isolated CSS/JS tweaks, run at minimum `/impeccable critique`, `/impeccable polish`, and `/impeccable harden`.
+3. For every finding either: implement the fix, or document in the PR body why it was intentionally waived with a rationale.
+4. Never push a frontend commit that leaves a `critique` or `harden` finding unaddressed without an explicit documented reason.
+5. `audit`, `clarify`, `colorize`, `bolder`, `quieter`, `distill`, and `onboard` are optional but recommended when auditing or redesigning a surface.
+
+---
+
+## 6. Security & Boundary Rules
 
 1. **NEVER commit `.env` or credentials:**
    - Strictly exclude `.env`, `.env.*`, `token.json`, `credentials.json`, `*.pem`, `*.key`.
@@ -134,7 +160,7 @@ src/
 
 ---
 
-## 6. BLOCK Violations (NEVER generate code or execute actions that do this)
+## 7. BLOCK Violations (NEVER generate code or execute actions that do this)
 
 * **Direct push to `main` branch** (strictly forbidden).
 * **Committing code directly onto `main`** instead of a topic branch.
@@ -146,3 +172,4 @@ src/
 * **Reinventing date/duration parsing outside `src/utils/duration.ts`**.
 * **Altering database tables without a corresponding migration in `supabase/migrations/`**.
 * **Modifying files in `/Users/thismac/rea/`**.
+* **Committing frontend changes (`public/`) without running at minimum `/impeccable critique`, `/impeccable polish`, and `/impeccable harden`**.

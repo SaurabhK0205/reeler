@@ -2,6 +2,24 @@
 
 See [CLAUDE.md](./CLAUDE.md) for the complete, canonical rules and conventions governing this repository.
 
+### Frontend Work — Impeccable Design Review (MANDATORY)
+
+Whenever you touch `public/` (HTML, CSS, JS) or any user-facing template, run Impeccable design review passes **before** committing and opening a PR:
+
+| Pass | Command | Focus |
+|------|---------|-------|
+| Critique | `/impeccable critique` | Full audit: contrast, spacing, hierarchy, accessibility |
+| Layout | `/impeccable layout` | Grid density, spacing scale, visual scan paths |
+| Typeset | `/impeccable typeset` | Font hierarchy, pairings, vertical rhythm |
+| Animate | `/impeccable animate` | Purposeful micro-interactions and transitions |
+| Adapt | `/impeccable adapt` | Responsive breakpoints, mobile density (≥44px touch targets), SE/landscape |
+| Harden | `/impeccable harden` | Empty states, errors, long captions, edge cases |
+| Polish | `/impeccable polish` | Final craft pass: spacing, alignment, interactive states |
+
+Run the full 7-pass suite for feature/UI changes, and at minimum `critique` + `polish` + `harden` for small tweaks. Address every finding or document why it was intentionally waived in the PR body. (Optional: `audit`, `clarify`, `colorize`, `bolder`, `quieter`, `distill`, `onboard`.)
+
+---
+
 ### Summary of Strict Invariants:
 1. **Branching**: NEVER push or commit directly to `main` or `staging`. Every unit of work must live on a dedicated branch (`feat/*`, `fix/*`, `refactor/*`, `chore/*`, `db/*`).
 2. **Author Identity**: Commits must always be authored by `saurabhk0205 <saurabhk0205@gmail.com>`.
