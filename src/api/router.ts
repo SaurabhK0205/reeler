@@ -4,6 +4,7 @@ import { Repository } from '../db/repository.ts';
 import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
+import { isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
 import type { ReelQueryFilters, WatchStatus, DateFilterPreset } from '../types.ts';
 
 export const apiRouter = express.Router();
@@ -95,6 +96,23 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
     res.json(result);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Resolve live media kind and cover aspect metadata for adaptive player framing
+apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
+  try {
+    const shortcode = String(req.params.shortcode || '');
+    if (!isValidShortcode(shortcode)) {
+      res.status(400).json({ error: 'Invalid shortcode format' });
+      return;
+    }
+
+    const meta = await resolveFeedMediaMetadata(shortcode);
+    res.setHeader('Cache-Control', 'private, max-age=1800');
+    res.json(meta);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Failed to resolve media metadata' });
   }
 });
 

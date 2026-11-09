@@ -29,6 +29,62 @@ function saveViewMode(mode) {
   }
 }
 
+const ASPECT_CACHE_STORAGE_KEY = 'reeler_aspect_cache_v1';
+const ASPECT_CACHE_MAX_ENTRIES = 300;
+
+/**
+ * Loads previously measured embed aspect ratios from localStorage (best effort).
+ * @returns {Map<string, { embedRatio: number | null, isClips: boolean | null, thumbAspectRatio: number | null }>}
+ */
+function loadAspectCache() {
+  const map = new Map();
+  try {
+    const raw = localStorage.getItem(ASPECT_CACHE_STORAGE_KEY);
+    if (!raw) return map;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      for (const [code, val] of Object.entries(parsed)) {
+        if (val && typeof val.r === 'number' && Number.isFinite(val.r)) {
+          map.set(code, {
+            embedRatio: val.r,
+            isClips: typeof val.c === 'boolean' ? val.c : null,
+            thumbAspectRatio: typeof val.tr === 'number' && Number.isFinite(val.tr) ? val.tr : null,
+          });
+        }
+      }
+    }
+  } catch (_) {
+    /* non-fatal */
+  }
+  return map;
+}
+
+/**
+ * Persists a measured embed aspect entry into bounded localStorage cache.
+ * @param {string} shortcode
+ * @param {{ embedRatio: number, isClips: boolean | null, thumbAspectRatio: number | null }} entry
+ */
+function persistAspectCacheEntry(shortcode, entry) {
+  if (!shortcode || !entry || typeof entry.embedRatio !== 'number') return;
+  if (state.aspectCache.size >= ASPECT_CACHE_MAX_ENTRIES && !state.aspectCache.has(shortcode)) {
+    const oldest = state.aspectCache.keys().next().value;
+    if (oldest) state.aspectCache.delete(oldest);
+  }
+  state.aspectCache.set(shortcode, entry);
+
+  try {
+    const obj = {};
+    for (const [code, val] of state.aspectCache.entries()) {
+      if (typeof val.embedRatio === 'number') {
+        obj[code] = { r: val.embedRatio, c: val.isClips, tr: val.thumbAspectRatio };
+      }
+    }
+    localStorage.setItem(ASPECT_CACHE_STORAGE_KEY, JSON.stringify(obj));
+  } catch (_) {
+    /* non-fatal */
+  }
+}
+
 const state = {
   filters: {
     creatorId: '',
@@ -48,6 +104,9 @@ const state = {
   currentFeedIndex: 0,
   previouslyFocusedElement: null,
   previouslyFocusedReelId: null,
+  thumbRatioCache: new Map(),
+  metaCache: new Map(),
+  aspectCache: loadAspectCache(),
 };
 
 // DOM References
@@ -385,6 +444,20 @@ function renderReels() {
       cycleStatus(reel.id, reel.watch_status);
     });
 
+    const cardImg = card.querySelector('.poster-actual-img');
+    if (cardImg && reel.shortcode) {
+      const recordRatio = () => {
+        if (cardImg.naturalWidth > 0 && cardImg.naturalHeight > 0) {
+          state.thumbRatioCache.set(reel.shortcode, cardImg.naturalWidth / cardImg.naturalHeight);
+        }
+      };
+      if (cardImg.complete) {
+        recordRatio();
+      } else {
+        cardImg.addEventListener('load', recordRatio, { once: true });
+      }
+    }
+
     reelsGrid.appendChild(card);
 
     // 2. Render Table Row (for List/Table View)
@@ -409,7 +482,7 @@ function renderReels() {
       </td>
       <td>
         <div class="table-actions-cell">
-          <button class="table-action-icon-btn btn-table-play" title="Play Reel in Feed">
+          <button class="table-action-icon-btn btn-table-play" title="Play Reel in Feed" aria-label="Play reel by @${safeCreator}">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
           </button>
           <button class="table-action-icon-btn btn-table-bookmark ${isWatchLater ? 'active' : ''}" title="Toggle Watch Later">
@@ -492,11 +565,384 @@ async function cycleStatus(reelId, currentStatus) {
 // ==============================================================================
 
 let feedIntersectionObserver = null;
+const metaInFlightMap = new Map();
 
 /**
- * Constructs 100vh reel slides for the vertical snap feed.
+ * Fetches server-side media kind & natural cover aspect ratio for a shortcode when DB thumbnail/efg is missing.
+ * Deduplicates concurrent requests and caches in state.metaCache.
+ * @param {string} shortcode
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<{ isClips: boolean | null, mediaKind: string, thumbAspectRatio: number | null, thumbnailUrl: string | null } | null>}
+ */
+async function fetchShortcodeMeta(shortcode, signal) {
+  if (!shortcode) return null;
+  if (state.metaCache.has(shortcode)) {
+    return state.metaCache.get(shortcode);
+  }
+  if (metaInFlightMap.has(shortcode)) {
+    return metaInFlightMap.get(shortcode);
+  }
+
+  const reqPromise = (async () => {
+    try {
+      const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}/meta`, { signal });
+      if (!res.ok) return null;
+      const data = await res.json();
+      state.metaCache.set(shortcode, data);
+      return data;
+    } catch (_) {
+      return null;
+    } finally {
+      metaInFlightMap.delete(shortcode);
+    }
+  })();
+
+  metaInFlightMap.set(shortcode, reqPromise);
+  return reqPromise;
+}
+
+/**
+ * Resolves the best known aspect classification inputs for a reel slide.
+ * @param {object} reel
+ */
+function getSlideAspectInput(reel) {
+  const shortcode = reel?.shortcode || '';
+  const cached = state.aspectCache.get(shortcode);
+  const serverMeta = state.metaCache.get(shortcode);
+  const cleanThumb = sanitizeMediaUrl(reel?.thumbnail_url);
+  const thumbMeta = ReelerGeometry.parseThumbMeta(cleanThumb);
+
+  return {
+    embedRatio: cached?.embedRatio ?? null,
+    isClips: cached?.isClips ?? serverMeta?.isClips ?? thumbMeta.isClips ?? null,
+    thumbAspectRatio: cached?.thumbAspectRatio ?? serverMeta?.thumbAspectRatio ?? state.thumbRatioCache.get(shortcode) ?? null,
+  };
+}
+
+/**
+ * Computes and applies adaptive container, overlay dock, action rail, and unscaled iframe geometry.
+ * @param {HTMLElement} slide
+ * @param {object} reel
+ * @param {{ embedRatio?: number | null, isClips?: boolean | null, thumbAspectRatio?: number | null }} [overrideInput]
+ */
+function applySlideStage(slide, reel, overrideInput) {
+  if (!slide || !reel) return null;
+  const input = overrideInput || getSlideAspectInput(reel);
+  const stage = ReelerGeometry.computeAdaptiveStage({
+    embedRatio: input.embedRatio ?? null,
+    isClips: input.isClips ?? null,
+    thumbAspectRatio: input.thumbAspectRatio ?? null,
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+  });
+
+  slide.classList.toggle('is-docked-meta', stage.useDockedMeta);
+  slide.classList.toggle('is-compact-rail', stage.useCompactRail);
+
+  const wrapper = slide.querySelector('.reel-stage-wrapper');
+  const slot = slide.querySelector('.reel-media-slot');
+  const viewport = slide.querySelector('.reel-media-viewport');
+  const iframe = slide.querySelector('.reel-player-iframe');
+
+  if (wrapper) {
+    wrapper.style.width = `${stage.viewW}px`;
+  }
+  if (slot) {
+    slot.style.width = `${stage.viewW}px`;
+    slot.style.height = `${stage.viewH}px`;
+  }
+  if (viewport) {
+    viewport.style.width = `${stage.viewW}px`;
+    viewport.style.height = `${stage.viewH}px`;
+  }
+  if (iframe && iframe.dataset.probing !== '1') {
+    iframe.style.width = `${stage.iframeW}px`;
+    iframe.style.height = `${stage.iframeH}px`;
+    iframe.style.left = `${stage.iframeLeft}px`;
+    iframe.style.top = `${stage.iframeTop}px`;
+  }
+
+  return stage;
+}
+
+/**
+ * Upgrades or sets the poster underlay image inside a slide viewport if a working URL becomes available.
+ * @param {HTMLElement} slide
+ * @param {object} reel
+ * @param {string} url
+ * @param {{ recordRatio?: boolean }} [options]
+ */
+function setSlidePosterUrl(slide, reel, url, { recordRatio = true } = {}) {
+  const viewport = slide?.querySelector('.reel-media-viewport');
+  const shortcode = reel?.shortcode || '';
+  if (!viewport || !url) return;
+  let posterImg = viewport.querySelector('.reel-poster-underlay');
+  if (!posterImg) {
+    posterImg = document.createElement('img');
+    posterImg.className = 'reel-poster-underlay';
+    posterImg.alt = '';
+    posterImg.setAttribute('aria-hidden', 'true');
+    const iframeBox = viewport.querySelector('.reel-iframe-container');
+    viewport.insertBefore(posterImg, iframeBox || null);
+  }
+  posterImg.style.display = '';
+  posterImg.src = url;
+  posterImg.addEventListener('load', () => {
+    if (recordRatio && posterImg.naturalWidth > 0 && posterImg.naturalHeight > 0 && shortcode) {
+      state.thumbRatioCache.set(shortcode, posterImg.naturalWidth / posterImg.naturalHeight);
+      const iframe = slide.querySelector('.reel-player-iframe');
+      if (!iframe || iframe.dataset.probing === '1') {
+        applySlideStage(slide, reel);
+      }
+    }
+  }, { once: true });
+  posterImg.addEventListener('error', () => {
+    posterImg.style.display = 'none';
+  }, { once: true });
+}
+
+/**
+ * Cleanly unmounts any active embed iframe, timers, and message listeners inside an iframe container.
+ * @param {HTMLElement | null} iframeBox
+ */
+function unmountSlideIframe(iframeBox) {
+  if (!iframeBox) return;
+  if (typeof iframeBox.__cleanup === 'function') {
+    iframeBox.__cleanup();
+    iframeBox.__cleanup = null;
+  }
+  if (iframeBox.firstChild) {
+    iframeBox.innerHTML = '';
+  }
+}
+
+/**
+ * Mounts an Instagram embed iframe and dynamically measures its true media aspect ratio
+ * using two-width MEASURE events before revealing the player at exact 1:1 unscaled framing.
+ * @param {HTMLElement} slide
+ * @param {object} reel
+ */
+function mountFeedIframe(slide, reel) {
+  const iframeBox = slide?.querySelector('.reel-iframe-container');
+  if (!iframeBox || !reel?.shortcode || iframeBox.querySelector('iframe')) return;
+
+  unmountSlideIframe(iframeBox);
+
+  const shortcode = reel.shortcode;
+  const cached = state.aspectCache.get(shortcode);
+  const cleanThumb = sanitizeMediaUrl(reel.thumbnail_url);
+  const hasRealThumbnail = Boolean(cleanThumb && !cleanThumb.includes('photo-1618005182384'));
+  const thumbMeta = ReelerGeometry.parseThumbMeta(cleanThumb);
+
+  let knownIsClips = cached?.isClips ?? state.metaCache.get(shortcode)?.isClips ?? thumbMeta.isClips ?? null;
+  let knownThumbRatio = cached?.thumbAspectRatio ?? state.metaCache.get(shortcode)?.thumbAspectRatio ?? state.thumbRatioCache.get(shortcode) ?? null;
+
+  const posterImg = slide.querySelector('.reel-poster-underlay');
+  const posterBroken = posterImg && posterImg.style.display === 'none';
+
+  const iframe = document.createElement('iframe');
+  iframe.src = `https://www.instagram.com/p/${encodeURIComponent(shortcode)}/embed/`;
+  iframe.className = 'reel-player-iframe';
+  iframe.setAttribute('allowfullscreen', 'true');
+  iframe.setAttribute('scrolling', 'no');
+  iframe.setAttribute('allowtransparency', 'true');
+  iframe.setAttribute('loading', 'eager');
+  iframe.setAttribute('title', `Instagram post by @${reel.creator?.username || 'creator'}`);
+
+  const abortController = new AbortController();
+  let metaPromise = null;
+  if (knownIsClips === null || !hasRealThumbnail || posterBroken) {
+    metaPromise = fetchShortcodeMeta(shortcode, abortController.signal).then((meta) => {
+      if (!meta || abortController.signal.aborted) return meta;
+      if (knownIsClips === null && meta.isClips !== undefined) {
+        knownIsClips = meta.isClips;
+      }
+      if (knownThumbRatio === null && typeof meta.thumbAspectRatio === 'number') {
+        knownThumbRatio = meta.thumbAspectRatio;
+      }
+      const currentPoster = slide.querySelector('.reel-poster-underlay');
+      const nowBroken = !currentPoster || currentPoster.style.display === 'none';
+      if (meta.thumbnailUrl && (!hasRealThumbnail || nowBroken)) {
+        setSlidePosterUrl(slide, reel, meta.thumbnailUrl, { recordRatio: meta.isClips === true });
+      }
+      if (iframe.dataset.probing === '1') {
+        applySlideStage(slide, reel, {
+          embedRatio: null,
+          isClips: knownIsClips,
+          thumbAspectRatio: knownThumbRatio,
+        });
+      }
+      return meta;
+    });
+  }
+
+  let settled = false;
+  let phase = cached?.embedRatio ? 'cached' : 'w1';
+  let mounted = false;
+  let h1 = null;
+  let safetyTimer = null;
+  let revealTimer = null;
+
+  const finalizeAndReveal = (embedRatio, persist, settleDelayMs = 0) => {
+    if (settled || abortController.signal.aborted) return;
+    settled = true;
+    delete iframe.dataset.probing;
+
+    if (persist && typeof embedRatio === 'number') {
+      persistAspectCacheEntry(shortcode, {
+        embedRatio,
+        isClips: knownIsClips,
+        thumbAspectRatio: knownThumbRatio,
+      });
+    }
+
+    const stage = applySlideStage(slide, reel, {
+      embedRatio,
+      isClips: knownIsClips,
+      thumbAspectRatio: knownThumbRatio,
+    });
+
+    const revealNow = () => {
+      revealTimer = null;
+      if (!abortController.signal.aborted) {
+        iframe.classList.add('is-ready');
+      }
+    };
+
+    const waitMs = stage && settleDelayMs > 0 && stage.iframeW !== ReelerGeometry.PROBE_WIDTH_2
+      ? settleDelayMs
+      : (settleDelayMs > 0 ? 48 : 0);
+
+    cleanupListeners();
+
+    if (waitMs > 0) {
+      revealTimer = setTimeout(revealNow, waitMs);
+    } else {
+      requestAnimationFrame(revealNow);
+    }
+  };
+
+  const onMessage = async (event) => {
+    if (event.source !== iframe.contentWindow) return;
+    if (!/^https:\/\/(?:www\.)?instagram\.com$/i.test(event.origin)) return;
+
+    const msg = ReelerGeometry.parseEmbedMessage(event.data);
+    if (!msg) return;
+
+    if (phase === 'cached') {
+      if (msg.type === 'MOUNTED') {
+        finalizeAndReveal(cached.embedRatio, false, 80);
+      }
+      return;
+    }
+
+    if (phase === 'w1') {
+      if (msg.type === 'MOUNTED') {
+        mounted = true;
+      }
+      if (msg.type === 'MEASURE' && msg.height && msg.height > 150) {
+        h1 = msg.height;
+      }
+      if (mounted && h1 !== null) {
+        phase = 'w2';
+        iframe.style.width = `${ReelerGeometry.PROBE_WIDTH_2}px`;
+        if (safetyTimer) {
+          clearTimeout(safetyTimer);
+          safetyTimer = setTimeout(() => {
+            phase = 'aborted';
+            finalizeAndReveal(null, false, 0);
+          }, 2500);
+        }
+      }
+      return;
+    }
+
+    if (phase === 'w2' && msg.type === 'MEASURE' && msg.height) {
+      const measuredRatio = ReelerGeometry.computeEmbedRatioFromHeights(
+        ReelerGeometry.PROBE_WIDTH_1,
+        h1,
+        ReelerGeometry.PROBE_WIDTH_2,
+        msg.height
+      );
+      if (measuredRatio === null) {
+        return; // Ignore stale W1 MEASURE event
+      }
+
+      phase = 'done';
+      if (safetyTimer) {
+        clearTimeout(safetyTimer);
+        safetyTimer = null;
+      }
+      // Only wait for server meta disambiguation when embed is ~4:5 and mediaKind is still unknown
+      if (measuredRatio >= 0.76 && measuredRatio <= 0.84 && knownIsClips === null && metaPromise) {
+        await Promise.race([
+          metaPromise,
+          new Promise((r) => setTimeout(r, 1200)),
+        ]);
+      }
+
+      finalizeAndReveal(measuredRatio, true, 180);
+    }
+  };
+
+  function cleanupListeners() {
+    window.removeEventListener('message', onMessage);
+    if (safetyTimer) {
+      clearTimeout(safetyTimer);
+      safetyTimer = null;
+    }
+  }
+
+  iframeBox.__cleanup = () => {
+    abortController.abort();
+    if (revealTimer) {
+      clearTimeout(revealTimer);
+      revealTimer = null;
+    }
+    cleanupListeners();
+  };
+
+  window.addEventListener('message', onMessage);
+
+  if (phase === 'cached') {
+    applySlideStage(slide, reel, cached);
+    const stage = ReelerGeometry.computeAdaptiveStage({
+      embedRatio: cached.embedRatio,
+      isClips: knownIsClips,
+      thumbAspectRatio: knownThumbRatio,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    });
+    iframe.style.width = `${stage.iframeW}px`;
+    iframe.style.height = `${stage.iframeH}px`;
+    iframe.style.left = `${stage.iframeLeft}px`;
+    iframe.style.top = `${stage.iframeTop}px`;
+    iframeBox.appendChild(iframe);
+
+    safetyTimer = setTimeout(() => {
+      finalizeAndReveal(cached.embedRatio, false, 0);
+    }, 2500);
+  } else {
+    iframe.dataset.probing = '1';
+    iframe.style.width = `${ReelerGeometry.PROBE_WIDTH_1}px`;
+    iframe.style.height = '1500px';
+    iframe.style.left = '0px';
+    iframe.style.top = `-${ReelerGeometry.HEADER_CLIP_PX}px`;
+    iframeBox.appendChild(iframe);
+
+    safetyTimer = setTimeout(() => {
+      phase = 'aborted';
+      finalizeAndReveal(null, false, 0);
+    }, 6500);
+  }
+}
+
+/**
+ * Constructs 100dvh reel slides for the vertical snap feed with adaptive framing.
  */
 function renderFeedSlides() {
+  const existingBoxes = feedScrollTrack.querySelectorAll('.reel-iframe-container');
+  existingBoxes.forEach((box) => unmountSlideIframe(box));
   feedScrollTrack.innerHTML = '';
 
   state.reels.forEach((reel, index) => {
@@ -506,7 +952,7 @@ function renderFeedSlides() {
     const isWatchLater = reel.watch_status === 'watch_later';
     const isWatched = reel.watch_status === 'watched';
     const cleanThumbnail = sanitizeMediaUrl(reel.thumbnail_url);
-    const hasRealThumbnail = cleanThumbnail && !cleanThumbnail.includes('photo-1618005182384');
+    const hasRealThumbnail = Boolean(cleanThumbnail && !cleanThumbnail.includes('photo-1618005182384'));
     const dateFormatted = formatRelativeDate(reel.taken_at || reel.saved_at);
     const captionText = reel.caption || 'No caption available for this reel.';
 
@@ -515,32 +961,56 @@ function renderFeedSlides() {
     slide.setAttribute('data-reel-id', reel.id);
     slide.setAttribute('data-index', String(index));
 
-    let underlayHtml = '';
-    if (hasRealThumbnail) {
-      underlayHtml = `<div class="reel-poster-underlay" style="background-image: url('${cleanThumbnail}');"></div>`;
-    } else {
-      underlayHtml = `
-        <div class="reel-monogram-underlay">
-          <div class="feed-monogram-circle">${initial}</div>
-          <div class="feed-monogram-handle">@${safeCreator}</div>
-        </div>
-      `;
-    }
-
     slide.innerHTML = `
       <div class="reel-stage-wrapper">
-        <div class="reel-media-viewport">
-          ${underlayHtml}
-          <!-- Boundary-Masked Clean Iframe Container (No white Instagram card/footer) -->
-          <div class="reel-iframe-container" id="feed-iframe-box-${reel.id}"></div>
+        <div class="reel-media-slot">
+          <div class="reel-media-viewport">
+            <div class="reel-monogram-underlay">
+              <div class="feed-monogram-circle">${initial}</div>
+              <div class="feed-monogram-handle">@${safeCreator}</div>
+            </div>
+            <!-- Boundary-Masked Clean Iframe Container (Zero white Instagram chrome) -->
+            <div class="reel-iframe-container" id="feed-iframe-box-${reel.id}"></div>
+          </div>
+
+          <!-- Adaptive Action Rail (Right Side on Desktop / Bottom Strip on Compact) -->
+          <div class="reel-actions-rail">
+            <div class="rail-action-item">
+              <button class="rail-action-btn ${isWatched ? 'active-watched' : ''}" data-action="feed-toggle-watched" title="Mark Watched" aria-label="Mark Watched">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="20 6 9 17 4 12"></polyline></svg>
+              </button>
+              <span class="rail-action-sublabel">Watched</span>
+            </div>
+
+            <div class="rail-action-item">
+              <button class="rail-action-btn ${isWatchLater ? 'active-later' : ''}" data-action="feed-toggle-later" title="Watch Later" aria-label="Watch Later">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+              </button>
+              <span class="rail-action-sublabel">Later</span>
+            </div>
+
+            <div class="rail-action-item">
+              <button class="rail-action-btn" data-action="feed-copy-link" title="Copy Reel Link" aria-label="Copy Reel Link">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+              </button>
+              <span class="rail-action-sublabel copy-label">Copy</span>
+            </div>
+
+            <div class="rail-action-item">
+              <a href="${escapeHtml(reel.reel_url)}" target="_blank" rel="noopener noreferrer" class="rail-action-btn" title="Open directly in Instagram app or web" aria-label="Open in Instagram">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+              </a>
+              <span class="rail-action-sublabel">Open ↗</span>
+            </div>
+          </div>
         </div>
 
-        <!-- Overlay Details (Bottom Left) -->
+        <!-- Overlay / Docked Details -->
         <div class="reel-overlay-content">
           <div class="reel-overlay-creator">
             <div class="reel-creator-avatar">${initial}</div>
             <div class="reel-creator-meta">
-              <a href="https://www.instagram.com/${creatorName}/" target="_blank" rel="noopener noreferrer" class="reel-creator-handle">@${safeCreator}</a>
+              <a href="https://www.instagram.com/${encodeURIComponent(creatorName)}/" target="_blank" rel="noopener noreferrer" class="reel-creator-handle">@${safeCreator}</a>
               <span class="reel-saved-badge">Saved ${dateFormatted}</span>
             </div>
           </div>
@@ -549,39 +1019,15 @@ function renderFeedSlides() {
             ${captionText.length > 90 ? '<button class="reel-caption-toggle" data-action="toggle-caption">more</button>' : ''}
           </div>
         </div>
-
-        <!-- Vertical Action Rail (Right Side) -->
-        <div class="reel-actions-rail">
-          <div class="rail-action-item">
-            <button class="rail-action-btn ${isWatched ? 'active-watched' : ''}" data-action="feed-toggle-watched" title="Mark Watched" aria-label="Mark Watched">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="20 6 9 17 4 12"></polyline></svg>
-            </button>
-            <span class="rail-action-sublabel">Watched</span>
-          </div>
-
-          <div class="rail-action-item">
-            <button class="rail-action-btn ${isWatchLater ? 'active-later' : ''}" data-action="feed-toggle-later" title="Watch Later" aria-label="Watch Later">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
-            </button>
-            <span class="rail-action-sublabel">Later</span>
-          </div>
-
-          <div class="rail-action-item">
-            <button class="rail-action-btn" data-action="feed-copy-link" title="Copy Reel Link" aria-label="Copy Reel Link">
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-            </button>
-            <span class="rail-action-sublabel copy-label">Copy</span>
-          </div>
-
-          <div class="rail-action-item">
-            <a href="${reel.reel_url}" target="_blank" rel="noopener noreferrer" class="rail-action-btn" title="Open directly in Instagram app or web" aria-label="Open in Instagram">
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
-            </a>
-            <span class="rail-action-sublabel">Open ↗</span>
-          </div>
-        </div>
       </div>
     `;
+
+    if (hasRealThumbnail) {
+      setSlidePosterUrl(slide, reel, cleanThumbnail, { recordRatio: true });
+    }
+
+    // Apply initial or cached adaptive dimensions before visibility observer fires
+    applySlideStage(slide, reel);
 
     // Slide internal click delegator
     slide.addEventListener('click', async (e) => {
@@ -653,22 +1099,12 @@ function setupFeedIntersectionObserver() {
         feedCounterKicker.textContent = `REEL ${index + 1} OF ${state.reels.length}`;
         feedShortcodeTag.textContent = `ID: ${reel?.shortcode || '—'}`;
 
-        // Mount Boundary-Masked Clean Iframe if not already mounted
-        if (iframeBox && !iframeBox.querySelector('iframe') && reel) {
-          const iframe = document.createElement('iframe');
-          iframe.src = `https://www.instagram.com/reel/${reel.shortcode}/embed/`;
-          iframe.className = 'reel-player-iframe';
-          iframe.setAttribute('allowfullscreen', 'true');
-          iframe.setAttribute('scrolling', 'no');
-          iframe.setAttribute('allowtransparency', 'true');
-          iframe.setAttribute('loading', 'eager');
-          iframeBox.appendChild(iframe);
+        if (reel) {
+          mountFeedIframe(slide, reel);
         }
       } else if (!entry.isIntersecting || entry.intersectionRatio < 0.2) {
-        // Unmount iframe to stop video playback and audio immediately
-        if (iframeBox && iframeBox.querySelector('iframe')) {
-          iframeBox.innerHTML = '';
-        }
+        // Unmount iframe and listeners to stop video playback and audio immediately
+        unmountSlideIframe(iframeBox);
       }
     });
   }, {
@@ -694,7 +1130,9 @@ function openReelsFeed(startReel) {
   document.body.style.overflow = 'hidden';
 
   // Scroll directly to target reel slide
-  const targetSlide = feedScrollTrack.querySelector(`[data-reel-id="${startReel.id}"]`);
+  const targetSlide = startReel?.id
+    ? feedScrollTrack.querySelector(`[data-reel-id="${CSS.escape(String(startReel.id))}"]`)
+    : null;
   if (targetSlide) {
     targetSlide.scrollIntoView({ behavior: 'instant', block: 'start' });
   }
@@ -711,9 +1149,9 @@ function closeReelsFeed() {
     feedIntersectionObserver.disconnect();
   }
 
-  // Clear all iframes immediately to silence audio
+  // Clear all iframes and active probes immediately to silence audio
   const iframes = feedScrollTrack.querySelectorAll('.reel-iframe-container');
-  iframes.forEach((box) => { box.innerHTML = ''; });
+  iframes.forEach((box) => unmountSlideIframe(box));
 
   feedModal.classList.remove('active');
   feedModal.setAttribute('aria-hidden', 'true');
@@ -721,12 +1159,23 @@ function closeReelsFeed() {
 
   state.currentFeedReelId = null;
 
-  // Restore previous focus
+  // Restore focus to the matching control in the currently visible catalog view
   const prev = state.previouslyFocusedElement;
   const reelId = state.previouslyFocusedReelId || prev?.closest?.('[data-id]')?.getAttribute('data-id');
-  const restoreTarget = (prev && prev.isConnected)
-    ? prev
-    : (reelId ? document.querySelector(`.vault-poster-card[data-id="${CSS.escape(reelId)}"], .table-row[data-id="${CSS.escape(reelId)}"] .btn-table-play`) : null);
+  const isPrevVisible = prev && prev.isConnected && prev.offsetParent !== null;
+  const isPrevCatalogControl = Boolean(isPrevVisible && prev.closest?.('[data-id]'));
+  let restoreTarget = isPrevCatalogControl ? prev : null;
+
+  if (!restoreTarget && reelId) {
+    const escapedId = CSS.escape(String(reelId));
+    const selector = state.viewMode === 'list'
+      ? `.table-row[data-id="${escapedId}"] .btn-table-play`
+      : `.vault-poster-card[data-id="${escapedId}"]`;
+    restoreTarget = document.querySelector(selector);
+  }
+  if (!restoreTarget && isPrevVisible) {
+    restoreTarget = prev;
+  }
   if (restoreTarget && typeof restoreTarget.focus === 'function') {
     restoreTarget.focus();
   }
@@ -754,7 +1203,7 @@ function scrollFeedBy(direction) {
  * @param {string} newStatus
  */
 function syncFeedSlideStatus(reelId, newStatus) {
-  const slide = feedScrollTrack.querySelector(`[data-reel-id="${reelId}"]`);
+  const slide = feedScrollTrack.querySelector(`[data-reel-id="${CSS.escape(String(reelId))}"]`);
   if (!slide) return;
 
   const watchedBtn = slide.querySelector('[data-action="feed-toggle-watched"]');
@@ -887,6 +1336,23 @@ function setupEventListeners() {
   feedCloseBtn.addEventListener('click', closeReelsFeed);
   feedArrowUp.addEventListener('click', () => scrollFeedBy(-1));
   feedArrowDown.addEventListener('click', () => scrollFeedBy(1));
+
+  let resizeRaf = 0;
+  window.addEventListener('resize', () => {
+    if (!feedModal.classList.contains('active')) return;
+    if (resizeRaf) cancelAnimationFrame(resizeRaf);
+    resizeRaf = requestAnimationFrame(() => {
+      resizeRaf = 0;
+      const slides = feedScrollTrack.querySelectorAll('.feed-reel-slide');
+      slides.forEach((slide) => {
+        const index = parseInt(slide.getAttribute('data-index') || '0', 10);
+        const reel = state.reels[index];
+        if (reel) {
+          applySlideStage(slide, reel);
+        }
+      });
+    });
+  });
 
   // Global keydown navigation for the Feed
   window.addEventListener('keydown', (e) => {
