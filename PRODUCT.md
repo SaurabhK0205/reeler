@@ -29,7 +29,7 @@ Unlike native Instagram saved folders (which are paginated, unsearchable, and mi
 - **Single-page web client**: Vanilla HTML5, modern CSS3, native ES modules (`public/index.html`, `public/style.css`, `public/app.js`).
 - **Backend**: Express on Node.js with native experimental strip-types and Supabase PostgreSQL.
 - **Constraints**: No heavy frontend build pipelines or runtime frameworks (React/Vue/Webpack); must remain lean, lightning fast, and load instantly from static files.
-- **Aspect Ratio**: Video content is vertical 9:16 reels; card hierarchy must prioritize vertical poster visual appeal over wide horizontal boxes.
+- **Aspect Ratio**: Catalog poster cards use uniform `9:13.5` vertical theater framing while the interactive player adapts seamlessly across `9:16` Reels and `3:4`, `4:5`, `1:1`, `5:4`, and `16:9` saved Instagram posts without web chrome.
 
 ## Brand Commitments
 
@@ -38,9 +38,9 @@ Unlike native Instagram saved folders (which are paginated, unsearchable, and mi
 
 ## Evidence on Hand
 
-- Real dataset: 7,111 saved reels and 4,793 creators parsed from official Instagram `saved_posts.json` export.
+- Live Supabase archive exceeds 7,100 saved items and 4,900 creators parsed from official Instagram `saved_posts.json` exports and webhook events.
 - Working Meta Graph API webhook and bidirectional DM notification system.
-- Full unit test suite (11/11 passing).
+- Full automated unit test suite (18/18 passing across archive import, DM bot, adaptive player geometry, and stream/search hardening).
 
 ## Product Principles
 

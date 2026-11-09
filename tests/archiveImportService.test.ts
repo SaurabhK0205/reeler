@@ -5,7 +5,7 @@ delete process.env.SUPABASE_URL;
 delete process.env.SUPABASE_SERVICE_ROLE_KEY;
 delete process.env.SUPABASE_ANON_KEY;
 
-const { ArchiveImportService } = await import('../src/services/archiveImportService.ts');
+const { ArchiveImportService, normalizeMetaExportText } = await import('../src/services/archiveImportService.ts');
 const { Repository } = await import('../src/db/repository.ts');
 
 async function runTests() {
@@ -143,6 +143,75 @@ async function runTests() {
   assert.equal(reel6.creator?.username, 'bhaavyaa____', 'Creator username must be parsed from Owner.Username');
   assert.equal(reel6.caption, 'Ajeeb.', 'Caption should be parsed from Caption label');
   assert.equal(reel6.instagram_media_id, '18084562202346176', 'Media ID should be fbid');
+
+  // Test 7: Meta Latin-1 UTF-8 mojibake decoding + BMP-truncated PUA cleanup + Repository.queryCreators bounding/pinning
+  console.log('Test 7: Meta mojibake normalization and bounded creator query');
+  assert.equal(
+    normalizeMetaExportText('thereâ\x80\x99s tears ð\x9F\x98\xad for Céline\uF5A4\uF90F\uF3FB\uE001'),
+    'there’s tears 😭 for Céline'
+  );
+  assert.equal(
+    normalizeMetaExportText('小coco来啰'),
+    '小coco来啰',
+    'Genuine CJK unified characters must never be stripped'
+  );
+
+  const mojibakeArchive = [
+    {
+      timestamp: 1794139000,
+      fbid: '18084562202349999',
+      label_values: [
+        {
+          label: 'URL',
+          href: 'https://www.instagram.com/reel/Dfbw_JqgcN0/',
+        },
+        {
+          label: 'Caption',
+          value: 'thereâ\x80\x99s hope ð\x9F\x98\xad',
+        },
+        {
+          title: 'Owner',
+          dict: [
+            {
+              dict: [
+                { label: 'Username', value: 'celine_Archive' },
+                { label: 'Name', value: 'CÃ©lineâ\x80\x99s Vault' },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ];
+  const res7 = await ArchiveImportService.importArchive(mojibakeArchive);
+  assert.equal(res7.status, 'success');
+  assert.equal(res7.reelsImported, 1);
+
+  const { reels: list7 } = await Repository.getReels({ limit: 20 });
+  const reel7 = list7.find((r) => r.shortcode === 'Dfbw_JqgcN0');
+  assert.ok(reel7, 'Reel Dfbw_JqgcN0 should exist');
+  assert.equal(reel7.caption, 'there’s hope 😭');
+  assert.equal(reel7.creator?.display_name, 'Céline’s Vault');
+
+  const atDisplaySearch = await Repository.getReels({ search: '@céline', limit: 20 });
+  assert.equal(atDisplaySearch.reels.some((r) => r.shortcode === 'Dfbw_JqgcN0'), true, '@display_name search must match handleQ');
+
+  const topBounded = await Repository.queryCreators({ limit: 2 });
+  assert.equal(topBounded.creators.length, 2);
+  assert.ok(topBounded.totalCount >= 4);
+  assert.equal(topBounded.matchCount, topBounded.totalCount);
+
+  const searchResult = await Repository.queryCreators({ q: '@bhaav', limit: 5 });
+  assert.equal(searchResult.matchCount, 1);
+  assert.equal(searchResult.creators[0]?.username, 'bhaavyaa____');
+
+  const displayResult = await Repository.queryCreators({ q: 'céline', limit: 5 });
+  assert.equal(displayResult.matchCount, 1);
+  assert.equal(displayResult.creators[0]?.username, 'celine_Archive');
+
+  const pinnedResult = await Repository.queryCreators({ limit: 1, includeId: reel7.creator_id });
+  assert.equal(pinnedResult.creators.length, 1);
+  assert.equal(pinnedResult.creators[0]?.id, reel7.creator_id);
 
   console.log('✅ All ArchiveImportService tests passed successfully!');
 }
