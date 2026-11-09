@@ -123,7 +123,9 @@ src/
 
 ## 5. Frontend Work — Impeccable Design Review (MANDATORY)
 
-Whenever you modify anything under `public/` (HTML, CSS, or JS) or any user-facing template, run Impeccable design review passes **before** committing frontend changes and opening or updating a Pull Request.
+**Setup (once per environment):** Install Impeccable via `npx impeccable install` (see the [Impeccable installation guide](https://github.com/pbakaus/impeccable#installation)) and reload your coding tool so `/impeccable` passes are available.
+
+Whenever you modify anything under `public/` (HTML, CSS, or JS) or any user-facing template, run Impeccable design review passes **before committing any frontend change** (including fixes requested during PR review before pushing or updating the PR).
 
 ### Required Passes
 
@@ -139,7 +141,7 @@ Whenever you modify anything under `public/` (HTML, CSS, or JS) or any user-faci
 
 ### Rules
 
-1. Run the suite **before** committing frontend changes — not after a PR is already open.
+1. Run the required passes **before each frontend commit** — when opening a PR and when pushing review follow-up commits.
 2. Run the full 7-pass suite above for feature, layout, or UI changes; for small isolated CSS/JS tweaks, run at minimum `/impeccable critique`, `/impeccable polish`, and `/impeccable harden`.
 3. For every finding either: implement the fix, or document in the PR body why it was intentionally waived with a rationale.
 4. Never push a frontend commit that leaves a `critique` or `harden` finding unaddressed without an explicit documented reason.
@@ -147,7 +149,20 @@ Whenever you modify anything under `public/` (HTML, CSS, or JS) or any user-faci
 
 ---
 
-## 6. Security & Boundary Rules
+## 6. Engineering Reliability — GRAVITAS Workflow (MANDATORY)
+
+**Setup (once per environment):** Install the GRAVITAS skill via `npx skills add udaysharmadev/Gravitas --skill gravitas --agent antigravity --yes` (see [udaysharmadev/Gravitas](https://github.com/udaysharmadev/Gravitas)) and reload your coding tool. Keep project-local symlinks under `.agents/skills/` (gitignored).
+
+For implementation, debugging, refactoring, review, and migrations:
+1. **Ground before mutating:** Read the target file, its callers, and relevant tests before editing. Never act on assumed file state.
+2. **Adaptive planning:** Scale rigor to blast radius (`direct` for localized 1-file edits, `compact` for multi-file dependencies, `deep` for architecture, security, or database migrations). Track acceptance criteria for non-trivial changes.
+3. **Evidence-backed verification:** Run executable checks (`npm test`, runtime/repro checks, and/or GRAVITAS `scripts/run-checks.sh`) **after the final edit**. Never rely on stale results or self-review alone; state an explicit `VERDICT: PASS` or `VERDICT: FAIL`.
+4. **Never exact-retry a failure:** After a failed command or patch, diagnose what changed and adapt strategy before retrying.
+5. **State unknowns honestly:** Explicitly label unverified checks or environment limitations rather than claiming pass without proof.
+
+---
+
+## 7. Security & Boundary Rules
 
 1. **NEVER commit `.env` or credentials:**
    - Strictly exclude `.env`, `.env.*`, `token.json`, `credentials.json`, `*.pem`, `*.key`.
@@ -160,7 +175,7 @@ Whenever you modify anything under `public/` (HTML, CSS, or JS) or any user-faci
 
 ---
 
-## 7. BLOCK Violations (NEVER generate code or execute actions that do this)
+## 8. BLOCK Violations (NEVER generate code or execute actions that do this)
 
 * **Direct push to `main` branch** (strictly forbidden).
 * **Committing code directly onto `main`** instead of a topic branch.
@@ -173,3 +188,4 @@ Whenever you modify anything under `public/` (HTML, CSS, or JS) or any user-faci
 * **Altering database tables without a corresponding migration in `supabase/migrations/`**.
 * **Modifying files in `/Users/thismac/rea/`**.
 * **Committing frontend changes (`public/`) without running at minimum `/impeccable critique`, `/impeccable polish`, and `/impeccable harden`**.
+* **Claiming a task or fix is verified without post-edit command/test evidence (per GRAVITAS)**.

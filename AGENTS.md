@@ -4,7 +4,9 @@ See [CLAUDE.md](./CLAUDE.md) for the complete, canonical rules and conventions g
 
 ### Frontend Work — Impeccable Design Review (MANDATORY)
 
-Whenever you touch `public/` (HTML, CSS, JS) or any user-facing template, run Impeccable design review passes **before** committing and opening a PR:
+**Setup (once per environment):** Install Impeccable via `npx impeccable install` (see the [Impeccable installation guide](https://github.com/pbakaus/impeccable#installation)) and reload your coding tool so `/impeccable` passes are available.
+
+Whenever you touch `public/` (HTML, CSS, JS) or any user-facing template, run Impeccable design review passes **before each frontend commit** (including PR review follow-ups before pushing/updating a PR):
 
 | Pass | Command | Focus |
 |------|---------|-------|
@@ -16,7 +18,20 @@ Whenever you touch `public/` (HTML, CSS, JS) or any user-facing template, run Im
 | Harden | `/impeccable harden` | Empty states, errors, long captions, edge cases |
 | Polish | `/impeccable polish` | Final craft pass: spacing, alignment, interactive states |
 
-Run the full 7-pass suite for feature/UI changes, and at minimum `critique` + `polish` + `harden` for small tweaks. Address every finding or document why it was intentionally waived in the PR body. (Optional: `audit`, `clarify`, `colorize`, `bolder`, `quieter`, `distill`, `onboard`.)
+Run the full 7-pass suite for feature/UI changes, and at minimum `critique` + `polish` + `harden` for small isolated tweaks. Address every finding or document why it was intentionally waived in the PR body. (Optional: `audit`, `clarify`, `colorize`, `bolder`, `quieter`, `distill`, `onboard`.)
+
+---
+
+### Engineering Reliability — GRAVITAS Workflow (MANDATORY)
+
+**Setup (once per environment):** Install the GRAVITAS skill via `npx skills add udaysharmadev/Gravitas --skill gravitas --agent antigravity --yes` (see [udaysharmadev/Gravitas](https://github.com/udaysharmadev/Gravitas)) and reload your coding tool. In this repository, keep local skill symlinks under `.agents/skills/` (gitignored).
+
+Follow GRAVITAS invariants for implementation, debugging, refactoring, review, and migrations:
+1. **Ground before mutating:** Read target files, their callers, and relevant tests before editing. Never act on assumed file state.
+2. **Adaptive planning:** Scale planning to risk (`direct` for localized 1-file edits, `compact` for multi-file dependencies, `deep` for architecture/security/schema work). Record scope and acceptance criteria for non-trivial changes.
+3. **Evidence-backed completion:** Run targeted and regression checks (`npm test`, typecheck, and/or GRAVITAS `scripts/run-checks.sh`) **after the final relevant edit** and base completion claims only on observed output (`VERDICT: PASS` / `VERDICT: FAIL`).
+4. **Never exact-retry a failure:** Change diagnosis, context, or strategy before retrying a failed command or edit.
+5. **State unknowns honestly:** Explicitly report anything not verified or runnable in the current environment instead of assuming it passes.
 
 ---
 
