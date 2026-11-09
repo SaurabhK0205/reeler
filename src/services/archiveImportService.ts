@@ -23,6 +23,33 @@ export interface ArchiveImportResult {
 
 const UNKNOWN_CREATOR_HANDLE = 'unattributed';
 const INSTAGRAM_HANDLE_REGEX = /^[a-zA-Z0-9._]{1,30}$/;
+const UTF8_DECODER_FATAL = new TextDecoder('utf-8', { fatal: true });
+
+/**
+ * Decodes Meta export Latin-1-wrapped UTF-8 mojibake sequences (e.g. `thereâ\x80\x99s`, `ð\x9F\x98\xad`)
+ * back into clean Unicode while preserving genuine Latin-1 text (`Céline`) and stripping leftover C1 controls.
+ */
+export function normalizeMetaExportText(raw: string | null | undefined): string {
+  if (!raw) return '';
+  const fixed = String(raw).replace(
+    /(?:[\u00C2-\u00DF][\u0080-\u00BF]|[\u00E0-\u00EF][\u0080-\u00BF]{2}|[\u00F0-\u00F4][\u0080-\u00BF]{3})+/g,
+    (chunk) => {
+      try {
+        const bytes = new Uint8Array(chunk.length);
+        for (let i = 0; i < chunk.length; i++) {
+          bytes[i] = chunk.charCodeAt(i);
+        }
+        return UTF8_DECODER_FATAL.decode(bytes);
+      } catch {
+        return chunk;
+      }
+    }
+  );
+  return fixed
+    .replace(/[\u007F-\u009F]/g, '')
+    .replace(/(?:[\uE000-\uF8FF]+[\uF900-\uFAFF]+|[\uF900-\uFAFF]+[\uE000-\uF8FF]+)/gu, '')
+    .replace(/[\uE000-\uF8FF]|[\u{F0000}-\u{FFFFD}]|[\u{100000}-\u{10FFFD}]/gu, '');
+}
 
 export class ArchiveImportService {
   /**
@@ -250,13 +277,16 @@ export class ArchiveImportService {
       }
       const recordDate = savedAtIso || new Date().toISOString();
 
+      const normalizedCaption = caption ? normalizeMetaExportText(caption).trim() || null : null;
+      const normalizedDisplayName = creatorDisplayName ? normalizeMetaExportText(creatorDisplayName).trim() || null : null;
+
       const candidate: ParsedCandidate = {
         mediaId,
         shortcode,
         reel_url,
         creatorHandle,
-        creatorDisplayName,
-        caption,
+        creatorDisplayName: normalizedDisplayName,
+        caption: normalizedCaption,
         recordDate,
         savedAtIso,
         rank: totalProcessed,

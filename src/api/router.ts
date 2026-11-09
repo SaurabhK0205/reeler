@@ -4,12 +4,18 @@ import { Repository } from '../db/repository.ts';
 import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
+import { feedMetaCacheControl, isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
 import type { ReelQueryFilters, WatchStatus, DateFilterPreset } from '../types.ts';
 
+/**
+ * Express API router handling Meta webhooks, vault queries, metadata resolution, status updates, and archive imports.
+ */
 export const apiRouter = express.Router();
 const metaBotService = new MetaInstagramBotService();
 
-// Instagram Webhook Verification (Meta calls this once when setting up)
+/**
+ * Verifies Meta Instagram webhook subscriptions using the configured verify token.
+ */
 apiRouter.get('/instagram/webhook', (req: Request, res: Response) => {
   const mode = req.query['hub.mode'] as string;
   const token = req.query['hub.verify_token'] as string;
@@ -26,7 +32,9 @@ apiRouter.get('/instagram/webhook', (req: Request, res: Response) => {
   }
 });
 
-// Instagram Webhook Event Handler (Official Meta Graph API webhook)
+/**
+ * Verifies X-Hub-Signature-256 on incoming Meta webhook events and dispatches asynchronous handling.
+ */
 apiRouter.post('/instagram/webhook', async (req: Request, res: Response) => {
   const signature = req.headers['x-hub-signature-256'] as string | undefined;
   const rawBody = (req as any).rawBody;
@@ -46,7 +54,9 @@ apiRouter.post('/instagram/webhook', async (req: Request, res: Response) => {
   }
 });
 
-// Health check and configuration status
+/**
+ * Returns server health and active storage/Instagram configuration status.
+ */
 apiRouter.get('/health', (_req: Request, res: Response) => {
   const config = loadConfig();
   res.json({
@@ -56,7 +66,9 @@ apiRouter.get('/health', (_req: Request, res: Response) => {
   });
 });
 
-// Get library overview statistics
+/**
+ * Returns aggregate saved-reel and creator counts for the vault header telemetry.
+ */
 apiRouter.get('/stats', async (_req: Request, res: Response) => {
   try {
     const stats = await Repository.getStats();
@@ -66,17 +78,41 @@ apiRouter.get('/stats', async (_req: Request, res: Response) => {
   }
 });
 
-// Get creators with their saved reels count
-apiRouter.get('/creators', async (_req: Request, res: Response) => {
+/**
+ * Returns saved creators ordered by saved reel count descending, supporting optional search (`q`),
+ * bounding (`limit`), and pinned active ID (`includeId`) to avoid shipping the entire creator directory.
+ */
+apiRouter.get('/creators', async (req: Request, res: Response) => {
   try {
+    const q = typeof req.query.q === 'string' ? req.query.q : undefined;
+    const rawLimit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
+    const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0
+      ? Math.min(100, Math.floor(rawLimit))
+      : undefined;
+    const includeId = typeof req.query.includeId === 'string' && req.query.includeId.trim()
+      ? req.query.includeId.trim()
+      : undefined;
+
+    if (q !== undefined || limit !== undefined || includeId !== undefined) {
+      const { creators, totalCount, matchCount } = await Repository.queryCreators({ q, limit, includeId });
+      res.setHeader('X-Total-Count', String(totalCount));
+      res.setHeader('X-Match-Count', String(matchCount));
+      res.json(creators);
+      return;
+    }
+
     const creators = await Repository.getCreators();
+    res.setHeader('X-Total-Count', String(creators.length));
+    res.setHeader('X-Match-Count', String(creators.length));
     res.json(creators);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get reels with compound filtering, search, and pagination
+/**
+ * Returns paginated saved reels filtered by creator, date range, watch status, and search query.
+ */
 apiRouter.get('/reels', async (req: Request, res: Response) => {
   try {
     const filters: ReelQueryFilters = {
@@ -98,7 +134,52 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
   }
 });
 
-// Update watch status of a Reel
+/**
+ * Resolves live media kind and cover aspect ratio for an Instagram shortcode with disconnect cancellation
+ * and bounded upstream concurrency.
+ */
+apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
+  const controller = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      controller.abort();
+    }
+  });
+
+  try {
+    const shortcode = String(req.params.shortcode || '');
+    if (!isValidShortcode(shortcode)) {
+      res.status(400).json({ error: 'Invalid shortcode format' });
+      return;
+    }
+
+    const meta = await resolveFeedMediaMetadata(shortcode, controller.signal);
+    if (controller.signal.aborted || res.writableEnded) {
+      return;
+    }
+    res.setHeader('Cache-Control', feedMetaCacheControl(meta));
+    res.json(meta);
+  } catch (error: any) {
+    if (controller.signal.aborted || res.writableEnded) {
+      return;
+    }
+    if (error?.name === 'AbortError') {
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(503).json({ error: 'Metadata lookup canceled, please retry' });
+      return;
+    }
+    if (error?.code === 'RATE_LIMITED') {
+      res.setHeader('Retry-After', '5');
+      res.status(429).json({ error: 'Too many metadata requests, please retry shortly' });
+      return;
+    }
+    res.status(500).json({ error: error.message || 'Failed to resolve media metadata' });
+  }
+});
+
+/**
+ * Updates the watch status (`unwatched`, `watch_later`, `watched`) of a saved reel.
+ */
 apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -121,7 +202,9 @@ apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
   }
 });
 
-// Import official Instagram data export (saved_posts.json)
+/**
+ * Imports an official Instagram `saved_posts.json` archive export into the repository.
+ */
 apiRouter.post('/archive/import', async (req: Request, res: Response) => {
   (req as any).markHandlerStarted?.();
   try {
