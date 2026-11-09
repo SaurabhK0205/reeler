@@ -24,6 +24,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Local project-only agent skill symlinks (machine-local paths)
+.agents/skills/
+
 # OS files
 .DS_Store
 Thumbs.db
