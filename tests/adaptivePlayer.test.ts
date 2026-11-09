@@ -2,13 +2,19 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import '../public/playerGeometry.js';
 import {
+  feedMetaCacheControl,
   isAllowedInstagramMediaHost,
   isValidShortcode,
   parseEfgMediaKind,
   parseImageDimensionsFromBuffer,
   readImageDimensionsFromStream,
+  resetFeedMetaResolverStateForTests,
+  resolveFeedMediaMetadata,
 } from '../src/services/reelMetadataResolver.ts';
-import { sanitizePostgrestSearchTerm } from '../src/db/repository.ts';
+import {
+  isPostgrestRangeNotSatisfiableError,
+  sanitizePostgrestSearchTerm,
+} from '../src/db/repository.ts';
 
 const ReelerGeometry = (globalThis as any).ReelerGeometry;
 
@@ -199,7 +205,7 @@ test('playerGeometry.computeAdaptiveStage fits all aspect ratios on Desktop, Mob
 
     if (c.expectSideDock) {
       assert.ok(st.sideDockMetaW >= 196 && st.sideDockMetaW <= 256, `${c.name} sideDockMetaW ${st.sideDockMetaW} bounded`);
-      assert.ok(st.viewW + st.sideDockMetaW + 96 <= c.vw, `${c.name} side-dock total fits viewport ${c.vw}`);
+      assert.ok(st.viewW + st.sideDockMetaW + 124 <= c.vw, `${c.name} side-dock total fits viewport ${c.vw} with 0px overflow`);
       if (c.name === '9:16 Short 700x500') {
         assert.ok(st.viewW >= 220 && st.viewH >= 400, `${c.name} renders full-height stage (${st.viewW}x${st.viewH}) instead of collapsed square`);
       }
@@ -358,4 +364,134 @@ test('sanitizePostgrestSearchTerm strips PostgREST filter injection characters a
     handle: 'test 50\\%\\_name',
   });
   assert.deepEqual(sanitizePostgrestSearchTerm('   '), { text: '', handle: '' });
+});
+
+test('feedMetaCacheControl disables browser caching on empty/negative lookups and allows 30m cache on valid lookups', () => {
+  assert.equal(
+    feedMetaCacheControl({
+      shortcode: 'TestEmpty01',
+      mediaKind: 'UNKNOWN',
+      isClips: null,
+      thumbAspectRatio: null,
+      thumbnailUrl: null,
+    }),
+    'no-store'
+  );
+  assert.equal(
+    feedMetaCacheControl({
+      shortcode: 'TestClips01',
+      mediaKind: 'CLIPS',
+      isClips: true,
+      thumbAspectRatio: null,
+      thumbnailUrl: null,
+    }),
+    'private, max-age=1800'
+  );
+  assert.equal(
+    feedMetaCacheControl({
+      shortcode: 'TestFeed01',
+      mediaKind: 'FEED',
+      isClips: false,
+      thumbAspectRatio: null,
+      thumbnailUrl: 'https://scontent.cdninstagram.com/v/img.jpg',
+    }),
+    'private, max-age=1800'
+  );
+});
+
+test('resolveFeedMediaMetadata discards aborted in-flight entries so subsequent callers start a fresh lookup', async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    fetchCalls++;
+    const attempt = fetchCalls;
+    const signal = init?.signal;
+
+    if (attempt === 1) {
+      return await new Promise<Response>((_resolve, reject) => {
+        if (signal?.aborted) {
+          const abortErr = new Error('Aborted');
+          abortErr.name = 'AbortError';
+          reject(abortErr);
+          return;
+        }
+        signal?.addEventListener('abort', () => {
+          const abortErr = new Error('Aborted');
+          abortErr.name = 'AbortError';
+          reject(abortErr);
+        }, { once: true });
+      });
+    }
+
+    const html = '<meta property="og:url" content="https://www.instagram.com/p/AbCde12345/"><meta property="og:title" content="@demo on Instagram">';
+    return new Response(html, {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+    });
+  }) as typeof fetch;
+
+  try {
+    resetFeedMetaResolverStateForTests();
+    const firstCtrl = new AbortController();
+    const firstPromise = resolveFeedMediaMetadata('AbCde12345', firstCtrl.signal);
+    await new Promise((r) => setTimeout(r, 10));
+    firstCtrl.abort();
+    await assert.rejects(() => firstPromise, (err: any) => err?.name === 'AbortError');
+
+    const secondCtrl = new AbortController();
+    const secondResult = await resolveFeedMediaMetadata('AbCde12345', secondCtrl.signal);
+    assert.equal(fetchCalls, 2);
+    assert.equal(secondResult.shortcode, 'AbCde12345');
+    assert.equal(secondResult.isClips, false);
+    assert.equal(secondResult.mediaKind, 'FEED');
+  } finally {
+    resetFeedMetaResolverStateForTests();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('resolveFeedMediaMetadata enforces upstream per-minute budget while allowing cache hits', async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = (async (url: unknown) => {
+    fetchCalls++;
+    const match = String(url).match(/\/p\/([A-Za-z0-9_-]+)\//);
+    const sc = match?.[1] || 'Demo01';
+    const html = `<meta property="og:url" content="https://www.instagram.com/reel/${sc}/"><meta property="og:title" content="@demo on Instagram">`;
+    return new Response(html, { status: 200, headers: { 'content-type': 'text/html' } });
+  }) as typeof fetch;
+
+  try {
+    resetFeedMetaResolverStateForTests();
+    for (let i = 0; i < 120; i++) {
+      await resolveFeedMediaMetadata(`RateCap${String(i).padStart(3, '0')}`);
+    }
+    assert.equal(fetchCalls, 120);
+
+    // Cached entry succeeds without consuming upstream budget or calling fetch
+    const cached = await resolveFeedMediaMetadata('RateCap000');
+    assert.equal(cached.shortcode, 'RateCap000');
+    assert.equal(fetchCalls, 120);
+
+    // 121st distinct uncached shortcode in the same minute is rate-limited
+    await assert.rejects(
+      () => resolveFeedMediaMetadata('RateCap999'),
+      (err: any) => err?.code === 'RATE_LIMITED'
+    );
+  } finally {
+    resetFeedMetaResolverStateForTests();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('isPostgrestRangeNotSatisfiableError recognizes PostgREST PGRST103 and HTTP 416 range errors only', () => {
+  assert.equal(
+    isPostgrestRangeNotSatisfiableError({ code: 'PGRST103', message: 'Requested range not satisfiable' }),
+    true
+  );
+  assert.equal(isPostgrestRangeNotSatisfiableError({ status: 416, message: 'Range Not Satisfiable' }), true);
+  assert.equal(isPostgrestRangeNotSatisfiableError({ message: 'Requested range not satisfiable' }), true);
+  assert.equal(isPostgrestRangeNotSatisfiableError({ code: '42P01', message: 'relation does not exist' }), false);
+  assert.equal(isPostgrestRangeNotSatisfiableError(null), false);
 });

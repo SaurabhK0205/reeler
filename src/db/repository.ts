@@ -222,12 +222,15 @@ class InMemoryStore {
     // Search query (captions, creator handles, creator display names, and shortcodes)
     if (filters.search?.trim()) {
       const q = filters.search.toLowerCase().trim();
-      const handleQ = q.startsWith('@') ? q.slice(1) : q;
+      const handleQ = q.replace(/^@+/, '');
       list = list.filter(r => {
         const captionMatch = r.caption?.toLowerCase().includes(q) ?? false;
         const shortcodeMatch = r.shortcode?.toLowerCase().includes(q) ?? false;
         const usernameMatch = r.creator?.username.toLowerCase().includes(handleQ) ?? false;
-        const nameMatch = r.creator?.display_name?.toLowerCase().includes(q) ?? false;
+        const nameMatch = (
+          r.creator?.display_name?.toLowerCase().includes(q) ||
+          (handleQ !== q && Boolean(handleQ) && r.creator?.display_name?.toLowerCase().includes(handleQ))
+        ) ?? false;
         return captionMatch || shortcodeMatch || usernameMatch || nameMatch;
       });
     }
@@ -266,7 +269,7 @@ class InMemoryStore {
       saved_count: counts.get(c.id) || 0
     }));
 
-    list.sort((a, b) => (b.saved_count || 0) - (a.saved_count || 0));
+    list.sort((a, b) => (b.saved_count || 0) - (a.saved_count || 0) || a.username.localeCompare(b.username));
     return list;
   }
 
@@ -381,17 +384,92 @@ export function sanitizePostgrestSearchTerm(raw: string): { text: string; handle
     .replace(/[%_]/g, '\\$&')
     .replace(/\s+/g, ' ')
     .trim();
-  const handle = cleaned.startsWith('@') ? cleaned.slice(1).trim() : cleaned;
+  const handle = cleaned.replace(/^@+/, '').trim();
   return { text: cleaned, handle };
 }
 
+/**
+ * Detects Supabase PostgREST 416 / PGRST103 errors returned when a paginated `.range()` offset
+ * extends past the last available matching row.
+ */
+export function isPostgrestRangeNotSatisfiableError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const errObj = error as { code?: unknown; status?: unknown; message?: unknown };
+  if (errObj.code === 'PGRST103' || errObj.status === 416) {
+    return true;
+  }
+  return typeof errObj.message === 'string' && /range not satisfiable/i.test(errObj.message);
+}
+
+/**
+ * Applies resolved reel query predicates onto a Supabase query builder for data and count queries.
+ */
+function applyReelQueryFilters(
+  query: any,
+  params: {
+    creatorId?: string;
+    watchStatus?: WatchStatus | 'all';
+    startDate?: string;
+    endDate?: string;
+    searchClauses: string[];
+  }
+): any {
+  let next = query;
+  if (params.creatorId) {
+    next = next.eq('creator_id', params.creatorId);
+  }
+  if (params.watchStatus && params.watchStatus !== 'all') {
+    next = next.eq('watch_status', params.watchStatus);
+  }
+  if (params.startDate) {
+    next = next.gte('first_detected_at', params.startDate);
+  }
+  if (params.endDate) {
+    next = next.lte('first_detected_at', params.endDate);
+  }
+  if (params.searchClauses.length > 0) {
+    next = next.or(params.searchClauses.join(','));
+  }
+  return next;
+}
+
+export interface CreatorQueryOptions {
+  q?: string;
+  limit?: number;
+  includeId?: string;
+}
+
+export interface CreatorQueryResult {
+  creators: Creator[];
+  totalCount: number;
+  matchCount: number;
+}
+
+const CREATORS_CACHE_TTL_MS = 30_000;
+
 export class Repository {
+  private static creatorsCache: Creator[] | null = null;
+  private static creatorsCacheAt = 0;
+  private static creatorsCacheGeneration = 0;
+  private static creatorsInFlight: Promise<Creator[]> | null = null;
+
+  /**
+   * Clears cached creator directory state and bumps generation so pre-mutation in-flight reads cannot repopulate stale data.
+   */
+  static invalidateCreatorsCache(): void {
+    Repository.creatorsCacheGeneration++;
+    Repository.creatorsCache = null;
+    Repository.creatorsCacheAt = 0;
+    Repository.creatorsInFlight = null;
+  }
+
   static async upsertCreator(data: {
     instagram_user_id: string;
     username: string;
     display_name?: string | null;
     profile_picture_url?: string | null;
   }): Promise<Creator> {
+    Repository.invalidateCreatorsCache();
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertCreator(data);
     }
@@ -439,6 +517,7 @@ export class Repository {
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
   }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean }): Promise<SavedReel | null> {
+    Repository.invalidateCreatorsCache();
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertSavedReel(data, options);
     }
@@ -525,6 +604,7 @@ export class Repository {
     display_name?: string | null;
     profile_picture_url?: string | null;
   }>): Promise<Map<string, Creator>> {
+    Repository.invalidateCreatorsCache();
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertCreatorsBatch(creators);
     }
@@ -586,6 +666,7 @@ export class Repository {
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
   }>, options?: { ignoreDuplicates?: boolean }): Promise<BatchReelsResult> {
+    Repository.invalidateCreatorsCache();
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertSavedReelsBatch(reels, options);
     }
@@ -831,29 +912,11 @@ export class Repository {
     const limit = Math.max(1, Math.min(100, filters.limit || 24));
     const offset = (page - 1) * limit;
 
-    let query = supabase
-      .from('saved_reels')
-      .select('*, creator:creators(*)', { count: 'exact' });
-
-    if (filters.creatorId) {
-      query = query.eq('creator_id', filters.creatorId);
-    }
-
-    if (filters.watchStatus && filters.watchStatus !== 'all') {
-      query = query.eq('watch_status', filters.watchStatus);
-    }
-
     const { startDate, endDate } = resolveDateRange(filters.datePreset, filters.startDate, filters.endDate);
-    if (startDate) {
-      query = query.gte('first_detected_at', startDate);
-    }
-    if (endDate) {
-      query = query.lte('first_detected_at', endDate);
-    }
+    const searchClauses: string[] = [];
 
     if (filters.search?.trim()) {
       const { text, handle } = sanitizePostgrestSearchTerm(filters.search);
-      const searchClauses: string[] = [];
 
       if (text) {
         searchClauses.push(`caption.ilike.%${text}%`);
@@ -861,21 +924,35 @@ export class Repository {
       }
 
       if (handle) {
-        const { data: matchedCreators } = await supabase
+        // PostgREST `.or()` filter capped at 40 deterministically ordered creators so `.in.(...)` stays within URL limits
+        const { data: matchedCreators, error: creatorErr } = await supabase
           .from('creators')
           .select('id')
-          .or(`username.ilike.%${handle}%,display_name.ilike.%${text || handle}%`)
+          .or(`username.ilike.%${handle}%,display_name.ilike.%${handle}%`)
+          .order('id', { ascending: true })
           .limit(40);
+        if (creatorErr) {
+          throw new Error(`Supabase creator search failed: ${creatorErr.message}`);
+        }
         const creatorIds = (matchedCreators || []).map((c: any) => c.id).filter(Boolean);
         if (creatorIds.length > 0) {
           searchClauses.push(`creator_id.in.(${creatorIds.join(',')})`);
         }
       }
-
-      if (searchClauses.length > 0) {
-        query = query.or(searchClauses.join(','));
-      }
     }
+
+    const filterState = {
+      creatorId: filters.creatorId,
+      watchStatus: filters.watchStatus,
+      startDate,
+      endDate,
+      searchClauses,
+    };
+
+    let query = applyReelQueryFilters(
+      supabase.from('saved_reels').select('*, creator:creators(*)', { count: 'exact' }),
+      filterState
+    );
 
     const sort = filters.sortBy || 'newest_saved';
     if (sort === 'newest_saved') query = query.order('save_order_rank', { ascending: true });
@@ -890,6 +967,21 @@ export class Repository {
 
     const { data, count, error } = await query;
     if (error) {
+      if (offset > 0 && isPostgrestRangeNotSatisfiableError(error)) {
+        const { count: exactCount, error: countErr } = await applyReelQueryFilters(
+          supabase.from('saved_reels').select('*', { count: 'exact', head: true }),
+          filterState
+        );
+        if (countErr) {
+          throw new Error(`Supabase getReels count fallback failed: ${countErr.message}`);
+        }
+        return {
+          reels: [],
+          total: exactCount || 0,
+          page,
+          limit,
+        };
+      }
       throw new Error(`Supabase getReels failed: ${error.message}`);
     }
 
@@ -902,71 +994,145 @@ export class Repository {
   }
 
   /**
-   * Fetches all creators across PostgREST 1000-row pages with saved reel counts sorted descending.
+   * Fetches all creators across PostgREST 1000-row pages with saved reel counts sorted descending,
+   * coalescing concurrent initial scans (`/api/stats` + `/api/creators`) and caching briefly between writes.
    */
   static async getCreators(): Promise<Creator[]> {
     if (!isSupabaseConfigured()) {
       return memoryStore.getCreators();
     }
 
-    const supabase = getSupabase();
-    const BATCH_SIZE = 1000;
-    const { data: firstBatch, count, error } = await supabase
-      .from('creators')
-      .select('*, saved_reels(count)', { count: 'exact' })
-      .order('created_at', { ascending: true })
-      .order('id', { ascending: true })
-      .range(0, BATCH_SIZE - 1);
-
-    if (error) {
-      throw new Error(`Supabase getCreators failed: ${error.message}`);
+    const now = Date.now();
+    if (Repository.creatorsCache && now - Repository.creatorsCacheAt < CREATORS_CACHE_TTL_MS) {
+      return Repository.creatorsCache;
     }
 
-    const allRows: any[] = [...(firstBatch || [])];
-    const totalCount = typeof count === 'number' ? count : allRows.length;
-    const MAX_CREATOR_PAGES = 20;
+    if (Repository.creatorsInFlight) {
+      return Repository.creatorsInFlight;
+    }
 
-    if (totalCount > BATCH_SIZE && firstBatch && firstBatch.length === BATCH_SIZE) {
-      const totalPages = Math.min(MAX_CREATOR_PAGES, Math.ceil(totalCount / BATCH_SIZE));
-      const remainingRequests: Promise<any>[] = [];
-      for (let p = 1; p < totalPages; p++) {
-        const from = p * BATCH_SIZE;
-        const to = from + BATCH_SIZE - 1;
-        remainingRequests.push(
-          Promise.resolve(
-            supabase
-              .from('creators')
-              .select('*, saved_reels(count)')
-              .order('created_at', { ascending: true })
-              .order('id', { ascending: true })
-              .range(from, to)
-          )
-        );
+    const generation = Repository.creatorsCacheGeneration;
+    const loader = (async () => {
+      const supabase = getSupabase();
+      const BATCH_SIZE = 1000;
+      const { data: firstBatch, count, error } = await supabase
+        .from('creators')
+        .select('*, saved_reels(count)', { count: 'exact' })
+        .order('created_at', { ascending: true })
+        .order('id', { ascending: true })
+        .range(0, BATCH_SIZE - 1);
+
+      if (error) {
+        throw new Error(`Supabase getCreators failed: ${error.message}`);
       }
-      const responses = await Promise.all(remainingRequests);
-      for (const res of responses) {
-        if (res.error) {
-          throw new Error(`Supabase getCreators page failed: ${res.error.message}`);
+
+      const allRows: any[] = [...(firstBatch || [])];
+      const totalCount = typeof count === 'number' ? count : allRows.length;
+      const MAX_CREATOR_PAGES = 20;
+
+      if (totalCount > BATCH_SIZE && firstBatch && firstBatch.length === BATCH_SIZE) {
+        const totalPages = Math.min(MAX_CREATOR_PAGES, Math.ceil(totalCount / BATCH_SIZE));
+        if (totalCount > MAX_CREATOR_PAGES * BATCH_SIZE) {
+          console.warn(
+            `[Repository] Creator directory truncated at ${MAX_CREATOR_PAGES * BATCH_SIZE} of ${totalCount} rows`
+          );
         }
-        if (Array.isArray(res.data)) {
-          allRows.push(...res.data);
+        const CREATOR_PAGE_CONCURRENCY = 4;
+        for (let startPage = 1; startPage < totalPages; startPage += CREATOR_PAGE_CONCURRENCY) {
+          const endPage = Math.min(totalPages, startPage + CREATOR_PAGE_CONCURRENCY);
+          const batchRequests: Promise<any>[] = [];
+          for (let p = startPage; p < endPage; p++) {
+            const from = p * BATCH_SIZE;
+            const to = from + BATCH_SIZE - 1;
+            batchRequests.push(
+              Promise.resolve(
+                supabase
+                  .from('creators')
+                  .select('*, saved_reels(count)')
+                  .order('created_at', { ascending: true })
+                  .order('id', { ascending: true })
+                  .range(from, to)
+              )
+            );
+          }
+          const responses = await Promise.all(batchRequests);
+          for (const res of responses) {
+            if (res.error) {
+              throw new Error(`Supabase getCreators page failed: ${res.error.message}`);
+            }
+            if (Array.isArray(res.data)) {
+              allRows.push(...res.data);
+            }
+          }
         }
+      }
+
+      const result: Creator[] = allRows.map((c: any) => ({
+        id: c.id,
+        instagram_user_id: c.instagram_user_id,
+        username: c.username,
+        display_name: c.display_name,
+        profile_picture_url: c.profile_picture_url,
+        created_at: c.created_at,
+        updated_at: c.updated_at,
+        saved_count: c.saved_reels?.[0]?.count || 0,
+      }));
+
+      result.sort((a, b) => (b.saved_count || 0) - (a.saved_count || 0) || a.username.localeCompare(b.username));
+
+      if (generation === Repository.creatorsCacheGeneration) {
+        Repository.creatorsCache = result;
+        Repository.creatorsCacheAt = Date.now();
+      }
+      return result;
+    })();
+
+    Repository.creatorsInFlight = loader;
+    try {
+      return await loader;
+    } finally {
+      if (Repository.creatorsInFlight === loader) {
+        Repository.creatorsInFlight = null;
+      }
+    }
+  }
+
+  /**
+   * Filters and bounds the sorted creator directory for quick-filter UI requests so clients never
+   * download thousands of unused creator rows.
+   */
+  static async queryCreators(opts: CreatorQueryOptions = {}): Promise<CreatorQueryResult> {
+    const all = await Repository.getCreators();
+    const totalCount = all.length;
+
+    const rawQ = String(opts.q || '').trim().toLowerCase();
+    const handleQ = rawQ.replace(/^@+/, '');
+
+    const matched = handleQ
+      ? all.filter((c) => {
+          const handle = String(c.username || '').toLowerCase();
+          const display = String(c.display_name || '').toLowerCase();
+          return handle.includes(handleQ) || display.includes(rawQ) || (rawQ !== handleQ && display.includes(handleQ));
+        })
+      : all;
+
+    const matchCount = matched.length;
+    const hasValidLimit = typeof opts.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0;
+    const boundedLimit = hasValidLimit ? Math.floor(opts.limit!) : matched.length;
+    let sliced = hasValidLimit ? matched.slice(0, boundedLimit) : [...matched];
+
+    if (!handleQ && opts.includeId && !sliced.some((c) => c.id === opts.includeId)) {
+      const pinned = all.find((c) => c.id === opts.includeId);
+      if (pinned) {
+        sliced = hasValidLimit ? [pinned, ...sliced].slice(0, boundedLimit) : [pinned, ...sliced];
       }
     }
 
-    const result: Creator[] = allRows.map((c: any) => ({
-      id: c.id,
-      instagram_user_id: c.instagram_user_id,
-      username: c.username,
-      display_name: c.display_name,
-      profile_picture_url: c.profile_picture_url,
-      created_at: c.created_at,
-      updated_at: c.updated_at,
-      saved_count: c.saved_reels?.[0]?.count || 0,
-    }));
-
-    result.sort((a, b) => (b.saved_count || 0) - (a.saved_count || 0) || a.username.localeCompare(b.username));
-    return result;
+    return {
+      creators: sliced,
+      totalCount,
+      matchCount,
+    };
   }
 
   static async getReelsByCreatorUsername(username: string): Promise<{ creator: Creator | null; reels: SavedReel[] }> {

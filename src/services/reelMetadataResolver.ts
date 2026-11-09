@@ -39,6 +39,8 @@ const META_CACHE_MAX_ENTRIES = 500;
 const MAX_IMAGE_PROBE_BYTES = 256 * 1024;
 const MAX_CONCURRENT_UPSTREAM_RESOLVES = 6;
 const MAX_QUEUED_RESOLVES = 18;
+const UPSTREAM_BUDGET_WINDOW_MS = 60 * 1000;
+const MAX_UPSTREAM_RESOLVES_PER_MINUTE = 120;
 
 interface InFlightMetaEntry {
   promise: Promise<FeedMediaMetadata>;
@@ -56,6 +58,32 @@ const feedMetaCache = new Map<string, { value: FeedMediaMetadata; expiresAt: num
 const feedMetaInFlight = new Map<string, InFlightMetaEntry>();
 let activeUpstreamResolves = 0;
 const upstreamResolveQueue: ResolveQueueWaiter[] = [];
+const upstreamResolveTimestamps: number[] = [];
+
+/**
+ * Clears cached feed metadata and upstream resolve budget state between isolated unit tests.
+ */
+export function resetFeedMetaResolverStateForTests(): void {
+  feedMetaCache.clear();
+  upstreamResolveTimestamps.length = 0;
+}
+
+/**
+ * Enforces a sliding per-minute budget across uncached upstream Instagram lookups so cache misses
+ * cannot trigger unbounded upstream requests.
+ */
+function consumeUpstreamResolveBudget(): void {
+  const cutoff = Date.now() - UPSTREAM_BUDGET_WINDOW_MS;
+  while (upstreamResolveTimestamps.length > 0 && upstreamResolveTimestamps[0] <= cutoff) {
+    upstreamResolveTimestamps.shift();
+  }
+  if (upstreamResolveTimestamps.length >= MAX_UPSTREAM_RESOLVES_PER_MINUTE) {
+    const budgetErr = new Error('Metadata resolver upstream rate budget reached') as Error & { code?: string };
+    budgetErr.code = 'RATE_LIMITED';
+    throw budgetErr;
+  }
+  upstreamResolveTimestamps.push(Date.now());
+}
 
 /**
  * Combines a timeout duration with an optional external AbortSignal cleanly.
@@ -76,12 +104,15 @@ function createAbortError(reason?: unknown): Error {
 }
 
 /**
- * Acquires a bounded upstream resolve concurrency slot or throws a RATE_LIMITED error if overloaded.
+ * Acquires a bounded upstream resolve concurrency slot and per-minute upstream budget,
+ * or throws a RATE_LIMITED error if overloaded.
  */
 async function acquireResolveSlot(signal?: AbortSignal): Promise<() => void> {
   if (signal?.aborted) {
     throw createAbortError(signal.reason);
   }
+
+  consumeUpstreamResolveBudget();
 
   if (activeUpstreamResolves < MAX_CONCURRENT_UPSTREAM_RESOLVES) {
     activeUpstreamResolves++;
@@ -509,9 +540,19 @@ export async function fetchReelMetadata(shortcode: string, signal?: AbortSignal)
       isClips,
     };
   } catch (e: any) {
-    console.error(`[MetadataResolver] Failed to resolve shortcode ${shortcode}:`, e.message);
+    if (!signal?.aborted && e?.name !== 'AbortError') {
+      console.error(`[MetadataResolver] Failed to resolve shortcode ${shortcode}:`, e.message);
+    }
     return {};
   }
+}
+
+/**
+ * Selects the HTTP `Cache-Control` header matching resolver cache semantics so empty/negative
+ * transient failures never stick in browser caches for 30 minutes.
+ */
+export function feedMetaCacheControl(meta: FeedMediaMetadata): string {
+  return meta.thumbnailUrl || meta.isClips !== null ? 'private, max-age=1800' : 'no-store';
 }
 
 /**
@@ -540,6 +581,10 @@ export async function resolveFeedMediaMetadata(
   }
 
   let entry = feedMetaInFlight.get(shortcode);
+  if (entry?.controller.signal.aborted) {
+    feedMetaInFlight.delete(shortcode);
+    entry = undefined;
+  }
   if (!entry) {
     const controller = new AbortController();
     const promise = (async (): Promise<FeedMediaMetadata> => {

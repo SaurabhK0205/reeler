@@ -244,8 +244,8 @@ function () {
      */
     function fitBox(compactRail) {
       if (useSideDock) {
-        const railAndGapsW = 54 + 26;
-        const horizontalPad = 28;
+        const railAndGapsW = 56 + 24;
+        const horizontalPad = 44;
         const maxW = Math.max(180, vw - sideDockMetaW - railAndGapsW - horizontalPad);
         const maxH = Math.max(180, vh - topBottomChrome);
 

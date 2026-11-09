@@ -113,6 +113,11 @@ app.use('/api', apiRouter);
 const publicDir = path.join(__dirname, '../public');
 app.use(express.static(publicDir));
 
+// Avoid falling through to the 19 KB HTML SPA shell on browser favicon probes
+app.get('/favicon.ico', (_req, res) => {
+  res.status(204).end();
+});
+
 // Fallback to index.html for SPA-style routing
 app.get('*', (_req, res) => {
   res.sendFile(path.join(publicDir, 'index.html'));

@@ -4,7 +4,7 @@ import { Repository } from '../db/repository.ts';
 import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
-import { isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
+import { feedMetaCacheControl, isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
 import type { ReelQueryFilters, WatchStatus, DateFilterPreset } from '../types.ts';
 
 /**
@@ -79,11 +79,31 @@ apiRouter.get('/stats', async (_req: Request, res: Response) => {
 });
 
 /**
- * Returns all saved creators ordered by saved reel count descending.
+ * Returns saved creators ordered by saved reel count descending, supporting optional search (`q`),
+ * bounding (`limit`), and pinned active ID (`includeId`) to avoid shipping the entire creator directory.
  */
-apiRouter.get('/creators', async (_req: Request, res: Response) => {
+apiRouter.get('/creators', async (req: Request, res: Response) => {
   try {
+    const q = typeof req.query.q === 'string' ? req.query.q : undefined;
+    const rawLimit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
+    const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0
+      ? Math.min(100, Math.floor(rawLimit))
+      : undefined;
+    const includeId = typeof req.query.includeId === 'string' && req.query.includeId.trim()
+      ? req.query.includeId.trim()
+      : undefined;
+
+    if (q !== undefined || limit !== undefined || includeId !== undefined) {
+      const { creators, totalCount, matchCount } = await Repository.queryCreators({ q, limit, includeId });
+      res.setHeader('X-Total-Count', String(totalCount));
+      res.setHeader('X-Match-Count', String(matchCount));
+      res.json(creators);
+      return;
+    }
+
     const creators = await Repository.getCreators();
+    res.setHeader('X-Total-Count', String(creators.length));
+    res.setHeader('X-Match-Count', String(creators.length));
     res.json(creators);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -137,10 +157,15 @@ apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
     if (controller.signal.aborted || res.writableEnded) {
       return;
     }
-    res.setHeader('Cache-Control', 'private, max-age=1800');
+    res.setHeader('Cache-Control', feedMetaCacheControl(meta));
     res.json(meta);
   } catch (error: any) {
-    if (controller.signal.aborted || res.writableEnded || error?.name === 'AbortError') {
+    if (controller.signal.aborted || res.writableEnded) {
+      return;
+    }
+    if (error?.name === 'AbortError') {
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(503).json({ error: 'Metadata lookup canceled, please retry' });
       return;
     }
     if (error?.code === 'RATE_LIMITED') {
