@@ -189,6 +189,9 @@ class InMemoryStore {
     return { newlyImported, alreadyPresent, failedCount, failedShortcodes };
   }
 
+  /**
+   * Filters and sorts in-memory saved reels across creator handles, display names, captions, and shortcodes.
+   */
   async getReels(filters: ReelQueryFilters) {
     let list = Array.from(this.reels.values()).map(r => ({
       ...r,
@@ -216,25 +219,31 @@ class InMemoryStore {
       list = list.filter(r => new Date(r.first_detected_at).getTime() <= endMs);
     }
 
-    // Search query
+    // Search query (captions, creator handles, creator display names, and shortcodes)
     if (filters.search?.trim()) {
       const q = filters.search.toLowerCase().trim();
+      const handleQ = q.startsWith('@') ? q.slice(1) : q;
       list = list.filter(r => {
         const captionMatch = r.caption?.toLowerCase().includes(q) ?? false;
-        const usernameMatch = r.creator?.username.toLowerCase().includes(q) ?? false;
+        const shortcodeMatch = r.shortcode?.toLowerCase().includes(q) ?? false;
+        const usernameMatch = r.creator?.username.toLowerCase().includes(handleQ) ?? false;
         const nameMatch = r.creator?.display_name?.toLowerCase().includes(q) ?? false;
-        return captionMatch || usernameMatch || nameMatch;
+        return captionMatch || shortcodeMatch || usernameMatch || nameMatch;
       });
     }
 
-    // Sorting
+    // Sorting with deterministic tie-breakers
     const sort = filters.sortBy || 'newest_saved';
     list.sort((a, b) => {
-      if (sort === 'newest_saved') return a.save_order_rank - b.save_order_rank; // 1 = newest
-      if (sort === 'oldest_saved') return b.save_order_rank - a.save_order_rank;
-      if (sort === 'newest_published') return new Date(b.taken_at).getTime() - new Date(a.taken_at).getTime();
-      if (sort === 'oldest_published') return new Date(a.taken_at).getTime() - new Date(b.taken_at).getTime();
-      return 0;
+      let primary = 0;
+      if (sort === 'newest_saved') primary = a.save_order_rank - b.save_order_rank; // 1 = newest
+      else if (sort === 'oldest_saved') primary = b.save_order_rank - a.save_order_rank;
+      else if (sort === 'newest_published') primary = new Date(b.taken_at).getTime() - new Date(a.taken_at).getTime();
+      else if (sort === 'oldest_published') primary = new Date(a.taken_at).getTime() - new Date(b.taken_at).getTime();
+      if (primary !== 0) return primary;
+      const detectedDiff = new Date(b.first_detected_at).getTime() - new Date(a.first_detected_at).getTime();
+      if (detectedDiff !== 0) return detectedDiff;
+      return String(a.id).localeCompare(String(b.id));
     });
 
     const total = list.length;
@@ -360,6 +369,20 @@ function resolveDateRange(preset?: DateFilterPreset, customStart?: string, custo
   }
 
   return { startDate: start.toISOString(), endDate: undefined };
+}
+
+/**
+ * Sanitizes user search text before interpolating into PostgREST `.or()` / `ilike` filter expressions.
+ */
+export function sanitizePostgrestSearchTerm(raw: string): { text: string; handle: string } {
+  const cleaned = String(raw || '')
+    .trim()
+    .replace(/[,()\\"*]/g, ' ')
+    .replace(/[%_]/g, '\\$&')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const handle = cleaned.startsWith('@') ? cleaned.slice(1).trim() : cleaned;
+  return { text: cleaned, handle };
 }
 
 export class Repository {
@@ -794,6 +817,10 @@ export class Repository {
       .eq('id', id);
   }
 
+  /**
+   * Fetches paginated reels matching active filters, search across captions/shortcodes/creators,
+   * and deterministic sort tie-breakers.
+   */
   static async getReels(filters: ReelQueryFilters): Promise<{ reels: SavedReel[]; total: number; page: number; limit: number }> {
     if (!isSupabaseConfigured()) {
       return memoryStore.getReels(filters);
@@ -825,8 +852,29 @@ export class Repository {
     }
 
     if (filters.search?.trim()) {
-      const q = filters.search.trim();
-      query = query.ilike('caption', `%${q}%`);
+      const { text, handle } = sanitizePostgrestSearchTerm(filters.search);
+      const searchClauses: string[] = [];
+
+      if (text) {
+        searchClauses.push(`caption.ilike.%${text}%`);
+        searchClauses.push(`shortcode.ilike.%${text}%`);
+      }
+
+      if (handle) {
+        const { data: matchedCreators } = await supabase
+          .from('creators')
+          .select('id')
+          .or(`username.ilike.%${handle}%,display_name.ilike.%${text || handle}%`)
+          .limit(40);
+        const creatorIds = (matchedCreators || []).map((c: any) => c.id).filter(Boolean);
+        if (creatorIds.length > 0) {
+          searchClauses.push(`creator_id.in.(${creatorIds.join(',')})`);
+        }
+      }
+
+      if (searchClauses.length > 0) {
+        query = query.or(searchClauses.join(','));
+      }
     }
 
     const sort = filters.sortBy || 'newest_saved';
@@ -835,7 +883,10 @@ export class Repository {
     else if (sort === 'newest_published') query = query.order('taken_at', { ascending: false });
     else if (sort === 'oldest_published') query = query.order('taken_at', { ascending: true });
 
-    query = query.range(offset, offset + limit - 1);
+    query = query
+      .order('first_detected_at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(offset, offset + limit - 1);
 
     const { data, count, error } = await query;
     if (error) {
@@ -850,21 +901,60 @@ export class Repository {
     };
   }
 
+  /**
+   * Fetches all creators across PostgREST 1000-row pages with saved reel counts sorted descending.
+   */
   static async getCreators(): Promise<Creator[]> {
     if (!isSupabaseConfigured()) {
       return memoryStore.getCreators();
     }
 
     const supabase = getSupabase();
-    const { data: creators, error } = await supabase
+    const BATCH_SIZE = 1000;
+    const { data: firstBatch, count, error } = await supabase
       .from('creators')
-      .select('*, saved_reels(count)');
+      .select('*, saved_reels(count)', { count: 'exact' })
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
+      .range(0, BATCH_SIZE - 1);
 
     if (error) {
       throw new Error(`Supabase getCreators failed: ${error.message}`);
     }
 
-    const result: Creator[] = (creators || []).map((c: any) => ({
+    const allRows: any[] = [...(firstBatch || [])];
+    const totalCount = typeof count === 'number' ? count : allRows.length;
+    const MAX_CREATOR_PAGES = 20;
+
+    if (totalCount > BATCH_SIZE && firstBatch && firstBatch.length === BATCH_SIZE) {
+      const totalPages = Math.min(MAX_CREATOR_PAGES, Math.ceil(totalCount / BATCH_SIZE));
+      const remainingRequests: Promise<any>[] = [];
+      for (let p = 1; p < totalPages; p++) {
+        const from = p * BATCH_SIZE;
+        const to = from + BATCH_SIZE - 1;
+        remainingRequests.push(
+          Promise.resolve(
+            supabase
+              .from('creators')
+              .select('*, saved_reels(count)')
+              .order('created_at', { ascending: true })
+              .order('id', { ascending: true })
+              .range(from, to)
+          )
+        );
+      }
+      const responses = await Promise.all(remainingRequests);
+      for (const res of responses) {
+        if (res.error) {
+          throw new Error(`Supabase getCreators page failed: ${res.error.message}`);
+        }
+        if (Array.isArray(res.data)) {
+          allRows.push(...res.data);
+        }
+      }
+    }
+
+    const result: Creator[] = allRows.map((c: any) => ({
       id: c.id,
       instagram_user_id: c.instagram_user_id,
       username: c.username,
@@ -875,7 +965,7 @@ export class Repository {
       saved_count: c.saved_reels?.[0]?.count || 0,
     }));
 
-    result.sort((a, b) => (b.saved_count || 0) - (a.saved_count || 0));
+    result.sort((a, b) => (b.saved_count || 0) - (a.saved_count || 0) || a.username.localeCompare(b.username));
     return result;
   }
 

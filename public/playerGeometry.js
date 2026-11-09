@@ -1,3 +1,6 @@
+/**
+ * UMD wrapper exposing adaptive Instagram player geometry helpers cleanly in both browser (`window.ReelerGeometry`) and Node.js.
+ */
 (function (root, factory) {
   const api = factory();
   if (typeof module === 'object' && module.exports) {
@@ -6,7 +9,11 @@
   if (root) {
     root.ReelerGeometry = api;
   }
-})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+})(typeof globalThis !== 'undefined' ? globalThis : this,
+/**
+ * Builds the pure geometry classification and stage sizing API.
+ */
+function () {
   const PROBE_WIDTH_1 = 320;
   const PROBE_WIDTH_2 = 520;
   const MIN_DELTA_H = 30;
@@ -120,6 +127,11 @@
     return Math.round(clamped * 10000) / 10000;
   }
 
+  /**
+   * Returns true if a numeric value is a finite aspect ratio within supported bounds.
+   * @param {unknown} val
+   * @returns {boolean}
+   */
   function isValidRatio(val) {
     return typeof val === 'number' && Number.isFinite(val) && val >= MIN_ASPECT && val <= MAX_ASPECT;
   }
@@ -127,6 +139,8 @@
   /**
    * Classifies whether the post renders a pillarboxed 9:16 reel inside Instagram's 4:5 embed box
    * or a true-ratio post (`3:4`, `4:5`, `1:1`, `5:4`, `16:9`).
+   * @param {{ embedRatio?: number | null, isClips?: boolean | null, thumbAspectRatio?: number | null }} [opts]
+   * @returns {{ isPillarboxedReel: boolean, effectiveEmbedRatio: number, displayRatio: number }}
    */
   function classifyPostAspect({ embedRatio = null, isClips = null, thumbAspectRatio = null } = {}) {
     const validThumb = isValidRatio(thumbAspectRatio) ? thumbAspectRatio : null;
@@ -197,8 +211,10 @@
   }
 
   /**
-   * Computes fitted stage, viewport, overlay dock mode, and exact unscaled iframe coordinates
-   * across all aspect ratios (`9:16`, `3:4`, `4:5`, `1:1`, `5:4`, `16:9`) on desktop and mobile.
+   * Computes fitted stage, viewport, control rail width, overlay/bottom/side dock mode, and exact unscaled
+   * iframe coordinates across all aspect ratios (`9:16`, `3:4`, `4:5`, `1:1`, `5:4`, `16:9`) on desktop,
+   * phone, SE (`320x568`), and short-landscape (`700x500`) viewports.
+   * @param {{ embedRatio?: number | null, isClips?: boolean | null, thumbAspectRatio?: number | null, viewportWidth?: number, viewportHeight?: number }} [opts]
    */
   function computeAdaptiveStage({
     embedRatio = null,
@@ -214,13 +230,35 @@
     const classification = classifyPostAspect({ embedRatio, isClips, thumbAspectRatio });
     const { isPillarboxedReel, effectiveEmbedRatio, displayRatio } = classification;
 
-    const useDockedMeta = displayRatio >= 0.70 || vh < 560;
+    const useSideDock = vh < 560 && vw >= 560;
+    const useDockedMeta = !useSideDock && displayRatio >= 0.70;
     let useCompactRail = useDockedMeta && (isMobile || vw < 760);
 
-    const topBottomChrome = isMobile ? 66 : 76;
+    const topBottomChrome = useSideDock ? 72 : (isMobile ? 80 : 88);
+    const sideDockMetaW = useSideDock ? Math.max(196, Math.min(256, Math.round(vw * 0.32))) : 0;
 
+    /**
+     * Fits media stage width/height inside available viewport bounds given dock/rail configuration.
+     * @param {boolean} compactRail
+     * @returns {{ viewW: number, viewH: number }}
+     */
     function fitBox(compactRail) {
-      const dockReserveH = !useDockedMeta ? 0 : (compactRail ? 186 : 124);
+      if (useSideDock) {
+        const railAndGapsW = 54 + 26;
+        const horizontalPad = 28;
+        const maxW = Math.max(180, vw - sideDockMetaW - railAndGapsW - horizontalPad);
+        const maxH = Math.max(180, vh - topBottomChrome);
+
+        let viewW = maxW;
+        let viewH = Math.round(viewW / displayRatio);
+        if (viewH > maxH) {
+          viewH = maxH;
+          viewW = Math.round(viewH * displayRatio);
+        }
+        return { viewW, viewH };
+      }
+
+      const dockReserveH = !useDockedMeta ? 0 : (compactRail ? 212 : 132);
       const maxW = isMobile
         ? vw - 16
         : (compactRail
@@ -246,6 +284,12 @@
     }
 
     const { viewW, viewH } = fitted;
+    const controlsW = useSideDock
+      ? viewW
+      : ((useDockedMeta || useCompactRail)
+        ? Math.max(viewW, Math.min(vw - (isMobile ? 16 : 32), 380))
+        : viewW);
+
     const iframeW = isPillarboxedReel
       ? Math.round(viewH * effectiveEmbedRatio) + 2
       : viewW + 2;
@@ -261,8 +305,11 @@
       isPillarboxedReel,
       effectiveEmbedRatio,
       displayRatio,
+      useSideDock,
+      sideDockMetaW,
       useDockedMeta,
       useCompactRail,
+      controlsW,
       viewW,
       viewH: viewportHeightPx,
       iframeW,

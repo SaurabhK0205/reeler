@@ -6,15 +6,69 @@ import {
   isValidShortcode,
   parseEfgMediaKind,
   parseImageDimensionsFromBuffer,
+  readImageDimensionsFromStream,
 } from '../src/services/reelMetadataResolver.ts';
+import { sanitizePostgrestSearchTerm } from '../src/db/repository.ts';
 
 const ReelerGeometry = (globalThis as any).ReelerGeometry;
 
-function makeEfgUrl(tag, { urlSafe = false, encodeAmp = false } = {}) {
+/**
+ * Constructs a synthetic Instagram CDN image URL containing an encoded `efg` metadata payload.
+ */
+function makeEfgUrl(tag: string, { urlSafe = false, encodeAmp = false } = {}) {
   const b64 = Buffer.from(JSON.stringify({ vencode_tag: tag }), 'utf8').toString('base64');
   const encoded = urlSafe ? b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') : encodeURIComponent(b64);
   const sep = encodeAmp ? '&amp;' : '&';
   return `https://scontent.cdninstagram.com/v/t51.82787-15/img.jpg?stp=dst-jpg${sep}efg=${encoded}${sep}oe=ABCDEF`;
+}
+
+/**
+ * Creates a synthetic PNG header buffer with explicit pixel dimensions.
+ */
+function makePngBytes(width: number, height: number, totalSize: number = 24): Uint8Array {
+  const png = Buffer.alloc(Math.max(24, totalSize));
+  png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  png.write('IHDR', 12, 'ascii');
+  png.writeUInt32BE(width, 16);
+  png.writeUInt32BE(height, 20);
+  return png;
+}
+
+/**
+ * Builds a ReadableStream yielding fixed chunks and tracking pull counts and reader cancellation.
+ */
+function makeTrackedChunkStream(chunks: Uint8Array[]) {
+  let index = 0;
+  let canceled = false;
+  let pulled = 0;
+
+  const stream = new ReadableStream<Uint8Array>({
+    /**
+     * Enqueues the next chunk or closes when exhausted.
+     */
+    pull(controller) {
+      pulled++;
+      if (index < chunks.length) {
+        controller.enqueue(chunks[index++]);
+      } else {
+        controller.close();
+      }
+    },
+    /**
+     * Records stream cancellation when the reader aborts or exits.
+     */
+    cancel() {
+      canceled = true;
+    },
+  });
+
+  return {
+    stream,
+    /**
+     * Returns whether the stream was canceled and how many chunks were pulled.
+     */
+    stats: () => ({ canceled, pulled }),
+  };
 }
 
 test('playerGeometry.parseThumbMeta decodes CLIPS, FEED, CAROUSEL_ITEM and malformed URLs', () => {
@@ -109,16 +163,21 @@ test('playerGeometry.classifyPostAspect disambiguates pillarboxed 9:16 Reels vs 
   assert.equal(preProbeVerticalUnknown.effectiveEmbedRatio, 0.8);
 });
 
-test('playerGeometry.computeAdaptiveStage fits all aspect ratios on Desktop and Mobile with 0 white bleed', () => {
+test('playerGeometry.computeAdaptiveStage fits all aspect ratios on Desktop, Mobile, 320x568 SE, and 700x500 landscape with 0 white bleed', () => {
   const cases = [
-    { name: '9:16 Desktop', embedRatio: 0.8, isClips: true, thumbAspectRatio: 0.563, vw: 1440, vh: 900, expectDocked: false, expectCompact: false },
-    { name: '3:4 Desktop', embedRatio: 0.755, isClips: false, thumbAspectRatio: null, vw: 1440, vh: 900, expectDocked: true, expectCompact: false },
-    { name: '1:1 Desktop', embedRatio: 1.0, isClips: false, thumbAspectRatio: null, vw: 1440, vh: 900, expectDocked: true, expectCompact: false },
-    { name: '5:4 Desktop', embedRatio: 1.25, isClips: false, thumbAspectRatio: null, vw: 1440, vh: 900, expectDocked: true, expectCompact: false },
-    { name: '16:9 Desktop', embedRatio: 1.778, isClips: true, thumbAspectRatio: 1.778, vw: 1440, vh: 900, expectDocked: true, expectCompact: false },
-    { name: '9:16 Mobile', embedRatio: 0.8, isClips: true, thumbAspectRatio: 0.563, vw: 390, vh: 844, expectDocked: false, expectCompact: false },
-    { name: '1:1 Mobile', embedRatio: 1.0, isClips: false, thumbAspectRatio: null, vw: 390, vh: 844, expectDocked: true, expectCompact: true },
-    { name: '16:9 Mobile', embedRatio: 1.778, isClips: true, thumbAspectRatio: 1.778, vw: 390, vh: 844, expectDocked: true, expectCompact: true },
+    { name: '9:16 Desktop', embedRatio: 0.8, isClips: true, thumbAspectRatio: 0.563, vw: 1440, vh: 900, expectDocked: false, expectCompact: false, expectSideDock: false },
+    { name: '3:4 Desktop', embedRatio: 0.755, isClips: false, thumbAspectRatio: null, vw: 1440, vh: 900, expectDocked: true, expectCompact: false, expectSideDock: false },
+    { name: '1:1 Desktop', embedRatio: 1.0, isClips: false, thumbAspectRatio: null, vw: 1440, vh: 900, expectDocked: true, expectCompact: false, expectSideDock: false },
+    { name: '5:4 Desktop', embedRatio: 1.25, isClips: false, thumbAspectRatio: null, vw: 1440, vh: 900, expectDocked: true, expectCompact: false, expectSideDock: false },
+    { name: '16:9 Desktop', embedRatio: 1.778, isClips: true, thumbAspectRatio: 1.778, vw: 1440, vh: 900, expectDocked: true, expectCompact: false, expectSideDock: false },
+    { name: '9:16 Mobile', embedRatio: 0.8, isClips: true, thumbAspectRatio: 0.563, vw: 390, vh: 844, expectDocked: false, expectCompact: false, expectSideDock: false },
+    { name: '1:1 Mobile', embedRatio: 1.0, isClips: false, thumbAspectRatio: null, vw: 390, vh: 844, expectDocked: true, expectCompact: true, expectSideDock: false },
+    { name: '16:9 Mobile', embedRatio: 1.778, isClips: true, thumbAspectRatio: 1.778, vw: 390, vh: 844, expectDocked: true, expectCompact: true, expectSideDock: false },
+    { name: '9:16 SE 320x568', embedRatio: 0.8, isClips: true, thumbAspectRatio: 0.563, vw: 320, vh: 568, expectDocked: false, expectCompact: false, expectSideDock: false },
+    { name: '1:1 SE 320x568', embedRatio: 1.0, isClips: false, thumbAspectRatio: null, vw: 320, vh: 568, expectDocked: true, expectCompact: true, expectSideDock: false },
+    { name: '9:16 Short 700x500', embedRatio: 0.8, isClips: true, thumbAspectRatio: 0.563, vw: 700, vh: 500, expectDocked: false, expectCompact: false, expectSideDock: true },
+    { name: '1:1 Short 700x500', embedRatio: 1.0, isClips: false, thumbAspectRatio: null, vw: 700, vh: 500, expectDocked: false, expectCompact: false, expectSideDock: true },
+    { name: '16:9 Short 700x500', embedRatio: 1.778, isClips: true, thumbAspectRatio: 1.778, vw: 700, vh: 500, expectDocked: false, expectCompact: false, expectSideDock: true },
   ];
 
   for (const c of cases) {
@@ -129,11 +188,27 @@ test('playerGeometry.computeAdaptiveStage fits all aspect ratios on Desktop and 
       viewportWidth: c.vw,
       viewportHeight: c.vh,
     });
+    assert.equal(st.useSideDock, c.expectSideDock, `${c.name} useSideDock`);
     assert.equal(st.useDockedMeta, c.expectDocked, `${c.name} useDockedMeta`);
     assert.equal(st.useCompactRail, c.expectCompact, `${c.name} useCompactRail`);
     assert.equal(st.iframeTop, -55, `${c.name} must clip 54px header + 1px safety`);
     assert.ok(st.viewW <= c.vw - 16, `${c.name} viewW ${st.viewW} fits viewport ${c.vw}`);
+    assert.ok(st.controlsW >= st.viewW, `${c.name} controlsW ${st.controlsW} >= viewW ${st.viewW}`);
+    assert.ok(st.controlsW <= c.vw - 16, `${c.name} controlsW ${st.controlsW} fits viewport ${c.vw}`);
     assert.ok(st.viewH <= c.vh - 66, `${c.name} viewH ${st.viewH} fits viewport ${c.vh}`);
+
+    if (c.expectSideDock) {
+      assert.ok(st.sideDockMetaW >= 196 && st.sideDockMetaW <= 256, `${c.name} sideDockMetaW ${st.sideDockMetaW} bounded`);
+      assert.ok(st.viewW + st.sideDockMetaW + 96 <= c.vw, `${c.name} side-dock total fits viewport ${c.vw}`);
+      if (c.name === '9:16 Short 700x500') {
+        assert.ok(st.viewW >= 220 && st.viewH >= 400, `${c.name} renders full-height stage (${st.viewW}x${st.viewH}) instead of collapsed square`);
+      }
+    }
+
+    if (c.expectCompact) {
+      const expectedMinControls = Math.min(c.vw - 32, 380);
+      assert.ok(st.controlsW >= Math.min(c.vw - 32, expectedMinControls), `${c.name} compact controlsW must not collapse`);
+    }
 
     const renderedMediaH = Math.round((st.iframeW - 2) / st.effectiveEmbedRatio);
     assert.ok(st.viewH <= renderedMediaH - 2, `${c.name} viewport height ${st.viewH} stays strictly inside media height ${renderedMediaH}`);
@@ -158,12 +233,7 @@ test('reelMetadataResolver parses PNG, GIF, JPEG SOF0/SOF2, WebP, shortcodes, an
   });
 
   // Synthetic PNG 360x640
-  const png = Buffer.alloc(24);
-  png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
-  png.write('IHDR', 12, 'ascii');
-  png.writeUInt32BE(360, 16);
-  png.writeUInt32BE(640, 20);
-  assert.deepEqual(parseImageDimensionsFromBuffer(png), { width: 360, height: 640 });
+  assert.deepEqual(parseImageDimensionsFromBuffer(makePngBytes(360, 640)), { width: 360, height: 640 });
 
   // Synthetic GIF 500x400
   const gif = Buffer.from('GIF89a\xf4\x01\x90\x01', 'latin1');
@@ -187,4 +257,105 @@ test('reelMetadataResolver parses PNG, GIF, JPEG SOF0/SOF2, WebP, shortcodes, an
 
   // Truncated / unknown
   assert.equal(parseImageDimensionsFromBuffer(Buffer.from([1, 2, 3])), null);
+});
+
+test('readImageDimensionsFromStream cancels stream reader on early match, EOF, error, and probe limit', async () => {
+  // 1. Multi-chunk match cancels early before trailing megabyte chunks are pulled
+  const png = makePngBytes(720, 1280);
+  const early = makeTrackedChunkStream([
+    png.subarray(0, 14),
+    png.subarray(14, 24),
+    new Uint8Array(64),
+    new Uint8Array(64),
+  ]);
+  const earlyDims = await readImageDimensionsFromStream(early.stream, 512);
+  assert.deepEqual(earlyDims, { width: 720, height: 1280 });
+  assert.equal(early.stats().canceled, true);
+  assert.equal(early.stream.locked, false);
+  assert.ok(early.stats().pulled <= 3);
+
+  // 2. Unrecognized stream hitting EOF cancels reader, unlocks stream, and returns null
+  const eof = makeTrackedChunkStream([new Uint8Array([1, 2, 3, 4]), new Uint8Array([5, 6, 7, 8])]);
+  const origGetReader = eof.stream.getReader.bind(eof.stream);
+  let eofCancelCalls = 0;
+  let eofReleaseCalls = 0;
+  (eof.stream as any).getReader = () => {
+    const reader = origGetReader();
+    const origCancel = reader.cancel.bind(reader);
+    const origRelease = reader.releaseLock.bind(reader);
+    reader.cancel = (...args: any[]) => {
+      eofCancelCalls++;
+      return origCancel(...args);
+    };
+    reader.releaseLock = () => {
+      eofReleaseCalls++;
+      return origRelease();
+    };
+    return reader;
+  };
+  const eofDims = await readImageDimensionsFromStream(eof.stream, 512);
+  assert.equal(eofDims, null);
+  assert.equal(eofCancelCalls, 1);
+  assert.equal(eofReleaseCalls, 1);
+  assert.equal(eof.stream.locked, false);
+
+  // 3. Stream exceeding maxBytes stops cleanly at limit and cancels reader
+  const over = makeTrackedChunkStream([
+    new Uint8Array(20),
+    new Uint8Array(20),
+    new Uint8Array(20),
+    new Uint8Array(20),
+  ]);
+  const overDims = await readImageDimensionsFromStream(over.stream, 32);
+  assert.equal(overDims, null);
+  assert.equal(over.stats().canceled, true);
+  assert.equal(over.stream.locked, false);
+  assert.ok(over.stats().pulled <= 3);
+
+  // 4. Reader failure still invokes cancel and releases stream lock
+  let errCancelCalls = 0;
+  let errReleaseCalls = 0;
+  const failingStream = {
+    /**
+     * Returns a synthetic reader that rejects on read while recording cleanup calls.
+     */
+    getReader() {
+      return {
+        /**
+         * Simulates a mid-stream network read rejection.
+         */
+        async read() {
+          throw new Error('Synthetic stream reset');
+        },
+        /**
+         * Records reader cancellation during error unwinding.
+         */
+        async cancel() {
+          errCancelCalls++;
+        },
+        /**
+         * Records lock release during error unwinding.
+         */
+        releaseLock() {
+          errReleaseCalls++;
+        },
+      };
+    },
+  } as unknown as ReadableStream<Uint8Array>;
+
+  await assert.rejects(() => readImageDimensionsFromStream(failingStream, 64), /Synthetic stream reset/);
+  assert.equal(errCancelCalls, 1);
+  assert.equal(errReleaseCalls, 1);
+});
+
+test('sanitizePostgrestSearchTerm strips PostgREST filter injection characters and preserves handle lookup', () => {
+  assert.deepEqual(sanitizePostgrestSearchTerm('@arrakisrunsonduncan'), {
+    text: '@arrakisrunsonduncan',
+    handle: 'arrakisrunsonduncan',
+  });
+  assert.deepEqual(sanitizePostgrestSearchTerm('(test,50%_name)'), {
+    text: 'test 50\\%\\_name',
+    handle: 'test 50\\%\\_name',
+  });
+  assert.deepEqual(sanitizePostgrestSearchTerm('   '), { text: '', handle: '' });
 });

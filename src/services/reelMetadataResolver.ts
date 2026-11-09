@@ -1,3 +1,6 @@
+/**
+ * Decodes common HTML entities found in Instagram meta attributes.
+ */
 function decodeHtml(html: string): string {
   return html
     .replace(/&#064;/g, '@')
@@ -31,16 +34,127 @@ export interface FeedMediaMetadata {
 
 const SHORTCODE_PATTERN = /^[A-Za-z0-9_-]{5,32}$/;
 const META_CACHE_TTL_MS = 30 * 60 * 1000;
+const META_NEGATIVE_CACHE_TTL_MS = 60 * 1000;
 const META_CACHE_MAX_ENTRIES = 500;
 const MAX_IMAGE_PROBE_BYTES = 256 * 1024;
+const MAX_CONCURRENT_UPSTREAM_RESOLVES = 6;
+const MAX_QUEUED_RESOLVES = 18;
+
+interface InFlightMetaEntry {
+  promise: Promise<FeedMediaMetadata>;
+  controller: AbortController;
+  waiters: number;
+}
+
+interface ResolveQueueWaiter {
+  resolve: () => void;
+  reject: (err: Error) => void;
+  cleanup: () => void;
+}
 
 const feedMetaCache = new Map<string, { value: FeedMediaMetadata; expiresAt: number }>();
-const feedMetaInFlight = new Map<string, Promise<FeedMediaMetadata>>();
+const feedMetaInFlight = new Map<string, InFlightMetaEntry>();
+let activeUpstreamResolves = 0;
+const upstreamResolveQueue: ResolveQueueWaiter[] = [];
 
+/**
+ * Combines a timeout duration with an optional external AbortSignal cleanly.
+ */
+function createCombinedSignal(timeoutMs: number, externalSignal?: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  return externalSignal ? AbortSignal.any([timeoutSignal, externalSignal]) : timeoutSignal;
+}
+
+/**
+ * Throws a structured AbortError when an AbortSignal is already aborted.
+ */
+function createAbortError(reason?: unknown): Error {
+  if (reason instanceof Error) return reason;
+  const err = new Error('Metadata resolution aborted');
+  err.name = 'AbortError';
+  return err;
+}
+
+/**
+ * Acquires a bounded upstream resolve concurrency slot or throws a RATE_LIMITED error if overloaded.
+ */
+async function acquireResolveSlot(signal?: AbortSignal): Promise<() => void> {
+  if (signal?.aborted) {
+    throw createAbortError(signal.reason);
+  }
+
+  if (activeUpstreamResolves < MAX_CONCURRENT_UPSTREAM_RESOLVES) {
+    activeUpstreamResolves++;
+    return releaseResolveSlot;
+  }
+
+  if (upstreamResolveQueue.length >= MAX_QUEUED_RESOLVES) {
+    const busyErr = new Error('Metadata resolver concurrency limit reached') as Error & { code?: string };
+    busyErr.code = 'RATE_LIMITED';
+    throw busyErr;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const entry: ResolveQueueWaiter = {
+      resolve: () => {
+        entry.cleanup();
+        resolve();
+      },
+      reject: (err: Error) => {
+        entry.cleanup();
+        reject(err);
+      },
+      cleanup: () => {
+        if (signal) {
+          signal.removeEventListener('abort', onAbort);
+        }
+      },
+    };
+
+    /**
+     * Removes a queued waiter immediately if the upstream operation is aborted.
+     */
+    const onAbort = () => {
+      const idx = upstreamResolveQueue.indexOf(entry);
+      if (idx !== -1) {
+        upstreamResolveQueue.splice(idx, 1);
+      }
+      entry.reject(createAbortError(signal?.reason));
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    upstreamResolveQueue.push(entry);
+  });
+
+  activeUpstreamResolves++;
+  return releaseResolveSlot;
+}
+
+/**
+ * Releases one active upstream resolve slot and resumes the next queued waiter if present.
+ */
+function releaseResolveSlot(): void {
+  if (activeUpstreamResolves > 0) {
+    activeUpstreamResolves--;
+  }
+  const next = upstreamResolveQueue.shift();
+  if (next) {
+    next.resolve();
+  }
+}
+
+/**
+ * Validates that an Instagram shortcode matches allowed URL path characters and length bounds.
+ */
 export function isValidShortcode(shortcode: string): boolean {
   return SHORTCODE_PATTERN.test(shortcode);
 }
 
+/**
+ * Ensures image probe URLs strictly target HTTPS Instagram or Meta CDN hosts to prevent SSRF.
+ */
 export function isAllowedInstagramMediaHost(urlString: string): boolean {
   try {
     const parsed = new URL(urlString);
@@ -57,6 +171,9 @@ export function isAllowedInstagramMediaHost(urlString: string): boolean {
   }
 }
 
+/**
+ * Decodes Instagram's base64 `efg` query parameter to classify `CLIPS`, `FEED`, or `CAROUSEL_ITEM`.
+ */
 export function parseEfgMediaKind(urlString?: string | null): { mediaKind: MediaKind; isClips: boolean | null } {
   if (!urlString) return { mediaKind: 'UNKNOWN', isClips: null };
   try {
@@ -87,6 +204,9 @@ export function parseEfgMediaKind(urlString?: string | null): { mediaKind: Media
   }
 }
 
+/**
+ * Extracts width and height from PNG, GIF, WebP (VP8/VP8L/VP8X), or JPEG (SOF) binary headers.
+ */
 export function parseImageDimensionsFromBuffer(buf: Uint8Array): { width: number; height: number } | null {
   if (!buf || buf.length < 10) return null;
 
@@ -181,16 +301,63 @@ export function parseImageDimensionsFromBuffer(buf: Uint8Array): { width: number
   return null;
 }
 
-async function fetchImageDimensions(urlString: string): Promise<{ width: number; height: number } | null> {
+/**
+ * Incrementally parses image dimensions from a readable byte stream into a single bounded buffer
+ * and cancels the stream reader on every exit path.
+ */
+export async function readImageDimensionsFromStream(
+  body: ReadableStream<Uint8Array>,
+  maxBytes: number = MAX_IMAGE_PROBE_BYTES
+): Promise<{ width: number; height: number } | null> {
+  const reader = body.getReader();
+  const limit = Math.max(24, maxBytes);
+  const probeBuf = new Uint8Array(limit);
+  let totalBytes = 0;
+
+  try {
+    while (totalBytes < limit) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      const copyLen = Math.min(value.byteLength, limit - totalBytes);
+      if (copyLen <= 0) break;
+      probeBuf.set(value.subarray(0, copyLen), totalBytes);
+      totalBytes += copyLen;
+
+      const dims = parseImageDimensionsFromBuffer(probeBuf.subarray(0, totalBytes));
+      if (dims) return dims;
+    }
+    return null;
+  } finally {
+    try {
+      await reader.cancel().catch(() => {});
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        // Reader already released
+      }
+    }
+  }
+}
+
+/**
+ * Fetches only the leading image header bytes from an allowed Instagram CDN URL to extract
+ * natural pixel dimensions without downloading full media payloads.
+ */
+async function fetchImageDimensions(
+  urlString: string,
+  signal?: AbortSignal
+): Promise<{ width: number; height: number } | null> {
   if (!isAllowedInstagramMediaHost(urlString)) return null;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 4500);
+  if (signal?.aborted) return null;
+
+  const combinedSignal = createCombinedSignal(4500, signal);
   try {
     let currentUrl = urlString;
     let res: Response | null = null;
     for (let redirects = 0; redirects < 3; redirects++) {
       if (!isAllowedInstagramMediaHost(currentUrl)) return null;
-      const attempt = await fetch(currentUrl, { signal: controller.signal, redirect: 'manual' });
+      const attempt = await fetch(currentUrl, { signal: combinedSignal, redirect: 'manual' });
       if (attempt.status >= 300 && attempt.status < 400) {
         const location = attempt.headers.get('location');
         await attempt.body?.cancel().catch(() => {});
@@ -201,47 +368,33 @@ async function fetchImageDimensions(urlString: string): Promise<{ width: number;
       res = attempt;
       break;
     }
-    if (!res || !res.ok || !res.body) return null;
-
-    const reader = res.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let totalBytes = 0;
-
-    while (totalBytes < MAX_IMAGE_PROBE_BYTES) {
-      const { done, value } = await reader.read();
-      if (done || !value) break;
-      chunks.push(value);
-      totalBytes += value.byteLength;
-
-      const combined = new Uint8Array(totalBytes);
-      let offset = 0;
-      for (const chunk of chunks) {
-        combined.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
-      const dims = parseImageDimensionsFromBuffer(combined);
-      if (dims) {
-        await reader.cancel().catch(() => {});
-        return dims;
-      }
+    if (!res) return null;
+    if (!res.ok || !res.body) {
+      await res.body?.cancel().catch(() => {});
+      return null;
     }
-    return null;
+
+    return await readImageDimensionsFromStream(res.body, MAX_IMAGE_PROBE_BYTES);
   } catch {
     return null;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
-export async function fetchReelMetadata(shortcode: string): Promise<ExtractedReelMetadata> {
+/**
+ * Fetches Instagram OpenGraph metadata for a saved reel or post shortcode.
+ */
+export async function fetchReelMetadata(shortcode: string, signal?: AbortSignal): Promise<ExtractedReelMetadata> {
   if (!isValidShortcode(shortcode)) {
+    return {};
+  }
+  if (signal?.aborted) {
     return {};
   }
 
   try {
     const url = `https://www.instagram.com/reel/${encodeURIComponent(shortcode)}/`;
     const res = await fetch(url, {
-      signal: AbortSignal.timeout(8000),
+      signal: createCombinedSignal(8000, signal),
       headers: {
         'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
         'Accept-Language': 'en-US,en;q=0.9',
@@ -249,6 +402,7 @@ export async function fetchReelMetadata(shortcode: string): Promise<ExtractedRee
     });
 
     if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
       return {};
     }
 
@@ -360,9 +514,20 @@ export async function fetchReelMetadata(shortcode: string): Promise<ExtractedRee
   }
 }
 
-export async function resolveFeedMediaMetadata(shortcode: string): Promise<FeedMediaMetadata> {
+/**
+ * Resolves cached or live media classification and aspect metadata for the adaptive feed player,
+ * coalescing concurrent lookups, bounding upstream concurrency, propagating client cancellation,
+ * and applying short negative caching for failed lookups.
+ */
+export async function resolveFeedMediaMetadata(
+  shortcode: string,
+  signal?: AbortSignal
+): Promise<FeedMediaMetadata> {
   if (!isValidShortcode(shortcode)) {
     throw new Error('Invalid shortcode format');
+  }
+  if (signal?.aborted) {
+    throw createAbortError(signal.reason);
   }
 
   const now = Date.now();
@@ -374,51 +539,107 @@ export async function resolveFeedMediaMetadata(shortcode: string): Promise<FeedM
     feedMetaCache.delete(shortcode);
   }
 
-  const existingPromise = feedMetaInFlight.get(shortcode);
-  if (existingPromise) {
-    return existingPromise;
+  let entry = feedMetaInFlight.get(shortcode);
+  if (!entry) {
+    const controller = new AbortController();
+    const promise = (async (): Promise<FeedMediaMetadata> => {
+      const releaseSlot = await acquireResolveSlot(controller.signal);
+      try {
+        const meta = await fetchReelMetadata(shortcode, controller.signal);
+        const thumbnailUrl = meta.thumbnailUrl || null;
+        const mediaKind: MediaKind = meta.mediaKind ?? 'UNKNOWN';
+        const isClips: boolean | null = meta.isClips ?? null;
+
+        let thumbAspectRatio: number | null = null;
+        if (thumbnailUrl && isClips === true && !controller.signal.aborted) {
+          const dims = await fetchImageDimensions(thumbnailUrl, controller.signal);
+          if (dims && dims.height > 0) {
+            thumbAspectRatio = Math.round((dims.width / dims.height) * 1000) / 1000;
+          }
+        }
+
+        const result: FeedMediaMetadata = {
+          shortcode,
+          mediaKind,
+          isClips,
+          thumbAspectRatio,
+          thumbnailUrl,
+        };
+
+        if (!controller.signal.aborted) {
+          if (feedMetaCache.size >= META_CACHE_MAX_ENTRIES) {
+            const oldestKey = feedMetaCache.keys().next().value;
+            if (oldestKey) feedMetaCache.delete(oldestKey);
+          }
+          const hasUsefulMeta = Boolean(thumbnailUrl || isClips !== null);
+          feedMetaCache.set(shortcode, {
+            value: result,
+            expiresAt: Date.now() + (hasUsefulMeta ? META_CACHE_TTL_MS : META_NEGATIVE_CACHE_TTL_MS),
+          });
+        }
+
+        return result;
+      } finally {
+        releaseSlot();
+      }
+    })();
+
+    entry = { promise, controller, waiters: 0 };
+    feedMetaInFlight.set(shortcode, entry);
+    promise.finally(() => {
+      if (feedMetaInFlight.get(shortcode) === entry) {
+        feedMetaInFlight.delete(shortcode);
+      }
+    }).catch(() => {});
   }
 
-  const task = (async (): Promise<FeedMediaMetadata> => {
-    const meta = await fetchReelMetadata(shortcode);
-    const thumbnailUrl = meta.thumbnailUrl || null;
-    const mediaKind: MediaKind = meta.mediaKind ?? 'UNKNOWN';
-    const isClips: boolean | null = meta.isClips ?? null;
+  entry.waiters++;
+  let waiterSettled = false;
 
-    let thumbAspectRatio: number | null = null;
-    if (thumbnailUrl && isClips === true) {
-      const dims = await fetchImageDimensions(thumbnailUrl);
-      if (dims && dims.height > 0) {
-        thumbAspectRatio = Math.round((dims.width / dims.height) * 1000) / 1000;
-      }
+  /**
+   * Aborts the shared upstream lookup only when the last active caller disconnects.
+   */
+  const onCallerAbort = () => {
+    if (waiterSettled) return;
+    waiterSettled = true;
+    entry!.waiters = Math.max(0, entry!.waiters - 1);
+    if (entry!.waiters === 0) {
+      entry!.controller.abort();
     }
+  };
 
-    const result: FeedMediaMetadata = {
-      shortcode,
-      mediaKind,
-      isClips,
-      thumbAspectRatio,
-      thumbnailUrl,
-    };
+  if (signal) {
+    signal.addEventListener('abort', onCallerAbort, { once: true });
+  }
 
-    if (thumbnailUrl || isClips !== null) {
-      if (feedMetaCache.size >= META_CACHE_MAX_ENTRIES) {
-        const oldestKey = feedMetaCache.keys().next().value;
-        if (oldestKey) feedMetaCache.delete(oldestKey);
-      }
-      feedMetaCache.set(shortcode, {
-        value: result,
-        expiresAt: Date.now() + META_CACHE_TTL_MS,
-      });
-    }
-
-    return result;
-  })();
-
-  feedMetaInFlight.set(shortcode, task);
   try {
-    return await task;
+    if (!signal) {
+      return await entry.promise;
+    }
+    return await new Promise<FeedMediaMetadata>((resolve, reject) => {
+      /**
+       * Rejects this caller's promise immediately upon request cancellation.
+       */
+      const abortReject = () => reject(createAbortError(signal.reason));
+      signal.addEventListener('abort', abortReject, { once: true });
+      entry!.promise.then(
+        (res) => {
+          signal.removeEventListener('abort', abortReject);
+          resolve(res);
+        },
+        (err) => {
+          signal.removeEventListener('abort', abortReject);
+          reject(err);
+        }
+      );
+    });
   } finally {
-    feedMetaInFlight.delete(shortcode);
+    if (signal) {
+      signal.removeEventListener('abort', onCallerAbort);
+    }
+    if (!waiterSettled) {
+      waiterSettled = true;
+      entry.waiters = Math.max(0, entry.waiters - 1);
+    }
   }
 }

@@ -7,10 +7,15 @@ import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts'
 import { isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
 import type { ReelQueryFilters, WatchStatus, DateFilterPreset } from '../types.ts';
 
+/**
+ * Express API router handling Meta webhooks, vault queries, metadata resolution, status updates, and archive imports.
+ */
 export const apiRouter = express.Router();
 const metaBotService = new MetaInstagramBotService();
 
-// Instagram Webhook Verification (Meta calls this once when setting up)
+/**
+ * Verifies Meta Instagram webhook subscriptions using the configured verify token.
+ */
 apiRouter.get('/instagram/webhook', (req: Request, res: Response) => {
   const mode = req.query['hub.mode'] as string;
   const token = req.query['hub.verify_token'] as string;
@@ -27,7 +32,9 @@ apiRouter.get('/instagram/webhook', (req: Request, res: Response) => {
   }
 });
 
-// Instagram Webhook Event Handler (Official Meta Graph API webhook)
+/**
+ * Verifies X-Hub-Signature-256 on incoming Meta webhook events and dispatches asynchronous handling.
+ */
 apiRouter.post('/instagram/webhook', async (req: Request, res: Response) => {
   const signature = req.headers['x-hub-signature-256'] as string | undefined;
   const rawBody = (req as any).rawBody;
@@ -47,7 +54,9 @@ apiRouter.post('/instagram/webhook', async (req: Request, res: Response) => {
   }
 });
 
-// Health check and configuration status
+/**
+ * Returns server health and active storage/Instagram configuration status.
+ */
 apiRouter.get('/health', (_req: Request, res: Response) => {
   const config = loadConfig();
   res.json({
@@ -57,7 +66,9 @@ apiRouter.get('/health', (_req: Request, res: Response) => {
   });
 });
 
-// Get library overview statistics
+/**
+ * Returns aggregate saved-reel and creator counts for the vault header telemetry.
+ */
 apiRouter.get('/stats', async (_req: Request, res: Response) => {
   try {
     const stats = await Repository.getStats();
@@ -67,7 +78,9 @@ apiRouter.get('/stats', async (_req: Request, res: Response) => {
   }
 });
 
-// Get creators with their saved reels count
+/**
+ * Returns all saved creators ordered by saved reel count descending.
+ */
 apiRouter.get('/creators', async (_req: Request, res: Response) => {
   try {
     const creators = await Repository.getCreators();
@@ -77,7 +90,9 @@ apiRouter.get('/creators', async (_req: Request, res: Response) => {
   }
 });
 
-// Get reels with compound filtering, search, and pagination
+/**
+ * Returns paginated saved reels filtered by creator, date range, watch status, and search query.
+ */
 apiRouter.get('/reels', async (req: Request, res: Response) => {
   try {
     const filters: ReelQueryFilters = {
@@ -99,8 +114,18 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
   }
 });
 
-// Resolve live media kind and cover aspect metadata for adaptive player framing
+/**
+ * Resolves live media kind and cover aspect ratio for an Instagram shortcode with disconnect cancellation
+ * and bounded upstream concurrency.
+ */
 apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
+  const controller = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      controller.abort();
+    }
+  });
+
   try {
     const shortcode = String(req.params.shortcode || '');
     if (!isValidShortcode(shortcode)) {
@@ -108,15 +133,28 @@ apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
       return;
     }
 
-    const meta = await resolveFeedMediaMetadata(shortcode);
+    const meta = await resolveFeedMediaMetadata(shortcode, controller.signal);
+    if (controller.signal.aborted || res.writableEnded) {
+      return;
+    }
     res.setHeader('Cache-Control', 'private, max-age=1800');
     res.json(meta);
   } catch (error: any) {
+    if (controller.signal.aborted || res.writableEnded || error?.name === 'AbortError') {
+      return;
+    }
+    if (error?.code === 'RATE_LIMITED') {
+      res.setHeader('Retry-After', '5');
+      res.status(429).json({ error: 'Too many metadata requests, please retry shortly' });
+      return;
+    }
     res.status(500).json({ error: error.message || 'Failed to resolve media metadata' });
   }
 });
 
-// Update watch status of a Reel
+/**
+ * Updates the watch status (`unwatched`, `watch_later`, `watched`) of a saved reel.
+ */
 apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -139,7 +177,9 @@ apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
   }
 });
 
-// Import official Instagram data export (saved_posts.json)
+/**
+ * Imports an official Instagram `saved_posts.json` archive export into the repository.
+ */
 apiRouter.post('/archive/import', async (req: Request, res: Response) => {
   (req as any).markHandlerStarted?.();
   try {
