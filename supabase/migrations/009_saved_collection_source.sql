@@ -11,8 +11,9 @@ ALTER TABLE public.saved_reels
   ALTER COLUMN is_saved_on_instagram SET DEFAULT true,
   ALTER COLUMN is_saved_on_instagram SET NOT NULL;
 
--- Reclassify historical items ingested exclusively via the DM bot
--- (DM synthetic media ID without any saved_posts.json archive bookmark timestamp)
+-- One-time historical heuristic: reclassify legacy DM-only items into "Sent to Bot".
+-- Do NOT re-run manually after new rows exist, since future timestamp-less archive
+-- imports also use synthetic shortcode_* IDs with saved_at = NULL.
 UPDATE public.saved_reels
 SET
   is_saved_on_instagram = false,

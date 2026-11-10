@@ -1005,19 +1005,29 @@ export class Repository {
                 payload.saved_at = item.saved_at;
                 payload.save_order_rank = item.save_order_rank;
               }
+              const isPromoteOnly = item.promoteToSaved && !item.saved_at;
+              if (isPromoteOnly) {
+                const { data: updatedRows, error: updateErr } = await supabase
+                  .from('saved_reels')
+                  .update(payload)
+                  .eq('id', item.id)
+                  .eq('is_saved_on_instagram', false)
+                  .select('id');
+                return { item, isPromoteOnly, updatedCount: updatedRows?.length ?? 0, error: updateErr };
+              }
               const { error: updateErr } = await supabase
                 .from('saved_reels')
                 .update(payload)
                 .eq('id', item.id);
-              return { item, error: updateErr };
+              return { item, isPromoteOnly, updatedCount: 1, error: updateErr };
             })
           );
-          for (const { item, error: updateErr } of results) {
+          for (const { item, isPromoteOnly, updatedCount, error: updateErr } of results) {
             if (updateErr) {
               console.error(`[Repository] Failed to update archive metadata for ${item.shortcode}:`, updateErr.message);
               failedCount++;
               failedShortcodes.push(item.shortcode);
-            } else {
+            } else if (!isPromoteOnly || updatedCount > 0) {
               if (item.promoteToSaved) promotedToSaved++;
               if (item.saved_at) savedAtBackfilled++;
             }
