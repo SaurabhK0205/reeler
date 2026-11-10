@@ -1632,6 +1632,49 @@ test('Sent to Bot items preserve full Watch Later, Reminder, Watched parity & ho
     assert.ok(sentMessages[2]?.includes('that post'), `Expected honest "that post" label, got: ${sentMessages[2]}`);
     assert.ok(!/saved post/i.test(sentMessages[2] || ''), `Got: ${sentMessages[2]}`);
 
+    // Monotonic source ownership: stale bot write after archive promotion never demotes true -> false or wipes saved_at
+    const raceCreator = await Repository.upsertCreator({
+      instagram_user_id: 'ig_race_creator',
+      username: 'race_creator',
+      display_name: 'Race Creator',
+    });
+    const archiveSavedIso = '2026-11-08T10:00:00.000Z';
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'shortcode_DMonoRace1',
+      shortcode: 'DMonoRace1',
+      reel_url: 'https://www.instagram.com/reel/DMonoRace1/',
+      media_type: 'reel',
+      creator_id: raceCreator.id,
+      caption: 'archive promoted mid-flight',
+      thumbnail_url: null,
+      taken_at: '2026-11-07T08:00:00.000Z',
+      saved_at: archiveSavedIso,
+      first_detected_at: archiveSavedIso,
+      save_order_rank: 1,
+      is_saved_on_instagram: true,
+    });
+    const afterStaleBotWrite = await Repository.upsertSavedReel({
+      instagram_media_id: 'shortcode_DMonoRace1',
+      shortcode: 'DMonoRace1',
+      reel_url: 'https://www.instagram.com/reel/DMonoRace1/',
+      media_type: 'reel',
+      creator_id: raceCreator.id,
+      caption: 'archive promoted mid-flight',
+      thumbnail_url: null,
+      taken_at: archiveSavedIso,
+      saved_at: null,
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 1,
+      watch_status: 'watch_later',
+      reminder_interval_seconds: 1800,
+      next_reminder_at: new Date(Date.now() + 1800 * 1000).toISOString(),
+      is_saved_on_instagram: false,
+      instagram_sender_id: 'sender_bot_parity',
+    });
+    assert.strictEqual(afterStaleBotWrite?.is_saved_on_instagram, true, 'Stale bot write must never demote IG-saved item');
+    assert.strictEqual(afterStaleBotWrite?.saved_at, archiveSavedIso, 'Stale bot write must preserve archive saved_at');
+    assert.strictEqual(afterStaleBotWrite?.watch_status, 'watch_later', 'Scheduling fields still update cleanly');
+
     Repository.resetMemoryStoreForTests();
   } finally {
     globalThis.fetch = originalFetch;

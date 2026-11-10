@@ -143,14 +143,17 @@ class InMemoryStore {
         existing.reminder_interval_seconds = data.reminder_interval_seconds;
         existing.reminder_interval_hours = Math.round(data.reminder_interval_seconds / 3600);
       }
-      if (data.saved_at !== undefined) {
-        existing.saved_at = data.saved_at ?? existing.saved_at;
+      if (data.saved_at !== undefined && data.saved_at !== null) {
+        if (existing.saved_at == null || shouldBackfillSavedAt(existing, data.saved_at)) {
+          existing.saved_at = data.saved_at;
+        }
       }
       if (data.first_detected_at) {
         existing.first_detected_at = existing.first_detected_at || data.first_detected_at;
       }
-      if (data.is_saved_on_instagram !== undefined) {
-        existing.is_saved_on_instagram = data.is_saved_on_instagram;
+      // Monotonic source ownership: never demote Instagram-saved -> Bot-sent on stale bot writes
+      if (data.is_saved_on_instagram === true) {
+        existing.is_saved_on_instagram = true;
       }
       existing.effective_saved_at = resolveEffectiveSavedAt(existing);
       if (data.instagram_sender_id !== undefined) existing.instagram_sender_id = data.instagram_sender_id;
@@ -746,79 +749,154 @@ export class Repository {
         mediaType: data.media_type,
         reelUrl: data.reel_url,
       });
-      const query = supabase
-        .from('saved_reels')
-        .upsert(
-          {
-            instagram_media_id: data.instagram_media_id,
-            shortcode: data.shortcode,
-            reel_url: data.reel_url,
-            media_type: mediaType,
-            creator_id: data.creator_id,
-            caption: data.caption,
-            thumbnail_url: data.thumbnail_url,
-            taken_at: data.taken_at,
-            saved_at: data.saved_at,
-            first_detected_at: data.first_detected_at,
-            save_order_rank: data.save_order_rank,
-            watch_status: data.watch_status || 'unwatched',
-            duration_seconds: data.duration_seconds,
-            reminder_interval_hours: Math.round(intervalSeconds / 3600),
-            reminder_interval_seconds: intervalSeconds,
-            next_reminder_at: data.next_reminder_at,
-            awaiting_reminder_choice_until: data.awaiting_reminder_choice_until ?? null,
-            is_saved_on_instagram: data.is_saved_on_instagram ?? true,
-            instagram_sender_id: data.instagram_sender_id,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: 'instagram_media_id', ignoreDuplicates: options?.ignoreDuplicates ?? false }
+      const resolvedSavedOnIg = data.is_saved_on_instagram ?? true;
+      const nowIso = new Date().toISOString();
+      const insertPayload = {
+        instagram_media_id: data.instagram_media_id,
+        shortcode: data.shortcode,
+        reel_url: data.reel_url,
+        media_type: mediaType,
+        creator_id: data.creator_id,
+        caption: data.caption,
+        thumbnail_url: data.thumbnail_url,
+        taken_at: data.taken_at,
+        saved_at: data.saved_at ?? null,
+        first_detected_at: data.first_detected_at,
+        save_order_rank: data.save_order_rank,
+        watch_status: data.watch_status || 'unwatched',
+        duration_seconds: data.duration_seconds,
+        reminder_interval_hours: Math.round(intervalSeconds / 3600),
+        reminder_interval_seconds: intervalSeconds,
+        next_reminder_at: data.next_reminder_at,
+        awaiting_reminder_choice_until: data.awaiting_reminder_choice_until ?? null,
+        is_saved_on_instagram: resolvedSavedOnIg,
+        instagram_sender_id: data.instagram_sender_id,
+        updated_at: nowIso,
+      };
+
+      const isConflictError = (err: { code?: string; message?: string } | null | undefined) =>
+        Boolean(
+          err &&
+            (err.code === '23505' ||
+              err.message?.includes('duplicate key') ||
+              err.message?.includes('shortcode') ||
+              err.message?.includes('instagram_media_id'))
         );
 
-      const { data: reel, error } = options?.skipReturn
-        ? await query
-        : await query.select('*, creator:creators(*)').maybeSingle();
+      // Atomic insert-if-absent so stale bot writes never demote a concurrently promoted IG row via ON CONFLICT DO UPDATE
+      const insertQuery = supabase
+        .from('saved_reels')
+        .upsert(insertPayload, { onConflict: 'instagram_media_id', ignoreDuplicates: true });
 
-      if (error) {
-        if (
-          options?.ignoreDuplicates &&
-          (error.code === '23505' ||
-            error.message?.includes('duplicate key') ||
-            error.message?.includes('shortcode') ||
-            error.message?.includes('instagram_media_id'))
-        ) {
-          if (options.skipReturn) {
-            return null;
-          }
-          const { data: existing, error: fetchErr } = await supabase
-            .from('saved_reels')
-            .select('*, creator:creators(*)')
-            .or(`instagram_media_id.eq.${data.instagram_media_id},shortcode.eq.${data.shortcode}`)
-            .maybeSingle();
-          if (existing) return existing as SavedReel;
-          if (fetchErr) throw new Error(`Supabase fetch conflicting reel failed: ${fetchErr.message}`);
-        }
+      const { data: insertedReel, error } = options?.skipReturn
+        ? await insertQuery.select('id').maybeSingle()
+        : await insertQuery.select('*, creator:creators(*)').maybeSingle();
+
+      if (error && !isConflictError(error)) {
         throw new Error(`Supabase upsertSavedReel failed: ${error.message}`);
       }
 
-      if (options?.skipReturn) {
+      if (insertedReel) {
+        return options?.skipReturn ? null : (insertedReel as SavedReel);
+      }
+
+      if (options?.ignoreDuplicates && options.skipReturn) {
         return null;
       }
 
-      if (!reel && options?.ignoreDuplicates) {
-        const { data: existing, error: fetchErr } = await supabase
+      const fetchExisting = async () => {
+        const byMedia = await supabase
           .from('saved_reels')
           .select('*, creator:creators(*)')
-          .or(`instagram_media_id.eq.${data.instagram_media_id},shortcode.eq.${data.shortcode}`)
+          .eq('instagram_media_id', data.instagram_media_id)
           .maybeSingle();
-        if (existing) return existing as SavedReel;
-        if (fetchErr) throw new Error(`Supabase fetch existing reel failed: ${fetchErr.message}`);
+        if (byMedia.error) {
+          throw new Error(`Supabase fetch conflicting reel failed: ${byMedia.error.message}`);
+        }
+        if (byMedia.data) return byMedia.data as SavedReel;
+
+        const byShortcode = await supabase
+          .from('saved_reels')
+          .select('*, creator:creators(*)')
+          .eq('shortcode', data.shortcode)
+          .maybeSingle();
+        if (byShortcode.error) {
+          throw new Error(`Supabase fetch existing reel failed: ${byShortcode.error.message}`);
+        }
+        return (byShortcode.data as SavedReel | null) ?? null;
+      };
+
+      const existing = await fetchExisting();
+      if (!existing) {
+        throw new Error('Supabase upsertSavedReel could not locate existing record');
       }
 
-      if (!reel) {
-        throw new Error('Supabase upsertSavedReel returned no record');
+      if (options?.ignoreDuplicates) {
+        return existing;
       }
 
-      return reel as SavedReel;
+      const updatePayload: Record<string, any> = {
+        reel_url: data.reel_url,
+        media_type: mediaType,
+        creator_id: data.creator_id || existing.creator_id,
+        caption: data.caption ?? existing.caption,
+        thumbnail_url: data.thumbnail_url ?? existing.thumbnail_url,
+        save_order_rank: data.save_order_rank,
+        duration_seconds: data.duration_seconds,
+        reminder_interval_hours: Math.round(intervalSeconds / 3600),
+        reminder_interval_seconds: intervalSeconds,
+        next_reminder_at: data.next_reminder_at,
+        awaiting_reminder_choice_until: data.awaiting_reminder_choice_until ?? null,
+        updated_at: nowIso,
+      };
+      if (data.watch_status) {
+        updatePayload.watch_status = data.watch_status;
+      }
+      if (data.instagram_sender_id !== undefined) {
+        updatePayload.instagram_sender_id = data.instagram_sender_id;
+      }
+      // Monotonic transition only (false -> true): never overwrite true -> false or wipe saved_at with null
+      if (resolvedSavedOnIg && existing.is_saved_on_instagram === false) {
+        updatePayload.is_saved_on_instagram = true;
+      }
+
+      if (data.saved_at && shouldBackfillSavedAt(existing, data.saved_at)) {
+        if (existing.saved_at == null) {
+          const { error: backfillErr } = await supabase
+            .from('saved_reels')
+            .update({ saved_at: data.saved_at, updated_at: nowIso })
+            .eq('id', existing.id)
+            .is('saved_at', null);
+          if (backfillErr) {
+            throw new Error(`Supabase saved_at backfill failed: ${backfillErr.message}`);
+          }
+        } else {
+          updatePayload.saved_at = data.saved_at;
+        }
+      }
+
+      if (options?.skipReturn) {
+        const { error: updateErr } = await supabase
+          .from('saved_reels')
+          .update(updatePayload)
+          .eq('id', existing.id);
+        if (updateErr) {
+          throw new Error(`Supabase upsertSavedReel update failed: ${updateErr.message}`);
+        }
+        return null;
+      }
+
+      const { data: updatedReel, error: updateErr } = await supabase
+        .from('saved_reels')
+        .update(updatePayload)
+        .eq('id', existing.id)
+        .select('*, creator:creators(*)')
+        .single();
+      if (updateErr || !updatedReel) {
+        throw new Error(`Supabase upsertSavedReel update failed: ${updateErr?.message || 'no record returned'}`);
+      }
+
+      return updatedReel as SavedReel;
     } finally {
       Repository.invalidateCreatorsCache();
     }
