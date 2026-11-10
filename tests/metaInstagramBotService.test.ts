@@ -1184,3 +1184,91 @@ test('MetaInstagramBotService preserves recovered post classification on inconcl
     if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
   }
 });
+
+test('Repository.getSavedItemByShortcode throws on Supabase query errors so MetaInstagramBotService fails closed without overwriting posts', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const prevAnonKey = process.env.SUPABASE_ANON_KEY;
+  const originalFetch = globalThis.fetch;
+
+  const { resetSupabaseClientForTests } = await import('../src/db/client.ts');
+  const { Repository } = await import('../src/db/repository.ts');
+
+  try {
+    resetSupabaseClientForTests();
+    process.env.SUPABASE_URL = 'https://mock-reeler-test.supabase.co';
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'mock-service-role-key';
+    delete process.env.SUPABASE_ANON_KEY;
+
+    let supabaseWriteAttempted = false;
+    let mode: 'error' | 'empty' = 'error';
+
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const target = String(url);
+      if (target.startsWith('https://mock-reeler-test.supabase.co/rest/v1/')) {
+        const method = (init?.method || 'GET').toUpperCase();
+        if (method !== 'GET') {
+          supabaseWriteAttempted = true;
+        }
+        if (mode === 'error') {
+          return new Response(
+            JSON.stringify({ code: 'XX000', message: 'connection terminated unexpectedly' }),
+            { status: 500, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      // Inconclusive Instagram metadata fetch
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+
+    await assert.rejects(
+      () => Repository.getSavedItemByShortcode('DS1goOmjhUi'),
+      /Failed to look up saved item DS1goOmjhUi: connection terminated unexpectedly/
+    );
+
+    const sentMessages: string[] = [];
+    const bot = new MetaInstagramBotService();
+    bot.sendDirectMessage = async (_recipientId: string, text: string) => {
+      sentMessages.push(text);
+      return true;
+    };
+
+    await assert.rejects(
+      () =>
+        bot.handleWebhookPayload({
+          object: 'instagram',
+          entry: [
+            {
+              messaging: [
+                {
+                  sender: { id: 'sender_supabase_error' },
+                  message: { text: 'https://www.instagram.com/reel/DS1goOmjhUi/ 30m' },
+                },
+              ],
+            },
+          ],
+        }),
+      /Failed to look up saved item DS1goOmjhUi/
+    );
+
+    assert.strictEqual(supabaseWriteAttempted, false, 'Bot must fail closed without writing to Supabase');
+    assert.strictEqual(sentMessages.length, 0, 'Bot must not send confirmation DM when lookup fails');
+
+    mode = 'empty';
+    const missing = await Repository.getSavedItemByShortcode('DMissingShortcode');
+    assert.strictEqual(missing, null);
+  } finally {
+    resetSupabaseClientForTests();
+    globalThis.fetch = originalFetch;
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    else delete process.env.SUPABASE_URL;
+    if (prevServiceKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevServiceKey;
+    else delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (prevAnonKey !== undefined) process.env.SUPABASE_ANON_KEY = prevAnonKey;
+    else delete process.env.SUPABASE_ANON_KEY;
+  }
+});

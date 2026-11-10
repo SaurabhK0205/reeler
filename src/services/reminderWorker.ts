@@ -94,12 +94,19 @@ export class ReminderWorker {
     // Process messages from admin only (newest items first)
     for (const msg of messages) {
       if (this.processedItemIds.has(msg.itemId)) continue;
-      this.processedItemIds.add(msg.itemId);
 
       // Only handle incoming messages from the admin (not bot's own replies)
-      if (msg.userId === config.instagram.userId) continue;
+      if (msg.userId === config.instagram.userId) {
+        this.processedItemIds.add(msg.itemId);
+        continue;
+      }
 
-      await this.handleAdminMessage(msg);
+      try {
+        await this.handleAdminMessage(msg);
+        this.processedItemIds.add(msg.itemId);
+      } catch (err: any) {
+        console.error(`[ReminderWorker] Failed to process admin DM item ${msg.itemId}:`, err?.message || err);
+      }
     }
   }
 

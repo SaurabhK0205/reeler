@@ -943,7 +943,7 @@ export class Repository {
     }
 
     const supabase = getSupabase();
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from('saved_reels')
       .select('*, creator:creators(*)')
       .eq('instagram_sender_id', senderId)
@@ -952,6 +952,10 @@ export class Repository {
       .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to fetch active awaiting reel for sender: ${error.message}`);
+    }
 
     return (data as SavedReel) || null;
   }
@@ -1000,7 +1004,10 @@ export class Repository {
         .order('last_reminded_at', { ascending: false, nullsFirst: false })
         .order('created_at', { ascending: false })
         .limit(25);
-      if (!error && senderCandidates && senderCandidates.length > 0) {
+      if (error) {
+        throw new Error(`Failed to fetch last Watch Later reel for sender: ${error.message}`);
+      }
+      if (senderCandidates && senderCandidates.length > 0) {
         return sortWatchLaterReelsMostRecentFirst(senderCandidates as SavedReel[])[0] || null;
       }
     }
@@ -1019,7 +1026,10 @@ export class Repository {
       .order('last_reminded_at', { ascending: false, nullsFirst: false })
       .order('created_at', { ascending: false })
       .limit(25);
-    if (fbErr || !fallbackCandidates || fallbackCandidates.length === 0) {
+    if (fbErr) {
+      throw new Error(`Failed to fetch fallback Watch Later reel: ${fbErr.message}`);
+    }
+    if (!fallbackCandidates || fallbackCandidates.length === 0) {
       return null;
     }
     return sortWatchLaterReelsMostRecentFirst(fallbackCandidates as SavedReel[])[0] || null;
@@ -1820,7 +1830,10 @@ export class Repository {
       .eq('shortcode', cleanCode)
       .maybeSingle();
 
-    if (error || !data) {
+    if (error) {
+      throw new Error(`Failed to look up saved item ${cleanCode}: ${error.message}`);
+    }
+    if (!data) {
       return null;
     }
 
