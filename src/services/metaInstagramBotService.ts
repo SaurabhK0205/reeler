@@ -352,8 +352,10 @@ export class MetaInstagramBotService {
       const instagramMediaId = existingItem?.instagram_media_id || `shortcode_${shortcode}`;
       const caption = meta.caption || existingItem?.caption || null;
       const thumbnailUrl = meta.thumbnailUrl || existingItem?.thumbnail_url || null;
-      const takenAt = existingItem?.taken_at || new Date().toISOString();
-      const firstDetectedAt = existingItem?.first_detected_at || new Date().toISOString();
+      const nowIso = new Date().toISOString();
+      const takenAt = existingItem?.taken_at || nowIso;
+      const savedAt = existingItem ? (existingItem.saved_at ?? null) : nowIso;
+      const firstDetectedAt = existingItem?.first_detected_at || nowIso;
       const saveOrderRank = existingItem?.save_order_rank ?? 1;
 
       const creatorLine = formatAddedToWatchLaterCreatorBlock({
@@ -375,6 +377,7 @@ export class MetaInstagramBotService {
           caption,
           thumbnail_url: thumbnailUrl,
           taken_at: takenAt,
+          saved_at: savedAt,
           first_detected_at: firstDetectedAt,
           save_order_rank: saveOrderRank,
           watch_status: 'watch_later',
@@ -399,6 +402,7 @@ export class MetaInstagramBotService {
           caption,
           thumbnail_url: thumbnailUrl,
           taken_at: takenAt,
+          saved_at: savedAt,
           first_detected_at: firstDetectedAt,
           save_order_rank: saveOrderRank,
           watch_status: 'watch_later',

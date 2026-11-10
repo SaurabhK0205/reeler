@@ -391,6 +391,116 @@ async function runTests() {
     ['DLegacyReel1', 'DLegacyUnres']
   );
 
+  // Test 10: Backfill missing/fallback saved_at on re-import & sort by effective save timestamp
+  console.log('Test 10: Backfill saved_at from saved_posts.json & chronological effective save sort');
+  Repository.resetMemoryStoreForTests();
+
+  const sortCreator = await Repository.upsertCreator({
+    instagram_user_id: 'creator_sort_backfill',
+    username: 'sort_creator',
+    display_name: 'Sort Creator',
+  });
+
+  // 1) Synced row (no saved_at, real older publish date in taken_at, colliding rank = 1)
+  await Repository.upsertSavedReel({
+    instagram_media_id: '4018206611560496764_3944673605',
+    shortcode: 'DSyncNoSaved',
+    reel_url: 'https://www.instagram.com/reel/DSyncNoSaved/',
+    media_type: 'reel',
+    creator_id: sortCreator.id,
+    caption: 'Synced on Nov 6, posted Oct 28',
+    taken_at: '2026-10-28T22:47:41.000Z',
+    saved_at: null,
+    first_detected_at: '2026-11-06T14:59:28.000Z',
+    save_order_rank: 1,
+    watch_status: 'watch_later',
+  });
+
+  // 2) DM row whose DM save timestamp is Nov 8, later than the true Nov 2 Instagram save timestamp
+  await Repository.upsertSavedReel({
+    instagram_media_id: 'shortcode_DDmOlderSave',
+    shortcode: 'DDmOlderSave',
+    reel_url: 'https://www.instagram.com/reel/DDmOlderSave/',
+    media_type: 'reel',
+    creator_id: sortCreator.id,
+    caption: 'DMed Nov 8, originally saved Nov 2',
+    taken_at: '2026-11-08T09:45:18.000Z',
+    saved_at: '2026-11-08T09:45:18.000Z',
+    first_detected_at: '2026-11-08T09:45:18.000Z',
+    save_order_rank: 1,
+    watch_status: 'watch_later',
+  });
+
+  // 3) Archive item with same-second save date to verify deterministic save_order_rank tie-break
+  const backfillImport = [
+    {
+      timestamp: 1794138985, // 2026-11-08T11:56:25Z (newest)
+      fbid: '18084562202349001',
+      label_values: [
+        { label: 'URL', href: 'https://www.instagram.com/reel/DNewestExp/' },
+        { title: 'Owner', dict: [{ dict: [{ label: 'Username', value: 'sort_creator' }] }] },
+      ],
+    },
+    {
+      timestamp: 1794058187, // 2026-11-06T13:29:47Z (wait - exact: let's compute via Date.UTC)
+      fbid: '18084562202349002',
+      label_values: [
+        { label: 'URL', href: 'https://www.instagram.com/reel/DSyncNoSaved/' },
+        { title: 'Owner', dict: [{ dict: [{ label: 'Username', value: 'sort_creator' }] }] },
+      ],
+    },
+    {
+      timestamp: 1793624911, // 2026-11-02T13:08:31Z
+      fbid: '18084562202349003',
+      label_values: [
+        { label: 'URL', href: 'https://www.instagram.com/reel/DDmOlderSave/' },
+        { title: 'Owner', dict: [{ dict: [{ label: 'Username', value: 'sort_creator' }] }] },
+      ],
+    },
+  ];
+  // Align middle timestamp cleanly with 2026-11-06T13:29:47Z
+  backfillImport[1].timestamp = Math.floor(Date.UTC(2026, 10, 6, 13, 29, 47) / 1000);
+
+  const bfRes1 = await ArchiveImportService.importArchive(backfillImport);
+  assert.equal(bfRes1.status, 'success');
+  assert.equal(bfRes1.reelsImported, 1);
+  assert.equal(bfRes1.alreadyPresent, 2);
+  assert.equal(bfRes1.savedAtBackfilled, 2, 'Both missing-saved_at sync row and earlier-bookmark DM row must backfill');
+
+  // Re-running same import must be completely idempotent (0 backfilled)
+  const bfRes2 = await ArchiveImportService.importArchive(backfillImport);
+  assert.equal(bfRes2.reelsImported, 0);
+  assert.equal(bfRes2.alreadyPresent, 3);
+  assert.equal(bfRes2.savedAtBackfilled, 0);
+
+  // Verify newest_saved and oldest_saved sort order ignores colliding save_order_rank=1 across batches
+  const { reels: sortedNewest } = await Repository.getReels({ sortBy: 'newest_saved', limit: 10 });
+  assert.deepEqual(
+    sortedNewest.map((r) => r.shortcode),
+    ['DNewestExp', 'DSyncNoSaved', 'DDmOlderSave']
+  );
+
+  const syncedItem = sortedNewest.find((r) => r.shortcode === 'DSyncNoSaved')!;
+  assert.equal(syncedItem.saved_at, '2026-11-06T13:29:47.000Z');
+  assert.equal(syncedItem.taken_at, '2026-10-28T22:47:41.000Z', 'Real publish date must stay intact on backfill');
+  assert.equal(syncedItem.watch_status, 'watch_later', 'Watch status must stay intact on backfill');
+
+  const dmItem = sortedNewest.find((r) => r.shortcode === 'DDmOlderSave')!;
+  assert.equal(dmItem.saved_at, '2026-11-02T13:08:31.000Z');
+  assert.equal(dmItem.watch_status, 'watch_later');
+
+  const { reels: sortedOldest } = await Repository.getReels({ sortBy: 'oldest_saved', limit: 10 });
+  assert.deepEqual(
+    sortedOldest.map((r) => r.shortcode),
+    ['DDmOlderSave', 'DSyncNoSaved', 'DNewestExp']
+  );
+
+  const byCreator = await Repository.getReelsByCreatorUsername('sort_creator');
+  assert.deepEqual(
+    byCreator.reels.map((r) => r.shortcode),
+    ['DNewestExp', 'DSyncNoSaved', 'DDmOlderSave']
+  );
+
   console.log('✅ All ArchiveImportService tests passed successfully!');
 }
 

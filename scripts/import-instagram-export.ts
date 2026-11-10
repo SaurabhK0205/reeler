@@ -26,11 +26,12 @@ async function main() {
   const result = await ArchiveImportService.importArchive(fileContent);
 
   console.log('\n✅ Import Completed!');
-  console.log(`- Total Items Scanned:  ${result.totalProcessed}`);
-  console.log(`- Newly Imported Reels: ${result.reelsImported}`);
-  console.log(`- Already in Library:   ${result.alreadyPresent}`);
-  console.log(`- Creators Added:       ${result.creatorsAdded}`);
-  console.log(`- Skipped / Non-reels:  ${result.skipped}`);
+  console.log(`- Total Items Scanned:     ${result.totalProcessed}`);
+  console.log(`- Newly Imported Reels:    ${result.reelsImported}`);
+  console.log(`- Already in Library:      ${result.alreadyPresent}`);
+  console.log(`- Saved Dates Backfilled:  ${result.savedAtBackfilled}`);
+  console.log(`- Creators Added:          ${result.creatorsAdded}`);
+  console.log(`- Skipped / Non-reels:     ${result.skipped}`);
 
   if (result.errors.length > 0) {
     console.log('\n⚠️ Errors encountered during import:');

@@ -11,6 +11,39 @@ import type {
 import { classifySavedMediaType } from '../utils/mediaType.ts';
 import { getSupabase, isSupabaseConfigured } from './client.ts';
 
+/**
+ * Resolves the authoritative save timestamp for sorting and date filtering (`saved_at` with `first_detected_at` fallback).
+ */
+export function resolveEffectiveSavedAt(reel: {
+  saved_at?: string | null;
+  first_detected_at?: string | null;
+  taken_at?: string | null;
+}): string {
+  return reel.saved_at || reel.first_detected_at || reel.taken_at || '';
+}
+
+/**
+ * Determines whether an archive-import `saved_at` timestamp should backfill an existing record
+ * that lacks `saved_at` or has a later fallback DM-ingestion timestamp.
+ */
+export function shouldBackfillSavedAt(
+  existing: { instagram_media_id?: string | null; saved_at?: string | null },
+  incomingSavedAt?: string | null
+): boolean {
+  if (!incomingSavedAt) return false;
+  const incomingMs = Date.parse(incomingSavedAt);
+  if (!Number.isFinite(incomingMs)) return false;
+  if (!existing.saved_at) return true;
+
+  const isDmIngested =
+    Boolean(existing.instagram_media_id?.startsWith('shortcode_')) ||
+    Boolean(existing.instagram_media_id?.startsWith('id_'));
+  if (!isDmIngested) return false;
+
+  const existingMs = Date.parse(existing.saved_at);
+  return !Number.isFinite(existingMs) || incomingMs < existingMs;
+}
+
 // In-Memory store for offline/demo/development fallback
 class InMemoryStore {
   creators: Map<string, Creator> = new Map();
@@ -106,6 +139,13 @@ class InMemoryStore {
         existing.reminder_interval_seconds = data.reminder_interval_seconds;
         existing.reminder_interval_hours = Math.round(data.reminder_interval_seconds / 3600);
       }
+      if (data.saved_at !== undefined) {
+        existing.saved_at = data.saved_at ?? existing.saved_at;
+      }
+      if (data.first_detected_at) {
+        existing.first_detected_at = existing.first_detected_at || data.first_detected_at;
+      }
+      existing.effective_saved_at = resolveEffectiveSavedAt(existing);
       if (data.instagram_sender_id !== undefined) existing.instagram_sender_id = data.instagram_sender_id;
       existing.updated_at = now;
       return options?.skipReturn ? null : { ...existing, creator: this.creators.get(existing.creator_id) };
@@ -128,6 +168,7 @@ class InMemoryStore {
       taken_at: data.taken_at,
       saved_at: data.saved_at,
       first_detected_at: data.first_detected_at,
+      effective_saved_at: resolveEffectiveSavedAt(data),
       save_order_rank: data.save_order_rank,
       watch_status: data.watch_status || 'unwatched',
       duration_seconds: data.duration_seconds,
@@ -184,9 +225,10 @@ class InMemoryStore {
     awaiting_reminder_choice_until?: string | null;
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
-  }>, options?: { ignoreDuplicates?: boolean }): Promise<BatchReelsResult> {
+  }>, options?: { ignoreDuplicates?: boolean; backfillMissingSavedAt?: boolean }): Promise<BatchReelsResult> {
     let newlyImported = 0;
     let alreadyPresent = 0;
+    let savedAtBackfilled = 0;
     let failedCount = 0;
     const failedShortcodes: string[] = [];
 
@@ -202,6 +244,13 @@ class InMemoryStore {
 
         if (existing && options?.ignoreDuplicates) {
           alreadyPresent++;
+          if (options.backfillMissingSavedAt && shouldBackfillSavedAt(existing, r.saved_at)) {
+            existing.saved_at = r.saved_at;
+            existing.effective_saved_at = resolveEffectiveSavedAt(existing);
+            existing.save_order_rank = r.save_order_rank;
+            existing.updated_at = new Date().toISOString();
+            savedAtBackfilled++;
+          }
           continue;
         }
 
@@ -213,7 +262,7 @@ class InMemoryStore {
       }
     }
 
-    return { newlyImported, alreadyPresent, failedCount, failedShortcodes };
+    return { newlyImported, alreadyPresent, savedAtBackfilled, failedCount, failedShortcodes };
   }
 
   /**
@@ -241,15 +290,15 @@ class InMemoryStore {
       list = list.filter(r => r.media_type === filters.mediaType);
     }
 
-    // Filter by Date Preset or Range
+    // Filter by Date Preset or Range (uses effective save timestamp)
     const { startDate, endDate } = resolveDateRange(filters.datePreset, filters.startDate, filters.endDate);
     if (startDate) {
-      const startMs = new Date(startDate).getTime();
-      list = list.filter(r => new Date(r.first_detected_at).getTime() >= startMs);
+      const startMs = parseTimestampMs(startDate);
+      list = list.filter(r => parseTimestampMs(resolveEffectiveSavedAt(r)) >= startMs);
     }
     if (endDate) {
-      const endMs = new Date(endDate).getTime();
-      list = list.filter(r => new Date(r.first_detected_at).getTime() <= endMs);
+      const endMs = parseTimestampMs(endDate);
+      list = list.filter(r => parseTimestampMs(resolveEffectiveSavedAt(r)) <= endMs);
     }
 
     // Search query (captions, creator handles, creator display names, and shortcodes)
@@ -271,13 +320,36 @@ class InMemoryStore {
     // Sorting with deterministic tie-breakers
     const sort = filters.sortBy || 'newest_saved';
     list.sort((a, b) => {
-      let primary = 0;
-      if (sort === 'newest_saved') primary = a.save_order_rank - b.save_order_rank; // 1 = newest
-      else if (sort === 'oldest_saved') primary = b.save_order_rank - a.save_order_rank;
-      else if (sort === 'newest_published') primary = new Date(b.taken_at).getTime() - new Date(a.taken_at).getTime();
-      else if (sort === 'oldest_published') primary = new Date(a.taken_at).getTime() - new Date(b.taken_at).getTime();
-      if (primary !== 0) return primary;
-      const detectedDiff = new Date(b.first_detected_at).getTime() - new Date(a.first_detected_at).getTime();
+      if (sort === 'newest_saved') {
+        const savedDiff =
+          parseTimestampMs(resolveEffectiveSavedAt(b)) -
+          parseTimestampMs(resolveEffectiveSavedAt(a));
+        if (savedDiff !== 0) return savedDiff;
+        const rankDiff = (a.save_order_rank || 0) - (b.save_order_rank || 0);
+        if (rankDiff !== 0) return rankDiff;
+      } else if (sort === 'oldest_saved') {
+        const savedDiff =
+          parseTimestampMs(resolveEffectiveSavedAt(a)) -
+          parseTimestampMs(resolveEffectiveSavedAt(b));
+        if (savedDiff !== 0) return savedDiff;
+        const rankDiff = (b.save_order_rank || 0) - (a.save_order_rank || 0);
+        if (rankDiff !== 0) return rankDiff;
+      } else if (sort === 'newest_published') {
+        const pubDiff = parseTimestampMs(b.taken_at) - parseTimestampMs(a.taken_at);
+        if (pubDiff !== 0) return pubDiff;
+        const savedDiff =
+          parseTimestampMs(resolveEffectiveSavedAt(b)) -
+          parseTimestampMs(resolveEffectiveSavedAt(a));
+        if (savedDiff !== 0) return savedDiff;
+      } else if (sort === 'oldest_published') {
+        const pubDiff = parseTimestampMs(a.taken_at) - parseTimestampMs(b.taken_at);
+        if (pubDiff !== 0) return pubDiff;
+        const savedDiff =
+          parseTimestampMs(resolveEffectiveSavedAt(b)) -
+          parseTimestampMs(resolveEffectiveSavedAt(a));
+        if (savedDiff !== 0) return savedDiff;
+      }
+      const detectedDiff = parseTimestampMs(b.first_detected_at) - parseTimestampMs(a.first_detected_at);
       if (detectedDiff !== 0) return detectedDiff;
       return String(a.id).localeCompare(String(b.id));
     });
@@ -327,9 +399,9 @@ class InMemoryStore {
         reelsCount++;
       }
 
-      const detectedMs = new Date(r.first_detected_at).getTime();
-      if (detectedMs >= sevenDaysAgo) savedThisWeek++;
-      if (detectedMs >= thirtyDaysAgo) savedThisMonth++;
+      const effectiveSavedMs = parseTimestampMs(resolveEffectiveSavedAt(r));
+      if (effectiveSavedMs >= sevenDaysAgo) savedThisWeek++;
+      if (effectiveSavedMs >= thirtyDaysAgo) savedThisMonth++;
 
       if (r.watch_status === 'unwatched') unwatchedCount++;
       else if (r.watch_status === 'watched') watchedCount++;
@@ -514,10 +586,10 @@ function applyReelQueryFilters(
     next = next.eq('media_type', params.mediaType);
   }
   if (params.startDate) {
-    next = next.gte('first_detected_at', params.startDate);
+    next = next.gte('effective_saved_at', params.startDate);
   }
   if (params.endDate) {
-    next = next.lte('first_detected_at', params.endDate);
+    next = next.lte('effective_saved_at', params.endDate);
   }
   if (params.searchClauses.length > 0) {
     next = next.or(params.searchClauses.join(','));
@@ -776,7 +848,7 @@ export class Repository {
     awaiting_reminder_choice_until?: string | null;
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
-  }>, options?: { ignoreDuplicates?: boolean }): Promise<BatchReelsResult> {
+  }>, options?: { ignoreDuplicates?: boolean; backfillMissingSavedAt?: boolean }): Promise<BatchReelsResult> {
     Repository.invalidateCreatorsCache();
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertSavedReelsBatch(reels, options);
@@ -785,14 +857,22 @@ export class Repository {
     const supabase = getSupabase();
     let newlyImported = 0;
     let alreadyPresent = 0;
+    let savedAtBackfilled = 0;
     let failedCount = 0;
     const failedShortcodes: string[] = [];
 
     try {
       let reelsToInsert = reels;
+      const backfillById = new Map<
+        string,
+        { id: string; shortcode: string; saved_at: string; save_order_rank: number }
+      >();
 
       if (options?.ignoreDuplicates) {
-        const existingShortcodes = new Set<string>();
+        const existingByShortcode = new Map<
+          string,
+          { id: string; instagram_media_id: string; saved_at: string | null }
+        >();
         const allShortcodes = Array.from(new Set(reels.map(r => r.shortcode)));
         const LOOKUP_CHUNK = 500;
 
@@ -800,7 +880,7 @@ export class Repository {
           const slice = allShortcodes.slice(i, i + LOOKUP_CHUNK);
           const { data: matched, error } = await supabase
             .from('saved_reels')
-            .select('shortcode')
+            .select('id, instagram_media_id, shortcode, saved_at')
             .in('shortcode', slice);
 
           if (error) {
@@ -808,20 +888,69 @@ export class Repository {
           }
           if (matched) {
             for (const row of matched) {
-              existingShortcodes.add(row.shortcode);
+              existingByShortcode.set(row.shortcode, {
+                id: String(row.id),
+                instagram_media_id: String(row.instagram_media_id),
+                saved_at: row.saved_at ? String(row.saved_at) : null,
+              });
             }
           }
         }
 
         const freshReels: typeof reels = [];
         for (const r of reels) {
-          if (existingShortcodes.has(r.shortcode)) {
+          const existing = existingByShortcode.get(r.shortcode);
+          if (existing) {
             alreadyPresent++;
+            if (
+              options.backfillMissingSavedAt &&
+              r.saved_at &&
+              !backfillById.has(existing.id) &&
+              shouldBackfillSavedAt(existing, r.saved_at)
+            ) {
+              backfillById.set(existing.id, {
+                id: existing.id,
+                shortcode: r.shortcode,
+                saved_at: r.saved_at,
+                save_order_rank: r.save_order_rank,
+              });
+            }
           } else {
             freshReels.push(r);
           }
         }
         reelsToInsert = freshReels;
+      }
+
+      if (backfillById.size > 0) {
+        const backfillItems = Array.from(backfillById.values());
+        const backfillNow = new Date().toISOString();
+        const BACKFILL_CONCURRENCY = 20;
+        for (let i = 0; i < backfillItems.length; i += BACKFILL_CONCURRENCY) {
+          const slice = backfillItems.slice(i, i + BACKFILL_CONCURRENCY);
+          const results = await Promise.all(
+            slice.map(async (item) => {
+              const { error: backfillErr } = await supabase
+                .from('saved_reels')
+                .update({
+                  saved_at: item.saved_at,
+                  save_order_rank: item.save_order_rank,
+                  updated_at: backfillNow,
+                })
+                .eq('id', item.id);
+              return { item, error: backfillErr };
+            })
+          );
+          for (const { item, error: backfillErr } of results) {
+            if (backfillErr) {
+              console.error(`[Repository] Failed to backfill saved_at for ${item.shortcode}:`, backfillErr.message);
+              failedCount++;
+              failedShortcodes.push(item.shortcode);
+            } else {
+              savedAtBackfilled++;
+            }
+          }
+        }
       }
 
       const CHUNK_SIZE = 300;
@@ -873,7 +1002,7 @@ export class Repository {
         }
       }
 
-      return { newlyImported, alreadyPresent, failedCount, failedShortcodes };
+      return { newlyImported, alreadyPresent, savedAtBackfilled, failedCount, failedShortcodes };
     } finally {
       Repository.invalidateCreatorsCache();
     }
@@ -1123,10 +1252,23 @@ export class Repository {
     );
 
     const sort = filters.sortBy || 'newest_saved';
-    if (sort === 'newest_saved') query = query.order('save_order_rank', { ascending: true });
-    else if (sort === 'oldest_saved') query = query.order('save_order_rank', { ascending: false });
-    else if (sort === 'newest_published') query = query.order('taken_at', { ascending: false });
-    else if (sort === 'oldest_published') query = query.order('taken_at', { ascending: true });
+    if (sort === 'newest_saved') {
+      query = query
+        .order('effective_saved_at', { ascending: false })
+        .order('save_order_rank', { ascending: true });
+    } else if (sort === 'oldest_saved') {
+      query = query
+        .order('effective_saved_at', { ascending: true })
+        .order('save_order_rank', { ascending: false });
+    } else if (sort === 'newest_published') {
+      query = query
+        .order('taken_at', { ascending: false })
+        .order('effective_saved_at', { ascending: false });
+    } else if (sort === 'oldest_published') {
+      query = query
+        .order('taken_at', { ascending: true })
+        .order('effective_saved_at', { ascending: false });
+    }
 
     query = query
       .order('first_detected_at', { ascending: false })
@@ -1316,15 +1458,16 @@ export class Repository {
 
     const sortCreatorItems = (items: SavedReel[]): SavedReel[] =>
       [...items].sort((a, b) => {
-        const createdDiff =
-          new Date(b.created_at || b.first_detected_at).getTime() -
-          new Date(a.created_at || a.first_detected_at).getTime();
-        if (createdDiff !== 0) return createdDiff;
+        const effectiveSavedDiff =
+          parseTimestampMs(resolveEffectiveSavedAt(b)) -
+          parseTimestampMs(resolveEffectiveSavedAt(a));
+        if (effectiveSavedDiff !== 0) return effectiveSavedDiff;
         const rankDiff = (a.save_order_rank || 0) - (b.save_order_rank || 0);
         if (rankDiff !== 0) return rankDiff;
-        const detectedDiff =
-          new Date(b.first_detected_at).getTime() - new Date(a.first_detected_at).getTime();
-        if (detectedDiff !== 0) return detectedDiff;
+        const createdDiff =
+          parseTimestampMs(b.created_at || b.first_detected_at) -
+          parseTimestampMs(a.created_at || a.first_detected_at);
+        if (createdDiff !== 0) return createdDiff;
         return String(a.id).localeCompare(String(b.id));
       });
 
@@ -1402,9 +1545,9 @@ export class Repository {
         .select('*, creator:creators(*)')
         .in('creator_id', creatorIds)
         .eq('media_type', type)
-        .order('created_at', { ascending: false })
+        .order('effective_saved_at', { ascending: false })
         .order('save_order_rank', { ascending: true })
-        .order('first_detected_at', { ascending: false })
+        .order('created_at', { ascending: false })
         .order('id', { ascending: true })
         .limit(25);
 
@@ -1455,8 +1598,8 @@ export class Repository {
       supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'reel'),
       supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'post'),
       Repository.getCreators(),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('first_detected_at', sevenDaysAgo),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('first_detected_at', thirtyDaysAgo),
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('effective_saved_at', sevenDaysAgo),
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('effective_saved_at', thirtyDaysAgo),
       supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'unwatched'),
       supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'watched'),
       supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'watch_later'),
