@@ -504,6 +504,219 @@ async function runTests() {
     ['DNewestExp', 'DSyncNoSaved', 'DDmOlderSave']
   );
 
+  // Test 11: Archive re-import promotes Sent to Bot items -> Saved on IG while preserving triage/reminders + HTTP /api source filtering
+  console.log('Test 11: Archive promotion (Bot -> IG Saved), repository source filtering, and HTTP apiRouter integration');
+  const http = await import('node:http');
+  const expressMod = await import('express');
+  const express = expressMod.default;
+  const { apiRouter } = await import('../src/api/router.ts');
+  Repository.resetMemoryStoreForTests();
+
+  const parityCreator = await Repository.upsertCreator({
+    instagram_user_id: 'creator_parity_test',
+    username: 'parity_creator',
+    display_name: 'Parity Creator',
+  });
+
+  const tomorrowIso = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+  const nowIso = new Date().toISOString();
+
+  // Bot-sent item with active Watch Later reminder & DM sender -> should promote on archive import without losing triage
+  const botPromotable = await Repository.upsertSavedReel({
+    instagram_media_id: 'shortcode_DBotPromote1',
+    shortcode: 'DBotPromote1',
+    reel_url: 'https://www.instagram.com/reel/DBotPromote1/',
+    media_type: 'reel',
+    creator_id: parityCreator.id,
+    caption: 'Bot caption worth keeping',
+    taken_at: nowIso,
+    saved_at: null,
+    first_detected_at: nowIso,
+    save_order_rank: 1,
+    watch_status: 'watch_later',
+    reminder_interval_seconds: 1800,
+    next_reminder_at: tomorrowIso,
+    is_saved_on_instagram: false,
+    instagram_sender_id: 'sender_parity_1',
+  });
+  assert.ok(botPromotable);
+  await Repository.recordReminderSent(botPromotable.id, tomorrowIso);
+
+  // Bot-sent post whose archive entry lacks timestamp -> still must promote false -> true without backfill timestamp
+  await Repository.upsertSavedReel({
+    instagram_media_id: 'shortcode_DBotNoDate2',
+    shortcode: 'DBotNoDate2',
+    reel_url: 'https://www.instagram.com/p/DBotNoDate2/',
+    media_type: 'post',
+    creator_id: parityCreator.id,
+    caption: 'Bot post promoted without timestamp',
+    taken_at: nowIso,
+    saved_at: null,
+    first_detected_at: nowIso,
+    save_order_rank: 2,
+    watch_status: 'unwatched',
+    is_saved_on_instagram: false,
+    instagram_sender_id: 'sender_parity_1',
+  });
+
+  // Bot-only item NOT present in archive -> remains Sent to Bot with Watch Later
+  const botOnlyItem = await Repository.upsertSavedReel({
+    instagram_media_id: 'shortcode_DBotOnly3',
+    shortcode: 'DBotOnly3',
+    reel_url: 'https://www.instagram.com/reel/DBotOnly3/',
+    media_type: 'reel',
+    creator_id: parityCreator.id,
+    caption: 'Pure bot reel watch later searchtoken',
+    taken_at: nowIso,
+    saved_at: null,
+    first_detected_at: nowIso,
+    save_order_rank: 3,
+    watch_status: 'watch_later',
+    next_reminder_at: tomorrowIso,
+    is_saved_on_instagram: false,
+    instagram_sender_id: 'sender_parity_1',
+  });
+  assert.ok(botOnlyItem);
+
+  // Native IG-saved item
+  await Repository.upsertSavedReel({
+    instagram_media_id: '18084562202349111',
+    shortcode: 'DIgSavedOnly',
+    reel_url: 'https://www.instagram.com/p/DIgSavedOnly/',
+    media_type: 'post',
+    creator_id: parityCreator.id,
+    caption: 'Native IG post',
+    taken_at: '2026-11-01T10:00:00.000Z',
+    saved_at: '2026-11-01T11:00:00.000Z',
+    first_detected_at: '2026-11-01T11:00:00.000Z',
+    save_order_rank: 4,
+    is_saved_on_instagram: true,
+  });
+
+  const preStats = await Repository.getStats();
+  assert.equal(preStats.totalReels, 4);
+  assert.equal(preStats.savedOnInstagramCount, 1);
+  assert.equal(preStats.botSentCount, 3);
+
+  const promotionArchivePayload = {
+    saved_saved_media: [
+      {
+        title: 'parity_creator',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/reel/DBotPromote1/',
+            timestamp: Math.floor(Date.UTC(2026, 10, 5, 14, 0, 0) / 1000),
+          },
+        },
+      },
+      {
+        title: 'parity_creator',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/p/DBotNoDate2/',
+          },
+        },
+      },
+      {
+        title: 'parity_creator',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/reel/DNewArchive4/',
+            timestamp: Math.floor(Date.UTC(2026, 10, 9, 14, 0, 0) / 1000),
+          },
+        },
+      },
+    ],
+  };
+
+  const promoteRes = await ArchiveImportService.importArchive(promotionArchivePayload);
+  assert.equal(promoteRes.status, 'success');
+  assert.equal(promoteRes.reelsImported, 1);
+  assert.equal(promoteRes.alreadyPresent, 2);
+  assert.equal(promoteRes.promotedToSaved, 2, 'Both matched bot items must promote to Saved on IG');
+  assert.equal(promoteRes.savedAtBackfilled, 1, 'Only entry with archive timestamp backfills saved_at');
+
+  // Re-running import must be idempotent
+  const promoteRepeat = await ArchiveImportService.importArchive(promotionArchivePayload);
+  assert.equal(promoteRepeat.promotedToSaved, 0);
+  assert.equal(promoteRepeat.savedAtBackfilled, 0);
+  assert.equal(promoteRepeat.reelsImported, 0);
+
+  const promotedItem1 = await Repository.getSavedItemByShortcode('DBotPromote1');
+  assert.equal(promotedItem1?.is_saved_on_instagram, true);
+  assert.equal(promotedItem1?.saved_at, '2026-11-05T14:00:00.000Z');
+  assert.equal(promotedItem1?.watch_status, 'watch_later', 'Promotion must preserve watch_status');
+  assert.equal(promotedItem1?.next_reminder_at, tomorrowIso, 'Promotion must preserve scheduled reminder');
+  assert.equal(promotedItem1?.reminder_interval_seconds, 1800, 'Promotion must preserve interval');
+  assert.equal(promotedItem1?.reminders_sent_count, 1, 'Promotion must preserve reminder counter');
+  assert.equal(promotedItem1?.caption, 'Bot caption worth keeping', 'Promotion must preserve existing caption');
+  assert.equal(promotedItem1?.instagram_sender_id, 'sender_parity_1', 'Promotion must preserve DM sender attribution');
+
+  const promotedItem2 = await Repository.getSavedItemByShortcode('DBotNoDate2');
+  assert.equal(promotedItem2?.is_saved_on_instagram, true);
+  assert.equal(promotedItem2?.saved_at, null);
+
+  const postStats = await Repository.getStats();
+  assert.equal(postStats.totalReels, 5);
+  assert.equal(postStats.savedOnInstagramCount, 4);
+  assert.equal(postStats.botSentCount, 1);
+
+  const botList = await Repository.getReels({ source: 'bot', limit: 20 });
+  assert.equal(botList.total, 1);
+  assert.deepEqual(botList.reels.map((r) => r.shortcode), ['DBotOnly3']);
+
+  const igList = await Repository.getReels({ source: 'instagram', limit: 20 });
+  assert.equal(igList.total, 4);
+  assert.ok(!igList.reels.some((r) => r.shortcode === 'DBotOnly3'));
+
+  // HTTP apiRouter integration checks (source filtering + stats + patch parity + validation)
+  const testApp = express();
+  testApp.use(express.json());
+  testApp.use('/api', apiRouter);
+  const server = http.createServer(testApp);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+
+  try {
+    const addr = server.address();
+    assert.ok(addr && typeof addr === 'object');
+    const baseUrl = `http://127.0.0.1:${addr.port}/api`;
+
+    const statsHttp = await fetch(`${baseUrl}/stats`);
+    assert.equal(statsHttp.status, 200);
+    const statsJson = await statsHttp.json();
+    assert.equal(statsJson.savedOnInstagramCount, 4);
+    assert.equal(statsJson.botSentCount, 1);
+
+    const botHttp = await fetch(
+      `${baseUrl}/reels?source=bot&watchStatus=watch_later&mediaType=reel&creatorId=${encodeURIComponent(parityCreator.id)}&search=searchtoken&datePreset=7d`
+    );
+    assert.equal(botHttp.status, 200);
+    const botHttpJson = await botHttp.json();
+    assert.equal(botHttpJson.total, 1);
+    assert.equal(botHttpJson.reels[0].shortcode, 'DBotOnly3');
+
+    const igPostsHttp = await fetch(`${baseUrl}/reels?source=instagram&mediaType=post`);
+    assert.equal(igPostsHttp.status, 200);
+    const igPostsJson = await igPostsHttp.json();
+    assert.equal(igPostsJson.total, 2);
+    assert.deepEqual(igPostsJson.reels.map((r: any) => r.shortcode).sort(), ['DBotNoDate2', 'DIgSavedOnly']);
+
+    const patchWatched = await fetch(`${baseUrl}/reels/${encodeURIComponent(botOnlyItem.id)}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'watched' }),
+    });
+    assert.equal(patchWatched.status, 200);
+    const patchedJson = await patchWatched.json();
+    assert.equal(patchedJson.watch_status, 'watched');
+    assert.equal(patchedJson.is_saved_on_instagram, false);
+
+    const badSource = await fetch(`${baseUrl}/reels?source=unknown_source`);
+    assert.equal(badSource.status, 400);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+
   console.log('✅ All ArchiveImportService tests passed successfully!');
 }
 

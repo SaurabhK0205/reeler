@@ -168,7 +168,7 @@ export function formatAddedToWatchLaterCreatorBlock(
  * and human-readable reel or post context (never shortcodes).
  */
 export function formatReminderSetMessage(
-  reel: Pick<SavedReel, 'caption' | 'creator' | 'media_type' | 'reel_url'>,
+  reel: Pick<SavedReel, 'caption' | 'creator' | 'media_type' | 'reel_url' | 'is_saved_on_instagram'>,
   durationLabel: string,
   formattedTarget: string
 ): string {
@@ -187,7 +187,7 @@ export function formatReminderSetMessage(
  * Formats the automatic 10-hour default reminder notice when a custom duration wait window expires.
  */
 export function formatDefaultReminderNotice(
-  reel: Pick<SavedReel, 'caption' | 'creator' | 'media_type' | 'reel_url'>,
+  reel: Pick<SavedReel, 'caption' | 'creator' | 'media_type' | 'reel_url' | 'is_saved_on_instagram'>,
   defaultHours: number,
   targetStr: string
 ): string {
@@ -361,23 +361,24 @@ export function formatCreatorSearchMessages(params: {
  * never falling back to opaque shortcodes or database IDs.
  */
 export function formatHumanReelLabel(
-  reel: Pick<SavedReel, 'caption' | 'creator' | 'media_type' | 'reel_url'>,
+  reel: Pick<SavedReel, 'caption' | 'creator' | 'media_type' | 'reel_url' | 'is_saved_on_instagram'>,
   maxCaptionChars = 48
 ): string {
   const creatorLabel = formatCreatorDisplayLabel(reel.creator, { includeProfileUrl: false });
   const captionSnippet = formatHumanCaptionSnippet(reel.caption, maxCaptionChars);
   const mediaNoun = classifySavedMediaType({ mediaType: reel.media_type, reelUrl: reel.reel_url }) === 'post' ? 'post' : 'reel';
+  const isSavedOnIg = reel.is_saved_on_instagram !== false;
 
   if (creatorLabel && captionSnippet) {
     return `${creatorLabel}'s ${mediaNoun} ("${captionSnippet}")`;
   }
   if (creatorLabel) {
-    return `${creatorLabel}'s saved ${mediaNoun}`;
+    return isSavedOnIg ? `${creatorLabel}'s saved ${mediaNoun}` : `${creatorLabel}'s ${mediaNoun}`;
   }
   if (captionSnippet) {
-    return `your saved ${mediaNoun} ("${captionSnippet}")`;
+    return isSavedOnIg ? `your saved ${mediaNoun} ("${captionSnippet}")` : `that ${mediaNoun} ("${captionSnippet}")`;
   }
-  return `your saved ${mediaNoun}`;
+  return isSavedOnIg ? `your saved ${mediaNoun}` : `that ${mediaNoun}`;
 }
 
 /**
@@ -385,16 +386,18 @@ export function formatHumanReelLabel(
  * keeping Instagram's rich thumbnail preview intact while making both Item and Creator Profile clickable.
  */
 export function formatWatchLaterReminderMessage(
-  reel: Pick<SavedReel, 'reel_url' | 'caption' | 'creator' | 'media_type'>
+  reel: Pick<SavedReel, 'reel_url' | 'caption' | 'creator' | 'media_type' | 'is_saved_on_instagram'>
 ): string {
   const isPost = classifySavedMediaType({ mediaType: reel.media_type, reelUrl: reel.reel_url }) === 'post';
+  const isSavedOnIg = reel.is_saved_on_instagram !== false;
   const publicHandle = extractPublicCreatorUsername(reel.creator);
   const creatorDisplay = formatCreatorDisplayLabel(reel.creator, { includeProfileUrl: false });
+  const fallbackHeader = isPost
+    ? (isSavedOnIg ? '🖼️ Saved Post' : '🖼️ Watch Later Post')
+    : (isSavedOnIg ? '🎬 Saved Reel' : '🎬 Watch Later Reel');
   const creatorHeader = creatorDisplay
     ? `${isPost ? '🖼️' : '🎬'} ${creatorDisplay}`
-    : isPost
-      ? '🖼️ Saved Post'
-      : '🎬 Saved Reel';
+    : fallbackHeader;
   const actionLabel = isPost ? '👉 View Post:' : '👉 Watch Reel:';
   const captionSnippet = formatHumanCaptionSnippet(reel.caption, 70);
   const captionLine = captionSnippet ? `"${captionSnippet}"\n` : '';

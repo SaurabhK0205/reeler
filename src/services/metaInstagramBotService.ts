@@ -354,7 +354,9 @@ export class MetaInstagramBotService {
       const thumbnailUrl = meta.thumbnailUrl || existingItem?.thumbnail_url || null;
       const nowIso = new Date().toISOString();
       const takenAt = existingItem?.taken_at || nowIso;
-      const savedAt = existingItem ? (existingItem.saved_at ?? null) : nowIso;
+      // Preserve native IG membership/save date for existing IG items; new DM shares live under "Sent to Bot" (false, saved_at=null)
+      const isSavedOnInstagram = existingItem ? existingItem.is_saved_on_instagram !== false : false;
+      const savedAt = existingItem ? (existingItem.saved_at ?? null) : null;
       const firstDetectedAt = existingItem?.first_detected_at || nowIso;
       const saveOrderRank = existingItem?.save_order_rank ?? 1;
 
@@ -384,7 +386,7 @@ export class MetaInstagramBotService {
           reminder_interval_seconds: customDuration.seconds,
           next_reminder_at: nextReminder,
           awaiting_reminder_choice_until: null,
-          is_saved_on_instagram: true,
+          is_saved_on_instagram: isSavedOnInstagram,
           instagram_sender_id: senderId,
         });
 
@@ -409,7 +411,7 @@ export class MetaInstagramBotService {
           reminder_interval_seconds: null,
           next_reminder_at: null,
           awaiting_reminder_choice_until: awaitingUntil,
-          is_saved_on_instagram: true,
+          is_saved_on_instagram: isSavedOnInstagram,
           instagram_sender_id: senderId,
         });
 
@@ -547,7 +549,7 @@ export class MetaInstagramBotService {
     }
 
     // Default welcome / help reply
-    const helpMsg = `👋 Hi! Whenever you see a Reel or Post you want to save or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username (or "reels by @name" / "posts by @name") to view your saved items!`;
+    const helpMsg = `👋 Hi! Whenever you see a Reel or Post you want to track or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username (or "reels by @name" / "posts by @name") to view your tracked items!`;
     await this.sendDirectMessage(senderId, helpMsg);
   }
 }

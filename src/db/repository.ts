@@ -2,6 +2,7 @@ import type {
   Creator,
   SavedReel,
   SavedMediaType,
+  SavedCollectionSource,
   ReelQueryFilters,
   LibraryStats,
   WatchStatus,
@@ -142,11 +143,17 @@ class InMemoryStore {
         existing.reminder_interval_seconds = data.reminder_interval_seconds;
         existing.reminder_interval_hours = Math.round(data.reminder_interval_seconds / 3600);
       }
-      if (data.saved_at !== undefined) {
-        existing.saved_at = data.saved_at ?? existing.saved_at;
+      if (data.saved_at !== undefined && data.saved_at !== null) {
+        if (existing.saved_at == null || shouldBackfillSavedAt(existing, data.saved_at)) {
+          existing.saved_at = data.saved_at;
+        }
       }
       if (data.first_detected_at) {
         existing.first_detected_at = existing.first_detected_at || data.first_detected_at;
+      }
+      // Monotonic source ownership: never demote Instagram-saved -> Bot-sent on stale bot writes
+      if (data.is_saved_on_instagram === true) {
+        existing.is_saved_on_instagram = true;
       }
       existing.effective_saved_at = resolveEffectiveSavedAt(existing);
       if (data.instagram_sender_id !== undefined) existing.instagram_sender_id = data.instagram_sender_id;
@@ -209,7 +216,8 @@ class InMemoryStore {
   }
 
   /**
-   * Batch-upserts saved items into the in-memory store with optional duplicate-skipping and `saved_at` backfill.
+   * Batch-upserts saved items into the in-memory store with duplicate-skipping,
+   * bot-to-IG promotion, and missing `saved_at` backfill.
    */
   async upsertSavedReelsBatch(reels: Array<{
     instagram_media_id: string;
@@ -235,6 +243,7 @@ class InMemoryStore {
     let newlyImported = 0;
     let alreadyPresent = 0;
     let savedAtBackfilled = 0;
+    let promotedToSaved = 0;
     let failedCount = 0;
     const failedShortcodes: string[] = [];
 
@@ -250,12 +259,22 @@ class InMemoryStore {
 
         if (existing && options?.ignoreDuplicates) {
           alreadyPresent++;
-          if (options.backfillMissingSavedAt && shouldBackfillSavedAt(existing, r.saved_at)) {
-            existing.saved_at = r.saved_at;
-            existing.effective_saved_at = resolveEffectiveSavedAt(existing);
-            existing.save_order_rank = r.save_order_rank;
+          const shouldPromote = r.is_saved_on_instagram !== false && existing.is_saved_on_instagram === false;
+          const shouldBackfill = Boolean(
+            options.backfillMissingSavedAt && r.saved_at && shouldBackfillSavedAt(existing, r.saved_at)
+          );
+          if (shouldPromote || shouldBackfill) {
+            if (shouldPromote) {
+              existing.is_saved_on_instagram = true;
+              promotedToSaved++;
+            }
+            if (shouldBackfill) {
+              existing.saved_at = r.saved_at;
+              existing.effective_saved_at = resolveEffectiveSavedAt(existing);
+              existing.save_order_rank = r.save_order_rank;
+              savedAtBackfilled++;
+            }
             existing.updated_at = new Date().toISOString();
-            savedAtBackfilled++;
           }
           continue;
         }
@@ -268,11 +287,11 @@ class InMemoryStore {
       }
     }
 
-    return { newlyImported, alreadyPresent, savedAtBackfilled, failedCount, failedShortcodes };
+    return { newlyImported, alreadyPresent, savedAtBackfilled, promotedToSaved, failedCount, failedShortcodes };
   }
 
   /**
-   * Filters and sorts in-memory saved reels across creator handles, display names, captions, and shortcodes.
+   * Filters and sorts in-memory saved reels across collection source, media type, creator handles, captions, and shortcodes.
    */
   async getReels(filters: ReelQueryFilters) {
     let list = Array.from(this.reels.values()).map(r => ({
@@ -284,6 +303,13 @@ class InMemoryStore {
     // Filter by Creator
     if (filters.creatorId) {
       list = list.filter(r => r.creator_id === filters.creatorId);
+    }
+
+    // Filter by Collection Source (Instagram Saved vs Bot-Sent)
+    if (filters.source === 'instagram') {
+      list = list.filter(r => r.is_saved_on_instagram !== false);
+    } else if (filters.source === 'bot') {
+      list = list.filter(r => r.is_saved_on_instagram === false);
     }
 
     // Filter by Watch Status
@@ -395,6 +421,8 @@ class InMemoryStore {
 
     let reelsCount = 0;
     let postsCount = 0;
+    let savedOnInstagramCount = 0;
+    let botSentCount = 0;
     let savedThisWeek = 0;
     let savedThisMonth = 0;
     let unwatchedCount = 0;
@@ -402,6 +430,12 @@ class InMemoryStore {
     let watchLaterCount = 0;
 
     for (const r of allReels) {
+      if (r.is_saved_on_instagram === false) {
+        botSentCount++;
+      } else {
+        savedOnInstagramCount++;
+      }
+
       if (classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }) === 'post') {
         postsCount++;
       } else {
@@ -428,6 +462,8 @@ class InMemoryStore {
 
     return {
       totalReels: allReels.length,
+      savedOnInstagramCount,
+      botSentCount,
       reelsCount,
       postsCount,
       totalCreators: this.creators.size,
@@ -577,6 +613,7 @@ function applyReelQueryFilters(
   query: any,
   params: {
     creatorId?: string;
+    source?: SavedCollectionSource | 'all';
     watchStatus?: WatchStatus | 'all';
     mediaType?: SavedMediaType | 'all';
     startDate?: string;
@@ -587,6 +624,11 @@ function applyReelQueryFilters(
   let next = query;
   if (params.creatorId) {
     next = next.eq('creator_id', params.creatorId);
+  }
+  if (params.source === 'instagram') {
+    next = next.eq('is_saved_on_instagram', true);
+  } else if (params.source === 'bot') {
+    next = next.eq('is_saved_on_instagram', false);
   }
   if (params.watchStatus && params.watchStatus !== 'all') {
     next = next.eq('watch_status', params.watchStatus);
@@ -707,79 +749,154 @@ export class Repository {
         mediaType: data.media_type,
         reelUrl: data.reel_url,
       });
-      const query = supabase
-        .from('saved_reels')
-        .upsert(
-          {
-            instagram_media_id: data.instagram_media_id,
-            shortcode: data.shortcode,
-            reel_url: data.reel_url,
-            media_type: mediaType,
-            creator_id: data.creator_id,
-            caption: data.caption,
-            thumbnail_url: data.thumbnail_url,
-            taken_at: data.taken_at,
-            saved_at: data.saved_at,
-            first_detected_at: data.first_detected_at,
-            save_order_rank: data.save_order_rank,
-            watch_status: data.watch_status || 'unwatched',
-            duration_seconds: data.duration_seconds,
-            reminder_interval_hours: Math.round(intervalSeconds / 3600),
-            reminder_interval_seconds: intervalSeconds,
-            next_reminder_at: data.next_reminder_at,
-            awaiting_reminder_choice_until: data.awaiting_reminder_choice_until ?? null,
-            is_saved_on_instagram: data.is_saved_on_instagram ?? true,
-            instagram_sender_id: data.instagram_sender_id,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: 'instagram_media_id', ignoreDuplicates: options?.ignoreDuplicates ?? false }
+      const resolvedSavedOnIg = data.is_saved_on_instagram ?? true;
+      const nowIso = new Date().toISOString();
+      const insertPayload = {
+        instagram_media_id: data.instagram_media_id,
+        shortcode: data.shortcode,
+        reel_url: data.reel_url,
+        media_type: mediaType,
+        creator_id: data.creator_id,
+        caption: data.caption,
+        thumbnail_url: data.thumbnail_url,
+        taken_at: data.taken_at,
+        saved_at: data.saved_at ?? null,
+        first_detected_at: data.first_detected_at,
+        save_order_rank: data.save_order_rank,
+        watch_status: data.watch_status || 'unwatched',
+        duration_seconds: data.duration_seconds,
+        reminder_interval_hours: Math.round(intervalSeconds / 3600),
+        reminder_interval_seconds: intervalSeconds,
+        next_reminder_at: data.next_reminder_at,
+        awaiting_reminder_choice_until: data.awaiting_reminder_choice_until ?? null,
+        is_saved_on_instagram: resolvedSavedOnIg,
+        instagram_sender_id: data.instagram_sender_id,
+        updated_at: nowIso,
+      };
+
+      const isConflictError = (err: { code?: string; message?: string } | null | undefined) =>
+        Boolean(
+          err &&
+            (err.code === '23505' ||
+              err.message?.includes('duplicate key') ||
+              err.message?.includes('shortcode') ||
+              err.message?.includes('instagram_media_id'))
         );
 
-      const { data: reel, error } = options?.skipReturn
-        ? await query
-        : await query.select('*, creator:creators(*)').maybeSingle();
+      // Atomic insert-if-absent so stale bot writes never demote a concurrently promoted IG row via ON CONFLICT DO UPDATE
+      const insertQuery = supabase
+        .from('saved_reels')
+        .upsert(insertPayload, { onConflict: 'instagram_media_id', ignoreDuplicates: true });
 
-      if (error) {
-        if (
-          options?.ignoreDuplicates &&
-          (error.code === '23505' ||
-            error.message?.includes('duplicate key') ||
-            error.message?.includes('shortcode') ||
-            error.message?.includes('instagram_media_id'))
-        ) {
-          if (options.skipReturn) {
-            return null;
-          }
-          const { data: existing, error: fetchErr } = await supabase
-            .from('saved_reels')
-            .select('*, creator:creators(*)')
-            .or(`instagram_media_id.eq.${data.instagram_media_id},shortcode.eq.${data.shortcode}`)
-            .maybeSingle();
-          if (existing) return existing as SavedReel;
-          if (fetchErr) throw new Error(`Supabase fetch conflicting reel failed: ${fetchErr.message}`);
-        }
+      const { data: insertedReel, error } = options?.skipReturn
+        ? await insertQuery.select('id').maybeSingle()
+        : await insertQuery.select('*, creator:creators(*)').maybeSingle();
+
+      if (error && !isConflictError(error)) {
         throw new Error(`Supabase upsertSavedReel failed: ${error.message}`);
       }
 
-      if (options?.skipReturn) {
+      if (insertedReel) {
+        return options?.skipReturn ? null : (insertedReel as SavedReel);
+      }
+
+      if (options?.ignoreDuplicates && options.skipReturn) {
         return null;
       }
 
-      if (!reel && options?.ignoreDuplicates) {
-        const { data: existing, error: fetchErr } = await supabase
+      const fetchExisting = async () => {
+        const byMedia = await supabase
           .from('saved_reels')
           .select('*, creator:creators(*)')
-          .or(`instagram_media_id.eq.${data.instagram_media_id},shortcode.eq.${data.shortcode}`)
+          .eq('instagram_media_id', data.instagram_media_id)
           .maybeSingle();
-        if (existing) return existing as SavedReel;
-        if (fetchErr) throw new Error(`Supabase fetch existing reel failed: ${fetchErr.message}`);
+        if (byMedia.error) {
+          throw new Error(`Supabase fetch conflicting reel failed: ${byMedia.error.message}`);
+        }
+        if (byMedia.data) return byMedia.data as SavedReel;
+
+        const byShortcode = await supabase
+          .from('saved_reels')
+          .select('*, creator:creators(*)')
+          .eq('shortcode', data.shortcode)
+          .maybeSingle();
+        if (byShortcode.error) {
+          throw new Error(`Supabase fetch existing reel failed: ${byShortcode.error.message}`);
+        }
+        return (byShortcode.data as SavedReel | null) ?? null;
+      };
+
+      const existing = await fetchExisting();
+      if (!existing) {
+        throw new Error('Supabase upsertSavedReel could not locate existing record');
       }
 
-      if (!reel) {
-        throw new Error('Supabase upsertSavedReel returned no record');
+      if (options?.ignoreDuplicates) {
+        return existing;
       }
 
-      return reel as SavedReel;
+      const updatePayload: Record<string, any> = {
+        reel_url: data.reel_url,
+        media_type: mediaType,
+        creator_id: data.creator_id || existing.creator_id,
+        caption: data.caption ?? existing.caption,
+        thumbnail_url: data.thumbnail_url ?? existing.thumbnail_url,
+        save_order_rank: data.save_order_rank,
+        duration_seconds: data.duration_seconds,
+        reminder_interval_hours: Math.round(intervalSeconds / 3600),
+        reminder_interval_seconds: intervalSeconds,
+        next_reminder_at: data.next_reminder_at,
+        awaiting_reminder_choice_until: data.awaiting_reminder_choice_until ?? null,
+        updated_at: nowIso,
+      };
+      if (data.watch_status) {
+        updatePayload.watch_status = data.watch_status;
+      }
+      if (data.instagram_sender_id !== undefined) {
+        updatePayload.instagram_sender_id = data.instagram_sender_id;
+      }
+      // Monotonic transition only (false -> true): never overwrite true -> false or wipe saved_at with null
+      if (resolvedSavedOnIg && existing.is_saved_on_instagram === false) {
+        updatePayload.is_saved_on_instagram = true;
+      }
+
+      if (data.saved_at && shouldBackfillSavedAt(existing, data.saved_at)) {
+        if (existing.saved_at == null) {
+          const { error: backfillErr } = await supabase
+            .from('saved_reels')
+            .update({ saved_at: data.saved_at, updated_at: nowIso })
+            .eq('id', existing.id)
+            .is('saved_at', null);
+          if (backfillErr) {
+            throw new Error(`Supabase saved_at backfill failed: ${backfillErr.message}`);
+          }
+        } else {
+          updatePayload.saved_at = data.saved_at;
+        }
+      }
+
+      if (options?.skipReturn) {
+        const { error: updateErr } = await supabase
+          .from('saved_reels')
+          .update(updatePayload)
+          .eq('id', existing.id);
+        if (updateErr) {
+          throw new Error(`Supabase upsertSavedReel update failed: ${updateErr.message}`);
+        }
+        return null;
+      }
+
+      const { data: updatedReel, error: updateErr } = await supabase
+        .from('saved_reels')
+        .update(updatePayload)
+        .eq('id', existing.id)
+        .select('*, creator:creators(*)')
+        .single();
+      if (updateErr || !updatedReel) {
+        throw new Error(`Supabase upsertSavedReel update failed: ${updateErr?.message || 'no record returned'}`);
+      }
+
+      return updatedReel as SavedReel;
     } finally {
       Repository.invalidateCreatorsCache();
     }
@@ -838,7 +955,7 @@ export class Repository {
   }
 
   /**
-   * Batch-upserts saved reels/posts and optionally backfills missing or earlier archive `saved_at` timestamps.
+   * Batch-upserts saved reels/posts and optionally promotes bot-sent items to IG-saved and backfills `saved_at`.
    */
   static async upsertSavedReelsBatch(reels: Array<{
     instagram_media_id: string;
@@ -870,20 +987,27 @@ export class Repository {
     let newlyImported = 0;
     let alreadyPresent = 0;
     let savedAtBackfilled = 0;
+    let promotedToSaved = 0;
     let failedCount = 0;
     const failedShortcodes: string[] = [];
 
     try {
       let reelsToInsert = reels;
-      const backfillById = new Map<
+      const updatesById = new Map<
         string,
-        { id: string; shortcode: string; saved_at: string; save_order_rank: number }
+        {
+          id: string;
+          shortcode: string;
+          promoteToSaved: boolean;
+          saved_at?: string;
+          save_order_rank?: number;
+        }
       >();
 
       if (options?.ignoreDuplicates) {
         const existingByShortcode = new Map<
           string,
-          { id: string; instagram_media_id: string; saved_at: string | null }
+          { id: string; instagram_media_id: string; saved_at: string | null; is_saved_on_instagram: boolean }
         >();
         const allShortcodes = Array.from(new Set(reels.map(r => r.shortcode)));
         const LOOKUP_CHUNK = 500;
@@ -892,7 +1016,7 @@ export class Repository {
           const slice = allShortcodes.slice(i, i + LOOKUP_CHUNK);
           const { data: matched, error } = await supabase
             .from('saved_reels')
-            .select('id, instagram_media_id, shortcode, saved_at')
+            .select('id, instagram_media_id, shortcode, saved_at, is_saved_on_instagram')
             .in('shortcode', slice);
 
           if (error) {
@@ -904,6 +1028,7 @@ export class Repository {
                 id: String(row.id),
                 instagram_media_id: String(row.instagram_media_id),
                 saved_at: row.saved_at ? String(row.saved_at) : null,
+                is_saved_on_instagram: row.is_saved_on_instagram !== false,
               });
             }
           }
@@ -914,18 +1039,24 @@ export class Repository {
           const existing = existingByShortcode.get(r.shortcode);
           if (existing) {
             alreadyPresent++;
-            if (
-              options.backfillMissingSavedAt &&
-              r.saved_at &&
-              !backfillById.has(existing.id) &&
-              shouldBackfillSavedAt(existing, r.saved_at)
-            ) {
-              backfillById.set(existing.id, {
+            const shouldPromote = r.is_saved_on_instagram !== false && existing.is_saved_on_instagram === false;
+            const shouldBackfill = Boolean(
+              options.backfillMissingSavedAt && r.saved_at && shouldBackfillSavedAt(existing, r.saved_at)
+            );
+            if (shouldPromote || shouldBackfill) {
+              const prev = updatesById.get(existing.id) || {
                 id: existing.id,
                 shortcode: r.shortcode,
-                saved_at: r.saved_at,
-                save_order_rank: r.save_order_rank,
-              });
+                promoteToSaved: false,
+              };
+              if (shouldPromote) {
+                prev.promoteToSaved = true;
+              }
+              if (shouldBackfill && r.saved_at && !prev.saved_at) {
+                prev.saved_at = r.saved_at;
+                prev.save_order_rank = r.save_order_rank;
+              }
+              updatesById.set(existing.id, prev);
             }
           } else {
             freshReels.push(r);
@@ -934,32 +1065,49 @@ export class Repository {
         reelsToInsert = freshReels;
       }
 
-      if (backfillById.size > 0) {
-        const backfillItems = Array.from(backfillById.values());
-        const backfillNow = new Date().toISOString();
+      if (updatesById.size > 0) {
+        const upgradeItems = Array.from(updatesById.values());
+        const upgradeNow = new Date().toISOString();
         const BACKFILL_CONCURRENCY = 20;
-        for (let i = 0; i < backfillItems.length; i += BACKFILL_CONCURRENCY) {
-          const slice = backfillItems.slice(i, i + BACKFILL_CONCURRENCY);
+        for (let i = 0; i < upgradeItems.length; i += BACKFILL_CONCURRENCY) {
+          const slice = upgradeItems.slice(i, i + BACKFILL_CONCURRENCY);
           const results = await Promise.all(
             slice.map(async (item) => {
-              const { error: backfillErr } = await supabase
+              const payload: Record<string, any> = {
+                updated_at: upgradeNow,
+              };
+              if (item.promoteToSaved) {
+                payload.is_saved_on_instagram = true;
+              }
+              if (item.saved_at) {
+                payload.saved_at = item.saved_at;
+                payload.save_order_rank = item.save_order_rank;
+              }
+              const isPromoteOnly = item.promoteToSaved && !item.saved_at;
+              if (isPromoteOnly) {
+                const { data: updatedRows, error: updateErr } = await supabase
+                  .from('saved_reels')
+                  .update(payload)
+                  .eq('id', item.id)
+                  .eq('is_saved_on_instagram', false)
+                  .select('id');
+                return { item, isPromoteOnly, updatedCount: updatedRows?.length ?? 0, error: updateErr };
+              }
+              const { error: updateErr } = await supabase
                 .from('saved_reels')
-                .update({
-                  saved_at: item.saved_at,
-                  save_order_rank: item.save_order_rank,
-                  updated_at: backfillNow,
-                })
+                .update(payload)
                 .eq('id', item.id);
-              return { item, error: backfillErr };
+              return { item, isPromoteOnly, updatedCount: 1, error: updateErr };
             })
           );
-          for (const { item, error: backfillErr } of results) {
-            if (backfillErr) {
-              console.error(`[Repository] Failed to backfill saved_at for ${item.shortcode}:`, backfillErr.message);
+          for (const { item, isPromoteOnly, updatedCount, error: updateErr } of results) {
+            if (updateErr) {
+              console.error(`[Repository] Failed to update archive metadata for ${item.shortcode}:`, updateErr.message);
               failedCount++;
               failedShortcodes.push(item.shortcode);
-            } else {
-              savedAtBackfilled++;
+            } else if (!isPromoteOnly || updatedCount > 0) {
+              if (item.promoteToSaved) promotedToSaved++;
+              if (item.saved_at) savedAtBackfilled++;
             }
           }
         }
@@ -1014,7 +1162,7 @@ export class Repository {
         }
       }
 
-      return { newlyImported, alreadyPresent, savedAtBackfilled, failedCount, failedShortcodes };
+      return { newlyImported, alreadyPresent, savedAtBackfilled, promotedToSaved, failedCount, failedShortcodes };
     } finally {
       Repository.invalidateCreatorsCache();
     }
@@ -1251,6 +1399,7 @@ export class Repository {
 
     const filterState = {
       creatorId: filters.creatorId,
+      source: filters.source,
       watchStatus: filters.watchStatus,
       mediaType: filters.mediaType,
       startDate,
@@ -1611,8 +1760,22 @@ export class Repository {
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
-    const [totalReelsRes, reelsCountRes, postsCountRes, creatorsRes, weekRes, monthRes, unwatchedRes, watchedRes, watchLaterRes] = await Promise.all([
+    const [
+      totalReelsRes,
+      savedOnIgRes,
+      botSentRes,
+      reelsCountRes,
+      postsCountRes,
+      creatorsRes,
+      weekRes,
+      monthRes,
+      unwatchedRes,
+      watchedRes,
+      watchLaterRes,
+    ] = await Promise.all([
       supabase.from('saved_reels').select('*', { count: 'exact', head: true }),
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('is_saved_on_instagram', true),
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('is_saved_on_instagram', false),
       supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'reel'),
       supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'post'),
       Repository.getCreators(),
@@ -1633,6 +1796,8 @@ export class Repository {
 
     return {
       totalReels: totalReelsRes.count || 0,
+      savedOnInstagramCount: savedOnIgRes.count || 0,
+      botSentCount: botSentRes.count || 0,
       reelsCount: reelsCountRes.count || 0,
       postsCount: postsCountRes.count || 0,
       totalCreators: creatorsRes.length,
