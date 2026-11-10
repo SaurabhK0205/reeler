@@ -1800,9 +1800,8 @@ async function fetchShortcodeMeta(shortcode, signal, preferredType) {
   if (state.metaCache.has(shortcode)) {
     return state.metaCache.get(shortcode);
   }
-  const cacheKey = preferredType === 'p' ? `${shortcode}:p` : `${shortcode}:reel`;
-  if (metaInFlightMap.has(cacheKey)) {
-    return metaInFlightMap.get(cacheKey);
+  if (metaInFlightMap.has(shortcode)) {
+    return metaInFlightMap.get(shortcode);
   }
 
   const reqPromise = (async () => {
@@ -1818,11 +1817,11 @@ async function fetchShortcodeMeta(shortcode, signal, preferredType) {
     } catch (_) {
       return null;
     } finally {
-      metaInFlightMap.delete(cacheKey);
+      metaInFlightMap.delete(shortcode);
     }
   })();
 
-  metaInFlightMap.set(cacheKey, reqPromise);
+  metaInFlightMap.set(shortcode, reqPromise);
   return reqPromise;
 }
 

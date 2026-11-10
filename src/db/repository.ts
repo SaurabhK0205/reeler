@@ -377,6 +377,13 @@ export interface MarkWatchedResult {
   remainingCount: number;
 }
 
+export interface LegacyReelUrlCandidate {
+  id: string;
+  shortcode: string;
+  reel_url: string;
+  media_type: SavedMediaType;
+}
+
 function parseTimestampMs(iso?: string | null): number {
   if (!iso) return 0;
   const ms = Date.parse(iso);
@@ -1691,5 +1698,97 @@ export class Repository {
     }
 
     return { reel: data as SavedReel, targetTime };
+  }
+
+  /**
+   * Lists saved items still classified as `'reel'` with legacy `/reel/` URLs so a one-off recovery
+   * job can re-check whether any DM-shared items were actually `/p/` posts.
+   */
+  static async getLegacyReelUrlCandidates(options?: {
+    limit?: number;
+    offset?: number;
+  }): Promise<LegacyReelUrlCandidate[]> {
+    const limit = Math.min(Math.max(1, Math.floor(options?.limit ?? 200)), 500);
+    const offset = Math.max(0, Math.floor(options?.offset ?? 0));
+
+    if (!isSupabaseConfigured()) {
+      const matches = Array.from(memoryStore.reels.values())
+        .filter(
+          (r) =>
+            classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }) === 'reel' &&
+            /instagram\.com\/(?:[a-zA-Z0-9._]+\/)?reel\//i.test(r.reel_url)
+        )
+        .sort((a, b) => {
+          const cmp = b.first_detected_at.localeCompare(a.first_detected_at);
+          return cmp !== 0 ? cmp : String(a.id).localeCompare(String(b.id));
+        });
+
+      return matches.slice(offset, offset + limit).map((r) => ({
+        id: r.id,
+        shortcode: r.shortcode,
+        reel_url: r.reel_url,
+        media_type: 'reel',
+      }));
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .select('id, shortcode, reel_url, media_type')
+      .eq('media_type', 'reel')
+      .ilike('reel_url', '%/reel/%')
+      .order('first_detected_at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(offset, offset + limit - 1);
+
+    if (error) {
+      throw new Error(`Failed to query legacy reel URL candidates: ${error.message}`);
+    }
+
+    return (data || []).map((row: any) => ({
+      id: String(row.id),
+      shortcode: String(row.shortcode),
+      reel_url: String(row.reel_url),
+      media_type: 'reel',
+    }));
+  }
+
+  /**
+   * Updates both `media_type` and canonical `reel_url` for a recovered saved item so backfill
+   * migrations remain idempotent on future reruns.
+   */
+  static async repairRecoveredMediaClassification(
+    id: string,
+    mediaType: SavedMediaType,
+    canonicalUrl: string
+  ): Promise<boolean> {
+    const now = new Date().toISOString();
+
+    if (!isSupabaseConfigured()) {
+      const existing = memoryStore.reels.get(id);
+      if (!existing) return false;
+      existing.media_type = mediaType;
+      existing.reel_url = canonicalUrl;
+      existing.updated_at = now;
+      return true;
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .update({
+        media_type: mediaType,
+        reel_url: canonicalUrl,
+        updated_at: now,
+      })
+      .eq('id', id)
+      .select('id')
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to update recovered media classification for ${id}: ${error.message}`);
+    }
+
+    return Boolean(data?.id);
   }
 }
