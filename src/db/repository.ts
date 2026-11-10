@@ -19,6 +19,9 @@ import { getSupabase, isSupabaseConfigured } from './client.ts';
 export class SenderReminderConflictError extends Error {
   readonly shortcode: string;
 
+  /**
+   * Creates a conflict error identifying the shortcode whose active reminder is owned by another sender.
+   */
   constructor(shortcode: string) {
     super(`Watch Later reminder already active for another sender on ${shortcode}`);
     this.name = 'SenderReminderConflictError';
@@ -26,10 +29,17 @@ export class SenderReminderConflictError extends Error {
   }
 }
 
+/**
+ * Escapes and quotes a literal string value for inclusion inside a PostgREST filter expression.
+ */
 function quotePostgrestLiteral(value: string): string {
   return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
+/**
+ * Returns true when an incoming sender attempts to schedule/overwrite an active `watch_later`
+ * reminder currently owned by a different Instagram sender.
+ */
 function isConflictingActiveSenderReminder(
   existing: Pick<SavedReel, 'watch_status' | 'instagram_sender_id'>,
   incomingSenderId?: string | null
@@ -747,6 +757,10 @@ export class Repository {
     }
   }
 
+  /**
+   * Inserts a new saved reel/post or updates an existing row in Supabase while preserving monotonic
+   * `is_saved_on_instagram` provenance, `saved_at` timestamps, and active sender reminder ownership.
+   */
   static async upsertSavedReel(data: {
     instagram_media_id: string;
     shortcode: string;
