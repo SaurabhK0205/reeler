@@ -1,12 +1,14 @@
 import type {
   Creator,
   SavedReel,
+  SavedMediaType,
   ReelQueryFilters,
   LibraryStats,
   WatchStatus,
   DateFilterPreset,
   BatchReelsResult
 } from '../types.ts';
+import { classifySavedMediaType } from '../utils/mediaType.ts';
 import { getSupabase, isSupabaseConfigured } from './client.ts';
 
 // In-Memory store for offline/demo/development fallback
@@ -54,6 +56,7 @@ class InMemoryStore {
     instagram_media_id: string;
     shortcode: string;
     reel_url: string;
+    media_type?: SavedMediaType;
     creator_id: string;
     caption?: string | null;
     thumbnail_url?: string | null;
@@ -84,6 +87,11 @@ class InMemoryStore {
       if (options?.ignoreDuplicates) {
         return options.skipReturn ? null : existing;
       }
+      if (data.reel_url) existing.reel_url = data.reel_url;
+      existing.media_type = classifySavedMediaType({
+        mediaType: data.media_type ?? existing.media_type,
+        reelUrl: data.reel_url || existing.reel_url,
+      });
       existing.creator_id = data.creator_id || existing.creator_id;
       existing.caption = data.caption ?? existing.caption;
       existing.thumbnail_url = data.thumbnail_url ?? existing.thumbnail_url;
@@ -103,11 +111,17 @@ class InMemoryStore {
       return options?.skipReturn ? null : { ...existing, creator: this.creators.get(existing.creator_id) };
     }
 
+    const resolvedMediaType = classifySavedMediaType({
+      mediaType: data.media_type,
+      reelUrl: data.reel_url,
+    });
+
     const newReel: SavedReel = {
       id: `reel_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       instagram_media_id: data.instagram_media_id,
       shortcode: data.shortcode,
       reel_url: data.reel_url,
+      media_type: resolvedMediaType,
       creator_id: data.creator_id,
       caption: data.caption,
       thumbnail_url: data.thumbnail_url,
@@ -154,6 +168,7 @@ class InMemoryStore {
     instagram_media_id: string;
     shortcode: string;
     reel_url: string;
+    media_type?: SavedMediaType;
     creator_id: string;
     caption?: string | null;
     thumbnail_url?: string | null;
@@ -207,6 +222,7 @@ class InMemoryStore {
   async getReels(filters: ReelQueryFilters) {
     let list = Array.from(this.reels.values()).map(r => ({
       ...r,
+      media_type: classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }),
       creator: this.creators.get(r.creator_id)
     }));
 
@@ -218,6 +234,11 @@ class InMemoryStore {
     // Filter by Watch Status
     if (filters.watchStatus && filters.watchStatus !== 'all') {
       list = list.filter(r => r.watch_status === filters.watchStatus);
+    }
+
+    // Filter by Media Type (Reel vs Post)
+    if (filters.mediaType && filters.mediaType !== 'all') {
+      list = list.filter(r => r.media_type === filters.mediaType);
     }
 
     // Filter by Date Preset or Range
@@ -291,6 +312,8 @@ class InMemoryStore {
     const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
     const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
 
+    let reelsCount = 0;
+    let postsCount = 0;
     let savedThisWeek = 0;
     let savedThisMonth = 0;
     let unwatchedCount = 0;
@@ -298,6 +321,12 @@ class InMemoryStore {
     let watchLaterCount = 0;
 
     for (const r of allReels) {
+      if (classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }) === 'post') {
+        postsCount++;
+      } else {
+        reelsCount++;
+      }
+
       const detectedMs = new Date(r.first_detected_at).getTime();
       if (detectedMs >= sevenDaysAgo) savedThisWeek++;
       if (detectedMs >= thirtyDaysAgo) savedThisMonth++;
@@ -318,6 +347,8 @@ class InMemoryStore {
 
     return {
       totalReels: allReels.length,
+      reelsCount,
+      postsCount,
       totalCreators: this.creators.size,
       savedThisWeek,
       savedThisMonth,
@@ -344,6 +375,13 @@ class InMemoryStore {
 export interface MarkWatchedResult {
   updatedReels: SavedReel[];
   remainingCount: number;
+}
+
+export interface LegacyReelUrlCandidate {
+  id: string;
+  shortcode: string;
+  reel_url: string;
+  media_type: SavedMediaType;
 }
 
 function parseTimestampMs(iso?: string | null): number {
@@ -459,6 +497,7 @@ function applyReelQueryFilters(
   params: {
     creatorId?: string;
     watchStatus?: WatchStatus | 'all';
+    mediaType?: SavedMediaType | 'all';
     startDate?: string;
     endDate?: string;
     searchClauses: string[];
@@ -470,6 +509,9 @@ function applyReelQueryFilters(
   }
   if (params.watchStatus && params.watchStatus !== 'all') {
     next = next.eq('watch_status', params.watchStatus);
+  }
+  if (params.mediaType && params.mediaType !== 'all') {
+    next = next.eq('media_type', params.mediaType);
   }
   if (params.startDate) {
     next = next.gte('first_detected_at', params.startDate);
@@ -555,6 +597,7 @@ export class Repository {
     instagram_media_id: string;
     shortcode: string;
     reel_url: string;
+    media_type?: SavedMediaType;
     creator_id: string;
     caption?: string | null;
     thumbnail_url?: string | null;
@@ -579,6 +622,10 @@ export class Repository {
     const supabase = getSupabase();
     try {
       const intervalSeconds = data.reminder_interval_seconds ?? (data.reminder_interval_hours ? data.reminder_interval_hours * 3600 : 36000);
+      const mediaType = classifySavedMediaType({
+        mediaType: data.media_type,
+        reelUrl: data.reel_url,
+      });
       const query = supabase
         .from('saved_reels')
         .upsert(
@@ -586,6 +633,7 @@ export class Repository {
             instagram_media_id: data.instagram_media_id,
             shortcode: data.shortcode,
             reel_url: data.reel_url,
+            media_type: mediaType,
             creator_id: data.creator_id,
             caption: data.caption,
             thumbnail_url: data.thumbnail_url,
@@ -712,6 +760,7 @@ export class Repository {
     instagram_media_id: string;
     shortcode: string;
     reel_url: string;
+    media_type?: SavedMediaType;
     creator_id: string;
     caption?: string | null;
     thumbnail_url?: string | null;
@@ -783,6 +832,7 @@ export class Repository {
             instagram_media_id: r.instagram_media_id,
             shortcode: r.shortcode,
             reel_url: r.reel_url,
+            media_type: classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }),
             creator_id: r.creator_id,
             caption: r.caption,
             thumbnail_url: r.thumbnail_url,
@@ -893,7 +943,7 @@ export class Repository {
     }
 
     const supabase = getSupabase();
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from('saved_reels')
       .select('*, creator:creators(*)')
       .eq('instagram_sender_id', senderId)
@@ -902,6 +952,10 @@ export class Repository {
       .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to fetch active awaiting reel for sender: ${error.message}`);
+    }
 
     return (data as SavedReel) || null;
   }
@@ -950,7 +1004,10 @@ export class Repository {
         .order('last_reminded_at', { ascending: false, nullsFirst: false })
         .order('created_at', { ascending: false })
         .limit(25);
-      if (!error && senderCandidates && senderCandidates.length > 0) {
+      if (error) {
+        throw new Error(`Failed to fetch last Watch Later reel for sender: ${error.message}`);
+      }
+      if (senderCandidates && senderCandidates.length > 0) {
         return sortWatchLaterReelsMostRecentFirst(senderCandidates as SavedReel[])[0] || null;
       }
     }
@@ -969,7 +1026,10 @@ export class Repository {
       .order('last_reminded_at', { ascending: false, nullsFirst: false })
       .order('created_at', { ascending: false })
       .limit(25);
-    if (fbErr || !fallbackCandidates || fallbackCandidates.length === 0) {
+    if (fbErr) {
+      throw new Error(`Failed to fetch fallback Watch Later reel: ${fbErr.message}`);
+    }
+    if (!fallbackCandidates || fallbackCandidates.length === 0) {
       return null;
     }
     return sortWatchLaterReelsMostRecentFirst(fallbackCandidates as SavedReel[])[0] || null;
@@ -1051,6 +1111,7 @@ export class Repository {
     const filterState = {
       creatorId: filters.creatorId,
       watchStatus: filters.watchStatus,
+      mediaType: filters.mediaType,
       startDate,
       endDate,
       searchClauses,
@@ -1093,7 +1154,10 @@ export class Repository {
     }
 
     return {
-      reels: (data || []) as SavedReel[],
+      reels: ((data || []) as SavedReel[]).map(r => ({
+        ...r,
+        media_type: classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }),
+      })),
       total: count || 0,
       page,
       limit,
@@ -1242,9 +1306,27 @@ export class Repository {
     };
   }
 
-  static async getReelsByCreatorUsername(username: string): Promise<{ creator: Creator | null; reels: SavedReel[] }> {
+  static async getReelsByCreatorUsername(
+    username: string,
+    options?: { mediaType?: SavedMediaType | 'all' }
+  ): Promise<{ creator: Creator | null; reels: SavedReel[]; totalReelsCount: number; totalPostsCount: number }> {
     const cleanUsername = username.replace(/^@/, '').trim().toLowerCase();
-    if (!cleanUsername) return { creator: null, reels: [] };
+    const mediaFilter = options?.mediaType ?? 'all';
+    if (!cleanUsername) return { creator: null, reels: [], totalReelsCount: 0, totalPostsCount: 0 };
+
+    const sortCreatorItems = (items: SavedReel[]): SavedReel[] =>
+      [...items].sort((a, b) => {
+        const createdDiff =
+          new Date(b.created_at || b.first_detected_at).getTime() -
+          new Date(a.created_at || a.first_detected_at).getTime();
+        if (createdDiff !== 0) return createdDiff;
+        const rankDiff = (a.save_order_rank || 0) - (b.save_order_rank || 0);
+        if (rankDiff !== 0) return rankDiff;
+        const detectedDiff =
+          new Date(b.first_detected_at).getTime() - new Date(a.first_detected_at).getTime();
+        if (detectedDiff !== 0) return detectedDiff;
+        return String(a.id).localeCompare(String(b.id));
+      });
 
     if (!isSupabaseConfigured()) {
       let matchedCreators = Array.from(memoryStore.creators.values()).filter(
@@ -1255,19 +1337,35 @@ export class Repository {
           c => c.username.toLowerCase().includes(cleanUsername) || (c.display_name && c.display_name.toLowerCase().includes(cleanUsername))
         );
       }
-      if (matchedCreators.length === 0) return { creator: null, reels: [] };
+      if (matchedCreators.length === 0) return { creator: null, reels: [], totalReelsCount: 0, totalPostsCount: 0 };
 
       const creatorIds = new Set(matchedCreators.map(c => c.id));
       const primaryCreator = matchedCreators.find(c => c.display_name && c.profile_picture_url)
         || matchedCreators.find(c => c.display_name)
         || matchedCreators[0];
 
-      const reels = Array.from(memoryStore.reels.values())
-        .filter(r => creatorIds.has(r.creator_id))
-        .sort((a, b) => new Date(b.created_at || b.first_detected_at).getTime() - new Date(a.created_at || a.first_detected_at).getTime())
-        .map(r => ({ ...r, creator: primaryCreator }));
+      const allItems = sortCreatorItems(
+        Array.from(memoryStore.reels.values())
+          .filter(r => creatorIds.has(r.creator_id))
+          .map(r => ({
+            ...r,
+            media_type: classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }),
+            creator: primaryCreator,
+          }))
+      );
 
-      return { creator: primaryCreator, reels };
+      let totalReelsCount = 0;
+      let totalPostsCount = 0;
+      for (const item of allItems) {
+        if (item.media_type === 'post') totalPostsCount++;
+        else totalReelsCount++;
+      }
+
+      const filtered = mediaFilter === 'all'
+        ? allItems
+        : allItems.filter(r => r.media_type === mediaFilter);
+
+      return { creator: primaryCreator, reels: filtered, totalReelsCount, totalPostsCount };
     }
 
     const supabase = getSupabase();
@@ -1288,7 +1386,7 @@ export class Repository {
     }
 
     if (!creators || creators.length === 0) {
-      return { creator: null, reels: [] };
+      return { creator: null, reels: [], totalReelsCount: 0, totalPostsCount: 0 };
     }
 
     // Pick best primary creator record for display information
@@ -1298,24 +1396,48 @@ export class Repository {
 
     const creatorIds = creators.map(c => c.id);
 
-    // Fetch all reels linked to any matching creator ID, sorted freshest first
-    const { data: reels, error: rErr } = await supabase
-      .from('saved_reels')
-      .select('*, creator:creators(*)')
-      .in('creator_id', creatorIds)
-      .order('created_at', { ascending: false });
+    const buildTypeQuery = (type: SavedMediaType) =>
+      supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .in('creator_id', creatorIds)
+        .eq('media_type', type)
+        .order('created_at', { ascending: false })
+        .order('save_order_rank', { ascending: true })
+        .order('first_detected_at', { ascending: false })
+        .order('id', { ascending: true })
+        .limit(25);
 
-    if (rErr) {
-      console.error(`[Repository] Error fetching reels for creator ${primaryCreator.id}:`, rErr.message);
-      return { creator: primaryCreator as Creator, reels: [] };
+    const [reelsCountRes, postsCountRes, reelsRowsRes, postsRowsRes] = await Promise.all([
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).in('creator_id', creatorIds).eq('media_type', 'reel'),
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).in('creator_id', creatorIds).eq('media_type', 'post'),
+      mediaFilter === 'post' ? Promise.resolve({ data: [], error: null }) : buildTypeQuery('reel'),
+      mediaFilter === 'reel' ? Promise.resolve({ data: [], error: null }) : buildTypeQuery('post'),
+    ]);
+
+    if (reelsRowsRes.error || postsRowsRes.error) {
+      const errMsg = reelsRowsRes.error?.message || postsRowsRes.error?.message || 'unknown error';
+      console.error(`[Repository] Error fetching items for creator ${primaryCreator.id}:`, errMsg);
+      return {
+        creator: primaryCreator as Creator,
+        reels: [],
+        totalReelsCount: reelsCountRes.count || 0,
+        totalPostsCount: postsCountRes.count || 0,
+      };
     }
 
-    const mappedReels = (reels || []).map(r => ({
+    const combinedRows = [...(reelsRowsRes.data || []), ...(postsRowsRes.data || [])].map(r => ({
       ...r,
+      media_type: classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }),
       creator: r.creator || primaryCreator,
     })) as SavedReel[];
 
-    return { creator: primaryCreator as Creator, reels: mappedReels };
+    return {
+      creator: primaryCreator as Creator,
+      reels: sortCreatorItems(combinedRows),
+      totalReelsCount: reelsCountRes.count || 0,
+      totalPostsCount: postsCountRes.count || 0,
+    };
   }
 
   static async getStats(): Promise<LibraryStats> {
@@ -1328,8 +1450,10 @@ export class Repository {
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
-    const [totalReelsRes, creatorsRes, weekRes, monthRes, unwatchedRes, watchedRes, watchLaterRes] = await Promise.all([
+    const [totalReelsRes, reelsCountRes, postsCountRes, creatorsRes, weekRes, monthRes, unwatchedRes, watchedRes, watchLaterRes] = await Promise.all([
       supabase.from('saved_reels').select('*', { count: 'exact', head: true }),
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'reel'),
+      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'post'),
       Repository.getCreators(),
       supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('first_detected_at', sevenDaysAgo),
       supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('first_detected_at', thirtyDaysAgo),
@@ -1348,6 +1472,8 @@ export class Repository {
 
     return {
       totalReels: totalReelsRes.count || 0,
+      reelsCount: reelsCountRes.count || 0,
+      postsCount: postsCountRes.count || 0,
       totalCreators: creatorsRes.length,
       savedThisWeek: weekRes.count || 0,
       savedThisMonth: monthRes.count || 0,
@@ -1582,5 +1708,139 @@ export class Repository {
     }
 
     return { reel: data as SavedReel, targetTime };
+  }
+
+  /**
+   * Lists saved items still classified as `'reel'` with legacy `/reel/` URLs so a one-off recovery
+   * job can re-check whether any DM-shared items were actually `/p/` posts.
+   */
+  static async getLegacyReelUrlCandidates(options?: {
+    limit?: number;
+    offset?: number;
+  }): Promise<LegacyReelUrlCandidate[]> {
+    const limit = Math.min(Math.max(1, Math.floor(options?.limit ?? 200)), 500);
+    const offset = Math.max(0, Math.floor(options?.offset ?? 0));
+
+    if (!isSupabaseConfigured()) {
+      const matches = Array.from(memoryStore.reels.values())
+        .filter(
+          (r) =>
+            classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }) === 'reel' &&
+            /instagram\.com\/(?:[a-zA-Z0-9._]+\/)?reel\//i.test(r.reel_url)
+        )
+        .sort((a, b) => {
+          const cmp = b.first_detected_at.localeCompare(a.first_detected_at);
+          return cmp !== 0 ? cmp : String(a.id).localeCompare(String(b.id));
+        });
+
+      return matches.slice(offset, offset + limit).map((r) => ({
+        id: r.id,
+        shortcode: r.shortcode,
+        reel_url: r.reel_url,
+        media_type: 'reel',
+      }));
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .select('id, shortcode, reel_url, media_type')
+      .eq('media_type', 'reel')
+      .ilike('reel_url', '%/reel/%')
+      .order('first_detected_at', { ascending: false })
+      .order('id', { ascending: true })
+      .range(offset, offset + limit - 1);
+
+    if (error) {
+      throw new Error(`Failed to query legacy reel URL candidates: ${error.message}`);
+    }
+
+    return (data || []).map((row: any) => ({
+      id: String(row.id),
+      shortcode: String(row.shortcode),
+      reel_url: String(row.reel_url),
+      media_type: 'reel',
+    }));
+  }
+
+  /**
+   * Updates both `media_type` and canonical `reel_url` for a recovered saved item so backfill
+   * migrations remain idempotent on future reruns.
+   */
+  static async repairRecoveredMediaClassification(
+    id: string,
+    mediaType: SavedMediaType,
+    canonicalUrl: string
+  ): Promise<boolean> {
+    const now = new Date().toISOString();
+
+    if (!isSupabaseConfigured()) {
+      const existing = memoryStore.reels.get(id);
+      if (!existing) return false;
+      existing.media_type = mediaType;
+      existing.reel_url = canonicalUrl;
+      existing.updated_at = now;
+      return true;
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .update({
+        media_type: mediaType,
+        reel_url: canonicalUrl,
+        updated_at: now,
+      })
+      .eq('id', id)
+      .select('id')
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to update recovered media classification for ${id}: ${error.message}`);
+    }
+
+    return Boolean(data?.id);
+  }
+
+  /**
+   * Looks up a saved item (with creator attribution) by its unique Instagram shortcode across both
+   * Supabase and in-memory fallback storage.
+   */
+  static async getSavedItemByShortcode(shortcode: string): Promise<SavedReel | null> {
+    const cleanCode = String(shortcode || '').trim();
+    if (!cleanCode) return null;
+
+    if (!isSupabaseConfigured()) {
+      for (const reel of memoryStore.reels.values()) {
+        if (reel.shortcode === cleanCode) {
+          return {
+            ...reel,
+            media_type: classifySavedMediaType({ mediaType: reel.media_type, reelUrl: reel.reel_url }),
+            creator: memoryStore.creators.get(reel.creator_id),
+          };
+        }
+      }
+      return null;
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('shortcode', cleanCode)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to look up saved item ${cleanCode}: ${error.message}`);
+    }
+    if (!data) {
+      return null;
+    }
+
+    const row = data as SavedReel;
+    return {
+      ...row,
+      media_type: classifySavedMediaType({ mediaType: row.media_type, reelUrl: row.reel_url }),
+    };
   }
 }

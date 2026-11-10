@@ -4,6 +4,7 @@ import { InstagramActionClient } from './instagramActionClient.ts';
 import type { InboundMessage } from './instagramActionClient.ts';
 import { MetaInstagramBotService } from './metaInstagramBotService.ts';
 import { formatTargetTime } from '../utils/duration.ts';
+import { classifySavedMediaType, formatCanonicalInstagramUrl } from '../utils/mediaType.ts';
 import {
   parseWatchedStopCommand,
   formatAddedToWatchLaterCreatorBlock,
@@ -13,9 +14,12 @@ import {
 } from '../utils/reelMessages.ts';
 
 export class ReminderWorker {
+  private static readonly MAX_ITEM_ATTEMPTS = 3;
+  private static readonly MAX_TRACKED_ITEM_IDS = 1000;
   private actionClient = new InstagramActionClient();
   private metaBot = new MetaInstagramBotService();
   private processedItemIds = new Set<string>();
+  private failedItemAttempts = new Map<string, number>();
   private isRunning = false;
   private dmInterval: NodeJS.Timeout | null = null;
   private reminderInterval: NodeJS.Timeout | null = null;
@@ -23,6 +27,28 @@ export class ReminderWorker {
   private adminUserId: string | null = null;
   private isDispatching = false;
   private failedReelSuppression = new Map<string, number>();
+
+  private markItemProcessed(itemId: string) {
+    if (!itemId) return;
+    if (this.processedItemIds.has(itemId)) {
+      this.processedItemIds.delete(itemId);
+    } else if (this.processedItemIds.size >= ReminderWorker.MAX_TRACKED_ITEM_IDS) {
+      const oldest = this.processedItemIds.values().next().value;
+      if (oldest) this.processedItemIds.delete(oldest);
+    }
+    this.processedItemIds.add(itemId);
+  }
+
+  private setFailedItemAttempts(itemId: string, attempts: number) {
+    if (!itemId) return;
+    if (this.failedItemAttempts.has(itemId)) {
+      this.failedItemAttempts.delete(itemId);
+    } else if (this.failedItemAttempts.size >= ReminderWorker.MAX_TRACKED_ITEM_IDS) {
+      const oldest = this.failedItemAttempts.keys().next().value;
+      if (oldest) this.failedItemAttempts.delete(oldest);
+    }
+    this.failedItemAttempts.set(itemId, attempts);
+  }
 
   /**
    * Starts the background DM polling and reminder dispatch loops.
@@ -90,15 +116,48 @@ export class ReminderWorker {
     if (!messagesRes.success) return;
 
     const messages = messagesRes.data;
+    const activeIds = new Set(messages.map((m) => m.itemId).filter(Boolean));
+    for (const id of this.processedItemIds) {
+      if (!activeIds.has(id)) {
+        this.processedItemIds.delete(id);
+      }
+    }
+    for (const id of this.failedItemAttempts.keys()) {
+      if (!activeIds.has(id)) {
+        this.failedItemAttempts.delete(id);
+      }
+    }
+
     // Process messages from admin only (newest items first)
     for (const msg of messages) {
-      if (this.processedItemIds.has(msg.itemId)) continue;
-      this.processedItemIds.add(msg.itemId);
+      if (!msg.itemId || this.processedItemIds.has(msg.itemId)) continue;
 
-      // Only handle incoming messages from the admin (not bot's own replies)
-      if (msg.userId === config.instagram.userId) continue;
+      // Only handle incoming messages from the admin (ignore bot's own replies without storing them)
+      if (msg.userId === config.instagram.userId) {
+        continue;
+      }
 
-      await this.handleAdminMessage(msg);
+      try {
+        await this.handleAdminMessage(msg);
+        this.markItemProcessed(msg.itemId);
+        this.failedItemAttempts.delete(msg.itemId);
+      } catch (err: any) {
+        const attempts = (this.failedItemAttempts.get(msg.itemId) ?? 0) + 1;
+        if (attempts >= ReminderWorker.MAX_ITEM_ATTEMPTS) {
+          console.error(
+            `[ReminderWorker] Permanent failure processing admin DM item ${msg.itemId} after ${attempts} attempts; marking processed:`,
+            err?.message || err
+          );
+          this.markItemProcessed(msg.itemId);
+          this.failedItemAttempts.delete(msg.itemId);
+        } else {
+          console.error(
+            `[ReminderWorker] Failed to process admin DM item ${msg.itemId} (attempt ${attempts}/${ReminderWorker.MAX_ITEM_ATTEMPTS}):`,
+            err?.message || err
+          );
+          this.setFailedItemAttempts(msg.itemId, attempts);
+        }
+      }
     }
   }
 
@@ -109,10 +168,20 @@ export class ReminderWorker {
     const config = loadConfig();
     const intervalHours = config.reminders.defaultIntervalHours;
 
-    // Case 1: Reel was shared!
+    // Case 1: Reel or Post was shared!
     if (msg.reel) {
-      const { mediaId, shortcode, authorUsername, caption, thumbnailUrl } = msg.reel;
-      console.log(`[ReminderWorker] 🎬 Detected shared Reel from admin: ${shortcode} (Media ID: ${mediaId})`);
+      const { mediaId, shortcode, authorUsername, caption, thumbnailUrl, mediaType, reelUrl } = msg.reel;
+      const existingItem = !mediaId && shortcode ? await Repository.getSavedItemByShortcode(shortcode) : null;
+      const isTextFallbackReel = !mediaId && mediaType === 'reel' && !/\/p\//i.test(reelUrl || '');
+      const resolvedMediaType =
+        isTextFallbackReel && existingItem
+          ? classifySavedMediaType({ mediaType: existingItem.media_type, reelUrl: existingItem.reel_url })
+          : classifySavedMediaType({ mediaType, reelUrl });
+      const canonicalUrl =
+        isTextFallbackReel && existingItem
+          ? formatCanonicalInstagramUrl(shortcode, resolvedMediaType, existingItem.reel_url)
+          : formatCanonicalInstagramUrl(shortcode, resolvedMediaType, reelUrl);
+      console.log(`[ReminderWorker] ${resolvedMediaType === 'post' ? '🖼️' : '🎬'} Detected shared ${resolvedMediaType} from admin: ${shortcode} (Media ID: ${mediaId})`);
 
       // 1. Save to native Instagram Saved collection
       let savedOnIg = false;
@@ -120,31 +189,32 @@ export class ReminderWorker {
         const saveRes = await this.actionClient.saveMedia(mediaId);
         savedOnIg = saveRes.success && saveRes.data;
         if (savedOnIg) {
-          console.log(`[ReminderWorker] ✅ Saved Reel ${mediaId} natively on Instagram!`);
+          console.log(`[ReminderWorker] ✅ Saved ${resolvedMediaType} ${mediaId} natively on Instagram!`);
         }
       }
 
       // 2. Upsert creator
-      const creatorUsername = authorUsername || 'instagram_user';
+      const creatorUsername = authorUsername || existingItem?.creator?.username || 'instagram_user';
       const creator = await Repository.upsertCreator({
-        instagram_user_id: creatorUsername,
+        instagram_user_id: existingItem?.creator?.instagram_user_id || creatorUsername,
         username: creatorUsername,
-        display_name: creatorUsername,
+        display_name: existingItem?.creator?.display_name || creatorUsername,
       });
 
-      // 3. Upsert reel into Supabase with watch_status = 'watch_later'
+      // 3. Upsert item into Supabase with watch_status = 'watch_later'
       const nextReminderDate = new Date(Date.now() + intervalHours * 60 * 60 * 1000).toISOString();
       await Repository.upsertSavedReel({
-        instagram_media_id: mediaId || `id_${shortcode}`,
+        instagram_media_id: existingItem?.instagram_media_id || mediaId || `id_${shortcode}`,
         shortcode,
-        reel_url: `https://www.instagram.com/reel/${shortcode}/`,
+        reel_url: canonicalUrl,
+        media_type: resolvedMediaType,
         creator_id: creator.id,
-        caption: caption || null,
-        thumbnail_url: thumbnailUrl || null,
-        taken_at: new Date().toISOString(),
-        saved_at: new Date().toISOString(),
-        first_detected_at: new Date().toISOString(),
-        save_order_rank: 1,
+        caption: caption || existingItem?.caption || null,
+        thumbnail_url: thumbnailUrl || existingItem?.thumbnail_url || null,
+        taken_at: existingItem?.taken_at || new Date().toISOString(),
+        saved_at: existingItem?.saved_at || new Date().toISOString(),
+        first_detected_at: existingItem?.first_detected_at || new Date().toISOString(),
+        save_order_rank: existingItem?.save_order_rank ?? 1,
         watch_status: 'watch_later',
         reminder_interval_hours: intervalHours,
         next_reminder_at: nextReminderDate,
@@ -154,7 +224,11 @@ export class ReminderWorker {
       // 4. Send immediate confirmation DM to admin
       if (this.adminUserId) {
         const creatorLine = formatAddedToWatchLaterCreatorBlock(creator);
-        const confirmText = `🎬 Saved to Watch Later & bookmarked to your Instagram Saved!${creatorLine}\n\nI will remind you about this in ${intervalHours} hours ⏰\n(Reply "done" when you've watched it)`;
+        const itemHeading =
+          resolvedMediaType === 'post'
+            ? '🖼️ Post saved to Watch Later & bookmarked to your Instagram Saved!'
+            : '🎬 Saved to Watch Later & bookmarked to your Instagram Saved!';
+        const confirmText = `${itemHeading}${creatorLine}\n\nI will remind you about this in ${intervalHours} hours ⏰\n(Reply "done" when you've watched it)`;
         await this.actionClient.sendDirectMessage(this.adminUserId, confirmText);
       }
       return;

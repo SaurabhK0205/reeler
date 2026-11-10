@@ -354,6 +354,7 @@ test('Repository + MetaInstagramBotService - marks most recently reminded reel i
 
     const sentMessages: Array<{ recipientId: string; text: string }> = [];
     const bot = new MetaInstagramBotService();
+    Object.defineProperty(bot, 'isConfigured', { get: () => true });
     bot.sendDirectMessage = async (recipientId: string, text: string) => {
       sentMessages.push({ recipientId, text });
       return true;
@@ -569,6 +570,7 @@ test('Repository.getLastReelForInstagramSender - ignores non-watch_later archive
     // Webhook duration or "stop all" from a user with no queue must NOT reschedule or disclose unattributed admin reels
     const sentMessages: Array<{ recipientId: string; text: string }> = [];
     const bot = new MetaInstagramBotService();
+    Object.defineProperty(bot, 'isConfigured', { get: () => true });
     bot.sendDirectMessage = async (recipientId: string, text: string) => {
       sentMessages.push({ recipientId, text });
       return true;
@@ -631,6 +633,7 @@ test('MetaInstagramBotService.handleWebhookPayload - displayName-only metadata s
 
     const sentMessages: Array<{ recipientId: string; text: string }> = [];
     const bot = new MetaInstagramBotService();
+    Object.defineProperty(bot, 'isConfigured', { get: () => true });
     bot.sendDirectMessage = async (recipientId: string, text: string) => {
       sentMessages.push({ recipientId, text });
       return true;
@@ -700,5 +703,664 @@ test('MetaInstagramBotService.handleWebhookPayload - displayName-only metadata s
     globalThis.fetch = originalFetch;
     if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
     if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+  }
+});
+
+test('extractCreatorQueryWithFilter & parseWatchedStopCommand isolate reels vs posts queries', async () => {
+  const { extractCreatorQueryWithFilter } = await import('../src/utils/creatorQuery.ts');
+  const { parseWatchedStopCommand } = await import('../src/utils/reelMessages.ts');
+
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('the_political_compass'), {
+    username: 'the_political_compass',
+    mediaFilter: 'all',
+  });
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('@the_political_compass'), {
+    username: 'the_political_compass',
+    mediaFilter: 'all',
+  });
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('reels by @the_political_compass'), {
+    username: 'the_political_compass',
+    mediaFilter: 'reel',
+  });
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('posts by @the_political_compass'), {
+    username: 'the_political_compass',
+    mediaFilter: 'post',
+  });
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('the_political_compass posts'), {
+    username: 'the_political_compass',
+    mediaFilter: 'post',
+  });
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('the_political_compass reels'), {
+    username: 'the_political_compass',
+    mediaFilter: 'reel',
+  });
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('show posts from the_political_compass'), {
+    username: 'the_political_compass',
+    mediaFilter: 'post',
+  });
+
+  // Ensure post queries for handle "done" route to creator search rather than watch-stop
+  assert.deepStrictEqual(parseWatchedStopCommand('posts by @done'), { isCommand: false, markAll: false });
+  assert.deepStrictEqual(parseWatchedStopCommand('done posts'), { isCommand: false, markAll: false });
+});
+
+test('MetaInstagramBotService isolates /p/ posts vs /reel/ reels across save, reminder, watched, and creator search', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  const originalFetch = globalThis.fetch;
+  try {
+    const { Repository } = await import('../src/db/repository.ts');
+    const { ReminderWorker } = await import('../src/services/reminderWorker.ts');
+    Repository.resetMemoryStoreForTests();
+
+    globalThis.fetch = (async (url: unknown) => {
+      const target = String(url);
+      if (target.includes('/p/DS1goOmjhUi/')) {
+        return new Response(
+          `<html><head>
+            <meta property="og:url" content="https://www.instagram.com/the_political_compass/p/DS1goOmjhUi/" />
+            <meta property="og:title" content="The Political Compass (@the_political_compass) on Instagram" />
+            <meta property="og:description" content="120 likes: &quot;Quadrant meme post&quot;." />
+          </head></html>`,
+          { status: 200, headers: { 'Content-Type': 'text/html' } }
+        );
+      }
+      if (target.includes('/reel/DT_x3F4Dj3-/')) {
+        return new Response(
+          `<html><head>
+            <meta property="og:url" content="https://www.instagram.com/the_political_compass/reel/DT_x3F4Dj3-/" />
+            <meta property="og:title" content="The Political Compass (@the_political_compass) on Instagram" />
+            <meta property="og:description" content="340 likes: &quot;Compass video reel&quot;." />
+          </head></html>`,
+          { status: 200, headers: { 'Content-Type': 'text/html' } }
+        );
+      }
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+
+    const sentMessages: Array<{ recipientId: string; text: string }> = [];
+    const bot = new MetaInstagramBotService();
+    Object.defineProperty(bot, 'isConfigured', { get: () => true });
+    bot.sendDirectMessage = async (recipientId: string, text: string) => {
+      sentMessages.push({ recipientId, text });
+      return true;
+    };
+
+    // 1. Share a /p/ post and reply "5m" to set a reminder
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'https://www.instagram.com/p/DS1goOmjhUi/' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('🖼️ Added post to your Watch Later!'), `Got: ${sentMessages[0].text}`);
+
+    const savedAfterPost = await Repository.getReels({ limit: 10 });
+    assert.strictEqual(savedAfterPost.reels.length, 1);
+    assert.strictEqual(savedAfterPost.reels[0].media_type, 'post');
+    assert.strictEqual(savedAfterPost.reels[0].reel_url, 'https://www.instagram.com/p/DS1goOmjhUi/');
+
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: '5m' },
+            },
+          ],
+        },
+      ],
+    });
+    assert.strictEqual(sentMessages.length, 2);
+    assert.ok(sentMessages[1].text.includes('⏰ Reminder set for @the_political_compass:'), `Got: ${sentMessages[1].text}`);
+
+    // 2. Make the reminder due and run ReminderWorker.checkDueReminders()
+    const currentPost = (await Repository.getReels({ limit: 10 })).reels[0];
+    await Repository.upsertSavedReel({
+      ...currentPost,
+      next_reminder_at: new Date(Date.now() - 1000).toISOString(),
+    });
+    const worker = new ReminderWorker();
+    (worker as any).metaBot = bot;
+    await worker.checkDueReminders();
+
+    assert.strictEqual(sentMessages.length, 3);
+    const reminderText = sentMessages[2].text;
+    assert.ok(reminderText.includes('🖼️ @the_political_compass'), `Got: ${reminderText}`);
+    assert.ok(reminderText.includes('👉 View Post: https://www.instagram.com/p/DS1goOmjhUi/'), `Got: ${reminderText}`);
+    assert.ok(!reminderText.includes('/reel/DS1goOmjhUi/'), `Must never rewrite /p/ to /reel/: ${reminderText}`);
+    const postUrlIdx = reminderText.indexOf('https://www.instagram.com/p/DS1goOmjhUi/');
+    const profileUrlIdx = reminderText.indexOf('https://www.instagram.com/the_political_compass/');
+    assert.ok(postUrlIdx > 0 && profileUrlIdx > postUrlIdx, 'Post URL must appear before creator profile URL');
+
+    // 3. Mark watched and verify post-specific confirmation wording
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'watched' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 4);
+    assert.ok(sentMessages[3].text.includes("@the_political_compass's post"), `Got: ${sentMessages[3].text}`);
+
+    // 4. Also save a /reel/ from the same creator so creator library has both Reels and Posts
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'https://www.instagram.com/reel/DT_x3F4Dj3-/ 2h' },
+            },
+          ],
+        },
+      ],
+    });
+
+    // 5. Query bare username "the_political_compass" -> split Saved Library into Latest Reels & Latest Posts
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'the_political_compass' },
+            },
+          ],
+        },
+      ],
+    });
+
+    const combinedMixedReply = sentMessages.map((m) => m.text).join('\n---\n');
+    assert.ok(combinedMixedReply.includes('📂 Saved Library'), `Expected split library header: ${combinedMixedReply}`);
+    assert.ok(combinedMixedReply.includes('1 reel · 1 post'), `Expected split breakdown: ${combinedMixedReply}`);
+    assert.ok(combinedMixedReply.includes('🎬 Saved Reel (1):'), `Expected Reels section: ${combinedMixedReply}`);
+    assert.ok(combinedMixedReply.includes('🖼️ Saved Post (1):'), `Expected Posts section: ${combinedMixedReply}`);
+    assert.ok(combinedMixedReply.includes('https://www.instagram.com/reel/DT_x3F4Dj3-/'));
+    assert.ok(combinedMixedReply.includes('https://www.instagram.com/p/DS1goOmjhUi/'));
+    assert.ok(!combinedMixedReply.includes('/reel/DS1goOmjhUi/'));
+
+    // 6. Query "posts by @the_political_compass" -> returns ONLY Posts
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'posts by @the_political_compass' },
+            },
+          ],
+        },
+      ],
+    });
+    const postsOnlyReply = sentMessages.map((m) => m.text).join('\n---\n');
+    assert.ok(postsOnlyReply.includes('🖼️ Saved Posts'), `Got: ${postsOnlyReply}`);
+    assert.ok(postsOnlyReply.includes('https://www.instagram.com/p/DS1goOmjhUi/'));
+    assert.ok(!postsOnlyReply.includes('DT_x3F4Dj3-'));
+
+    // 7. Query "reels by @the_political_compass" -> returns ONLY Reels
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'reels by @the_political_compass' },
+            },
+          ],
+        },
+      ],
+    });
+    const reelsOnlyReply = sentMessages.map((m) => m.text).join('\n---\n');
+    assert.ok(reelsOnlyReply.includes('🎬 Saved Reels'), `Got: ${reelsOnlyReply}`);
+    assert.ok(reelsOnlyReply.includes('https://www.instagram.com/reel/DT_x3F4Dj3-/'));
+    assert.ok(!reelsOnlyReply.includes('DS1goOmjhUi'));
+
+    // 8. Cross-type 0-match hint when a creator has only reels and user asks for posts
+    const reelOnlyCreator = await Repository.upsertCreator({
+      instagram_user_id: 'creator_reel_only',
+      username: 'reel_only_creator',
+      display_name: 'Reel Only',
+    });
+    await Repository.upsertSavedReel({
+      creator_id: reelOnlyCreator.id,
+      shortcode: 'DReelOnly01',
+      reel_url: 'https://www.instagram.com/reel/DReelOnly01/',
+      media_type: 'reel',
+      caption: 'Only a reel',
+      thumbnail_url: null,
+      saved_at: new Date().toISOString(),
+    });
+
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'posts by @reel_only_creator' },
+            },
+          ],
+        },
+      ],
+    });
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('No saved posts found for Creator: @reel_only_creator'));
+    assert.ok(sentMessages[0].text.includes('They do have 1 saved reel — reply "reels by @reel_only_creator"'));
+
+    Repository.resetMemoryStoreForTests();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+  }
+});
+
+test('MetaInstagramBotService preserves recovered post classification on inconclusive legacy /reel/ resends while allowing conclusive updates', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  const originalFetch = globalThis.fetch;
+  try {
+    const { Repository } = await import('../src/db/repository.ts');
+    Repository.resetMemoryStoreForTests();
+
+    const creator = await Repository.upsertCreator({
+      instagram_user_id: 'export_creator_compass',
+      username: 'the_political_compass',
+      display_name: 'The Political Compass',
+    });
+
+    // Recovered legacy post already repaired to media_type='post' & /p/ URL
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'export_DS1goOmjhUi',
+      shortcode: 'DS1goOmjhUi',
+      reel_url: 'https://www.instagram.com/p/DS1goOmjhUi/',
+      media_type: 'post',
+      creator_id: creator.id,
+      caption: 'Preserved quadrant post',
+      thumbnail_url: 'https://scontent.cdninstagram.com/v/t51.2885-15/saved-post.jpg',
+      taken_at: '2026-11-10T09:00:00Z',
+      first_detected_at: '2026-11-10T09:00:00Z',
+      save_order_rank: 1,
+    });
+
+    // Existing row whose metadata will conclusively classify it as CLIPS/reel
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'export_DUpgradeReel',
+      shortcode: 'DUpgradeReel',
+      reel_url: 'https://www.instagram.com/p/DUpgradeReel/',
+      media_type: 'post',
+      creator_id: creator.id,
+      caption: 'Upgraded clip item',
+      taken_at: '2026-11-10T08:00:00Z',
+      first_detected_at: '2026-11-10T08:00:00Z',
+      save_order_rank: 2,
+    });
+
+    // Legacy misclassified row whose metadata conclusively identifies it as a /p/ post (and omits @handle)
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'export_DRetroPost',
+      shortcode: 'DRetroPost',
+      reel_url: 'https://www.instagram.com/reel/DRetroPost/',
+      media_type: 'reel',
+      creator_id: creator.id,
+      caption: 'Legacy misclassified post',
+      taken_at: '2026-11-10T07:00:00Z',
+      first_detected_at: '2026-11-10T07:00:00Z',
+      save_order_rank: 3,
+    });
+
+    globalThis.fetch = (async (url: unknown) => {
+      const target = String(url);
+      if (target.includes('DUpgradeReel')) {
+        return new Response(
+          `<html><head>
+            <meta property="og:url" content="https://www.instagram.com/the_political_compass/reel/DUpgradeReel/" />
+            <meta property="og:title" content="The Political Compass (@the_political_compass) on Instagram" />
+            <meta property="og:description" content="50 likes: &quot;Upgraded clip item&quot;." />
+          </head></html>`,
+          { status: 200, headers: { 'Content-Type': 'text/html' } }
+        );
+      }
+      if (target.includes('DRetroPost')) {
+        return new Response(
+          `<html><head>
+            <meta property="og:url" content="https://www.instagram.com/the_political_compass/p/DRetroPost/" />
+            <meta property="og:title" content="The Political Compass on Instagram: &quot;Retro post&quot;" />
+          </head></html>`,
+          { status: 200, headers: { 'Content-Type': 'text/html' } }
+        );
+      }
+      // Inconclusive / empty response simulating rate-limited or login-walled Instagram fetch
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+
+    const sentMessages: Array<{ recipientId: string; text: string }> = [];
+    const bot = new MetaInstagramBotService();
+    bot.sendDirectMessage = async (recipientId: string, text: string) => {
+      sentMessages.push({ recipientId, text });
+      return true;
+    };
+
+    // 1. Resend legacy /reel/ URL for DS1goOmjhUi when metadata is unavailable
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_preserve' },
+              message: { text: 'https://www.instagram.com/reel/DS1goOmjhUi/ 30m' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('🖼️ Added post to your Watch Later!'), `Got: ${sentMessages[0].text}`);
+    assert.ok(sentMessages[0].text.includes('Creator: @the_political_compass'), `Got: ${sentMessages[0].text}`);
+
+    const preserved = await Repository.getSavedItemByShortcode('DS1goOmjhUi');
+    assert.ok(preserved);
+    assert.strictEqual(preserved.media_type, 'post');
+    assert.strictEqual(preserved.reel_url, 'https://www.instagram.com/p/DS1goOmjhUi/');
+    assert.strictEqual(preserved.instagram_media_id, 'export_DS1goOmjhUi');
+    assert.strictEqual(preserved.caption, 'Preserved quadrant post');
+    assert.strictEqual(preserved.taken_at, '2026-11-10T09:00:00Z');
+    assert.strictEqual(preserved.first_detected_at, '2026-11-10T09:00:00Z');
+
+    const postFiltered = await Repository.getReels({ mediaType: 'post', limit: 10 });
+    assert.strictEqual(postFiltered.reels.some((r) => r.shortcode === 'DS1goOmjhUi'), true);
+
+    // 2. Resend /reel/ URL for DUpgradeReel when metadata conclusively identifies CLIPS
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_preserve' },
+              message: { text: 'https://www.instagram.com/reel/DUpgradeReel/ 30m' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 2);
+    assert.ok(sentMessages[1].text.includes('🎬 Added to your Watch Later!'), `Got: ${sentMessages[1].text}`);
+
+    const upgraded = await Repository.getSavedItemByShortcode('DUpgradeReel');
+    assert.ok(upgraded);
+    assert.strictEqual(upgraded.media_type, 'reel');
+    assert.strictEqual(upgraded.reel_url, 'https://www.instagram.com/reel/DUpgradeReel/');
+
+    // 3. Resend legacy /reel/ URL for DRetroPost when metadata conclusively resolves /p/ without @handle
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_preserve' },
+              message: { text: 'https://www.instagram.com/reel/DRetroPost/ 30m' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 3);
+    assert.ok(sentMessages[2].text.includes('🖼️ Added post to your Watch Later!'), `Got: ${sentMessages[2].text}`);
+    assert.ok(sentMessages[2].text.includes('Creator: @the_political_compass'), `Got: ${sentMessages[2].text}`);
+
+    const retroFixed = await Repository.getSavedItemByShortcode('DRetroPost');
+    assert.ok(retroFixed);
+    assert.strictEqual(retroFixed.media_type, 'post');
+    assert.strictEqual(retroFixed.reel_url, 'https://www.instagram.com/p/DRetroPost/');
+    assert.strictEqual(retroFixed.creator?.username, 'the_political_compass');
+
+    // 4. New unknown /reel/ link with unavailable metadata still defaults to reel
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_preserve' },
+              message: { text: 'https://www.instagram.com/reel/DBrandNewReel/ 30m' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 4);
+    assert.ok(sentMessages[3].text.includes('🎬 Added to your Watch Later!'), `Got: ${sentMessages[3].text}`);
+    const freshReel = await Repository.getSavedItemByShortcode('DBrandNewReel');
+    assert.ok(freshReel);
+    assert.strictEqual(freshReel.media_type, 'reel');
+    assert.strictEqual(freshReel.reel_url, 'https://www.instagram.com/reel/DBrandNewReel/');
+
+    Repository.resetMemoryStoreForTests();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+  }
+});
+
+test('Repository.getSavedItemByShortcode throws on Supabase query errors so MetaInstagramBotService fails closed without overwriting posts', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const prevAnonKey = process.env.SUPABASE_ANON_KEY;
+  const originalFetch = globalThis.fetch;
+
+  const { resetSupabaseClientForTests } = await import('../src/db/client.ts');
+  const { Repository } = await import('../src/db/repository.ts');
+
+  try {
+    resetSupabaseClientForTests();
+    process.env.SUPABASE_URL = 'https://mock-reeler-test.supabase.co';
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'mock-service-role-key';
+    delete process.env.SUPABASE_ANON_KEY;
+
+    let supabaseWriteAttempted = false;
+    let mode: 'error' | 'empty' = 'error';
+
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const target = String(url);
+      if (target.startsWith('https://mock-reeler-test.supabase.co/rest/v1/')) {
+        const method = (init?.method || 'GET').toUpperCase();
+        if (method !== 'GET') {
+          supabaseWriteAttempted = true;
+        }
+        if (mode === 'error') {
+          return new Response(
+            JSON.stringify({ code: 'XX000', message: 'connection terminated unexpectedly' }),
+            { status: 500, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      // Inconclusive Instagram metadata fetch
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+
+    await assert.rejects(
+      () => Repository.getSavedItemByShortcode('DS1goOmjhUi'),
+      /Failed to look up saved item DS1goOmjhUi: connection terminated unexpectedly/
+    );
+
+    const sentMessages: string[] = [];
+    const bot = new MetaInstagramBotService();
+    bot.sendDirectMessage = async (_recipientId: string, text: string) => {
+      sentMessages.push(text);
+      return true;
+    };
+
+    await assert.rejects(
+      () =>
+        bot.handleWebhookPayload({
+          object: 'instagram',
+          entry: [
+            {
+              messaging: [
+                {
+                  sender: { id: 'sender_supabase_error' },
+                  message: { text: 'https://www.instagram.com/reel/DS1goOmjhUi/ 30m' },
+                },
+              ],
+            },
+          ],
+        }),
+      /Failed to look up saved item DS1goOmjhUi/
+    );
+
+    assert.strictEqual(supabaseWriteAttempted, false, 'Bot must fail closed without writing to Supabase');
+    assert.strictEqual(sentMessages.length, 0, 'Bot must not send confirmation DM when lookup fails');
+
+    mode = 'empty';
+    const missing = await Repository.getSavedItemByShortcode('DMissingShortcode');
+    assert.strictEqual(missing, null);
+  } finally {
+    resetSupabaseClientForTests();
+    globalThis.fetch = originalFetch;
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    else delete process.env.SUPABASE_URL;
+    if (prevServiceKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevServiceKey;
+    else delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (prevAnonKey !== undefined) process.env.SUPABASE_ANON_KEY = prevAnonKey;
+    else delete process.env.SUPABASE_ANON_KEY;
+  }
+});
+
+test('ReminderWorker.pollInboundDMs bounds failed admin DM retries, ignores bot replies without tracking, and prunes stale IDs', async () => {
+  const prevAdminUsername = process.env.ADMIN_USERNAME;
+  const prevIgUserId = process.env.INSTAGRAM_USER_ID;
+
+  try {
+    process.env.ADMIN_USERNAME = 'admin_tester';
+    process.env.INSTAGRAM_USER_ID = 'bot_user_999';
+
+    const { ReminderWorker } = await import('../src/services/reminderWorker.ts');
+    const worker = new ReminderWorker();
+    const internal = worker as any;
+    internal.adminThreadId = 'thread_1';
+    internal.adminUserId = 'admin_1';
+
+    let currentMessages = [
+      { itemId: 'bot_msg_1', userId: 'bot_user_999', timestamp: 1, itemType: 'text', text: 'bot echo' },
+      { itemId: 'transient_msg', userId: 'admin_1', timestamp: 2, itemType: 'text', text: 'transient' },
+      { itemId: 'perm_fail_msg', userId: 'admin_1', timestamp: 3, itemType: 'text', text: 'broken' },
+    ];
+
+    internal.actionClient = {
+      getThreadMessages: async () => ({ success: true, data: currentMessages }),
+    };
+
+    const callCounts = new Map<string, number>();
+    let transientShouldFail = true;
+
+    internal.handleAdminMessage = async (msg: { itemId: string }) => {
+      callCounts.set(msg.itemId, (callCounts.get(msg.itemId) ?? 0) + 1);
+      if (msg.itemId === 'perm_fail_msg') {
+        throw new Error('permanent error');
+      }
+      if (msg.itemId === 'transient_msg' && transientShouldFail) {
+        throw new Error('transient error');
+      }
+    };
+
+    // Poll 1: transient fails (1), perm fails (1), bot reply ignored without being tracked
+    await worker.pollInboundDMs();
+    assert.strictEqual(callCounts.get('bot_msg_1'), undefined);
+    assert.strictEqual(internal.processedItemIds.has('bot_msg_1'), false);
+    assert.strictEqual(internal.failedItemAttempts.get('transient_msg'), 1);
+    assert.strictEqual(internal.failedItemAttempts.get('perm_fail_msg'), 1);
+
+    // Poll 2: transient succeeds and clears failures; perm fails (2)
+    transientShouldFail = false;
+    await worker.pollInboundDMs();
+    assert.strictEqual(callCounts.get('transient_msg'), 2);
+    assert.strictEqual(internal.processedItemIds.has('transient_msg'), true);
+    assert.strictEqual(internal.failedItemAttempts.has('transient_msg'), false);
+    assert.strictEqual(internal.failedItemAttempts.get('perm_fail_msg'), 2);
+
+    // Poll 3: transient skipped; perm fails attempt 3 -> marked processed & removed from failure map
+    await worker.pollInboundDMs();
+    assert.strictEqual(callCounts.get('transient_msg'), 2);
+    assert.strictEqual(callCounts.get('perm_fail_msg'), 3);
+    assert.strictEqual(internal.processedItemIds.has('perm_fail_msg'), true);
+    assert.strictEqual(internal.failedItemAttempts.has('perm_fail_msg'), false);
+
+    // Poll 4: permanent failure is not retried again
+    await worker.pollInboundDMs();
+    assert.strictEqual(callCounts.get('perm_fail_msg'), 3);
+
+    // Poll 5: stale IDs outside latest window are pruned, keeping processedItemIds bounded
+    currentMessages = [
+      { itemId: 'fresh_msg', userId: 'admin_1', timestamp: 4, itemType: 'text', text: 'fresh' },
+    ];
+    await worker.pollInboundDMs();
+    assert.strictEqual(internal.processedItemIds.has('transient_msg'), false);
+    assert.strictEqual(internal.processedItemIds.has('perm_fail_msg'), false);
+    assert.strictEqual(internal.processedItemIds.has('fresh_msg'), true);
+    assert.strictEqual(internal.processedItemIds.size, 1);
+
+    // Bounded capacity safeguard even if active thread payload exceeds 1000 items
+    const largeBatch = Array.from({ length: 1005 }, (_, i) => ({
+      itemId: `bulk_${i}`,
+      userId: 'admin_1',
+      timestamp: 100 + i,
+      itemType: 'text',
+      text: `msg ${i}`,
+    }));
+    currentMessages = largeBatch;
+    await worker.pollInboundDMs();
+    assert.ok(internal.processedItemIds.size <= 1000, `Expected <= 1000, got ${internal.processedItemIds.size}`);
+  } finally {
+    if (prevAdminUsername !== undefined) process.env.ADMIN_USERNAME = prevAdminUsername;
+    else delete process.env.ADMIN_USERNAME;
+    if (prevIgUserId !== undefined) process.env.INSTAGRAM_USER_ID = prevIgUserId;
+    else delete process.env.INSTAGRAM_USER_ID;
   }
 });

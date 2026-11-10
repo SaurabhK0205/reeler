@@ -213,6 +213,184 @@ async function runTests() {
   assert.equal(pinnedResult.creators.length, 1);
   assert.equal(pinnedResult.creators[0]?.id, reel7.creator_id);
 
+  // Test 8: Media type isolation (/p/ posts vs /reel/ & /tv/ reels) and repository filtering
+  console.log('Test 8: Media type isolation for /p/ posts vs /reel/ and /tv/ reels');
+  const mixedMediaExport = {
+    saved_saved_media: [
+      {
+        title: 'the_political_compass',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/p/DS1goOmjhUi/',
+            timestamp: 1700001000,
+          },
+        },
+      },
+      {
+        title: 'the_political_compass',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/the_political_compass/p/DUCwaqkjmvc/',
+            timestamp: 1700001100,
+          },
+        },
+      },
+      {
+        title: 'the_political_compass',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/reel/DT_x3F4Dj3-/',
+            timestamp: 1700001200,
+          },
+        },
+      },
+      {
+        title: 'the_political_compass',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/tv/DIgtv123456/',
+            timestamp: 1700001300,
+          },
+        },
+      },
+    ],
+  };
+
+  const res8 = await ArchiveImportService.importArchive(mixedMediaExport);
+  assert.equal(res8.status, 'success');
+  assert.equal(res8.reelsImported, 4);
+
+  const { reels: postsOnly, total: totalPostsFiltered } = await Repository.getReels({
+    mediaType: 'post',
+    limit: 50,
+  });
+  assert.equal(totalPostsFiltered, 2, 'Expected exact count of 2 saved posts');
+  assert.ok(postsOnly.every((item) => item.media_type === 'post'), 'Every item under mediaType=post must be a post');
+
+  const post1 = postsOnly.find((item) => item.shortcode === 'DS1goOmjhUi');
+  const post2 = postsOnly.find((item) => item.shortcode === 'DUCwaqkjmvc');
+  assert.equal(post1?.reel_url, 'https://www.instagram.com/p/DS1goOmjhUi/');
+  assert.equal(post2?.reel_url, 'https://www.instagram.com/p/DUCwaqkjmvc/');
+
+  const { reels: reelsOnly, total: totalReelsFiltered } = await Repository.getReels({
+    mediaType: 'reel',
+    limit: 50,
+  });
+  assert.ok(totalReelsFiltered >= 2);
+  assert.ok(reelsOnly.every((item) => item.media_type === 'reel'), 'Every item under mediaType=reel must be a reel');
+
+  const importedReel = reelsOnly.find((item) => item.shortcode === 'DT_x3F4Dj3-');
+  const importedTv = reelsOnly.find((item) => item.shortcode === 'DIgtv123456');
+  assert.equal(importedReel?.reel_url, 'https://www.instagram.com/reel/DT_x3F4Dj3-/');
+  assert.equal(importedTv?.reel_url, 'https://www.instagram.com/tv/DIgtv123456/');
+
+  const statsAfterMixed = await Repository.getStats();
+  assert.equal(statsAfterMixed.postsCount, 2);
+  assert.equal(statsAfterMixed.reelsCount, totalReelsFiltered);
+  assert.equal(statsAfterMixed.totalReels, statsAfterMixed.reelsCount + statsAfterMixed.postsCount);
+
+  // Test 9: One-off legacy DM post recovery (rewritten /reel/ -> canonical /p/ + media_type='post')
+  console.log('Test 9: Legacy DM post recovery script & Repository classification repair');
+  const { recoverLegacyPosts } = await import('../scripts/recover-legacy-posts.ts');
+  Repository.resetMemoryStoreForTests();
+
+  const legacyCreator = await Repository.upsertCreator({
+    instagram_user_id: 'creator_legacy_dm',
+    username: 'legacy_dm_creator',
+    display_name: 'Legacy DM Creator',
+  });
+
+  // 1) Legacy DM post stored with rewritten /reel/ URL
+  await Repository.upsertSavedReel({
+    instagram_media_id: 'shortcode_DLegacyPost1',
+    shortcode: 'DLegacyPost1',
+    reel_url: 'https://www.instagram.com/reel/DLegacyPost1/',
+    media_type: 'reel',
+    creator_id: legacyCreator.id,
+    caption: 'Legacy DM post',
+    taken_at: '2026-11-10T09:00:00Z',
+    first_detected_at: '2026-11-10T09:03:00Z',
+    save_order_rank: 1,
+  });
+
+  // 2) Genuine reel stored with /reel/ URL
+  await Repository.upsertSavedReel({
+    instagram_media_id: 'shortcode_DLegacyReel1',
+    shortcode: 'DLegacyReel1',
+    reel_url: 'https://www.instagram.com/reel/DLegacyReel1/',
+    media_type: 'reel',
+    creator_id: legacyCreator.id,
+    caption: 'Genuine reel',
+    taken_at: '2026-11-10T08:00:00Z',
+    first_detected_at: '2026-11-10T08:00:00Z',
+    save_order_rank: 2,
+  });
+
+  // 3) Unresolved item (transient network failure -> must stay untouched for retry)
+  await Repository.upsertSavedReel({
+    instagram_media_id: 'shortcode_DLegacyUnres',
+    shortcode: 'DLegacyUnres',
+    reel_url: 'https://www.instagram.com/reel/DLegacyUnres/',
+    media_type: 'reel',
+    creator_id: legacyCreator.id,
+    caption: 'Unresolved item',
+    taken_at: '2026-11-10T07:00:00Z',
+    first_detected_at: '2026-11-10T07:00:00Z',
+    save_order_rank: 3,
+  });
+
+  const mockResolver = async (shortcode: string) => {
+    if (shortcode === 'DLegacyPost1') return { isClips: false, mediaKind: 'FEED' as const };
+    if (shortcode === 'DLegacyReel1') return { isClips: true, mediaKind: 'CLIPS' as const };
+    return {};
+  };
+
+  // Dry run must NOT mutate rows
+  const drySummary = await recoverLegacyPosts({
+    limit: 10,
+    pageSize: 2,
+    delayMs: 0,
+    dryRun: true,
+    resolver: mockResolver,
+  });
+  assert.deepEqual(drySummary, {
+    scanned: 3,
+    recoveredPosts: 1,
+    confirmedReels: 1,
+    unresolved: 1,
+    updated: 0,
+  });
+  assert.equal((await Repository.getLegacyReelUrlCandidates({ limit: 10 })).length, 3);
+
+  // Real run updates DLegacyPost1 to media_type='post' & /p/ URL, leaving DLegacyReel1 and DLegacyUnres intact
+  const liveSummary = await recoverLegacyPosts({
+    limit: 10,
+    pageSize: 2,
+    delayMs: 0,
+    dryRun: false,
+    resolver: mockResolver,
+  });
+  assert.deepEqual(liveSummary, {
+    scanned: 3,
+    recoveredPosts: 1,
+    confirmedReels: 1,
+    unresolved: 1,
+    updated: 1,
+  });
+
+  const postCheck = await Repository.getReels({ mediaType: 'post', limit: 10 });
+  assert.equal(postCheck.total, 1);
+  assert.equal(postCheck.reels[0].shortcode, 'DLegacyPost1');
+  assert.equal(postCheck.reels[0].media_type, 'post');
+  assert.equal(postCheck.reels[0].reel_url, 'https://www.instagram.com/p/DLegacyPost1/');
+
+  // Recovered post drops out of legacy /reel/ candidates so reruns only retry remaining items
+  const remainingCandidates = await Repository.getLegacyReelUrlCandidates({ limit: 10 });
+  assert.deepEqual(
+    remainingCandidates.map((c) => c.shortcode),
+    ['DLegacyReel1', 'DLegacyUnres']
+  );
+
   console.log('✅ All ArchiveImportService tests passed successfully!');
 }
 

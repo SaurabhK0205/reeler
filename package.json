@@ -7,6 +7,7 @@
     "start": "node --experimental-strip-types --env-file-if-exists=.env src/server.ts",
     "dev": "node --experimental-strip-types --watch --env-file-if-exists=.env src/server.ts",
     "import": "node --experimental-strip-types --env-file-if-exists=.env scripts/import-instagram-export.ts",
+    "recover-posts": "node --experimental-strip-types --env-file-if-exists=.env scripts/recover-legacy-posts.ts",
     "seed": "node --experimental-strip-types --env-file-if-exists=.env scripts/seed-demo.ts",
     "test": "node --experimental-strip-types tests/archiveImportService.test.ts && node --experimental-strip-types tests/metaInstagramBotService.test.ts && node --experimental-strip-types tests/adaptivePlayer.test.ts"
   },

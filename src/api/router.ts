@@ -5,7 +5,7 @@ import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
 import { feedMetaCacheControl, isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
-import type { ReelQueryFilters, WatchStatus, DateFilterPreset } from '../types.ts';
+import type { ReelQueryFilters, WatchStatus, DateFilterPreset, SavedMediaType } from '../types.ts';
 
 /**
  * Express API router handling Meta webhooks, vault queries, metadata resolution, status updates, and archive imports.
@@ -115,12 +115,19 @@ apiRouter.get('/creators', async (req: Request, res: Response) => {
  */
 apiRouter.get('/reels', async (req: Request, res: Response) => {
   try {
+    const rawMediaType = typeof req.query.mediaType === 'string' ? req.query.mediaType.trim().toLowerCase() : '';
+    if (rawMediaType && rawMediaType !== 'all' && rawMediaType !== 'reel' && rawMediaType !== 'post') {
+      res.status(400).json({ error: 'Invalid mediaType filter' });
+      return;
+    }
+
     const filters: ReelQueryFilters = {
       creatorId: req.query.creatorId as string || undefined,
       datePreset: (req.query.datePreset as DateFilterPreset) || 'all',
       startDate: req.query.startDate as string || undefined,
       endDate: req.query.endDate as string || undefined,
       watchStatus: (req.query.watchStatus as WatchStatus | 'all') || 'all',
+      mediaType: (rawMediaType as SavedMediaType | 'all') || 'all',
       search: req.query.search as string || undefined,
       sortBy: (req.query.sortBy as any) || 'newest_saved',
       page: Number(req.query.page) || 1,
@@ -153,7 +160,15 @@ apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
       return;
     }
 
-    const meta = await resolveFeedMediaMetadata(shortcode, controller.signal);
+    const rawTypeHint = typeof req.query.type === 'string' ? req.query.type.trim().toLowerCase() : '';
+    const preferredPath =
+      rawTypeHint === 'p' || rawTypeHint === 'post'
+        ? 'p'
+        : rawTypeHint === 'reel'
+          ? 'reel'
+          : undefined;
+
+    const meta = await resolveFeedMediaMetadata(shortcode, controller.signal, preferredPath);
     if (controller.signal.aborted || res.writableEnded) {
       return;
     }

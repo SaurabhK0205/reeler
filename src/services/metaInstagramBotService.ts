@@ -3,7 +3,13 @@ import { loadConfig } from '../config.ts';
 import { Repository } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
 import { parseDuration, formatTargetTime } from '../utils/duration.ts';
-import { extractCreatorQuery } from '../utils/creatorQuery.ts';
+import { extractCreatorQueryWithFilter } from '../utils/creatorQuery.ts';
+import {
+  classifySavedMediaType,
+  extractInstagramShortcodeAndPath,
+  formatCanonicalInstagramUrl,
+  resolveInboundMediaClassification,
+} from '../utils/mediaType.ts';
 import {
   parseWatchedStopCommand,
   extractPublicCreatorUsername,
@@ -239,12 +245,14 @@ export class MetaInstagramBotService {
 
           const text = event.message?.text || '';
           
-          // Check for attachments (e.g. shared Reel clip, ig_reel, share, video)
+          // Check for attachments (e.g. shared Reel clip, ig_reel, share, photo/carousel post)
           let reelUrl: string | null = null;
+          let attachmentType: string | null = null;
           if (event.message?.attachments) {
             for (const att of event.message.attachments) {
               if (att.payload?.url) {
                 reelUrl = att.payload.url;
+                attachmentType = typeof att.type === 'string' ? att.type : null;
                 break;
               }
             }
@@ -252,7 +260,7 @@ export class MetaInstagramBotService {
 
           const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
           if (combinedText) {
-            await this.processIncomingText(senderId, combinedText);
+            await this.processIncomingText(senderId, combinedText, attachmentType);
           }
         }
 
@@ -265,17 +273,19 @@ export class MetaInstagramBotService {
             if (!senderId || val.message?.is_echo) continue;
             const text = val.message?.text || '';
             let reelUrl: string | null = null;
+            let attachmentType: string | null = null;
             if (val.message?.attachments) {
               for (const att of val.message.attachments) {
                 if (att.payload?.url) {
                   reelUrl = att.payload.url;
+                  attachmentType = typeof att.type === 'string' ? att.type : null;
                   break;
                 }
               }
             }
             const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
             if (combinedText) {
-              await this.processIncomingText(senderId, combinedText);
+              await this.processIncomingText(senderId, combinedText, attachmentType);
             }
           }
         }
@@ -286,51 +296,87 @@ export class MetaInstagramBotService {
   /**
    * Processes incoming text/link from an Instagram user
    */
-  private async processIncomingText(senderId: string, text: string): Promise<void> {
+  private async processIncomingText(senderId: string, text: string, attachmentType?: string | null): Promise<void> {
     console.log(`[MetaIG] 📩 Incoming DM from Instagram user ${senderId}: "${text}"`);
 
-    // Check for Reel URL
-    const reelMatch = text.match(/https?:\/\/(?:www\.)?instagram\.com\/(?:reel|p)\/([A-Za-z0-9_-]+)/i);
-    if (reelMatch) {
-      const shortcode = reelMatch[1];
-      const remaining = text.replace(reelMatch[0], '').trim();
+    // Check for Reel or Post URL
+    const mediaLink = extractInstagramShortcodeAndPath(text);
+    if (mediaLink) {
+      const { shortcode, pathType, matchedText } = mediaLink;
+      const remaining = text.replace(matchedText, '').trim();
       const customDuration = parseDuration(remaining);
 
-      // Fetch public metadata (keep arbitrary displayName out of username so placeholders stay clean)
-      const meta = await fetchReelMetadata(shortcode);
-      const validHandle = extractPublicCreatorUsername({ username: meta.username });
-      const username = validHandle || 'Instagram Creator';
-      const displayName = meta.displayName || validHandle || username;
-      const creatorExternalId = validHandle
-        ? `creator_${validHandle}`
-        : `creator_unattributed_${shortcode}`;
+      // Fetch public metadata (probe /p/ first for post links, /reel/ first for reel/tv links)
+      const preferredPath = pathType === 'p' ? 'p' : 'reel';
+      const [meta, existingItem] = await Promise.all([
+        fetchReelMetadata(shortcode, undefined, preferredPath),
+        Repository.getSavedItemByShortcode(shortcode),
+      ]);
 
-      // Upsert Creator
-      const creator = await Repository.upsertCreator({
-        instagram_user_id: creatorExternalId,
-        username: username,
-        display_name: displayName,
-        profile_picture_url: meta.thumbnailUrl || null,
+      const { mediaType, canonicalUrl } = resolveInboundMediaClassification({
+        shortcode,
+        pathType,
+        matchedText,
+        isClips: meta.isClips,
+        mediaKind: meta.mediaKind,
+        attachmentType,
+        existing: existingItem,
       });
+
+      const validHandle = extractPublicCreatorUsername({ username: meta.username });
+      const existingCreator = existingItem?.creator;
+      const existingHandle = extractPublicCreatorUsername(existingCreator);
+
+      let creator: NonNullable<typeof existingCreator>;
+      if (!validHandle && !meta.displayName && existingCreator) {
+        creator = existingCreator;
+      } else {
+        const resolvedHandle = validHandle || existingHandle;
+        const matchesExistingHandle =
+          Boolean(resolvedHandle && existingHandle && resolvedHandle.toLowerCase() === existingHandle.toLowerCase());
+        const reuseExistingCreatorId = matchesExistingHandle || (!validHandle && Boolean(existingCreator));
+        const creatorExternalId = reuseExistingCreatorId
+          ? existingCreator!.instagram_user_id
+          : resolvedHandle
+            ? `creator_${resolvedHandle}`
+            : `creator_unattributed_${shortcode}`;
+
+        creator = await Repository.upsertCreator({
+          instagram_user_id: creatorExternalId,
+          username: resolvedHandle || existingCreator?.username || 'Instagram Creator',
+          display_name: meta.displayName || existingCreator?.display_name || resolvedHandle || 'Instagram Creator',
+          profile_picture_url: existingCreator?.profile_picture_url || meta.thumbnailUrl || null,
+        });
+      }
+
+      const instagramMediaId = existingItem?.instagram_media_id || `shortcode_${shortcode}`;
+      const caption = meta.caption || existingItem?.caption || null;
+      const thumbnailUrl = meta.thumbnailUrl || existingItem?.thumbnail_url || null;
+      const takenAt = existingItem?.taken_at || new Date().toISOString();
+      const firstDetectedAt = existingItem?.first_detected_at || new Date().toISOString();
+      const saveOrderRank = existingItem?.save_order_rank ?? 1;
 
       const creatorLine = formatAddedToWatchLaterCreatorBlock({
         username: creator.username,
         display_name: creator.display_name,
       });
 
+      const addedHeading = mediaType === 'post' ? '🖼️ Added post to your Watch Later!' : '🎬 Added to your Watch Later!';
+
       if (customDuration) {
-        // User provided a specific time along with the reel!
+        // User provided a specific time along with the item!
         const nextReminder = customDuration.targetDate.toISOString();
         await Repository.upsertSavedReel({
-          instagram_media_id: `shortcode_${shortcode}`,
+          instagram_media_id: instagramMediaId,
           shortcode,
-          reel_url: `https://www.instagram.com/reel/${shortcode}/`,
+          reel_url: canonicalUrl,
+          media_type: mediaType,
           creator_id: creator.id,
-          caption: meta.caption || null,
-          thumbnail_url: meta.thumbnailUrl || null,
-          taken_at: new Date().toISOString(),
-          first_detected_at: new Date().toISOString(),
-          save_order_rank: 1,
+          caption,
+          thumbnail_url: thumbnailUrl,
+          taken_at: takenAt,
+          first_detected_at: firstDetectedAt,
+          save_order_rank: saveOrderRank,
           watch_status: 'watch_later',
           reminder_interval_seconds: customDuration.seconds,
           next_reminder_at: nextReminder,
@@ -339,21 +385,22 @@ export class MetaInstagramBotService {
           instagram_sender_id: senderId,
         });
 
-        const reply = `🎬 Added to your Watch Later!${creatorLine}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done!`;
+        const reply = `${addedHeading}${creatorLine}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done!`;
         await this.sendDirectMessage(senderId, reply);
       } else {
         // No time provided — wait up to 10 minutes for user choice before defaulting to 10 hours
         const awaitingUntil = new Date(Date.now() + 10 * 60 * 1000).toISOString();
         await Repository.upsertSavedReel({
-          instagram_media_id: `shortcode_${shortcode}`,
+          instagram_media_id: instagramMediaId,
           shortcode,
-          reel_url: `https://www.instagram.com/reel/${shortcode}/`,
+          reel_url: canonicalUrl,
+          media_type: mediaType,
           creator_id: creator.id,
-          caption: meta.caption || null,
-          thumbnail_url: meta.thumbnailUrl || null,
-          taken_at: new Date().toISOString(),
-          first_detected_at: new Date().toISOString(),
-          save_order_rank: 1,
+          caption,
+          thumbnail_url: thumbnailUrl,
+          taken_at: takenAt,
+          first_detected_at: firstDetectedAt,
+          save_order_rank: saveOrderRank,
           watch_status: 'watch_later',
           reminder_interval_seconds: null,
           next_reminder_at: null,
@@ -364,8 +411,11 @@ export class MetaInstagramBotService {
 
         const defaultTriggerDate = new Date(Date.now() + (10 * 60 + 10 * 3600) * 1000);
         const defaultTriggerStr = formatTargetTime(defaultTriggerDate);
+        const promptQuestion = mediaType === 'post'
+          ? '⏰ When should I remind you to view this?'
+          : '⏰ When should I remind you to watch this?';
 
-        const reply = `🎬 Added to your Watch Later!${creatorLine}\n\n⏰ When should I remind you to watch this?\nReply with a time (e.g. "30m", "2h", "tomorrow at 5pm", or "remind me in 5 days").\n\n⏳ If you don't reply within 10 mins, I'll automatically set a reminder for 10 hours from now (${defaultTriggerStr})!`;
+        const reply = `${addedHeading}${creatorLine}\n\n${promptQuestion}\nReply with a time (e.g. "30m", "2h", "tomorrow at 5pm", or "remind me in 5 days").\n\n⏳ If you don't reply within 10 mins, I'll automatically set a reminder for 10 hours from now (${defaultTriggerStr})!`;
         await this.sendDirectMessage(senderId, reply);
       }
       return;
@@ -396,28 +446,52 @@ export class MetaInstagramBotService {
       } else {
         await this.sendDirectMessage(
           senderId,
-          `⏰ Got it! Duration set to ${customDuration.label} (${customDuration.formattedTarget}). Share any Reel to track it!`
+          `⏰ Got it! Duration set to ${customDuration.label} (${customDuration.formattedTarget}). Share any Reel or Post to track it!`
         );
       }
       return;
     }
 
-    // 3. Creator reels search (e.g. "@_docthor_", "who.bhartiiiii", "reels by @_docthor_", "show @_docthor_")
-    const creatorQuery = extractCreatorQuery(text);
+    // 3. Creator reels & posts search (e.g. "@_docthor_", "reels by @_docthor_", "posts by @the_political_compass")
+    const creatorQuery = extractCreatorQueryWithFilter(text);
     if (creatorQuery) {
-      const { creator, reels } = await Repository.getReelsByCreatorUsername(creatorQuery);
-      const cleanHandle = creatorQuery.replace(/^@/, '').trim();
+      const { creator, reels, totalReelsCount, totalPostsCount } = await Repository.getReelsByCreatorUsername(
+        creatorQuery.username,
+        { mediaType: creatorQuery.mediaFilter }
+      );
+      const cleanHandle = creatorQuery.username.replace(/^@/, '').trim();
       const resolvedUsername = creator?.username || cleanHandle;
-      const totalCount = reels.length;
-      const limit = Math.min(reels.length, 5);
+
+      const reelItems = reels.filter(
+        (r) => classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }) === 'reel'
+      );
+      const postItems = reels.filter(
+        (r) => classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }) === 'post'
+      );
+
+      const isMixed = creatorQuery.mediaFilter === 'all' && totalReelsCount > 0 && totalPostsCount > 0;
+      const reelsToSend = isMixed
+        ? reelItems.slice(0, 3)
+        : creatorQuery.mediaFilter === 'post'
+          ? []
+          : reelItems.slice(0, 5);
+      const postsToSend = isMixed
+        ? postItems.slice(0, 3)
+        : creatorQuery.mediaFilter === 'reel'
+          ? []
+          : postItems.slice(0, 5);
+
       const searchCopy = formatCreatorSearchMessages({
         username: resolvedUsername,
         displayName: creator?.display_name,
-        totalCount,
-        limit,
+        totalReelsCount,
+        totalPostsCount,
+        shownReelsCount: reelsToSend.length,
+        shownPostsCount: postsToSend.length,
+        mediaFilter: creatorQuery.mediaFilter,
       });
 
-      if (!creator || reels.length === 0) {
+      if (!creator || (reelsToSend.length === 0 && postsToSend.length === 0)) {
         await this.sendDirectMessage(senderId, searchCopy.notFound);
         return;
       }
@@ -429,19 +503,39 @@ export class MetaInstagramBotService {
         return;
       }
 
-      // 2. Send each reel in a separate single message (allows Instagram client to unfurl interactive Reel cards)
-      for (let i = 0; i < limit; i++) {
-        const r = reels[i];
-        await new Promise((resolve) => setTimeout(resolve, 350));
-        const reelSent = await this.sendDirectMessage(senderId, `https://www.instagram.com/reel/${r.shortcode}/`);
-        if (!reelSent) {
-          console.warn(`[MetaIG] Failed to send reel ${r.shortcode} message to ${senderId}`);
-          break;
+      const sendItemsBatch = async (
+        items: typeof reels,
+        sectionHeader: string | null
+      ): Promise<boolean> => {
+        if (items.length === 0) return true;
+        if (sectionHeader) {
+          await new Promise((resolve) => setTimeout(resolve, 350));
+          const sectionSent = await this.sendDirectMessage(senderId, sectionHeader);
+          if (!sectionSent) {
+            console.warn(`[MetaIG] Failed to send section header to ${senderId}`);
+            return false;
+          }
         }
-      }
+        for (const r of items) {
+          await new Promise((resolve) => setTimeout(resolve, 350));
+          const canonicalItemUrl = formatCanonicalInstagramUrl(r.shortcode, r.media_type, r.reel_url);
+          const itemSent = await this.sendDirectMessage(senderId, canonicalItemUrl);
+          if (!itemSent) {
+            console.warn(`[MetaIG] Failed to send item ${r.shortcode} message to ${senderId}`);
+            return false;
+          }
+        }
+        return true;
+      };
 
-      // 3. Send footer message if additional reels exist in the user's library
-      if (reels.length > limit) {
+      const reelsOk = await sendItemsBatch(reelsToSend, searchCopy.reelsSectionHeader);
+      if (!reelsOk) return;
+
+      const postsOk = await sendItemsBatch(postsToSend, searchCopy.postsSectionHeader);
+      if (!postsOk) return;
+
+      // 3. Send footer message if additional items exist in the user's library
+      if (searchCopy.footer) {
         await new Promise((resolve) => setTimeout(resolve, 350));
         await this.sendDirectMessage(senderId, searchCopy.footer);
       }
@@ -449,7 +543,7 @@ export class MetaInstagramBotService {
     }
 
     // Default welcome / help reply
-    const helpMsg = `👋 Hi! Whenever you see a Reel you want to save or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username to view your saved reels!`;
+    const helpMsg = `👋 Hi! Whenever you see a Reel or Post you want to save or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username (or "reels by @name" / "posts by @name") to view your saved items!`;
     await this.sendDirectMessage(senderId, helpMsg);
   }
 }

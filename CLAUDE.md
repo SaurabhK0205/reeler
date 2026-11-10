@@ -71,7 +71,8 @@ Before writing any code or executing commands:
 ## 3. Shared Metaphor — Use these exact terms everywhere
 
 ```
-Saved Reel              → saved_reel, saved_reels (not post, media, bookmark, video)
+Saved Reel / Post       → saved_reel, saved_reels with media_type ('reel' | 'post')
+Media Type              → media_type ('reel' for /reel/, /reels/, /tv/; 'post' for /p/ photo & carousel posts)
 Creator                 → creator, creators (not author, user, influencer)
 Shortcode               → shortcode (exact 11-char Instagram identifier, e.g. Db4eVUcsoTh)
 Instagram Sender ID     → instagram_sender_id (exact IGSID string from webhook, not chat_id, user_id)
@@ -115,8 +116,9 @@ src/
    - Never write ad-hoc date/regex parsing in services or route handlers.
 5. **Instagram In-App DM UX Rules:**
    - **Creator Profile Links**: Meta Graph API DMs do NOT automatically linkify plain `@username` mentions on Instagram Web or reliably across mobile clients. Whenever a valid Instagram handle exists (never for placeholder fallbacks like `Instagram Creator` or spaced display names), include a clean clickable profile URL (`https://www.instagram.com/<username>/`) paired with `@<username>` in Watch Later save confirmations, custom/default schedule replies, reminder DMs, and creator-search replies (short `"watched"` / `"stop"` confirmation DMs intentionally omit profile link cards to keep the reply compact).
-   - **Link Preview Priority**: In reminder DMs that contain a Reel URL, always place the Reel URL **before** the creator profile URL so Instagram unfurls the Reel video thumbnail card rather than overriding it with a profile card.
-   - **Human-Readable Reel Labels**: Never expose raw shortcodes (e.g. `Da1iWbSMAOz`) in user-facing DM copy or the frontend UI; identify reels by creator handle, caption snippet, save date, or plain `"your saved reel"`.
+   - **Link Preview Priority**: In reminder DMs that contain a Reel or Post URL, always place the Item URL **before** the creator profile URL so Instagram unfurls the media thumbnail card rather than overriding it with a profile card.
+   - **Canonical Media URLs & Type Isolation**: Preserve canonical `/p/` URLs for photo/carousel Posts and `/reel/` (or `/tv/`) URLs for Reels—never rewrite a `/p/` shortcode to `/reel/`. When a creator has both saved Reels and saved Posts, split creator-search DMs into separate `🎬 Latest Reels` and `🖼️ Latest Posts` sections and support explicit `"reels by @username"` / `"posts by @username"` filters.
+   - **Human-Readable Reel Labels**: Never expose raw shortcodes (e.g. `Da1iWbSMAOz`) in user-facing DM copy or the frontend UI; identify items by creator handle, media type (`reel` vs `post`), caption snippet, save date, or plain `"your saved reel"` / `"your saved post"`.
    - When a user shares a reel, prompt them for custom reminder timing with a **10-minute window**. If no reply within 10 minutes, default to **10 hours**.
    - When a user sends `"watched"` / `"done"` / `"stop"`, mark the **most recently reminded / latest active** Watch Later reel as watched and clear both `next_reminder_at` and `awaiting_reminder_choice_until` (using `"stop all"` / `"watched all"` for bulk clearing all pending Watch Later reels).
 

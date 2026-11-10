@@ -1,4 +1,5 @@
 export type WatchStatus = 'unwatched' | 'watched' | 'watch_later';
+export type SavedMediaType = 'reel' | 'post';
 
 export interface Creator {
   id: string;
@@ -16,6 +17,7 @@ export interface SavedReel {
   instagram_media_id: string;
   shortcode: string;
   reel_url: string;
+  media_type?: SavedMediaType;
   creator_id: string;
   caption?: string | null;
   thumbnail_url?: string | null;
@@ -56,6 +58,7 @@ export interface ReelQueryFilters {
   startDate?: string;
   endDate?: string;
   watchStatus?: WatchStatus | 'all';
+  mediaType?: SavedMediaType | 'all';
   search?: string;
   sortBy?: 'newest_saved' | 'oldest_saved' | 'newest_published' | 'oldest_published';
   page?: number;
@@ -64,6 +67,8 @@ export interface ReelQueryFilters {
 
 export interface LibraryStats {
   totalReels: number;
+  reelsCount: number;
+  postsCount: number;
   totalCreators: number;
   savedThisWeek: number;
   savedThisMonth: number;
