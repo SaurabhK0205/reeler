@@ -354,6 +354,7 @@ test('Repository + MetaInstagramBotService - marks most recently reminded reel i
 
     const sentMessages: Array<{ recipientId: string; text: string }> = [];
     const bot = new MetaInstagramBotService();
+    Object.defineProperty(bot, 'isConfigured', { get: () => true });
     bot.sendDirectMessage = async (recipientId: string, text: string) => {
       sentMessages.push({ recipientId, text });
       return true;
@@ -569,6 +570,7 @@ test('Repository.getLastReelForInstagramSender - ignores non-watch_later archive
     // Webhook duration or "stop all" from a user with no queue must NOT reschedule or disclose unattributed admin reels
     const sentMessages: Array<{ recipientId: string; text: string }> = [];
     const bot = new MetaInstagramBotService();
+    Object.defineProperty(bot, 'isConfigured', { get: () => true });
     bot.sendDirectMessage = async (recipientId: string, text: string) => {
       sentMessages.push({ recipientId, text });
       return true;
@@ -631,6 +633,7 @@ test('MetaInstagramBotService.handleWebhookPayload - displayName-only metadata s
 
     const sentMessages: Array<{ recipientId: string; text: string }> = [];
     const bot = new MetaInstagramBotService();
+    Object.defineProperty(bot, 'isConfigured', { get: () => true });
     bot.sendDirectMessage = async (recipientId: string, text: string) => {
       sentMessages.push({ recipientId, text });
       return true;
@@ -694,6 +697,287 @@ test('MetaInstagramBotService.handleWebhookPayload - displayName-only metadata s
     assert.strictEqual(firstReel?.creator?.display_name, 'Creative Studio');
     assert.strictEqual(secondReel?.creator?.display_name, 'ज़रणेश');
     assert.notStrictEqual(firstReel?.creator_id, secondReel?.creator_id);
+
+    Repository.resetMemoryStoreForTests();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+  }
+});
+
+test('extractCreatorQueryWithFilter & parseWatchedStopCommand isolate reels vs posts queries', async () => {
+  const { extractCreatorQueryWithFilter } = await import('../src/utils/creatorQuery.ts');
+  const { parseWatchedStopCommand } = await import('../src/utils/reelMessages.ts');
+
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('the_political_compass'), {
+    username: 'the_political_compass',
+    mediaFilter: 'all',
+  });
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('@the_political_compass'), {
+    username: 'the_political_compass',
+    mediaFilter: 'all',
+  });
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('reels by @the_political_compass'), {
+    username: 'the_political_compass',
+    mediaFilter: 'reel',
+  });
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('posts by @the_political_compass'), {
+    username: 'the_political_compass',
+    mediaFilter: 'post',
+  });
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('the_political_compass posts'), {
+    username: 'the_political_compass',
+    mediaFilter: 'post',
+  });
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('the_political_compass reels'), {
+    username: 'the_political_compass',
+    mediaFilter: 'reel',
+  });
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('show posts from the_political_compass'), {
+    username: 'the_political_compass',
+    mediaFilter: 'post',
+  });
+
+  // Ensure post queries for handle "done" route to creator search rather than watch-stop
+  assert.deepStrictEqual(parseWatchedStopCommand('posts by @done'), { isCommand: false, markAll: false });
+  assert.deepStrictEqual(parseWatchedStopCommand('done posts'), { isCommand: false, markAll: false });
+});
+
+test('MetaInstagramBotService isolates /p/ posts vs /reel/ reels across save, reminder, watched, and creator search', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  const originalFetch = globalThis.fetch;
+  try {
+    const { Repository } = await import('../src/db/repository.ts');
+    const { ReminderWorker } = await import('../src/services/reminderWorker.ts');
+    Repository.resetMemoryStoreForTests();
+
+    globalThis.fetch = (async (url: unknown) => {
+      const target = String(url);
+      if (target.includes('/p/DS1goOmjhUi/')) {
+        return new Response(
+          `<html><head>
+            <meta property="og:url" content="https://www.instagram.com/the_political_compass/p/DS1goOmjhUi/" />
+            <meta property="og:title" content="The Political Compass (@the_political_compass) on Instagram" />
+            <meta property="og:description" content="120 likes: &quot;Quadrant meme post&quot;." />
+          </head></html>`,
+          { status: 200, headers: { 'Content-Type': 'text/html' } }
+        );
+      }
+      if (target.includes('/reel/DT_x3F4Dj3-/')) {
+        return new Response(
+          `<html><head>
+            <meta property="og:url" content="https://www.instagram.com/the_political_compass/reel/DT_x3F4Dj3-/" />
+            <meta property="og:title" content="The Political Compass (@the_political_compass) on Instagram" />
+            <meta property="og:description" content="340 likes: &quot;Compass video reel&quot;." />
+          </head></html>`,
+          { status: 200, headers: { 'Content-Type': 'text/html' } }
+        );
+      }
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+
+    const sentMessages: Array<{ recipientId: string; text: string }> = [];
+    const bot = new MetaInstagramBotService();
+    Object.defineProperty(bot, 'isConfigured', { get: () => true });
+    bot.sendDirectMessage = async (recipientId: string, text: string) => {
+      sentMessages.push({ recipientId, text });
+      return true;
+    };
+
+    // 1. Share a /p/ post and reply "5m" to set a reminder
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'https://www.instagram.com/p/DS1goOmjhUi/' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('🖼️ Added post to your Watch Later!'), `Got: ${sentMessages[0].text}`);
+
+    const savedAfterPost = await Repository.getReels({ limit: 10 });
+    assert.strictEqual(savedAfterPost.reels.length, 1);
+    assert.strictEqual(savedAfterPost.reels[0].media_type, 'post');
+    assert.strictEqual(savedAfterPost.reels[0].reel_url, 'https://www.instagram.com/p/DS1goOmjhUi/');
+
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: '5m' },
+            },
+          ],
+        },
+      ],
+    });
+    assert.strictEqual(sentMessages.length, 2);
+    assert.ok(sentMessages[1].text.includes('⏰ Reminder set for @the_political_compass:'), `Got: ${sentMessages[1].text}`);
+
+    // 2. Make the reminder due and run ReminderWorker.checkDueReminders()
+    const currentPost = (await Repository.getReels({ limit: 10 })).reels[0];
+    await Repository.upsertSavedReel({
+      ...currentPost,
+      next_reminder_at: new Date(Date.now() - 1000).toISOString(),
+    });
+    const worker = new ReminderWorker();
+    (worker as any).metaBot = bot;
+    await worker.checkDueReminders();
+
+    assert.strictEqual(sentMessages.length, 3);
+    const reminderText = sentMessages[2].text;
+    assert.ok(reminderText.includes('🖼️ @the_political_compass'), `Got: ${reminderText}`);
+    assert.ok(reminderText.includes('👉 View Post: https://www.instagram.com/p/DS1goOmjhUi/'), `Got: ${reminderText}`);
+    assert.ok(!reminderText.includes('/reel/DS1goOmjhUi/'), `Must never rewrite /p/ to /reel/: ${reminderText}`);
+    const postUrlIdx = reminderText.indexOf('https://www.instagram.com/p/DS1goOmjhUi/');
+    const profileUrlIdx = reminderText.indexOf('https://www.instagram.com/the_political_compass/');
+    assert.ok(postUrlIdx > 0 && profileUrlIdx > postUrlIdx, 'Post URL must appear before creator profile URL');
+
+    // 3. Mark watched and verify post-specific confirmation wording
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'watched' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 4);
+    assert.ok(sentMessages[3].text.includes("@the_political_compass's post"), `Got: ${sentMessages[3].text}`);
+
+    // 4. Also save a /reel/ from the same creator so creator library has both Reels and Posts
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'https://www.instagram.com/reel/DT_x3F4Dj3-/ 2h' },
+            },
+          ],
+        },
+      ],
+    });
+
+    // 5. Query bare username "the_political_compass" -> split Saved Library into Latest Reels & Latest Posts
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'the_political_compass' },
+            },
+          ],
+        },
+      ],
+    });
+
+    const combinedMixedReply = sentMessages.map((m) => m.text).join('\n---\n');
+    assert.ok(combinedMixedReply.includes('📂 Saved Library'), `Expected split library header: ${combinedMixedReply}`);
+    assert.ok(combinedMixedReply.includes('1 reel · 1 post'), `Expected split breakdown: ${combinedMixedReply}`);
+    assert.ok(combinedMixedReply.includes('🎬 Saved Reel (1):'), `Expected Reels section: ${combinedMixedReply}`);
+    assert.ok(combinedMixedReply.includes('🖼️ Saved Post (1):'), `Expected Posts section: ${combinedMixedReply}`);
+    assert.ok(combinedMixedReply.includes('https://www.instagram.com/reel/DT_x3F4Dj3-/'));
+    assert.ok(combinedMixedReply.includes('https://www.instagram.com/p/DS1goOmjhUi/'));
+    assert.ok(!combinedMixedReply.includes('/reel/DS1goOmjhUi/'));
+
+    // 6. Query "posts by @the_political_compass" -> returns ONLY Posts
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'posts by @the_political_compass' },
+            },
+          ],
+        },
+      ],
+    });
+    const postsOnlyReply = sentMessages.map((m) => m.text).join('\n---\n');
+    assert.ok(postsOnlyReply.includes('🖼️ Saved Posts'), `Got: ${postsOnlyReply}`);
+    assert.ok(postsOnlyReply.includes('https://www.instagram.com/p/DS1goOmjhUi/'));
+    assert.ok(!postsOnlyReply.includes('DT_x3F4Dj3-'));
+
+    // 7. Query "reels by @the_political_compass" -> returns ONLY Reels
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'reels by @the_political_compass' },
+            },
+          ],
+        },
+      ],
+    });
+    const reelsOnlyReply = sentMessages.map((m) => m.text).join('\n---\n');
+    assert.ok(reelsOnlyReply.includes('🎬 Saved Reels'), `Got: ${reelsOnlyReply}`);
+    assert.ok(reelsOnlyReply.includes('https://www.instagram.com/reel/DT_x3F4Dj3-/'));
+    assert.ok(!reelsOnlyReply.includes('DS1goOmjhUi'));
+
+    // 8. Cross-type 0-match hint when a creator has only reels and user asks for posts
+    const reelOnlyCreator = await Repository.upsertCreator({
+      instagram_user_id: 'creator_reel_only',
+      username: 'reel_only_creator',
+      display_name: 'Reel Only',
+    });
+    await Repository.upsertSavedReel({
+      creator_id: reelOnlyCreator.id,
+      shortcode: 'DReelOnly01',
+      reel_url: 'https://www.instagram.com/reel/DReelOnly01/',
+      media_type: 'reel',
+      caption: 'Only a reel',
+      thumbnail_url: null,
+      saved_at: new Date().toISOString(),
+    });
+
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_media_isolation' },
+              message: { text: 'posts by @reel_only_creator' },
+            },
+          ],
+        },
+      ],
+    });
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('No saved posts found for Creator: @reel_only_creator'));
+    assert.ok(sentMessages[0].text.includes('They do have 1 saved reel — reply "reels by @reel_only_creator"'));
 
     Repository.resetMemoryStoreForTests();
   } finally {

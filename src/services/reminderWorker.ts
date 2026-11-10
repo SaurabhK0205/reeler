@@ -4,6 +4,7 @@ import { InstagramActionClient } from './instagramActionClient.ts';
 import type { InboundMessage } from './instagramActionClient.ts';
 import { MetaInstagramBotService } from './metaInstagramBotService.ts';
 import { formatTargetTime } from '../utils/duration.ts';
+import { classifySavedMediaType, formatCanonicalInstagramUrl } from '../utils/mediaType.ts';
 import {
   parseWatchedStopCommand,
   formatAddedToWatchLaterCreatorBlock,
@@ -109,10 +110,12 @@ export class ReminderWorker {
     const config = loadConfig();
     const intervalHours = config.reminders.defaultIntervalHours;
 
-    // Case 1: Reel was shared!
+    // Case 1: Reel or Post was shared!
     if (msg.reel) {
-      const { mediaId, shortcode, authorUsername, caption, thumbnailUrl } = msg.reel;
-      console.log(`[ReminderWorker] 🎬 Detected shared Reel from admin: ${shortcode} (Media ID: ${mediaId})`);
+      const { mediaId, shortcode, authorUsername, caption, thumbnailUrl, mediaType, reelUrl } = msg.reel;
+      const resolvedMediaType = classifySavedMediaType({ mediaType, reelUrl });
+      const canonicalUrl = formatCanonicalInstagramUrl(shortcode, resolvedMediaType, reelUrl);
+      console.log(`[ReminderWorker] ${resolvedMediaType === 'post' ? '🖼️' : '🎬'} Detected shared ${resolvedMediaType} from admin: ${shortcode} (Media ID: ${mediaId})`);
 
       // 1. Save to native Instagram Saved collection
       let savedOnIg = false;
@@ -120,7 +123,7 @@ export class ReminderWorker {
         const saveRes = await this.actionClient.saveMedia(mediaId);
         savedOnIg = saveRes.success && saveRes.data;
         if (savedOnIg) {
-          console.log(`[ReminderWorker] ✅ Saved Reel ${mediaId} natively on Instagram!`);
+          console.log(`[ReminderWorker] ✅ Saved ${resolvedMediaType} ${mediaId} natively on Instagram!`);
         }
       }
 
@@ -132,12 +135,13 @@ export class ReminderWorker {
         display_name: creatorUsername,
       });
 
-      // 3. Upsert reel into Supabase with watch_status = 'watch_later'
+      // 3. Upsert item into Supabase with watch_status = 'watch_later'
       const nextReminderDate = new Date(Date.now() + intervalHours * 60 * 60 * 1000).toISOString();
       await Repository.upsertSavedReel({
         instagram_media_id: mediaId || `id_${shortcode}`,
         shortcode,
-        reel_url: `https://www.instagram.com/reel/${shortcode}/`,
+        reel_url: canonicalUrl,
+        media_type: resolvedMediaType,
         creator_id: creator.id,
         caption: caption || null,
         thumbnail_url: thumbnailUrl || null,
@@ -154,7 +158,11 @@ export class ReminderWorker {
       // 4. Send immediate confirmation DM to admin
       if (this.adminUserId) {
         const creatorLine = formatAddedToWatchLaterCreatorBlock(creator);
-        const confirmText = `🎬 Saved to Watch Later & bookmarked to your Instagram Saved!${creatorLine}\n\nI will remind you about this in ${intervalHours} hours ⏰\n(Reply "done" when you've watched it)`;
+        const itemHeading =
+          resolvedMediaType === 'post'
+            ? '🖼️ Post saved to Watch Later & bookmarked to your Instagram Saved!'
+            : '🎬 Saved to Watch Later & bookmarked to your Instagram Saved!';
+        const confirmText = `${itemHeading}${creatorLine}\n\nI will remind you about this in ${intervalHours} hours ⏰\n(Reply "done" when you've watched it)`;
         await this.actionClient.sendDirectMessage(this.adminUserId, confirmText);
       }
       return;

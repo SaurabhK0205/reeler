@@ -1,4 +1,6 @@
-import type { Creator, SavedReel } from '../types.ts';
+import type { Creator, SavedMediaType, SavedReel } from '../types.ts';
+import type { CreatorMediaFilter } from './creatorQuery.ts';
+import { classifySavedMediaType } from './mediaType.ts';
 
 const INSTAGRAM_HANDLE_REGEX = /^[a-zA-Z0-9._]{1,30}$/;
 
@@ -26,9 +28,12 @@ export function parseWatchedStopCommand(text: string): WatchedStopCommand {
     return { isCommand: false, markAll: false };
   }
 
-  // Explicit creator-lookup messages (e.g. "@stop.motion", "reels by @done", "reels by stop.motion", "show @done")
+  // Explicit creator-lookup messages (e.g. "@stop.motion", "reels by @done", "posts by @done", "done posts", "show @done")
   // must route to creator search rather than being misread as watch/stop commands.
-  if (/^(?:reels?\s+(?:by|of|from)|show|get|fetch|find|creator)\s+@?[a-z0-9._]+$/i.test(lower)) {
+  if (
+    /^(?:(?:show|get|fetch|find)\s+)?(?:(?:reels?|posts?)\s+(?:by|of|from)|show|get|fetch|find|creator)\s+@?[a-z0-9._]+$/i.test(lower) ||
+    /^@?[a-z0-9._]+\s+(?:reels?|posts?)$/i.test(lower)
+  ) {
     return { isCommand: false, markAll: false };
   }
 
@@ -160,10 +165,10 @@ export function formatAddedToWatchLaterCreatorBlock(
 
 /**
  * Formats the "Reminder set" DM with creator attribution, clickable profile URL (when available),
- * and human-readable reel context (never shortcodes).
+ * and human-readable reel or post context (never shortcodes).
  */
 export function formatReminderSetMessage(
-  reel: Pick<SavedReel, 'caption' | 'creator'>,
+  reel: Pick<SavedReel, 'caption' | 'creator' | 'media_type' | 'reel_url'>,
   durationLabel: string,
   formattedTarget: string
 ): string {
@@ -182,7 +187,7 @@ export function formatReminderSetMessage(
  * Formats the automatic 10-hour default reminder notice when a custom duration wait window expires.
  */
 export function formatDefaultReminderNotice(
-  reel: Pick<SavedReel, 'caption' | 'creator'>,
+  reel: Pick<SavedReel, 'caption' | 'creator' | 'media_type' | 'reel_url'>,
   defaultHours: number,
   targetStr: string
 ): string {
@@ -197,72 +202,200 @@ export function formatDefaultReminderNotice(
   );
 }
 
+export interface CreatorSearchMessages {
+  notFound: string;
+  header: string;
+  reelsSectionHeader: string | null;
+  postsSectionHeader: string | null;
+  footer: string;
+}
+
 /**
- * Formats creator-search header, empty-state, and pagination footer messages with tappable profile URLs.
+ * Formats creator-search header, empty-state, split Reels/Posts section headers, and pagination footer messages
+ * with tappable profile URLs.
  */
 export function formatCreatorSearchMessages(params: {
   username: string;
   displayName?: string | null;
-  totalCount: number;
-  limit: number;
-}): { notFound: string; header: string; footer: string } {
+  totalCount?: number;
+  limit?: number;
+  totalReelsCount?: number;
+  totalPostsCount?: number;
+  shownReelsCount?: number;
+  shownPostsCount?: number;
+  mediaFilter?: CreatorMediaFilter;
+}): CreatorSearchMessages {
   const creatorRef = { username: params.username, display_name: params.displayName ?? null };
   const publicHandle = extractPublicCreatorUsername(creatorRef);
   const creatorLabel = formatCreatorDisplayLabel(creatorRef, { includeProfileUrl: false }) || 'this creator';
   const profileLine = publicHandle ? `\n${formatCreatorProfileLine(creatorRef)}` : '';
-  const countLabel = params.totalCount === 1 ? '1 saved reel' : `${params.totalCount} saved reels`;
-  const remaining = Math.max(0, params.totalCount - params.limit);
   const rawQueryHint = String(params.username || '').trim().replace(/^@+/, '');
   const searchHint =
     publicHandle ||
     (!PLACEHOLDER_CREATOR_NAMES.has(rawQueryHint.toLowerCase()) ? rawQueryHint.slice(0, 60) : '') ||
     creatorLabel;
+  const cmdTarget = publicHandle ? `@${publicHandle}` : searchHint;
+  const mediaFilter: CreatorMediaFilter = params.mediaFilter ?? 'all';
 
-  return {
-    notFound:
+  const totalReels =
+    typeof params.totalReelsCount === 'number'
+      ? params.totalReelsCount
+      : mediaFilter === 'post'
+        ? 0
+        : (params.totalCount ?? 0);
+  const totalPosts =
+    typeof params.totalPostsCount === 'number'
+      ? params.totalPostsCount
+      : mediaFilter === 'post'
+        ? (params.totalCount ?? 0)
+        : 0;
+  const shownReels =
+    typeof params.shownReelsCount === 'number'
+      ? params.shownReelsCount
+      : mediaFilter === 'post'
+        ? 0
+        : (params.limit ?? totalReels);
+  const shownPosts =
+    typeof params.shownPostsCount === 'number'
+      ? params.shownPostsCount
+      : mediaFilter === 'post'
+        ? (params.limit ?? totalPosts)
+        : 0;
+
+  let notFound: string;
+  if (mediaFilter === 'reel' && totalPosts > 0) {
+    const postsStr = totalPosts === 1 ? '1 saved post' : `${totalPosts} saved posts`;
+    notFound =
+      `🔍 No saved reels found for Creator: ${creatorLabel} yet.${profileLine}\n\n` +
+      `They do have ${postsStr} — reply "posts by ${cmdTarget}" to view ${totalPosts === 1 ? 'it' : 'them'}.`;
+  } else if (mediaFilter === 'post' && totalReels > 0) {
+    const reelsStr = totalReels === 1 ? '1 saved reel' : `${totalReels} saved reels`;
+    notFound =
+      `🔍 No saved posts found for Creator: ${creatorLabel} yet.${profileLine}\n\n` +
+      `They do have ${reelsStr} — reply "reels by ${cmdTarget}" to view ${totalReels === 1 ? 'it' : 'them'}.`;
+  } else if (mediaFilter === 'reel') {
+    notFound =
       `🔍 No saved reels found for Creator: ${creatorLabel} yet!${profileLine}\n\n` +
-      `Share any Reel link from them here to start tracking.`,
-    header:
-      `🎬 Saved Reels\nCreator: ${creatorLabel}${profileLine}\nFound: ${countLabel}\n\nHere are the latest ${params.limit} reels:`,
+      `Share any Reel link from them here to start tracking.`;
+  } else if (mediaFilter === 'post') {
+    notFound =
+      `🔍 No saved posts found for Creator: ${creatorLabel} yet!${profileLine}\n\n` +
+      `Share any Post link from them here to start tracking.`;
+  } else {
+    notFound =
+      `🔍 No saved reels or posts found for Creator: ${creatorLabel} yet!${profileLine}\n\n` +
+      `Share any Reel or Post link from them here to start tracking.`;
+  }
+
+  // Mixed creator library: isolate Reels vs Posts into dedicated sections
+  if (mediaFilter === 'all' && totalReels > 0 && totalPosts > 0) {
+    const totalItems = totalReels + totalPosts;
+    const reelsPart = totalReels === 1 ? '1 reel' : `${totalReels} reels`;
+    const postsPart = totalPosts === 1 ? '1 post' : `${totalPosts} posts`;
+    const header =
+      `📂 Saved Library\n` +
+      `Creator: ${creatorLabel}${profileLine}\n` +
+      `Found: ${totalItems} saved items (${reelsPart} · ${postsPart})\n\n` +
+      `Reply "reels by ${cmdTarget}" or "posts by ${cmdTarget}" to filter by type.`;
+
+    const reelsSectionHeader =
+      shownReels === 1 && totalReels === 1
+        ? '🎬 Saved Reel (1):'
+        : `🎬 Latest Reels (showing ${shownReels} of ${totalReels}):`;
+    const postsSectionHeader =
+      shownPosts === 1 && totalPosts === 1
+        ? '🖼️ Saved Post (1):'
+        : `🖼️ Latest Posts (showing ${shownPosts} of ${totalPosts}):`;
+
+    const remReels = Math.max(0, totalReels - shownReels);
+    const remPosts = Math.max(0, totalPosts - shownPosts);
+    const remParts: string[] = [];
+    if (remReels > 0) remParts.push(`${remReels} more ${remReels === 1 ? 'reel' : 'reels'}`);
+    if (remPosts > 0) remParts.push(`${remPosts} more ${remPosts === 1 ? 'post' : 'posts'}`);
+    const footer =
+      remParts.length > 0
+        ? `... and ${remParts.join(' & ')} from ${creatorLabel} in your library!${profileLine}\n\n` +
+          `Reply "reels by ${cmdTarget}" or "posts by ${cmdTarget}", or search "${searchHint}" on your web dashboard to see all.`
+        : '';
+
+    return { notFound, header, reelsSectionHeader, postsSectionHeader, footer };
+  }
+
+  // Posts-only (homogeneous posts creator or explicit "posts by @...")
+  if (mediaFilter === 'post' || (totalPosts > 0 && totalReels === 0)) {
+    const countLabel = totalPosts === 1 ? '1 saved post' : `${totalPosts} saved posts`;
+    const latestLabel = shownPosts === 1 ? 'Here is the latest post:' : `Here are the latest ${shownPosts} posts:`;
+    const remPosts = Math.max(0, totalPosts - shownPosts);
+    return {
+      notFound,
+      header: `🖼️ Saved Posts\nCreator: ${creatorLabel}${profileLine}\nFound: ${countLabel}\n\n${latestLabel}`,
+      reelsSectionHeader: null,
+      postsSectionHeader: null,
+      footer:
+        remPosts > 0
+          ? `... and ${remPosts} more ${remPosts === 1 ? 'post' : 'posts'} from ${creatorLabel} in your library!${profileLine}\n\n` +
+            `Search "${searchHint}" on your web dashboard to see all.`
+          : '',
+    };
+  }
+
+  // Reels-only (homogeneous reels creator or explicit "reels by @...")
+  const countLabel = totalReels === 1 ? '1 saved reel' : `${totalReels} saved reels`;
+  const latestLabel = shownReels === 1 ? 'Here is the latest reel:' : `Here are the latest ${shownReels} reels:`;
+  const remReels = Math.max(0, totalReels - shownReels);
+  return {
+    notFound,
+    header: `🎬 Saved Reels\nCreator: ${creatorLabel}${profileLine}\nFound: ${countLabel}\n\n${latestLabel}`,
+    reelsSectionHeader: null,
+    postsSectionHeader: null,
     footer:
-      `... and ${remaining} more reels from ${creatorLabel} in your library!${profileLine}\n\n` +
-      `Search "${searchHint}" on your web dashboard to see all.`,
+      remReels > 0
+        ? `... and ${remReels} more ${remReels === 1 ? 'reel' : 'reels'} from ${creatorLabel} in your library!${profileLine}\n\n` +
+          `Search "${searchHint}" on your web dashboard to see all.`
+        : '',
   };
 }
 
 /**
- * Formats a human-readable identifier for a saved reel using creator identity and caption context,
+ * Formats a human-readable identifier for a saved reel or post using creator identity, media type, and caption context,
  * never falling back to opaque shortcodes or database IDs.
  */
 export function formatHumanReelLabel(
-  reel: Pick<SavedReel, 'caption' | 'creator'>,
+  reel: Pick<SavedReel, 'caption' | 'creator' | 'media_type' | 'reel_url'>,
   maxCaptionChars = 48
 ): string {
   const creatorLabel = formatCreatorDisplayLabel(reel.creator, { includeProfileUrl: false });
   const captionSnippet = formatHumanCaptionSnippet(reel.caption, maxCaptionChars);
+  const mediaNoun = classifySavedMediaType({ mediaType: reel.media_type, reelUrl: reel.reel_url }) === 'post' ? 'post' : 'reel';
 
   if (creatorLabel && captionSnippet) {
-    return `${creatorLabel}'s reel ("${captionSnippet}")`;
+    return `${creatorLabel}'s ${mediaNoun} ("${captionSnippet}")`;
   }
   if (creatorLabel) {
-    return `${creatorLabel}'s saved reel`;
+    return `${creatorLabel}'s saved ${mediaNoun}`;
   }
   if (captionSnippet) {
-    return `your saved reel ("${captionSnippet}")`;
+    return `your saved ${mediaNoun} ("${captionSnippet}")`;
   }
-  return 'your saved reel';
+  return `your saved ${mediaNoun}`;
 }
 
 /**
- * Formats the Watch Later reminder DM so the Reel URL appears BEFORE the creator profile URL,
- * keeping Instagram's rich Reel thumbnail preview intact while making both Reel and Creator Profile clickable.
+ * Formats the Watch Later reminder DM so the Item URL appears BEFORE the creator profile URL,
+ * keeping Instagram's rich thumbnail preview intact while making both Item and Creator Profile clickable.
  */
 export function formatWatchLaterReminderMessage(
-  reel: Pick<SavedReel, 'reel_url' | 'caption' | 'creator'>
+  reel: Pick<SavedReel, 'reel_url' | 'caption' | 'creator' | 'media_type'>
 ): string {
+  const isPost = classifySavedMediaType({ mediaType: reel.media_type, reelUrl: reel.reel_url }) === 'post';
   const publicHandle = extractPublicCreatorUsername(reel.creator);
   const creatorDisplay = formatCreatorDisplayLabel(reel.creator, { includeProfileUrl: false });
-  const creatorHeader = creatorDisplay ? `🎬 ${creatorDisplay}` : '🎬 Saved Reel';
+  const creatorHeader = creatorDisplay
+    ? `${isPost ? '🖼️' : '🎬'} ${creatorDisplay}`
+    : isPost
+      ? '🖼️ Saved Post'
+      : '🎬 Saved Reel';
+  const actionLabel = isPost ? '👉 View Post:' : '👉 Watch Reel:';
   const captionSnippet = formatHumanCaptionSnippet(reel.caption, 70);
   const captionLine = captionSnippet ? `"${captionSnippet}"\n` : '';
   const profileLine = publicHandle
@@ -273,14 +406,14 @@ export function formatWatchLaterReminderMessage(
     `🔔 Watch Later Reminder!\n\n` +
     `${creatorHeader}\n` +
     `${captionLine}` +
-    `👉 Watch Reel: ${reel.reel_url}` +
+    `${actionLabel} ${reel.reel_url}` +
     `${profileLine}\n\n` +
     `Reply "watched" when done, or reply e.g. "5m" or "snooze 1h" to delay!`
   );
 }
 
 /**
- * Formats the confirmation DM sent after marking one or all Watch Later reels as watched.
+ * Formats the confirmation DM sent after marking one or all Watch Later items as watched.
  */
 export function formatWatchedConfirmationMessage(
   updatedReels: SavedReel[],
@@ -294,10 +427,15 @@ export function formatWatchedConfirmationMessage(
   const primaryLabel = formatHumanReelLabel(updatedReels[0], 48);
 
   if (markAll && updatedReels.length > 1) {
+    const types = new Set<SavedMediaType>(
+      updatedReels.map((r) => classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }))
+    );
+    const bulkNoun = types.size === 1 ? (types.has('post') ? 'posts' : 'reels') : 'items';
+
     if (remainingCount === 0) {
-      return `✅ Marked all ${updatedReels.length} pending reels as watched (latest: ${primaryLabel})! All reminders stopped.`;
+      return `✅ Marked all ${updatedReels.length} pending ${bulkNoun} as watched (latest: ${primaryLabel})! All reminders stopped.`;
     }
-    return `✅ Marked ${updatedReels.length} pending reels as watched (latest: ${primaryLabel}). ${remainingCount} other Watch Later ${remainingCount === 1 ? 'reminder remains' : 'reminders remain'} active.`;
+    return `✅ Marked ${updatedReels.length} pending ${bulkNoun} as watched (latest: ${primaryLabel}). ${remainingCount} other Watch Later ${remainingCount === 1 ? 'reminder remains' : 'reminders remain'} active.`;
   }
 
   if (remainingCount > 0) {

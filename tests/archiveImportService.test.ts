@@ -213,6 +213,82 @@ async function runTests() {
   assert.equal(pinnedResult.creators.length, 1);
   assert.equal(pinnedResult.creators[0]?.id, reel7.creator_id);
 
+  // Test 8: Media type isolation (/p/ posts vs /reel/ & /tv/ reels) and repository filtering
+  console.log('Test 8: Media type isolation for /p/ posts vs /reel/ and /tv/ reels');
+  const mixedMediaExport = {
+    saved_saved_media: [
+      {
+        title: 'the_political_compass',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/p/DS1goOmjhUi/',
+            timestamp: 1700001000,
+          },
+        },
+      },
+      {
+        title: 'the_political_compass',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/the_political_compass/p/DUCwaqkjmvc/',
+            timestamp: 1700001100,
+          },
+        },
+      },
+      {
+        title: 'the_political_compass',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/reel/DT_x3F4Dj3-/',
+            timestamp: 1700001200,
+          },
+        },
+      },
+      {
+        title: 'the_political_compass',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/tv/DIgtv123456/',
+            timestamp: 1700001300,
+          },
+        },
+      },
+    ],
+  };
+
+  const res8 = await ArchiveImportService.importArchive(mixedMediaExport);
+  assert.equal(res8.status, 'success');
+  assert.equal(res8.reelsImported, 4);
+
+  const { reels: postsOnly, total: totalPostsFiltered } = await Repository.getReels({
+    mediaType: 'post',
+    limit: 50,
+  });
+  assert.equal(totalPostsFiltered, 2, 'Expected exact count of 2 saved posts');
+  assert.ok(postsOnly.every((item) => item.media_type === 'post'), 'Every item under mediaType=post must be a post');
+
+  const post1 = postsOnly.find((item) => item.shortcode === 'DS1goOmjhUi');
+  const post2 = postsOnly.find((item) => item.shortcode === 'DUCwaqkjmvc');
+  assert.equal(post1?.reel_url, 'https://www.instagram.com/p/DS1goOmjhUi/');
+  assert.equal(post2?.reel_url, 'https://www.instagram.com/p/DUCwaqkjmvc/');
+
+  const { reels: reelsOnly, total: totalReelsFiltered } = await Repository.getReels({
+    mediaType: 'reel',
+    limit: 50,
+  });
+  assert.ok(totalReelsFiltered >= 2);
+  assert.ok(reelsOnly.every((item) => item.media_type === 'reel'), 'Every item under mediaType=reel must be a reel');
+
+  const importedReel = reelsOnly.find((item) => item.shortcode === 'DT_x3F4Dj3-');
+  const importedTv = reelsOnly.find((item) => item.shortcode === 'DIgtv123456');
+  assert.equal(importedReel?.reel_url, 'https://www.instagram.com/reel/DT_x3F4Dj3-/');
+  assert.equal(importedTv?.reel_url, 'https://www.instagram.com/tv/DIgtv123456/');
+
+  const statsAfterMixed = await Repository.getStats();
+  assert.equal(statsAfterMixed.postsCount, 2);
+  assert.equal(statsAfterMixed.reelsCount, totalReelsFiltered);
+  assert.equal(statsAfterMixed.totalReels, statsAfterMixed.reelsCount + statsAfterMixed.postsCount);
+
   console.log('✅ All ArchiveImportService tests passed successfully!');
 }
 
