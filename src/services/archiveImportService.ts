@@ -16,6 +16,7 @@ export interface ArchiveImportResult {
   totalProcessed: number;
   reelsImported: number;
   alreadyPresent: number;
+  savedAtBackfilled: number;
   creatorsAdded: number;
   skipped: number;
   errors: string[];
@@ -70,6 +71,7 @@ export class ArchiveImportService {
           totalProcessed: 0,
           reelsImported: 0,
           alreadyPresent: 0,
+          savedAtBackfilled: 0,
           creatorsAdded: 0,
           skipped: 0,
           errors: ['Failed to parse JSON file: malformed JSON format.'],
@@ -117,6 +119,7 @@ export class ArchiveImportService {
         totalProcessed: 0,
         reelsImported: 0,
         alreadyPresent: 0,
+        savedAtBackfilled: 0,
         creatorsAdded: 0,
         skipped: 0,
         errors: ['No saved media items found in the provided export file.'],
@@ -299,6 +302,7 @@ export class ArchiveImportService {
 
     let reelsImported = 0;
     let alreadyPresent = 0;
+    let savedAtBackfilled = 0;
     const creatorsSeen = new Set<string>();
     const parsedCandidates = Array.from(candidatesByShortcode.values());
 
@@ -403,10 +407,14 @@ export class ArchiveImportService {
           }
         }
 
-        // Batch upsert saved reels
-        const batchResult = await Repository.upsertSavedReelsBatch(reelsPayload, { ignoreDuplicates: true });
+        // Batch upsert saved reels (backfilling missing saved_at on already-synced/DMed items)
+        const batchResult = await Repository.upsertSavedReelsBatch(reelsPayload, {
+          ignoreDuplicates: true,
+          backfillMissingSavedAt: true,
+        });
         reelsImported = batchResult.newlyImported;
         alreadyPresent = batchResult.alreadyPresent;
+        savedAtBackfilled = batchResult.savedAtBackfilled;
 
         if (batchResult.failedShortcodes.length > 0) {
           for (const sc of batchResult.failedShortcodes) {
@@ -438,6 +446,7 @@ export class ArchiveImportService {
       totalProcessed,
       reelsImported,
       alreadyPresent,
+      savedAtBackfilled,
       creatorsAdded: creatorsSeen.size,
       skipped: totalProcessed - totalRecognized,
       errors: errors.slice(0, 5),

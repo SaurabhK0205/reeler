@@ -1364,3 +1364,115 @@ test('ReminderWorker.pollInboundDMs bounds failed admin DM retries, ignores bot 
     else delete process.env.INSTAGRAM_USER_ID;
   }
 });
+
+test('MetaInstagramBotService populates saved_at on new DM saves while preserving null saved_at on synced items', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  const originalFetch = globalThis.fetch;
+  try {
+    const { Repository } = await import('../src/db/repository.ts');
+    Repository.resetMemoryStoreForTests();
+
+    const creator = await Repository.upsertCreator({
+      instagram_user_id: 'creator_dm_saved_at',
+      username: 'saved_date_creator',
+      display_name: 'Saved Date Creator',
+    });
+
+    await Repository.upsertSavedReel({
+      instagram_media_id: '4023660617817200517_76670992220',
+      shortcode: 'DSyncedNoDate',
+      reel_url: 'https://www.instagram.com/reel/DSyncedNoDate/',
+      media_type: 'reel',
+      creator_id: creator.id,
+      caption: 'Synced item without saved_at',
+      taken_at: '2026-11-05T11:22:28Z',
+      saved_at: null,
+      first_detected_at: '2026-11-06T14:45:00Z',
+      save_order_rank: 1,
+    });
+
+    globalThis.fetch = (async () =>
+      new Response(
+        `<html><head>
+          <meta property="og:url" content="https://www.instagram.com/saved_date_creator/reel/DFreshDmSave/" />
+          <meta property="og:title" content="Saved Date Creator (@saved_date_creator) on Instagram" />
+          <meta property="og:description" content="10 likes: &quot;Fresh DM&quot;." />
+        </head></html>`,
+        { status: 200, headers: { 'Content-Type': 'text/html' } }
+      )) as typeof fetch;
+
+    const bot = new MetaInstagramBotService();
+    Object.defineProperty(bot, 'isConfigured', { get: () => true });
+    bot.sendDirectMessage = async () => true;
+
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: 'sender_dm_date' }, message: { text: 'https://www.instagram.com/reel/DFreshDmSave/ 2h' } },
+            { sender: { id: 'sender_dm_date' }, message: { text: 'https://www.instagram.com/reel/DSyncedNoDate/ 2h' } },
+          ],
+        },
+      ],
+    });
+
+    const freshItem = await Repository.getSavedItemByShortcode('DFreshDmSave');
+    assert.ok(freshItem?.saved_at, 'Brand-new DM save should populate saved_at');
+
+    const syncedItem = await Repository.getSavedItemByShortcode('DSyncedNoDate');
+    assert.strictEqual(syncedItem?.saved_at, null, 'Existing synced item must preserve null saved_at for future archive backfill');
+
+    // Also verify ReminderWorker with rich mediaId attachment preserves archive saved_at and null synced saved_at
+    const { ReminderWorker } = await import('../src/services/reminderWorker.ts');
+    const worker = new ReminderWorker();
+    const workerAny = worker as any;
+    workerAny.actionClient = {
+      saveMedia: async () => ({ success: false, data: false }),
+      sendDirectMessage: async () => true,
+    };
+
+    await Repository.upsertSavedReel({
+      instagram_media_id: '18084562202349999',
+      shortcode: 'DArchivedWorker',
+      reel_url: 'https://www.instagram.com/reel/DArchivedWorker/',
+      media_type: 'reel',
+      creator_id: creator.id,
+      caption: 'Archived in 2024',
+      taken_at: '2024-05-01T10:00:00.000Z',
+      saved_at: '2024-05-02T12:00:00.000Z',
+      first_detected_at: '2024-05-02T12:00:00.000Z',
+      save_order_rank: 42,
+    });
+
+    await workerAny.handleAdminMessage({
+      itemId: 'rich_archive_msg',
+      userId: 'admin_1',
+      timestamp: Date.now(),
+      itemType: 'reel_share',
+      reel: {
+        mediaId: '999999999999',
+        shortcode: 'DArchivedWorker',
+        authorUsername: 'saved_date_creator',
+        caption: 'Archived in 2024',
+        thumbnailUrl: null,
+        mediaType: 'reel',
+        reelUrl: 'https://www.instagram.com/reel/DArchivedWorker/',
+      },
+    });
+
+    const afterWorker = await Repository.getSavedItemByShortcode('DArchivedWorker');
+    assert.strictEqual(afterWorker?.saved_at, '2024-05-02T12:00:00.000Z', 'Worker must preserve original archive saved_at even when mediaId is present');
+    assert.strictEqual(afterWorker?.instagram_media_id, '18084562202349999', 'Worker must preserve existing instagram_media_id');
+
+    Repository.resetMemoryStoreForTests();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+  }
+});

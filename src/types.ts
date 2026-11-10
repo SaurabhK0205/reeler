@@ -24,6 +24,7 @@ export interface SavedReel {
   taken_at: string;
   saved_at?: string | null;
   first_detected_at: string;
+  effective_saved_at?: string | null;
   save_order_rank: number;
   watch_status: WatchStatus;
   duration_seconds?: number | null;
@@ -120,6 +121,7 @@ export function err<E>(error: E): Result<never, E> {
 export interface BatchReelsResult {
   newlyImported: number;
   alreadyPresent: number;
+  savedAtBackfilled: number;
   failedCount: number;
   failedShortcodes: string[];
 }

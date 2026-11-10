@@ -171,7 +171,7 @@ export class ReminderWorker {
     // Case 1: Reel or Post was shared!
     if (msg.reel) {
       const { mediaId, shortcode, authorUsername, caption, thumbnailUrl, mediaType, reelUrl } = msg.reel;
-      const existingItem = !mediaId && shortcode ? await Repository.getSavedItemByShortcode(shortcode) : null;
+      const existingItem = shortcode ? await Repository.getSavedItemByShortcode(shortcode) : null;
       const isTextFallbackReel = !mediaId && mediaType === 'reel' && !/\/p\//i.test(reelUrl || '');
       const resolvedMediaType =
         isTextFallbackReel && existingItem
@@ -193,16 +193,23 @@ export class ReminderWorker {
         }
       }
 
-      // 2. Upsert creator
+      // 2. Upsert creator (avoid overwriting an unrelated handle like instagram_unknown)
       const creatorUsername = authorUsername || existingItem?.creator?.username || 'instagram_user';
+      const sameCreatorHandle =
+        !authorUsername ||
+        !existingItem?.creator?.username ||
+        authorUsername.toLowerCase() === existingItem.creator.username.toLowerCase();
       const creator = await Repository.upsertCreator({
-        instagram_user_id: existingItem?.creator?.instagram_user_id || creatorUsername,
+        instagram_user_id:
+          (sameCreatorHandle ? existingItem?.creator?.instagram_user_id : undefined) || creatorUsername,
         username: creatorUsername,
-        display_name: existingItem?.creator?.display_name || creatorUsername,
+        display_name:
+          (sameCreatorHandle ? existingItem?.creator?.display_name : undefined) || creatorUsername,
       });
 
       // 3. Upsert item into Supabase with watch_status = 'watch_later'
       const nextReminderDate = new Date(Date.now() + intervalHours * 60 * 60 * 1000).toISOString();
+      const nowIso = new Date().toISOString();
       await Repository.upsertSavedReel({
         instagram_media_id: existingItem?.instagram_media_id || mediaId || `id_${shortcode}`,
         shortcode,
@@ -211,9 +218,9 @@ export class ReminderWorker {
         creator_id: creator.id,
         caption: caption || existingItem?.caption || null,
         thumbnail_url: thumbnailUrl || existingItem?.thumbnail_url || null,
-        taken_at: existingItem?.taken_at || new Date().toISOString(),
-        saved_at: existingItem?.saved_at || new Date().toISOString(),
-        first_detected_at: existingItem?.first_detected_at || new Date().toISOString(),
+        taken_at: existingItem?.taken_at || nowIso,
+        saved_at: existingItem ? (existingItem.saved_at ?? null) : nowIso,
+        first_detected_at: existingItem?.first_detected_at || nowIso,
         save_order_rank: existingItem?.save_order_rank ?? 1,
         watch_status: 'watch_later',
         reminder_interval_hours: intervalHours,
