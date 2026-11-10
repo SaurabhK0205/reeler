@@ -1272,3 +1272,95 @@ test('Repository.getSavedItemByShortcode throws on Supabase query errors so Meta
     else delete process.env.SUPABASE_ANON_KEY;
   }
 });
+
+test('ReminderWorker.pollInboundDMs bounds failed admin DM retries, ignores bot replies without tracking, and prunes stale IDs', async () => {
+  const prevAdminUsername = process.env.ADMIN_USERNAME;
+  const prevIgUserId = process.env.INSTAGRAM_USER_ID;
+
+  try {
+    process.env.ADMIN_USERNAME = 'admin_tester';
+    process.env.INSTAGRAM_USER_ID = 'bot_user_999';
+
+    const { ReminderWorker } = await import('../src/services/reminderWorker.ts');
+    const worker = new ReminderWorker();
+    const internal = worker as any;
+    internal.adminThreadId = 'thread_1';
+    internal.adminUserId = 'admin_1';
+
+    let currentMessages = [
+      { itemId: 'bot_msg_1', userId: 'bot_user_999', timestamp: 1, itemType: 'text', text: 'bot echo' },
+      { itemId: 'transient_msg', userId: 'admin_1', timestamp: 2, itemType: 'text', text: 'transient' },
+      { itemId: 'perm_fail_msg', userId: 'admin_1', timestamp: 3, itemType: 'text', text: 'broken' },
+    ];
+
+    internal.actionClient = {
+      getThreadMessages: async () => ({ success: true, data: currentMessages }),
+    };
+
+    const callCounts = new Map<string, number>();
+    let transientShouldFail = true;
+
+    internal.handleAdminMessage = async (msg: { itemId: string }) => {
+      callCounts.set(msg.itemId, (callCounts.get(msg.itemId) ?? 0) + 1);
+      if (msg.itemId === 'perm_fail_msg') {
+        throw new Error('permanent error');
+      }
+      if (msg.itemId === 'transient_msg' && transientShouldFail) {
+        throw new Error('transient error');
+      }
+    };
+
+    // Poll 1: transient fails (1), perm fails (1), bot reply ignored without being tracked
+    await worker.pollInboundDMs();
+    assert.strictEqual(callCounts.get('bot_msg_1'), undefined);
+    assert.strictEqual(internal.processedItemIds.has('bot_msg_1'), false);
+    assert.strictEqual(internal.failedItemAttempts.get('transient_msg'), 1);
+    assert.strictEqual(internal.failedItemAttempts.get('perm_fail_msg'), 1);
+
+    // Poll 2: transient succeeds and clears failures; perm fails (2)
+    transientShouldFail = false;
+    await worker.pollInboundDMs();
+    assert.strictEqual(callCounts.get('transient_msg'), 2);
+    assert.strictEqual(internal.processedItemIds.has('transient_msg'), true);
+    assert.strictEqual(internal.failedItemAttempts.has('transient_msg'), false);
+    assert.strictEqual(internal.failedItemAttempts.get('perm_fail_msg'), 2);
+
+    // Poll 3: transient skipped; perm fails attempt 3 -> marked processed & removed from failure map
+    await worker.pollInboundDMs();
+    assert.strictEqual(callCounts.get('transient_msg'), 2);
+    assert.strictEqual(callCounts.get('perm_fail_msg'), 3);
+    assert.strictEqual(internal.processedItemIds.has('perm_fail_msg'), true);
+    assert.strictEqual(internal.failedItemAttempts.has('perm_fail_msg'), false);
+
+    // Poll 4: permanent failure is not retried again
+    await worker.pollInboundDMs();
+    assert.strictEqual(callCounts.get('perm_fail_msg'), 3);
+
+    // Poll 5: stale IDs outside latest window are pruned, keeping processedItemIds bounded
+    currentMessages = [
+      { itemId: 'fresh_msg', userId: 'admin_1', timestamp: 4, itemType: 'text', text: 'fresh' },
+    ];
+    await worker.pollInboundDMs();
+    assert.strictEqual(internal.processedItemIds.has('transient_msg'), false);
+    assert.strictEqual(internal.processedItemIds.has('perm_fail_msg'), false);
+    assert.strictEqual(internal.processedItemIds.has('fresh_msg'), true);
+    assert.strictEqual(internal.processedItemIds.size, 1);
+
+    // Bounded capacity safeguard even if active thread payload exceeds 1000 items
+    const largeBatch = Array.from({ length: 1005 }, (_, i) => ({
+      itemId: `bulk_${i}`,
+      userId: 'admin_1',
+      timestamp: 100 + i,
+      itemType: 'text',
+      text: `msg ${i}`,
+    }));
+    currentMessages = largeBatch;
+    await worker.pollInboundDMs();
+    assert.ok(internal.processedItemIds.size <= 1000, `Expected <= 1000, got ${internal.processedItemIds.size}`);
+  } finally {
+    if (prevAdminUsername !== undefined) process.env.ADMIN_USERNAME = prevAdminUsername;
+    else delete process.env.ADMIN_USERNAME;
+    if (prevIgUserId !== undefined) process.env.INSTAGRAM_USER_ID = prevIgUserId;
+    else delete process.env.INSTAGRAM_USER_ID;
+  }
+});

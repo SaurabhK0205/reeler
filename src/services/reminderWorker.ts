@@ -14,9 +14,12 @@ import {
 } from '../utils/reelMessages.ts';
 
 export class ReminderWorker {
+  private static readonly MAX_ITEM_ATTEMPTS = 3;
+  private static readonly MAX_TRACKED_ITEM_IDS = 1000;
   private actionClient = new InstagramActionClient();
   private metaBot = new MetaInstagramBotService();
   private processedItemIds = new Set<string>();
+  private failedItemAttempts = new Map<string, number>();
   private isRunning = false;
   private dmInterval: NodeJS.Timeout | null = null;
   private reminderInterval: NodeJS.Timeout | null = null;
@@ -24,6 +27,28 @@ export class ReminderWorker {
   private adminUserId: string | null = null;
   private isDispatching = false;
   private failedReelSuppression = new Map<string, number>();
+
+  private markItemProcessed(itemId: string) {
+    if (!itemId) return;
+    if (this.processedItemIds.has(itemId)) {
+      this.processedItemIds.delete(itemId);
+    } else if (this.processedItemIds.size >= ReminderWorker.MAX_TRACKED_ITEM_IDS) {
+      const oldest = this.processedItemIds.values().next().value;
+      if (oldest) this.processedItemIds.delete(oldest);
+    }
+    this.processedItemIds.add(itemId);
+  }
+
+  private setFailedItemAttempts(itemId: string, attempts: number) {
+    if (!itemId) return;
+    if (this.failedItemAttempts.has(itemId)) {
+      this.failedItemAttempts.delete(itemId);
+    } else if (this.failedItemAttempts.size >= ReminderWorker.MAX_TRACKED_ITEM_IDS) {
+      const oldest = this.failedItemAttempts.keys().next().value;
+      if (oldest) this.failedItemAttempts.delete(oldest);
+    }
+    this.failedItemAttempts.set(itemId, attempts);
+  }
 
   /**
    * Starts the background DM polling and reminder dispatch loops.
@@ -91,21 +116,47 @@ export class ReminderWorker {
     if (!messagesRes.success) return;
 
     const messages = messagesRes.data;
+    const activeIds = new Set(messages.map((m) => m.itemId).filter(Boolean));
+    for (const id of this.processedItemIds) {
+      if (!activeIds.has(id)) {
+        this.processedItemIds.delete(id);
+      }
+    }
+    for (const id of this.failedItemAttempts.keys()) {
+      if (!activeIds.has(id)) {
+        this.failedItemAttempts.delete(id);
+      }
+    }
+
     // Process messages from admin only (newest items first)
     for (const msg of messages) {
-      if (this.processedItemIds.has(msg.itemId)) continue;
+      if (!msg.itemId || this.processedItemIds.has(msg.itemId)) continue;
 
-      // Only handle incoming messages from the admin (not bot's own replies)
+      // Only handle incoming messages from the admin (ignore bot's own replies without storing them)
       if (msg.userId === config.instagram.userId) {
-        this.processedItemIds.add(msg.itemId);
         continue;
       }
 
       try {
         await this.handleAdminMessage(msg);
-        this.processedItemIds.add(msg.itemId);
+        this.markItemProcessed(msg.itemId);
+        this.failedItemAttempts.delete(msg.itemId);
       } catch (err: any) {
-        console.error(`[ReminderWorker] Failed to process admin DM item ${msg.itemId}:`, err?.message || err);
+        const attempts = (this.failedItemAttempts.get(msg.itemId) ?? 0) + 1;
+        if (attempts >= ReminderWorker.MAX_ITEM_ATTEMPTS) {
+          console.error(
+            `[ReminderWorker] Permanent failure processing admin DM item ${msg.itemId} after ${attempts} attempts; marking processed:`,
+            err?.message || err
+          );
+          this.markItemProcessed(msg.itemId);
+          this.failedItemAttempts.delete(msg.itemId);
+        } else {
+          console.error(
+            `[ReminderWorker] Failed to process admin DM item ${msg.itemId} (attempt ${attempts}/${ReminderWorker.MAX_ITEM_ATTEMPTS}):`,
+            err?.message || err
+          );
+          this.setFailedItemAttempts(msg.itemId, attempts);
+        }
       }
     }
   }
