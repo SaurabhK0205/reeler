@@ -1826,12 +1826,12 @@ test('MetaInstagramBotService and Repository preserve existing sender Watch Late
     // Rejections sent with honest notice, never success confirmation or shortcodes
     assert.strictEqual(sentMessages.length, 2);
     assert.strictEqual(sentMessages[0].recipientId, 'sender_beta');
-    assert.ok(sentMessages[0].text.includes('already has an active reminder for another sender'));
+    assert.ok(sentMessages[0].text.includes('already has an active reminder'));
     assert.ok(!sentMessages[0].text.includes('Added to your Watch Later'));
     assert.ok(!sentMessages[0].text.includes('DConflictReel1'));
 
     assert.strictEqual(sentMessages[1].recipientId, 'sender_beta');
-    assert.ok(sentMessages[1].text.includes('already has an active reminder for another sender'));
+    assert.ok(sentMessages[1].text.includes('already has an active reminder'));
     assert.ok(sentMessages[1].text.includes('post'));
     assert.ok(!sentMessages[1].text.includes('Added post to your Watch Later'));
     assert.ok(!sentMessages[1].text.includes('DConflictPost1'));
@@ -1942,9 +1942,14 @@ test('MetaInstagramBotService and Repository preserve existing sender Watch Late
               { status: 200, headers: { 'Content-Type': 'application/json' } }
             );
           }
-          // 3) Guarded PATCH includes atomic `.or(...)` ownership filter and matches 0 rows (null)
+          // 3) Guarded PATCH includes strict atomic `.or(...)` ownership filter (rejects unattributed active too) and matches 0 rows (null)
           if (method === 'PATCH') {
-            if (target.includes('watch_status.neq.watch_later') && target.includes('sender_beta')) {
+            if (
+              target.includes('watch_status.neq.watch_later') &&
+              target.includes('sender_beta') &&
+              !target.includes('instagram_sender_id.is.null') &&
+              !target.includes('instagram_sender_id.eq.%22%22')
+            ) {
               sawAtomicGuardOrFilter = true;
             }
             return new Response(JSON.stringify(null), {
@@ -1972,7 +1977,7 @@ test('MetaInstagramBotService and Repository preserve existing sender Watch Late
     assert.strictEqual(sawAtomicGuardOrFilter, true, 'Supabase update must include atomic PostgREST sender ownership guard');
     assert.strictEqual(sentMessages.length, 1);
     assert.strictEqual(sentMessages[0].recipientId, 'sender_beta');
-    assert.ok(sentMessages[0].text.includes('already has an active reminder for another sender'));
+    assert.ok(sentMessages[0].text.includes('already has an active reminder'));
     assert.ok(!sentMessages[0].text.includes('Added to your Watch Later'));
 
     await assert.rejects(
@@ -1990,6 +1995,255 @@ test('MetaInstagramBotService and Repository preserve existing sender Watch Late
           instagram_sender_id: 'sender_beta',
         }),
       (e: unknown) => e instanceof SenderReminderConflictError
+    );
+  } finally {
+    resetSupabaseClientForTests();
+    globalThis.fetch = originalFetch;
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    else delete process.env.SUPABASE_URL;
+    if (prevServiceKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevServiceKey;
+    else delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (prevAnonKey !== undefined) process.env.SUPABASE_ANON_KEY = prevAnonKey;
+    else delete process.env.SUPABASE_ANON_KEY;
+  }
+});
+
+test('Repository and MetaInstagramBotService protect unattributed active reminders while preserving admin rescheduling, post-watched claiming, and scoped stop updates', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const prevAnonKey = process.env.SUPABASE_ANON_KEY;
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  delete process.env.SUPABASE_ANON_KEY;
+
+  const originalFetch = globalThis.fetch;
+  const { resetSupabaseClientForTests } = await import('../src/db/client.ts');
+  const { Repository, SenderReminderConflictError } = await import('../src/db/repository.ts');
+  try {
+    Repository.resetMemoryStoreForTests();
+    globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
+
+    const sentMessages: Array<{ recipientId: string; text: string }> = [];
+    const bot = new MetaInstagramBotService();
+    bot.sendDirectMessage = async (recipientId: string, text: string) => {
+      sentMessages.push({ recipientId, text });
+      return true;
+    };
+
+    const creator = await Repository.upsertCreator({
+      instagram_user_id: 'admin_creator_1',
+      username: 'admin_creator',
+      display_name: 'Admin Creator',
+    });
+
+    const initialAdminReminderAt = new Date(Date.now() + 10 * 3600 * 1000).toISOString();
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'admin_media_1',
+      shortcode: 'DAdminActive1',
+      reel_url: 'https://www.instagram.com/reel/DAdminActive1/',
+      media_type: 'reel',
+      creator_id: creator.id,
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 1,
+      watch_status: 'watch_later',
+      reminder_interval_hours: 10,
+      next_reminder_at: initialAdminReminderAt,
+      is_saved_on_instagram: true,
+    });
+
+    // 1. Outside sender sharing an unattributed active Watch Later item is rejected without altering reminder or ownership
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: 'outside_sender_1' }, message: { text: 'https://www.instagram.com/reel/DAdminActive1/ 15m' } },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.strictEqual(sentMessages[0].recipientId, 'outside_sender_1');
+    assert.ok(sentMessages[0].text.includes('already has an active reminder'));
+    assert.ok(!sentMessages[0].text.includes('Added to your Watch Later'));
+
+    const untouchedAdminItem = await Repository.getSavedItemByShortcode('DAdminActive1');
+    assert.strictEqual(untouchedAdminItem?.watch_status, 'watch_later');
+    assert.strictEqual(untouchedAdminItem?.instagram_sender_id, undefined);
+    assert.strictEqual(untouchedAdminItem?.next_reminder_at, initialAdminReminderAt);
+
+    // Direct Repository upsert by outside sender must also fail closed on unattributed active reminder
+    await assert.rejects(
+      () =>
+        Repository.upsertSavedReel({
+          instagram_media_id: 'admin_media_1',
+          shortcode: 'DAdminActive1',
+          reel_url: 'https://www.instagram.com/reel/DAdminActive1/',
+          media_type: 'reel',
+          creator_id: creator.id,
+          taken_at: new Date().toISOString(),
+          first_detected_at: new Date().toISOString(),
+          save_order_rank: 1,
+          watch_status: 'watch_later',
+          instagram_sender_id: 'outside_sender_1',
+        }),
+      (e: unknown) => e instanceof SenderReminderConflictError
+    );
+
+    // 2. Admin rescheduling (no incoming sender) still works on unattributed active reminder
+    const rescheduledAdminAt = new Date(Date.now() + 2 * 3600 * 1000).toISOString();
+    const adminUpdated = await Repository.upsertSavedReel({
+      instagram_media_id: 'admin_media_1',
+      shortcode: 'DAdminActive1',
+      reel_url: 'https://www.instagram.com/reel/DAdminActive1/',
+      media_type: 'reel',
+      creator_id: creator.id,
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 1,
+      watch_status: 'watch_later',
+      reminder_interval_hours: 2,
+      next_reminder_at: rescheduledAdminAt,
+      is_saved_on_instagram: true,
+    });
+    assert.strictEqual(adminUpdated?.next_reminder_at, rescheduledAdminAt);
+    assert.strictEqual(adminUpdated?.reminder_interval_hours, 2);
+
+    // 3. Once admin marks it watched, an external sender can schedule and claim it
+    const adminStop = await Repository.markWatchedForInstagramSender('', { includeUnattributedFallback: true });
+    assert.strictEqual(adminStop.updatedReels.length, 1);
+
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: 'outside_sender_1' }, message: { text: 'https://www.instagram.com/reel/DAdminActive1/ 45m' } },
+          ],
+        },
+      ],
+    });
+    const claimedItem = await Repository.getSavedItemByShortcode('DAdminActive1');
+    assert.strictEqual(claimedItem?.watch_status, 'watch_later');
+    assert.strictEqual(claimedItem?.instagram_sender_id, 'outside_sender_1');
+    assert.strictEqual(claimedItem?.reminder_interval_seconds, 2700);
+    assert.ok(sentMessages[0]?.text.includes('Added to your Watch Later!'));
+
+    Repository.resetMemoryStoreForTests();
+
+    // 4. Supabase atomic guard rejects concurrent unattributed active takeover AND scopes markWatched PATCH by sender
+    resetSupabaseClientForTests();
+    process.env.SUPABASE_URL = 'https://mock-reeler-test.supabase.co';
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'mock-service-role-key';
+
+    let sawUnattrStrictGuard = false;
+    const stopPatchUrls: string[] = [];
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const target = String(url);
+      const method = (init?.method || 'GET').toUpperCase();
+      if (target.startsWith('https://mock-reeler-test.supabase.co/rest/v1/saved_reels')) {
+        if (method === 'POST') {
+          return new Response(JSON.stringify(null), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (
+          method === 'GET' &&
+          (target.includes('instagram_media_id=eq.unattr_media_1') || target.includes('shortcode=eq.DUnattrRace'))
+        ) {
+          return new Response(
+            JSON.stringify({
+              id: 'uuid_unattr_1',
+              instagram_media_id: 'unattr_media_1',
+              shortcode: 'DUnattrRace',
+              reel_url: 'https://www.instagram.com/reel/DUnattrRace/',
+              media_type: 'reel',
+              creator_id: 'creator_1',
+              watch_status: 'unwatched',
+              instagram_sender_id: null,
+              is_saved_on_instagram: true,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (method === 'GET' && target.includes('id=eq.uuid_unattr_1')) {
+          return new Response(
+            JSON.stringify({
+              id: 'uuid_unattr_1',
+              watch_status: 'watch_later',
+              instagram_sender_id: null,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (method === 'PATCH' && target.includes('id=eq.uuid_unattr_1')) {
+          if (
+            target.includes('watch_status.neq.watch_later') &&
+            target.includes('outside_sender_1') &&
+            !target.includes('instagram_sender_id.is.null')
+          ) {
+            sawUnattrStrictGuard = true;
+          }
+          return new Response(JSON.stringify(null), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (method === 'GET' && target.includes('watch_status=eq.watch_later')) {
+          return new Response(
+            JSON.stringify([
+              {
+                id: 'uuid_stop_1',
+                shortcode: 'DStopGuard1',
+                reel_url: 'https://www.instagram.com/reel/DStopGuard1/',
+                media_type: 'reel',
+                watch_status: 'watch_later',
+                instagram_sender_id: target.includes('instagram_sender_id=eq.sender_alpha') ? 'sender_alpha' : null,
+                updated_at: new Date().toISOString(),
+                created_at: new Date().toISOString(),
+                creator: { id: 'c1', instagram_user_id: 'u1', username: 'creator1' },
+              },
+            ]),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (method === 'PATCH' && target.includes('watch_status=eq.watch_later')) {
+          stopPatchUrls.push(target);
+          return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+      }
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+
+    await assert.rejects(
+      () =>
+        Repository.upsertSavedReel({
+          instagram_media_id: 'unattr_media_1',
+          shortcode: 'DUnattrRace',
+          reel_url: 'https://www.instagram.com/reel/DUnattrRace/',
+          media_type: 'reel',
+          creator_id: 'creator_1',
+          taken_at: new Date().toISOString(),
+          first_detected_at: new Date().toISOString(),
+          save_order_rank: 1,
+          watch_status: 'watch_later',
+          instagram_sender_id: 'outside_sender_1',
+        }),
+      (e: unknown) => e instanceof SenderReminderConflictError
+    );
+    assert.strictEqual(sawUnattrStrictGuard, true, 'Supabase update must reject active unattributed takeover atomically');
+
+    await Repository.markWatchedForInstagramSender('sender_alpha', { markAll: true });
+    await Repository.markWatchedForInstagramSender('', { markAll: true, includeUnattributedFallback: true });
+
+    assert.strictEqual(stopPatchUrls.length, 2);
+    assert.ok(
+      stopPatchUrls[0].includes('instagram_sender_id=eq.sender_alpha'),
+      'Exact-sender stop UPDATE must retain sender predicate so a concurrently reclaimed item cannot be cleared'
+    );
+    assert.ok(
+      stopPatchUrls[1].includes('instagram_sender_id.is.null') && stopPatchUrls[1].includes('instagram_sender_id.eq.'),
+      'Unattributed fallback stop UPDATE must retain unattributed predicate'
     );
   } finally {
     resetSupabaseClientForTests();
