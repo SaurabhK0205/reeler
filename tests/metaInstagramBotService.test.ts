@@ -1185,7 +1185,7 @@ test('MetaInstagramBotService preserves recovered post classification on inconcl
   }
 });
 
-test('Repository.getSavedItemByShortcode throws on Supabase query errors so MetaInstagramBotService fails closed without overwriting posts', async () => {
+test('Repository.getSavedItemByShortcode throws on Supabase query errors so MetaInstagramBotService fails closed per-event while continuing batch processing', async () => {
   const prevUrl = process.env.SUPABASE_URL;
   const prevServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   const prevAnonKey = process.env.SUPABASE_ANON_KEY;
@@ -1200,22 +1200,69 @@ test('Repository.getSavedItemByShortcode throws on Supabase query errors so Meta
     process.env.SUPABASE_SERVICE_ROLE_KEY = 'mock-service-role-key';
     delete process.env.SUPABASE_ANON_KEY;
 
-    let supabaseWriteAttempted = false;
+    const failedShortcodes = new Set(['DS1goOmjhUi', 'DFailChange1']);
+    const savedWrites: string[] = [];
     let mode: 'error' | 'empty' = 'error';
 
     globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
       const target = String(url);
       if (target.startsWith('https://mock-reeler-test.supabase.co/rest/v1/')) {
         const method = (init?.method || 'GET').toUpperCase();
-        if (method !== 'GET') {
-          supabaseWriteAttempted = true;
+        const bodyText = typeof init?.body === 'string' ? init.body : '';
+
+        if (method === 'GET' && target.includes('/saved_reels?')) {
+          if (mode === 'error') {
+            for (const failCode of failedShortcodes) {
+              if (target.includes(failCode)) {
+                return new Response(
+                  JSON.stringify({ code: 'XX000', message: 'connection terminated unexpectedly' }),
+                  { status: 500, headers: { 'Content-Type': 'application/json' } }
+                );
+              }
+            }
+          }
+          return new Response(JSON.stringify(null), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
         }
-        if (mode === 'error') {
+
+        if (target.includes('/creators')) {
+          if (method === 'POST') {
+            return new Response(
+              JSON.stringify({
+                id: 'creator_mock_1',
+                instagram_user_id: 'creator_unattributed',
+                username: 'Instagram Creator',
+                display_name: 'Instagram Creator',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              }),
+              { status: 201, headers: { 'Content-Type': 'application/json' } }
+            );
+          }
+          return new Response(JSON.stringify([]), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        if (method !== 'GET' && target.includes('/saved_reels')) {
+          savedWrites.push(bodyText);
+          let parsed: any = {};
+          try {
+            parsed = JSON.parse(bodyText);
+          } catch {}
           return new Response(
-            JSON.stringify({ code: 'XX000', message: 'connection terminated unexpectedly' }),
-            { status: 500, headers: { 'Content-Type': 'application/json' } }
+            JSON.stringify({
+              id: `reel_${parsed.shortcode || 'ok'}`,
+              ...parsed,
+              creator: { id: 'creator_mock_1', username: 'Instagram Creator', display_name: 'Instagram Creator' },
+            }),
+            { status: 201, headers: { 'Content-Type': 'application/json' } }
           );
         }
+
         return new Response(JSON.stringify([]), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
@@ -1230,33 +1277,68 @@ test('Repository.getSavedItemByShortcode throws on Supabase query errors so Meta
       /Failed to look up saved item DS1goOmjhUi: connection terminated unexpectedly/
     );
 
-    const sentMessages: string[] = [];
+    const sentMessages: Array<{ recipientId: string; text: string }> = [];
     const bot = new MetaInstagramBotService();
-    bot.sendDirectMessage = async (_recipientId: string, text: string) => {
-      sentMessages.push(text);
+    bot.sendDirectMessage = async (recipientId: string, text: string) => {
+      sentMessages.push({ recipientId, text });
       return true;
     };
 
-    await assert.rejects(
-      () =>
-        bot.handleWebhookPayload({
-          object: 'instagram',
-          entry: [
+    // Failing items in both `messaging` and `changes` must fail closed while later items in each batch still process
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
             {
-              messaging: [
-                {
-                  sender: { id: 'sender_supabase_error' },
-                  message: { text: 'https://www.instagram.com/reel/DS1goOmjhUi/ 30m' },
-                },
-              ],
+              sender: { id: 'sender_supabase_error' },
+              message: { text: 'https://www.instagram.com/reel/DS1goOmjhUi/ 30m' },
+            },
+            {
+              sender: { id: 'sender_batch_ok' },
+              message: { text: 'https://www.instagram.com/reel/DBatchOk1/ 30m' },
             },
           ],
-        }),
-      /Failed to look up saved item DS1goOmjhUi/
-    );
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                sender: { id: 'sender_change_error' },
+                message: { text: 'https://www.instagram.com/reel/DFailChange1/ 30m' },
+              },
+            },
+            {
+              field: 'messages',
+              value: {
+                sender: { id: 'sender_change_ok' },
+                message: { text: 'https://www.instagram.com/p/DChangeOk1/ 20m' },
+              },
+            },
+          ],
+        },
+      ],
+    });
 
-    assert.strictEqual(supabaseWriteAttempted, false, 'Bot must fail closed without writing to Supabase');
-    assert.strictEqual(sentMessages.length, 0, 'Bot must not send confirmation DM when lookup fails');
+    assert.strictEqual(
+      savedWrites.some((w) => w.includes('DS1goOmjhUi') || w.includes('DFailChange1')),
+      false,
+      'Failed lookups must fail closed without writing to Supabase'
+    );
+    assert.strictEqual(
+      savedWrites.some((w) => w.includes('DBatchOk1')),
+      true,
+      'Subsequent messaging event after a failure must still be saved'
+    );
+    assert.strictEqual(
+      savedWrites.some((w) => w.includes('DChangeOk1')),
+      true,
+      'Subsequent change event after a failure must still be saved'
+    );
+    assert.deepStrictEqual(
+      sentMessages.map((m) => m.recipientId),
+      ['sender_batch_ok', 'sender_change_ok'],
+      'Only successfully processed events receive confirmation DMs'
+    );
 
     mode = 'empty';
     const missing = await Repository.getSavedItemByShortcode('DMissingShortcode');
@@ -1680,5 +1762,243 @@ test('Sent to Bot items preserve full Watch Later, Reminder, Watched parity & ho
     globalThis.fetch = originalFetch;
     if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
     if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+  }
+});
+
+test('MetaInstagramBotService and Repository preserve existing sender Watch Later reminder when a conflicting sender shares the same item (sequential and concurrent Supabase guard)', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const prevAnonKey = process.env.SUPABASE_ANON_KEY;
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  delete process.env.SUPABASE_ANON_KEY;
+
+  const originalFetch = globalThis.fetch;
+  const { resetSupabaseClientForTests } = await import('../src/db/client.ts');
+  const { Repository, SenderReminderConflictError } = await import('../src/db/repository.ts');
+  try {
+    Repository.resetMemoryStoreForTests();
+
+    globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
+
+    const sentMessages: Array<{ recipientId: string; text: string }> = [];
+    const bot = new MetaInstagramBotService();
+    bot.sendDirectMessage = async (recipientId: string, text: string) => {
+      sentMessages.push({ recipientId, text });
+      return true;
+    };
+
+    // 1. Sender A adds a reel with a 30m custom reminder and a post awaiting choice (10m prompt)
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: 'sender_alpha' }, message: { text: 'https://www.instagram.com/reel/DConflictReel1/ 30m' } },
+            { sender: { id: 'sender_alpha' }, message: { text: 'https://www.instagram.com/p/DConflictPost1/' } },
+          ],
+        },
+      ],
+    });
+
+    const reelBefore = await Repository.getSavedItemByShortcode('DConflictReel1');
+    const postBefore = await Repository.getSavedItemByShortcode('DConflictPost1');
+    assert.strictEqual(reelBefore?.instagram_sender_id, 'sender_alpha');
+    assert.strictEqual(postBefore?.instagram_sender_id, 'sender_alpha');
+    assert.ok(reelBefore?.next_reminder_at);
+    assert.ok(postBefore?.awaiting_reminder_choice_until);
+
+    sentMessages.length = 0;
+
+    // 2. Conflicting Sender B tries to schedule both items with different schedules
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: 'sender_beta' }, message: { text: 'https://www.instagram.com/reel/DConflictReel1/ 2h' } },
+            { sender: { id: 'sender_beta' }, message: { text: 'https://www.instagram.com/p/DConflictPost1/' } },
+          ],
+        },
+      ],
+    });
+
+    // Rejections sent with honest notice, never success confirmation or shortcodes
+    assert.strictEqual(sentMessages.length, 2);
+    assert.strictEqual(sentMessages[0].recipientId, 'sender_beta');
+    assert.ok(sentMessages[0].text.includes('already has an active reminder for another sender'));
+    assert.ok(!sentMessages[0].text.includes('Added to your Watch Later'));
+    assert.ok(!sentMessages[0].text.includes('DConflictReel1'));
+
+    assert.strictEqual(sentMessages[1].recipientId, 'sender_beta');
+    assert.ok(sentMessages[1].text.includes('already has an active reminder for another sender'));
+    assert.ok(sentMessages[1].text.includes('post'));
+    assert.ok(!sentMessages[1].text.includes('Added post to your Watch Later'));
+    assert.ok(!sentMessages[1].text.includes('DConflictPost1'));
+
+    // Sender A's schedule & ownership remain untouched
+    const reelAfter = await Repository.getSavedItemByShortcode('DConflictReel1');
+    const postAfter = await Repository.getSavedItemByShortcode('DConflictPost1');
+    assert.strictEqual(reelAfter?.instagram_sender_id, 'sender_alpha');
+    assert.strictEqual(reelAfter?.next_reminder_at, reelBefore?.next_reminder_at);
+    assert.strictEqual(reelAfter?.reminder_interval_seconds, reelBefore?.reminder_interval_seconds);
+    assert.strictEqual(postAfter?.instagram_sender_id, 'sender_alpha');
+    assert.strictEqual(postAfter?.awaiting_reminder_choice_until, postBefore?.awaiting_reminder_choice_until);
+
+    // Same sender resending continues to update their own schedule cleanly
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: 'sender_alpha' }, message: { text: 'https://www.instagram.com/reel/DConflictReel1/ 2h' } },
+          ],
+        },
+      ],
+    });
+    assert.ok(sentMessages[0]?.text.includes('Added to your Watch Later!'));
+    const reelRescheduled = await Repository.getSavedItemByShortcode('DConflictReel1');
+    assert.strictEqual(reelRescheduled?.reminder_interval_seconds, 7200);
+
+    // Once Sender A finishes watching, Sender B can schedule the same item cleanly
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: 'sender_alpha' }, message: { text: 'stop all' } },
+            { sender: { id: 'sender_beta' }, message: { text: 'https://www.instagram.com/reel/DConflictReel1/ 45m' } },
+          ],
+        },
+      ],
+    });
+    const reelClaimedAfterWatched = await Repository.getSavedItemByShortcode('DConflictReel1');
+    assert.strictEqual(reelClaimedAfterWatched?.instagram_sender_id, 'sender_beta');
+    assert.strictEqual(reelClaimedAfterWatched?.watch_status, 'watch_later');
+    assert.strictEqual(reelClaimedAfterWatched?.reminder_interval_seconds, 2700);
+
+    Repository.resetMemoryStoreForTests();
+
+    // 3. Concurrent TOCTOU race in Supabase path: atomic .or() guard rejects conflicting sender without confirmation
+    resetSupabaseClientForTests();
+    process.env.SUPABASE_URL = 'https://mock-reeler-test.supabase.co';
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'mock-service-role-key';
+
+    let rowGetCount = 0;
+    let sawAtomicGuardOrFilter = false;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const target = String(url);
+      if (target.startsWith('https://mock-reeler-test.supabase.co/rest/v1/')) {
+        const method = (init?.method || 'GET').toUpperCase();
+        if (target.includes('/creators')) {
+          return new Response(
+            JSON.stringify({
+              id: 'creator_race_1',
+              instagram_user_id: 'creator_unattributed_DRaceConflict1',
+              username: 'Instagram Creator',
+              display_name: 'Instagram Creator',
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            }),
+            { status: 201, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (target.includes('/saved_reels')) {
+          // 1) insert(ignoreDuplicates=true) returns empty -> conflict exists
+          if (method === 'POST') {
+            return new Response(JSON.stringify(null), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          // 2) Initial lookups see unattributed 'unwatched', final ownership check after guarded PATCH sees sender_alpha active
+          if (method === 'GET') {
+            rowGetCount++;
+            if (rowGetCount <= 2) {
+              return new Response(
+                JSON.stringify({
+                  id: 'uuid_race_1',
+                  instagram_media_id: 'export_race_1',
+                  shortcode: 'DRaceConflict1',
+                  reel_url: 'https://www.instagram.com/reel/DRaceConflict1/',
+                  media_type: 'reel',
+                  creator_id: 'creator_race_1',
+                  watch_status: 'unwatched',
+                  instagram_sender_id: null,
+                  is_saved_on_instagram: true,
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+              );
+            }
+            return new Response(
+              JSON.stringify({
+                id: 'uuid_race_1',
+                watch_status: 'watch_later',
+                instagram_sender_id: 'sender_alpha',
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+          }
+          // 3) Guarded PATCH includes atomic `.or(...)` ownership filter and matches 0 rows (null)
+          if (method === 'PATCH') {
+            if (target.includes('watch_status.neq.watch_later') && target.includes('sender_beta')) {
+              sawAtomicGuardOrFilter = true;
+            }
+            return new Response(JSON.stringify(null), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+        }
+      }
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: 'sender_beta' }, message: { text: 'https://www.instagram.com/reel/DRaceConflict1/ 30m' } },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sawAtomicGuardOrFilter, true, 'Supabase update must include atomic PostgREST sender ownership guard');
+    assert.strictEqual(sentMessages.length, 1);
+    assert.strictEqual(sentMessages[0].recipientId, 'sender_beta');
+    assert.ok(sentMessages[0].text.includes('already has an active reminder for another sender'));
+    assert.ok(!sentMessages[0].text.includes('Added to your Watch Later'));
+
+    await assert.rejects(
+      () =>
+        Repository.upsertSavedReel({
+          instagram_media_id: 'export_race_1',
+          shortcode: 'DRaceConflict1',
+          reel_url: 'https://www.instagram.com/reel/DRaceConflict1/',
+          media_type: 'reel',
+          creator_id: 'creator_race_1',
+          taken_at: new Date().toISOString(),
+          first_detected_at: new Date().toISOString(),
+          save_order_rank: 1,
+          watch_status: 'watch_later',
+          instagram_sender_id: 'sender_beta',
+        }),
+      (e: unknown) => e instanceof SenderReminderConflictError
+    );
+  } finally {
+    resetSupabaseClientForTests();
+    globalThis.fetch = originalFetch;
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    else delete process.env.SUPABASE_URL;
+    if (prevServiceKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevServiceKey;
+    else delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (prevAnonKey !== undefined) process.env.SUPABASE_ANON_KEY = prevAnonKey;
+    else delete process.env.SUPABASE_ANON_KEY;
   }
 });

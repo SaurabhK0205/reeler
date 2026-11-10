@@ -13,6 +13,44 @@ import { classifySavedMediaType } from '../utils/mediaType.ts';
 import { getSupabase, isSupabaseConfigured } from './client.ts';
 
 /**
+ * Error thrown when a different Instagram sender attempts to schedule or overwrite
+ * an active Watch Later reminder already owned by another sender on the same item.
+ */
+export class SenderReminderConflictError extends Error {
+  readonly shortcode: string;
+
+  /**
+   * Creates a conflict error identifying the shortcode whose active reminder is owned by another sender.
+   */
+  constructor(shortcode: string) {
+    super(`Watch Later reminder already active for another sender on ${shortcode}`);
+    this.name = 'SenderReminderConflictError';
+    this.shortcode = shortcode;
+  }
+}
+
+/**
+ * Escapes and quotes a literal string value for inclusion inside a PostgREST filter expression.
+ */
+function quotePostgrestLiteral(value: string): string {
+  return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * Returns true when an incoming sender attempts to schedule/overwrite an active `watch_later`
+ * reminder currently owned by a different Instagram sender.
+ */
+function isConflictingActiveSenderReminder(
+  existing: Pick<SavedReel, 'watch_status' | 'instagram_sender_id'>,
+  incomingSenderId?: string | null
+): boolean {
+  const incoming = String(incomingSenderId || '').trim();
+  if (!incoming) return false;
+  const owner = String(existing.instagram_sender_id || '').trim();
+  return Boolean(owner && owner !== incoming && existing.watch_status === 'watch_later');
+}
+
+/**
  * Resolves the authoritative save timestamp for sorting and date filtering (`saved_at` with `first_detected_at` fallback).
  */
 export function resolveEffectiveSavedAt(reel: {
@@ -123,6 +161,9 @@ class InMemoryStore {
     if (existing) {
       if (options?.ignoreDuplicates) {
         return options.skipReturn ? null : existing;
+      }
+      if (isConflictingActiveSenderReminder(existing, data.instagram_sender_id)) {
+        throw new SenderReminderConflictError(data.shortcode);
       }
       if (data.reel_url) existing.reel_url = data.reel_url;
       existing.media_type = classifySavedMediaType({
@@ -716,6 +757,10 @@ export class Repository {
     }
   }
 
+  /**
+   * Inserts a new saved reel/post or updates an existing row in Supabase while preserving monotonic
+   * `is_saved_on_instagram` provenance, `saved_at` timestamps, and active sender reminder ownership.
+   */
   static async upsertSavedReel(data: {
     instagram_media_id: string;
     shortcode: string;
@@ -835,6 +880,11 @@ export class Repository {
         return existing;
       }
 
+      const incomingSender = String(data.instagram_sender_id || '').trim();
+      if (isConflictingActiveSenderReminder(existing, incomingSender)) {
+        throw new SenderReminderConflictError(data.shortcode);
+      }
+
       const updatePayload: Record<string, any> = {
         reel_url: data.reel_url,
         media_type: mediaType,
@@ -860,43 +910,67 @@ export class Repository {
         updatePayload.is_saved_on_instagram = true;
       }
 
-      if (data.saved_at && shouldBackfillSavedAt(existing, data.saved_at)) {
-        if (existing.saved_at == null) {
-          const { error: backfillErr } = await supabase
-            .from('saved_reels')
-            .update({ saved_at: data.saved_at, updated_at: nowIso })
-            .eq('id', existing.id)
-            .is('saved_at', null);
-          if (backfillErr) {
-            throw new Error(`Supabase saved_at backfill failed: ${backfillErr.message}`);
-          }
-        } else {
-          updatePayload.saved_at = data.saved_at;
-        }
+      const needsNullSafeSavedAtBackfill = Boolean(
+        data.saved_at && shouldBackfillSavedAt(existing, data.saved_at) && existing.saved_at == null
+      );
+      if (data.saved_at && !needsNullSafeSavedAtBackfill && shouldBackfillSavedAt(existing, data.saved_at)) {
+        updatePayload.saved_at = data.saved_at;
       }
 
-      if (options?.skipReturn) {
-        const { error: updateErr } = await supabase
-          .from('saved_reels')
-          .update(updatePayload)
-          .eq('id', existing.id);
-        if (updateErr) {
-          throw new Error(`Supabase upsertSavedReel update failed: ${updateErr.message}`);
-        }
-        return null;
-      }
+      const senderOwnershipGuard = incomingSender
+        ? `watch_status.neq.watch_later,instagram_sender_id.is.null,instagram_sender_id.eq.,instagram_sender_id.eq.${quotePostgrestLiteral(incomingSender)}`
+        : null;
 
-      const { data: updatedReel, error: updateErr } = await supabase
+      let updateQuery = supabase
         .from('saved_reels')
         .update(updatePayload)
-        .eq('id', existing.id)
-        .select('*, creator:creators(*)')
-        .single();
-      if (updateErr || !updatedReel) {
-        throw new Error(`Supabase upsertSavedReel update failed: ${updateErr?.message || 'no record returned'}`);
+        .eq('id', existing.id);
+      if (senderOwnershipGuard) {
+        updateQuery = updateQuery.or(senderOwnershipGuard);
       }
 
-      return updatedReel as SavedReel;
+      const { data: updatedRow, error: updateErr } = await updateQuery
+        .select(options?.skipReturn ? 'id' : '*, creator:creators(*)')
+        .maybeSingle();
+
+      if (updateErr) {
+        throw new Error(`Supabase upsertSavedReel update failed: ${updateErr.message}`);
+      }
+
+      if (!updatedRow) {
+        if (incomingSender) {
+          const { data: currentState, error: checkErr } = await supabase
+            .from('saved_reels')
+            .select('id, watch_status, instagram_sender_id')
+            .eq('id', existing.id)
+            .maybeSingle();
+          if (checkErr) {
+            throw new Error(`Supabase upsertSavedReel ownership check failed: ${checkErr.message}`);
+          }
+          if (currentState && isConflictingActiveSenderReminder(currentState as SavedReel, incomingSender)) {
+            throw new SenderReminderConflictError(data.shortcode);
+          }
+        }
+        throw new Error('Supabase upsertSavedReel update failed: no record updated');
+      }
+
+      if (needsNullSafeSavedAtBackfill && data.saved_at) {
+        const { data: backfilledRow, error: backfillErr } = await supabase
+          .from('saved_reels')
+          .update({ saved_at: data.saved_at, updated_at: nowIso })
+          .eq('id', existing.id)
+          .is('saved_at', null)
+          .select('saved_at')
+          .maybeSingle();
+        if (backfillErr) {
+          throw new Error(`Supabase saved_at backfill failed: ${backfillErr.message}`);
+        }
+        if (!options?.skipReturn && backfilledRow?.saved_at) {
+          (updatedRow as SavedReel).saved_at = backfilledRow.saved_at;
+        }
+      }
+
+      return options?.skipReturn ? null : (updatedRow as SavedReel);
     } finally {
       Repository.invalidateCreatorsCache();
     }

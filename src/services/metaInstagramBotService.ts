@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { loadConfig } from '../config.ts';
-import { Repository } from '../db/repository.ts';
+import { Repository, SenderReminderConflictError } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
 import { parseDuration, formatTargetTime } from '../utils/duration.ts';
 import { extractCreatorQueryWithFilter } from '../utils/creatorQuery.ts';
@@ -17,6 +17,7 @@ import {
   formatWatchedConfirmationMessage,
   formatReminderSetMessage,
   formatCreatorSearchMessages,
+  formatSenderConflictRejectionMessage,
 } from '../utils/reelMessages.ts';
 
 export class MetaInstagramBotService {
@@ -260,7 +261,11 @@ export class MetaInstagramBotService {
 
           const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
           if (combinedText) {
-            await this.processIncomingText(senderId, combinedText, attachmentType);
+            try {
+              await this.processIncomingText(senderId, combinedText, attachmentType);
+            } catch (error) {
+              console.error(`[MetaIG] Failed to process messaging event for sender ${senderId}:`, error);
+            }
           }
         }
 
@@ -285,7 +290,11 @@ export class MetaInstagramBotService {
             }
             const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
             if (combinedText) {
-              await this.processIncomingText(senderId, combinedText, attachmentType);
+              try {
+                await this.processIncomingText(senderId, combinedText, attachmentType);
+              } catch (error) {
+                console.error(`[MetaIG] Failed to process change event for sender ${senderId}:`, error);
+              }
             }
           }
         }
@@ -322,6 +331,20 @@ export class MetaInstagramBotService {
         attachmentType,
         existing: existingItem,
       });
+
+      const activeOwner = String(existingItem?.instagram_sender_id || '').trim();
+      if (
+        existingItem &&
+        existingItem.watch_status === 'watch_later' &&
+        activeOwner &&
+        activeOwner !== senderId
+      ) {
+        console.warn(
+          `[MetaIG] Rejected Watch Later update for ${shortcode} from sender ${senderId}: active reminder belongs to another sender.`
+        );
+        await this.sendDirectMessage(senderId, formatSenderConflictRejectionMessage(mediaType));
+        return;
+      }
 
       const validHandle = extractPublicCreatorUsername({ username: meta.username });
       const existingCreator = existingItem?.creator;
@@ -367,34 +390,10 @@ export class MetaInstagramBotService {
 
       const addedHeading = mediaType === 'post' ? '🖼️ Added post to your Watch Later!' : '🎬 Added to your Watch Later!';
 
-      if (customDuration) {
-        // User provided a specific time along with the item!
-        const nextReminder = customDuration.targetDate.toISOString();
-        await Repository.upsertSavedReel({
-          instagram_media_id: instagramMediaId,
-          shortcode,
-          reel_url: canonicalUrl,
-          media_type: mediaType,
-          creator_id: creator.id,
-          caption,
-          thumbnail_url: thumbnailUrl,
-          taken_at: takenAt,
-          saved_at: savedAt,
-          first_detected_at: firstDetectedAt,
-          save_order_rank: saveOrderRank,
-          watch_status: 'watch_later',
-          reminder_interval_seconds: customDuration.seconds,
-          next_reminder_at: nextReminder,
-          awaiting_reminder_choice_until: null,
-          is_saved_on_instagram: isSavedOnInstagram,
-          instagram_sender_id: senderId,
-        });
+      const nextReminder = customDuration ? customDuration.targetDate.toISOString() : null;
+      const awaitingUntil = customDuration ? null : new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
-        const reply = `${addedHeading}${creatorLine}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done!`;
-        await this.sendDirectMessage(senderId, reply);
-      } else {
-        // No time provided — wait up to 10 minutes for user choice before defaulting to 10 hours
-        const awaitingUntil = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+      try {
         await Repository.upsertSavedReel({
           instagram_media_id: instagramMediaId,
           shortcode,
@@ -408,13 +407,29 @@ export class MetaInstagramBotService {
           first_detected_at: firstDetectedAt,
           save_order_rank: saveOrderRank,
           watch_status: 'watch_later',
-          reminder_interval_seconds: null,
-          next_reminder_at: null,
+          reminder_interval_seconds: customDuration ? customDuration.seconds : null,
+          next_reminder_at: nextReminder,
           awaiting_reminder_choice_until: awaitingUntil,
           is_saved_on_instagram: isSavedOnInstagram,
           instagram_sender_id: senderId,
         });
+      } catch (error) {
+        if (error instanceof SenderReminderConflictError) {
+          console.warn(
+            `[MetaIG] Concurrent Watch Later conflict for ${shortcode} from sender ${senderId}; existing reminder preserved.`
+          );
+          await this.sendDirectMessage(senderId, formatSenderConflictRejectionMessage(mediaType));
+          return;
+        }
+        throw error;
+      }
 
+      if (customDuration) {
+        // User provided a specific time along with the item!
+        const reply = `${addedHeading}${creatorLine}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done!`;
+        await this.sendDirectMessage(senderId, reply);
+      } else {
+        // No time provided — wait up to 10 minutes for user choice before defaulting to 10 hours
         const defaultTriggerDate = new Date(Date.now() + (10 * 60 + 10 * 3600) * 1000);
         const defaultTriggerStr = formatTargetTime(defaultTriggerDate);
         const promptQuestion = mediaType === 'post'

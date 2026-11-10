@@ -451,3 +451,15 @@ export function formatWatchedConfirmationMessage(
 
   return `✅ Marked ${primaryLabel} as watched! Reminders stopped.`;
 }
+
+/**
+ * Formats an honest rejection DM when a different sender shares an item that already has
+ * an active Watch Later reminder owned by another sender, without exposing shortcodes or IDs.
+ */
+export function formatSenderConflictRejectionMessage(mediaType?: SavedMediaType | string): string {
+  const noun = mediaType === 'post' ? 'post' : 'reel';
+  return (
+    `⚠️ Unable to schedule Watch Later for that ${noun} because it already has an active reminder for another sender. ` +
+    `Its existing reminder schedule was left unchanged.`
+  );
+}
