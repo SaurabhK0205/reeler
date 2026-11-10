@@ -20,6 +20,43 @@ import {
   formatSenderConflictRejectionMessage,
 } from '../utils/reelMessages.ts';
 
+/**
+ * Options for sending messages via Meta Graph API.
+ */
+export interface SendDirectMessageOptions {
+  /**
+   * Optional message tag (e.g. 'HUMAN_AGENT' to message users up to 7 days after their last interaction).
+   */
+  tag?: 'HUMAN_AGENT';
+  /**
+   * If true (default), automatically attempts fallback with the HUMAN_AGENT tag
+   * when standard delivery fails due to the 24-hour messaging window having elapsed.
+   */
+  allowHumanAgentFallback?: boolean;
+}
+
+/**
+ * Determines whether a Meta Graph API response error indicates that the 24-hour
+ * standard messaging window has closed for the given recipient.
+ * @param {unknown} errorData - The parsed JSON error payload from Meta Graph API.
+ * @returns {boolean} True if the error indicates an expired 24-hour messaging window.
+ */
+export function isMetaMessagingWindowError(errorData: unknown): boolean {
+  if (!errorData || typeof errorData !== 'object') return false;
+  const errorObj = (errorData as Record<string, unknown>).error;
+  if (!errorObj || typeof errorObj !== 'object') return false;
+
+  const code = (errorObj as Record<string, unknown>).code;
+  const subcode = (errorObj as Record<string, unknown>).error_subcode;
+  const message = (errorObj as Record<string, unknown>).message;
+
+  if (code === 10 && subcode === 2018278) return true;
+  if (typeof message === 'string' && /outside.*window|allowed window|24 hour/i.test(message)) {
+    return true;
+  }
+  return false;
+}
+
 export class MetaInstagramBotService {
   private accessToken: string;
   private verifyToken: string;
@@ -94,9 +131,14 @@ export class MetaInstagramBotService {
   }
 
   /**
-   * Sends a message to a user via Meta Graph API (automatically splits into safe chunks <= 950 chars)
+   * Sends a message to a user via Meta Graph API (automatically splits into safe chunks <= 950 chars).
+   * Supports HUMAN_AGENT tag and automatic fallback when the standard 24-hour messaging window has elapsed.
+   * @param {string} recipientId - The Instagram-scoped ID of the message recipient.
+   * @param {string} text - Message text to send.
+   * @param {SendDirectMessageOptions} [options] - Optional messaging configuration including tags and fallback behavior.
+   * @returns {Promise<boolean>} Resolves to true if all message chunks were delivered successfully.
    */
-  async sendDirectMessage(recipientId: string, text: string): Promise<boolean> {
+  async sendDirectMessage(recipientId: string, text: string, options?: SendDirectMessageOptions): Promise<boolean> {
     if (!this.accessToken) {
       console.warn('[MetaIG] No META_PAGE_ACCESS_TOKEN configured. Cannot send DM reply.');
       return false;
@@ -104,22 +146,59 @@ export class MetaInstagramBotService {
 
     const chunks = this.splitMessageIntoChunks(text, 950);
     let allSuccess = true;
+    const initialTag = options?.tag;
+    const allowFallback = options?.allowHumanAgentFallback !== false;
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       try {
         const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${this.accessToken}`;
-        const res = await fetch(url, {
+        const basePayload: Record<string, unknown> = {
+          recipient: { id: recipientId },
+          message: { text: chunk },
+        };
+        if (initialTag) {
+          basePayload.tag = initialTag;
+        }
+
+        let res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            recipient: { id: recipientId },
-            message: { text: chunk },
-          }),
+          body: JSON.stringify(basePayload),
           signal: AbortSignal.timeout(10000),
         });
 
-        const data = await res.json() as any;
+        let data = (await res.json()) as any;
+
+        // If standard delivery failed because the 24h window closed, attempt fallback with HUMAN_AGENT tag
+        if (!res.ok && !initialTag && allowFallback && isMetaMessagingWindowError(data)) {
+          console.warn(
+            `[MetaIG] 24-hour messaging window closed for ${recipientId}. Attempting fallback with HUMAN_AGENT tag...`
+          );
+          const fallbackPayload = {
+            recipient: { id: recipientId },
+            message: { text: chunk },
+            tag: 'HUMAN_AGENT',
+          };
+          res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(fallbackPayload),
+            signal: AbortSignal.timeout(10000),
+          });
+          data = (await res.json()) as any;
+          if (res.ok) {
+            console.log(
+              `[MetaIG] DM delivered to ${recipientId} via HUMAN_AGENT tag: "${chunk.slice(0, 40)}..."`
+            );
+          } else {
+            console.error(
+              `[MetaIG] HUMAN_AGENT tag fallback failed (requires Meta App Review approval for the Human Agent feature):`,
+              data
+            );
+          }
+        }
+
         if (!res.ok) {
           console.error('[MetaIG] Failed to send DM:', data);
           allSuccess = false;
