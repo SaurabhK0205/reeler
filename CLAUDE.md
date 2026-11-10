@@ -72,7 +72,8 @@ Before writing any code or executing commands:
 
 ```
 Saved Reel / Post       → saved_reel, saved_reels with media_type ('reel' | 'post')
-Collection Source       → is_saved_on_instagram (boolean) / SavedCollectionSource ('all' | 'instagram' | 'bot')
+Collection Source       → is_saved_on_instagram (boolean) / SavedCollectionSource ('instagram' | 'bot')
+Collection Filter       → ReelQueryFilters.source ('all' | 'instagram' | 'bot')
 Media Type              → media_type ('reel' for /reel/, /reels/, /tv/; 'post' for /p/ photo & carousel posts)
 Creator                 → creator, creators (not author, user, influencer)
 Shortcode               → shortcode (exact 11-char Instagram identifier, e.g. Db4eVUcsoTh)
@@ -128,26 +129,26 @@ src/
 
 ## 5. Frontend Work — Impeccable Design Review (MANDATORY)
 
-**Setup (once per environment):** Install Impeccable via `npx impeccable install` (see the [Impeccable installation guide](https://github.com/pbakaus/impeccable#installation)) and reload your coding tool so `/impeccable` passes are available.
+**Setup (once per environment):** Install Impeccable via `npx impeccable install` (see the [Impeccable installation guide](https://github.com/pbakaus/impeccable#installation)) and reload your coding tool so `/impeccable` passes (or `$impeccable` passes on Codex) are available.
 
-Whenever you modify anything under `public/` (HTML, CSS, or JS) or any user-facing template, run Impeccable design review passes **before committing any frontend change** (including fixes requested during PR review before pushing or updating the PR).
+Whenever you modify anything under `public/` (HTML, CSS, or JS) or any user-facing template, run Impeccable design review passes **before committing any frontend change** (including fixes requested during PR review before pushing or updating the PR). On Codex, invoke `$impeccable <pass>` (for example `$impeccable critique`) instead of `/impeccable <pass>`.
 
 ### Required Passes
 
-| Pass | Slash Command | Focus Area |
-|------|--------------|------------|
-| **Critique** | `/impeccable critique` | Full audit: contrast ratios, spacing, visual hierarchy, accessibility |
-| **Layout** | `/impeccable layout` | Grid density, spacing scale, visual scanning paths |
-| **Typeset** | `/impeccable typeset` | Font hierarchy, pairings, line-height, vertical rhythm |
-| **Animate** | `/impeccable animate` | Purposeful micro-interactions, transitions, reduced-motion support |
-| **Adapt** | `/impeccable adapt` | Responsive breakpoints, mobile density (≥44px touch targets), SE/landscape |
-| **Harden** | `/impeccable harden` | Empty states, error states, long captions, offline / skeleton edge cases |
-| **Polish** | `/impeccable polish` | Final craft pass: alignment, interactive states, focus rings, hover states |
+| Pass | Slash Command | Codex Invocation | Focus Area |
+|------|---------------|------------------|------------|
+| **Critique** | `/impeccable critique` | `$impeccable critique` | Full audit: contrast ratios, spacing, visual hierarchy, accessibility |
+| **Layout** | `/impeccable layout` | `$impeccable layout` | Grid density, spacing scale, visual scanning paths |
+| **Typeset** | `/impeccable typeset` | `$impeccable typeset` | Font hierarchy, pairings, line-height, vertical rhythm |
+| **Animate** | `/impeccable animate` | `$impeccable animate` | Purposeful micro-interactions, transitions, reduced-motion support |
+| **Adapt** | `/impeccable adapt` | `$impeccable adapt` | Responsive breakpoints, mobile density (≥44px touch targets), SE/landscape |
+| **Harden** | `/impeccable harden` | `$impeccable harden` | Empty states, error states, long captions, offline / skeleton edge cases |
+| **Polish** | `/impeccable polish` | `$impeccable polish` | Final craft pass: alignment, interactive states, focus rings, hover states |
 
 ### Rules
 
 1. Run the required passes **before each frontend commit** — when opening a PR and when pushing review follow-up commits.
-2. Run the full 7-pass suite above for feature, layout, or UI changes; for small isolated CSS/JS tweaks, run at minimum `/impeccable critique`, `/impeccable polish`, and `/impeccable harden`.
+2. Run the full 7-pass suite above for feature, layout, or UI changes; for small isolated CSS/JS tweaks, run at minimum `/impeccable critique`, `/impeccable polish`, and `/impeccable harden` (or `$impeccable critique`, `$impeccable polish`, and `$impeccable harden` on Codex).
 3. For every finding either: implement the fix, or document in the PR body why it was intentionally waived with a rationale.
 4. Never push a frontend commit that leaves a `critique` or `harden` finding unaddressed without an explicit documented reason.
 5. `audit`, `clarify`, `colorize`, `bolder`, `quieter`, `distill`, and `onboard` are optional but recommended when auditing or redesigning a surface.
@@ -156,7 +157,7 @@ Whenever you modify anything under `public/` (HTML, CSS, or JS) or any user-faci
 
 ## 6. Engineering Reliability — GRAVITAS Workflow (MANDATORY)
 
-**Setup (once per environment):** Install the GRAVITAS skill via `npx skills add udaysharmadev/Gravitas --skill gravitas --agent antigravity --yes` (see [udaysharmadev/Gravitas](https://github.com/udaysharmadev/Gravitas)) and reload your coding tool. Keep project-local symlinks under `.agents/skills/` (gitignored).
+**Setup (once per environment):** Install the GRAVITAS skill via `npx skills add udaysharmadev/Gravitas --skill gravitas --agent antigravity --yes` (or `--agent claude-code` for Claude Code; see [udaysharmadev/Gravitas](https://github.com/udaysharmadev/Gravitas)) and reload your coding tool. Keep project-local symlinks under `.agents/skills/` or `.claude/skills/` (both gitignored).
 
 For implementation, debugging, refactoring, review, and migrations:
 1. **Ground before mutating:** Read the target file, its callers, and relevant tests before editing. Never act on assumed file state.

@@ -26,6 +26,7 @@ yarn-error.log*
 
 # Local project-only agent skill symlinks (machine-local paths)
 .agents/skills/
+.claude/skills/
 
 # OS files
 .DS_Store

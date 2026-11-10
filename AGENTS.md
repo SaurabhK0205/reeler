@@ -4,19 +4,19 @@ See [CLAUDE.md](./CLAUDE.md) for the complete, canonical rules and conventions g
 
 ### Frontend Work — Impeccable Design Review (MANDATORY)
 
-**Setup (once per environment):** Install Impeccable via `npx impeccable install` (see the [Impeccable installation guide](https://github.com/pbakaus/impeccable#installation)) and reload your coding tool so `/impeccable` passes are available.
+**Setup (once per environment):** Install Impeccable via `npx impeccable install` (see the [Impeccable installation guide](https://github.com/pbakaus/impeccable#installation)) and reload your coding tool so `/impeccable` passes (or `$impeccable` passes on Codex) are available.
 
-Whenever you touch `public/` (HTML, CSS, JS) or any user-facing template, run Impeccable design review passes **before each frontend commit** (including PR review follow-ups before pushing/updating a PR):
+Whenever you touch `public/` (HTML, CSS, JS) or any user-facing template, run Impeccable design review passes **before each frontend commit** (including PR review follow-ups before pushing/updating a PR). On Codex, invoke the matching `$impeccable <pass>` prompt (for example `$impeccable critique`) instead of `/impeccable <pass>`:
 
-| Pass | Command | Focus |
-|------|---------|-------|
-| Critique | `/impeccable critique` | Full audit: contrast, spacing, hierarchy, accessibility |
-| Layout | `/impeccable layout` | Grid density, spacing scale, visual scan paths |
-| Typeset | `/impeccable typeset` | Font hierarchy, pairings, vertical rhythm |
-| Animate | `/impeccable animate` | Purposeful micro-interactions and transitions |
-| Adapt | `/impeccable adapt` | Responsive breakpoints, mobile density (≥44px touch targets), SE/landscape |
-| Harden | `/impeccable harden` | Empty states, errors, long captions, edge cases |
-| Polish | `/impeccable polish` | Final craft pass: spacing, alignment, interactive states |
+| Pass | Slash Command | Codex Invocation | Focus |
+|------|---------------|------------------|-------|
+| Critique | `/impeccable critique` | `$impeccable critique` | Full audit: contrast, spacing, hierarchy, accessibility |
+| Layout | `/impeccable layout` | `$impeccable layout` | Grid density, spacing scale, visual scan paths |
+| Typeset | `/impeccable typeset` | `$impeccable typeset` | Font hierarchy, pairings, vertical rhythm |
+| Animate | `/impeccable animate` | `$impeccable animate` | Purposeful micro-interactions and transitions |
+| Adapt | `/impeccable adapt` | `$impeccable adapt` | Responsive breakpoints, mobile density (≥44px touch targets), SE/landscape |
+| Harden | `/impeccable harden` | `$impeccable harden` | Empty states, errors, long captions, edge cases |
+| Polish | `/impeccable polish` | `$impeccable polish` | Final craft pass: spacing, alignment, interactive states |
 
 Run the full 7-pass suite for feature/UI changes, and at minimum `critique` + `polish` + `harden` for small isolated tweaks. Address every finding or document why it was intentionally waived in the PR body. (Optional: `audit`, `clarify`, `colorize`, `bolder`, `quieter`, `distill`, `onboard`.)
 
@@ -24,7 +24,7 @@ Run the full 7-pass suite for feature/UI changes, and at minimum `critique` + `p
 
 ### Engineering Reliability — GRAVITAS Workflow (MANDATORY)
 
-**Setup (once per environment):** Install the GRAVITAS skill via `npx skills add udaysharmadev/Gravitas --skill gravitas --agent antigravity --yes` (see [udaysharmadev/Gravitas](https://github.com/udaysharmadev/Gravitas)) and reload your coding tool. In this repository, keep local skill symlinks under `.agents/skills/` (gitignored).
+**Setup (once per environment):** Install the GRAVITAS skill via `npx skills add udaysharmadev/Gravitas --skill gravitas --agent antigravity --yes` (or `--agent claude-code` for Claude Code; see [udaysharmadev/Gravitas](https://github.com/udaysharmadev/Gravitas)) and reload your coding tool. In this repository, keep local skill symlinks under `.agents/skills/` or `.claude/skills/` (both gitignored).
 
 Follow GRAVITAS invariants for implementation, debugging, refactoring, review, and migrations:
 1. **Ground before mutating:** Read target files, their callers, and relevant tests before editing. Never act on assumed file state.
