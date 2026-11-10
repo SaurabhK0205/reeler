@@ -5,7 +5,7 @@ import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
 import { feedMetaCacheControl, isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
-import type { ReelQueryFilters, WatchStatus, DateFilterPreset, SavedMediaType } from '../types.ts';
+import type { ReelQueryFilters, WatchStatus, DateFilterPreset, SavedMediaType, SavedCollectionSource } from '../types.ts';
 
 /**
  * Express API router handling Meta webhooks, vault queries, metadata resolution, status updates, and archive imports.
@@ -121,6 +121,12 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
       return;
     }
 
+    const rawSource = typeof req.query.source === 'string' ? req.query.source.trim().toLowerCase() : '';
+    if (rawSource && rawSource !== 'all' && rawSource !== 'instagram' && rawSource !== 'bot') {
+      res.status(400).json({ error: 'Invalid source filter' });
+      return;
+    }
+
     const filters: ReelQueryFilters = {
       creatorId: req.query.creatorId as string || undefined,
       datePreset: (req.query.datePreset as DateFilterPreset) || 'all',
@@ -128,6 +134,7 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
       endDate: req.query.endDate as string || undefined,
       watchStatus: (req.query.watchStatus as WatchStatus | 'all') || 'all',
       mediaType: (rawMediaType as SavedMediaType | 'all') || 'all',
+      source: (rawSource as SavedCollectionSource | 'all') || 'all',
       search: req.query.search as string || undefined,
       sortBy: (req.query.sortBy as any) || 'newest_saved',
       page: Number(req.query.page) || 1,

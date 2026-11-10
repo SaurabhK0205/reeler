@@ -10,7 +10,7 @@ export interface ParsedInstagramMediaLink {
 }
 
 const INSTAGRAM_MEDIA_URL_REGEX =
-  /https?:\/\/(?:www\.)?instagram\.com\/(?:(?!stories\/)[a-zA-Z0-9._]+\/)?(reel|reels|p|tv)\/([A-Za-z0-9_-]+)/i;
+  /https?:\/\/(?:www\.)?instagram\.com\/(?:(?!stories\/)[a-zA-Z0-9._]+\/)?(reel|reels|p|tv)\/([A-Za-z0-9_-]+)\/?(?:\?[^\s#]*)?(?:#[^\s]*)?/i;
 
 /**
  * Classifies a saved Instagram item as `'reel'` or `'post'` from explicit classification,

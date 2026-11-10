@@ -33,6 +33,7 @@ async function main() {
   console.log(`- Newly Imported Reels:    ${result.reelsImported}`);
   console.log(`- Already in Library:      ${result.alreadyPresent}`);
   console.log(`- Saved Dates Backfilled:  ${result.savedAtBackfilled}`);
+  console.log(`- Promoted to IG Saved:    ${result.promotedToSaved}`);
   console.log(`- Creators Added:          ${result.creatorsAdded}`);
   console.log(`- Skipped / Non-reels:     ${result.skipped}`);
 

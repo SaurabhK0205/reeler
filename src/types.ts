@@ -1,5 +1,6 @@
 export type WatchStatus = 'unwatched' | 'watched' | 'watch_later';
 export type SavedMediaType = 'reel' | 'post';
+export type SavedCollectionSource = 'instagram' | 'bot';
 
 export interface Creator {
   id: string;
@@ -60,6 +61,7 @@ export interface ReelQueryFilters {
   endDate?: string;
   watchStatus?: WatchStatus | 'all';
   mediaType?: SavedMediaType | 'all';
+  source?: SavedCollectionSource | 'all';
   search?: string;
   sortBy?: 'newest_saved' | 'oldest_saved' | 'newest_published' | 'oldest_published';
   page?: number;
@@ -68,6 +70,8 @@ export interface ReelQueryFilters {
 
 export interface LibraryStats {
   totalReels: number;
+  savedOnInstagramCount: number;
+  botSentCount: number;
   reelsCount: number;
   postsCount: number;
   totalCreators: number;
@@ -122,6 +126,7 @@ export interface BatchReelsResult {
   newlyImported: number;
   alreadyPresent: number;
   savedAtBackfilled: number;
+  promotedToSaved: number;
   failedCount: number;
   failedShortcodes: string[];
 }

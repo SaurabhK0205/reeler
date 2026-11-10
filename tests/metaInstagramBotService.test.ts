@@ -1365,7 +1365,7 @@ test('ReminderWorker.pollInboundDMs bounds failed admin DM retries, ignores bot 
   }
 });
 
-test('MetaInstagramBotService populates saved_at on new DM saves while preserving null saved_at on synced items', async () => {
+test('MetaInstagramBotService marks new DM shares as bot-sent (is_saved_on_instagram=false, saved_at=null) while preserving IG-saved items', async () => {
   const prevUrl = process.env.SUPABASE_URL;
   const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   delete process.env.SUPABASE_URL;
@@ -1373,7 +1373,7 @@ test('MetaInstagramBotService populates saved_at on new DM saves while preservin
 
   const originalFetch = globalThis.fetch;
   try {
-    const { Repository } = await import('../src/db/repository.ts');
+    const { Repository, resolveEffectiveSavedAt } = await import('../src/db/repository.ts');
     Repository.resetMemoryStoreForTests();
 
     const creator = await Repository.upsertCreator({
@@ -1393,6 +1393,7 @@ test('MetaInstagramBotService populates saved_at on new DM saves while preservin
       saved_at: null,
       first_detected_at: '2026-11-06T14:45:00Z',
       save_order_rank: 1,
+      is_saved_on_instagram: true,
     });
 
     globalThis.fetch = (async () =>
@@ -1405,9 +1406,13 @@ test('MetaInstagramBotService populates saved_at on new DM saves while preservin
         { status: 200, headers: { 'Content-Type': 'text/html' } }
       )) as typeof fetch;
 
+    const dmReplies: string[] = [];
     const bot = new MetaInstagramBotService();
     Object.defineProperty(bot, 'isConfigured', { get: () => true });
-    bot.sendDirectMessage = async () => true;
+    bot.sendDirectMessage = async (_recipientId: string, text: string) => {
+      dmReplies.push(text);
+      return true;
+    };
 
     await bot.handleWebhookPayload({
       object: 'instagram',
@@ -1422,19 +1427,31 @@ test('MetaInstagramBotService populates saved_at on new DM saves while preservin
     });
 
     const freshItem = await Repository.getSavedItemByShortcode('DFreshDmSave');
-    assert.ok(freshItem?.saved_at, 'Brand-new DM save should populate saved_at');
+    assert.ok(freshItem, 'Fresh DM item must be tracked in repository');
+    assert.strictEqual(freshItem.is_saved_on_instagram, false, 'Brand-new DM webhook item belongs to Sent to Bot, not Saved on IG');
+    assert.strictEqual(freshItem.saved_at, null, 'Brand-new DM item must leave archive saved_at null until imported from saved_posts.json');
+    assert.ok(resolveEffectiveSavedAt(freshItem), 'Effective timestamp must fall back to first_detected_at for sorting and filters');
+    assert.ok(dmReplies[0]?.includes('Added to your Watch Later!'), `Expected honest Watch Later reply, got: ${dmReplies[0]}`);
+    assert.ok(!/instagram saved/i.test(dmReplies[0] || ''), `Must not claim IG Saved bookmark for DM webhook: ${dmReplies[0]}`);
 
     const syncedItem = await Repository.getSavedItemByShortcode('DSyncedNoDate');
+    assert.strictEqual(syncedItem?.is_saved_on_instagram, true, 'Existing IG-saved item must remain Saved on IG when shared via DM');
     assert.strictEqual(syncedItem?.saved_at, null, 'Existing synced item must preserve null saved_at for future archive backfill');
 
-    // Also verify ReminderWorker with rich mediaId attachment preserves archive saved_at and null synced saved_at
+    // Verify ReminderWorker honesty: saveMedia=false keeps is_saved_on_instagram=false; saveMedia=true promotes cleanly
     const { ReminderWorker } = await import('../src/services/reminderWorker.ts');
     const worker = new ReminderWorker();
     const workerAny = worker as any;
+    const workerMessages: string[] = [];
+    let shouldNativeSaveSucceed = false;
     workerAny.actionClient = {
-      saveMedia: async () => ({ success: false, data: false }),
-      sendDirectMessage: async () => true,
+      saveMedia: async () => ({ success: shouldNativeSaveSucceed, data: shouldNativeSaveSucceed }),
+      sendDirectMessage: async (_uid: string, text: string) => {
+        workerMessages.push(text);
+        return true;
+      },
     };
+    workerAny.adminUserId = 'admin_1';
 
     await Repository.upsertSavedReel({
       instagram_media_id: '18084562202349999',
@@ -1447,6 +1464,7 @@ test('MetaInstagramBotService populates saved_at on new DM saves while preservin
       saved_at: '2024-05-02T12:00:00.000Z',
       first_detected_at: '2024-05-02T12:00:00.000Z',
       save_order_rank: 42,
+      is_saved_on_instagram: true,
     });
 
     await workerAny.handleAdminMessage({
@@ -1468,6 +1486,151 @@ test('MetaInstagramBotService populates saved_at on new DM saves while preservin
     const afterWorker = await Repository.getSavedItemByShortcode('DArchivedWorker');
     assert.strictEqual(afterWorker?.saved_at, '2024-05-02T12:00:00.000Z', 'Worker must preserve original archive saved_at even when mediaId is present');
     assert.strictEqual(afterWorker?.instagram_media_id, '18084562202349999', 'Worker must preserve existing instagram_media_id');
+    assert.strictEqual(afterWorker?.is_saved_on_instagram, true, 'Worker must preserve IG-saved membership');
+
+    // New item through ReminderWorker when saveMedia fails -> Sent to Bot + honest reply without Instagram Saved claim
+    await workerAny.handleAdminMessage({
+      itemId: 'rich_worker_nosave',
+      userId: 'admin_1',
+      timestamp: Date.now(),
+      itemType: 'reel_share',
+      reel: {
+        mediaId: '888888888881',
+        shortcode: 'DBotWorkerNoSave',
+        authorUsername: 'saved_date_creator',
+        caption: 'Bot worker unsaved',
+        thumbnailUrl: null,
+        mediaType: 'reel',
+        reelUrl: 'https://www.instagram.com/reel/DBotWorkerNoSave/',
+      },
+    });
+
+    const workerUnsaved = await Repository.getSavedItemByShortcode('DBotWorkerNoSave');
+    assert.strictEqual(workerUnsaved?.is_saved_on_instagram, false);
+    assert.strictEqual(workerUnsaved?.saved_at, null);
+    assert.ok(workerMessages[1]?.includes('🎬 Added to your Watch Later!'), `Got: ${workerMessages[1]}`);
+    assert.ok(!workerMessages[1]?.includes('bookmarked to your Instagram Saved'), `Must not lie when saveMedia failed: ${workerMessages[1]}`);
+
+    // New item through ReminderWorker when saveMedia succeeds -> Saved on IG + saved_at + bookmark confirmation
+    shouldNativeSaveSucceed = true;
+    await workerAny.handleAdminMessage({
+      itemId: 'rich_worker_saved',
+      userId: 'admin_1',
+      timestamp: Date.now(),
+      itemType: 'reel_share',
+      reel: {
+        mediaId: '888888888882',
+        shortcode: 'DIgSavedWorker',
+        authorUsername: 'saved_date_creator',
+        caption: 'Native IG save succeeded',
+        thumbnailUrl: null,
+        mediaType: 'post',
+        reelUrl: 'https://www.instagram.com/p/DIgSavedWorker/',
+      },
+    });
+
+    const workerSaved = await Repository.getSavedItemByShortcode('DIgSavedWorker');
+    assert.strictEqual(workerSaved?.is_saved_on_instagram, true);
+    assert.ok(workerSaved?.saved_at, 'Successful native IG save must record saved_at');
+    assert.ok(workerMessages[2]?.includes('bookmarked to your Instagram Saved!'), `Got: ${workerMessages[2]}`);
+
+    Repository.resetMemoryStoreForTests();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+  }
+});
+
+test('Sent to Bot items preserve full Watch Later, Reminder, Watched parity & honest DM copy', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  const originalFetch = globalThis.fetch;
+  try {
+    const { Repository } = await import('../src/db/repository.ts');
+    const { ReminderWorker } = await import('../src/services/reminderWorker.ts');
+    const { formatHumanReelLabel, formatWatchLaterReminderMessage } = await import('../src/utils/reelMessages.ts');
+    Repository.resetMemoryStoreForTests();
+
+    // Unit check DM wording honesty when is_saved_on_instagram === false vs true
+    assert.strictEqual(
+      formatHumanReelLabel({ caption: null, creator: null, media_type: 'reel', reel_url: 'https://www.instagram.com/reel/X1/', is_saved_on_instagram: false }),
+      'that reel'
+    );
+    assert.strictEqual(
+      formatHumanReelLabel({ caption: null, creator: null, media_type: 'post', reel_url: 'https://www.instagram.com/p/X2/', is_saved_on_instagram: true }),
+      'your saved post'
+    );
+
+    const botReminderHeader = formatWatchLaterReminderMessage({
+      reel_url: 'https://www.instagram.com/p/X3/',
+      caption: null,
+      creator: null,
+      media_type: 'post',
+      is_saved_on_instagram: false,
+    });
+    assert.ok(botReminderHeader.includes('🖼️ Watch Later Post'), `Got: ${botReminderHeader}`);
+    assert.ok(!botReminderHeader.includes('Saved Post'), `Must not label bot-only item as Saved Post: ${botReminderHeader}`);
+
+    globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
+
+    const sentMessages: string[] = [];
+    const bot = new MetaInstagramBotService();
+    Object.defineProperty(bot, 'isConfigured', { get: () => true });
+    bot.sendDirectMessage = async (_recipientId: string, text: string) => {
+      sentMessages.push(text);
+      return true;
+    };
+
+    // Share a bot-only post with reminder schedule via webhook
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: 'sender_bot_parity' }, message: { text: 'https://www.instagram.com/p/DBotParity1/?igsh=testToken123 30m' } },
+          ],
+        },
+      ],
+    });
+
+    const botItem = await Repository.getSavedItemByShortcode('DBotParity1');
+    assert.ok(botItem);
+    assert.strictEqual(botItem.is_saved_on_instagram, false);
+    assert.strictEqual(botItem.watch_status, 'watch_later');
+    assert.ok(botItem.next_reminder_at);
+
+    // Due reminder dispatches cleanly for bot item
+    await Repository.updateReminderSchedule(botItem.id, new Date(Date.now() - 1000).toISOString(), 1800);
+    const worker = new ReminderWorker();
+    (worker as any).metaBot = bot;
+    await worker.checkDueReminders();
+
+    assert.strictEqual(sentMessages.length, 2);
+    assert.ok(sentMessages[1].includes('🔔 Watch Later Reminder!'));
+    assert.ok(sentMessages[1].includes('https://www.instagram.com/p/DBotParity1/'));
+
+    // Replying "watched" marks the bot item watched while staying in Sent to Bot category
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: 'sender_bot_parity' }, message: { text: 'watched' } },
+          ],
+        },
+      ],
+    });
+
+    const afterWatched = await Repository.getSavedItemByShortcode('DBotParity1');
+    assert.strictEqual(afterWatched?.watch_status, 'watched');
+    assert.strictEqual(afterWatched?.is_saved_on_instagram, false);
+    assert.strictEqual(afterWatched?.next_reminder_at, null);
+    assert.ok(sentMessages[2]?.includes('that post'), `Expected honest "that post" label, got: ${sentMessages[2]}`);
+    assert.ok(!/saved post/i.test(sentMessages[2] || ''), `Got: ${sentMessages[2]}`);
 
     Repository.resetMemoryStoreForTests();
   } finally {

@@ -210,6 +210,10 @@ export class ReminderWorker {
       // 3. Upsert item into Supabase with watch_status = 'watch_later'
       const nextReminderDate = new Date(Date.now() + intervalHours * 60 * 60 * 1000).toISOString();
       const nowIso = new Date().toISOString();
+      const isSavedOnInstagram = savedOnIg || (existingItem ? existingItem.is_saved_on_instagram !== false : false);
+      const savedAt = existingItem
+        ? (existingItem.saved_at ?? (savedOnIg && existingItem.is_saved_on_instagram === false ? nowIso : null))
+        : (savedOnIg ? nowIso : null);
       await Repository.upsertSavedReel({
         instagram_media_id: existingItem?.instagram_media_id || mediaId || `id_${shortcode}`,
         shortcode,
@@ -219,22 +223,25 @@ export class ReminderWorker {
         caption: caption || existingItem?.caption || null,
         thumbnail_url: thumbnailUrl || existingItem?.thumbnail_url || null,
         taken_at: existingItem?.taken_at || nowIso,
-        saved_at: existingItem ? (existingItem.saved_at ?? null) : nowIso,
+        saved_at: savedAt,
         first_detected_at: existingItem?.first_detected_at || nowIso,
         save_order_rank: existingItem?.save_order_rank ?? 1,
         watch_status: 'watch_later',
         reminder_interval_hours: intervalHours,
         next_reminder_at: nextReminderDate,
-        is_saved_on_instagram: savedOnIg,
+        is_saved_on_instagram: isSavedOnInstagram,
       });
 
       // 4. Send immediate confirmation DM to admin
       if (this.adminUserId) {
         const creatorLine = formatAddedToWatchLaterCreatorBlock(creator);
-        const itemHeading =
-          resolvedMediaType === 'post'
+        const itemHeading = savedOnIg
+          ? (resolvedMediaType === 'post'
             ? '🖼️ Post saved to Watch Later & bookmarked to your Instagram Saved!'
-            : '🎬 Saved to Watch Later & bookmarked to your Instagram Saved!';
+            : '🎬 Saved to Watch Later & bookmarked to your Instagram Saved!')
+          : (resolvedMediaType === 'post'
+            ? '🖼️ Post added to your Watch Later!'
+            : '🎬 Added to your Watch Later!');
         const confirmText = `${itemHeading}${creatorLine}\n\nI will remind you about this in ${intervalHours} hours ⏰\n(Reply "done" when you've watched it)`;
         await this.actionClient.sendDirectMessage(this.adminUserId, confirmText);
       }
