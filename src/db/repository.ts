@@ -64,6 +64,7 @@ class InMemoryStore {
     watch_status?: WatchStatus;
     duration_seconds?: number | null;
     reminder_interval_hours?: number | null;
+    reminder_interval_seconds?: number | null;
     next_reminder_at?: string | null;
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
@@ -83,15 +84,23 @@ class InMemoryStore {
       if (options?.ignoreDuplicates) {
         return options.skipReturn ? null : existing;
       }
+      existing.creator_id = data.creator_id || existing.creator_id;
       existing.caption = data.caption ?? existing.caption;
       existing.thumbnail_url = data.thumbnail_url ?? existing.thumbnail_url;
       existing.save_order_rank = data.save_order_rank;
       if (data.watch_status) existing.watch_status = data.watch_status;
       if (data.next_reminder_at !== undefined) existing.next_reminder_at = data.next_reminder_at;
       if (data.awaiting_reminder_choice_until !== undefined) existing.awaiting_reminder_choice_until = data.awaiting_reminder_choice_until;
-      if (data.reminder_interval_hours) existing.reminder_interval_hours = data.reminder_interval_hours;
+      if (data.reminder_interval_hours !== undefined && data.reminder_interval_hours !== null) {
+        existing.reminder_interval_hours = data.reminder_interval_hours;
+      }
+      if (data.reminder_interval_seconds !== undefined && data.reminder_interval_seconds !== null) {
+        existing.reminder_interval_seconds = data.reminder_interval_seconds;
+        existing.reminder_interval_hours = Math.round(data.reminder_interval_seconds / 3600);
+      }
+      if (data.instagram_sender_id !== undefined) existing.instagram_sender_id = data.instagram_sender_id;
       existing.updated_at = now;
-      return options?.skipReturn ? null : existing;
+      return options?.skipReturn ? null : { ...existing, creator: this.creators.get(existing.creator_id) };
     }
 
     const newReel: SavedReel = {
@@ -108,7 +117,10 @@ class InMemoryStore {
       save_order_rank: data.save_order_rank,
       watch_status: data.watch_status || 'unwatched',
       duration_seconds: data.duration_seconds,
-      reminder_interval_hours: data.reminder_interval_hours ?? 10,
+      reminder_interval_hours: data.reminder_interval_seconds
+        ? Math.round(data.reminder_interval_seconds / 3600)
+        : (data.reminder_interval_hours ?? 10),
+      reminder_interval_seconds: data.reminder_interval_seconds ?? undefined,
       reminders_sent_count: 0,
       next_reminder_at: data.next_reminder_at,
       awaiting_reminder_choice_until: data.awaiting_reminder_choice_until,
@@ -320,12 +332,50 @@ class InMemoryStore {
     const reel = this.reels.get(id);
     if (!reel) return null;
     reel.watch_status = status;
-    if (status === 'watched') {
+    if (status !== 'watch_later') {
       reel.next_reminder_at = null;
+      reel.awaiting_reminder_choice_until = null;
     }
     reel.updated_at = new Date().toISOString();
     return { ...reel, creator: this.creators.get(reel.creator_id) };
   }
+}
+
+export interface MarkWatchedResult {
+  updatedReels: SavedReel[];
+  remainingCount: number;
+}
+
+function parseTimestampMs(iso?: string | null): number {
+  if (!iso) return 0;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+/**
+ * Orders active Watch Later reels so the most recently reminded or updated reel always comes first,
+ * preventing older queued reels from being selected or reported ahead of a just-reminded reel.
+ */
+export function sortWatchLaterReelsMostRecentFirst(reels: SavedReel[]): SavedReel[] {
+  return [...reels].sort((a, b) => {
+    const bInteraction = Math.max(parseTimestampMs(b.last_reminded_at), parseTimestampMs(b.updated_at));
+    const aInteraction = Math.max(parseTimestampMs(a.last_reminded_at), parseTimestampMs(a.updated_at));
+    if (bInteraction !== aInteraction) return bInteraction - aInteraction;
+
+    const bReminded = parseTimestampMs(b.last_reminded_at);
+    const aReminded = parseTimestampMs(a.last_reminded_at);
+    if (bReminded !== aReminded) return bReminded - aReminded;
+
+    const bUpdated = parseTimestampMs(b.updated_at);
+    const aUpdated = parseTimestampMs(a.updated_at);
+    if (bUpdated !== aUpdated) return bUpdated - aUpdated;
+
+    const bCreated = parseTimestampMs(b.created_at);
+    const aCreated = parseTimestampMs(a.created_at);
+    if (bCreated !== aCreated) return bCreated - aCreated;
+
+    return String(a.id).localeCompare(String(b.id));
+  });
 }
 
 const memoryStore = new InMemoryStore();
@@ -808,7 +858,9 @@ export class Repository {
       const reel = memoryStore.reels.get(id);
       if (reel) {
         reel.next_reminder_at = nextReminderAt;
+        reel.watch_status = 'watch_later';
         reel.awaiting_reminder_choice_until = null;
+        reel.updated_at = now;
         if (intervalSeconds) {
           reel.reminder_interval_seconds = intervalSeconds;
           reel.reminder_interval_hours = Math.round(intervalSeconds / 3600);
@@ -854,35 +906,73 @@ export class Repository {
     return (data as SavedReel) || null;
   }
 
-  static async getLastReelForInstagramSender(senderId: string): Promise<SavedReel | null> {
+  static async getLastReelForInstagramSender(
+    senderId: string,
+    options?: { includeUnattributedFallback?: boolean }
+  ): Promise<SavedReel | null> {
+    const trimmedSender = String(senderId || '').trim();
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    if (!trimmedSender && !allowUnattributedFallback) {
+      return null;
+    }
+
     if (!isSupabaseConfigured()) {
-      const match = Array.from(memoryStore.reels.values())
-        .filter(r => r.instagram_sender_id === senderId)
-        .sort((a, b) => new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime())[0];
-      return match || null;
+      const activeWatchLater = Array.from(memoryStore.reels.values()).filter(
+        (r) => r.watch_status === 'watch_later'
+      );
+      let candidates = trimmedSender
+        ? activeWatchLater.filter((r) => r.instagram_sender_id === trimmedSender)
+        : [];
+
+      // Unattributed fallback is strictly opt-in (admin workflow only) so webhook senders cannot access other queues
+      if (allowUnattributedFallback && candidates.length === 0) {
+        candidates = activeWatchLater.filter((r) => !r.instagram_sender_id);
+      }
+
+      if (candidates.length === 0) {
+        return null;
+      }
+
+      const ordered = sortWatchLaterReelsMostRecentFirst(
+        candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) || r.creator }))
+      );
+      return ordered[0] || null;
     }
 
     const supabase = getSupabase();
-    const { data, error } = await supabase
-      .from('saved_reels')
-      .select('*, creator:creators(*)')
-      .eq('instagram_sender_id', senderId)
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (error || !data) {
-      // Fallback: return the most recent reel overall
-      const { data: fallback } = await supabase
+    if (trimmedSender) {
+      const { data: senderCandidates, error } = await supabase
         .from('saved_reels')
         .select('*, creator:creators(*)')
+        .eq('instagram_sender_id', trimmedSender)
+        .eq('watch_status', 'watch_later')
         .order('updated_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      return fallback as SavedReel || null;
+        .order('last_reminded_at', { ascending: false, nullsFirst: false })
+        .order('created_at', { ascending: false })
+        .limit(25);
+      if (!error && senderCandidates && senderCandidates.length > 0) {
+        return sortWatchLaterReelsMostRecentFirst(senderCandidates as SavedReel[])[0] || null;
+      }
     }
 
-    return data as SavedReel;
+    if (!allowUnattributedFallback) {
+      return null;
+    }
+
+    // Opt-in fallback strictly scoped to unattributed active Watch Later reels
+    const { data: fallbackCandidates, error: fbErr } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('watch_status', 'watch_later')
+      .or('instagram_sender_id.is.null,instagram_sender_id.eq.')
+      .order('updated_at', { ascending: false })
+      .order('last_reminded_at', { ascending: false, nullsFirst: false })
+      .order('created_at', { ascending: false })
+      .limit(25);
+    if (fbErr || !fallbackCandidates || fallbackCandidates.length === 0) {
+      return null;
+    }
+    return sortWatchLaterReelsMostRecentFirst(fallbackCandidates as SavedReel[])[0] || null;
   }
 
   static async recordReminderSent(id: string, nextReminderAt: string | null): Promise<void> {
@@ -894,6 +984,7 @@ export class Repository {
         reel.reminders_sent_count = (reel.reminders_sent_count || 0) + 1;
         reel.last_reminded_at = now;
         reel.next_reminder_at = nextReminderAt;
+        reel.updated_at = now;
       }
       return;
     }
@@ -1267,6 +1358,16 @@ export class Repository {
     };
   }
 
+  /**
+   * Clears in-memory store state for isolated unit tests (no-op when Supabase is configured).
+   */
+  static resetMemoryStoreForTests(): void {
+    if (!isSupabaseConfigured()) {
+      memoryStore.creators.clear();
+      memoryStore.reels.clear();
+    }
+  }
+
   static async updateWatchStatus(id: string, status: WatchStatus): Promise<SavedReel | null> {
     if (!isSupabaseConfigured()) {
       return memoryStore.updateWatchStatus(id, status);
@@ -1277,8 +1378,9 @@ export class Repository {
       watch_status: status,
       updated_at: new Date().toISOString(),
     };
-    if (status === 'watched') {
+    if (status !== 'watch_later') {
       updatePayload.next_reminder_at = null;
+      updatePayload.awaiting_reminder_choice_until = null;
     }
 
     const { data, error } = await supabase
@@ -1295,32 +1397,107 @@ export class Repository {
     return data as SavedReel;
   }
 
-  static async markWatchedForInstagramSender(senderId: string): Promise<SavedReel[]> {
+  /**
+   * Marks either the most recently reminded/updated active Watch Later reel (default)
+   * or all active Watch Later reels (`markAll: true`) as watched for an Instagram sender.
+   */
+  static async markWatchedForInstagramSender(
+    senderId: string,
+    options?: { markAll?: boolean; includeUnattributedFallback?: boolean }
+  ): Promise<MarkWatchedResult> {
+    const trimmedSender = String(senderId || '').trim();
+    const markAll = Boolean(options?.markAll);
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
     const now = new Date().toISOString();
+
+    if (!trimmedSender && !allowUnattributedFallback) {
+      return { updatedReels: [], remainingCount: 0 };
+    }
+
     if (!isSupabaseConfigured()) {
-      const updated: SavedReel[] = [];
-      for (const reel of memoryStore.reels.values()) {
-        if (reel.watch_status === 'watch_later' && (!senderId || reel.instagram_sender_id === senderId)) {
-          reel.watch_status = 'watched';
-          reel.next_reminder_at = null;
-          reel.awaiting_reminder_choice_until = null;
-          reel.updated_at = now;
-          updated.push({ ...reel, creator: memoryStore.creators.get(reel.creator_id) });
+      const activeWatchLater = Array.from(memoryStore.reels.values()).filter(
+        (r) => r.watch_status === 'watch_later'
+      );
+      let candidates = trimmedSender
+        ? activeWatchLater.filter((r) => r.instagram_sender_id === trimmedSender)
+        : [];
+
+      // Unattributed fallback is strictly opt-in (admin workflow only) so webhook senders cannot mark or view admin/UI reels
+      if (allowUnattributedFallback && candidates.length === 0) {
+        candidates = activeWatchLater.filter((r) => !r.instagram_sender_id);
+      }
+
+      if (candidates.length === 0) {
+        return { updatedReels: [], remainingCount: 0 };
+      }
+
+      const ordered = sortWatchLaterReelsMostRecentFirst(
+        candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) }))
+      );
+      const targets = markAll ? ordered : [ordered[0]];
+      const updatedReels: SavedReel[] = [];
+
+      for (const target of targets) {
+        const stored = memoryStore.reels.get(target.id);
+        if (stored && stored.watch_status === 'watch_later') {
+          stored.watch_status = 'watched';
+          stored.next_reminder_at = null;
+          stored.awaiting_reminder_choice_until = null;
+          stored.updated_at = now;
+          updatedReels.push({ ...stored, creator: memoryStore.creators.get(stored.creator_id) });
         }
       }
-      return updated;
+
+      const remainingCount = Math.max(0, ordered.length - updatedReels.length);
+      return { updatedReels, remainingCount };
     }
 
     const supabase = getSupabase();
-    // 1. Try finding reels explicitly matching instagram_sender_id
-    const { data: activeReels } = await supabase
-      .from('saved_reels')
-      .select('*, creator:creators(*)')
-      .eq('instagram_sender_id', senderId)
-      .eq('watch_status', 'watch_later');
 
-    if (activeReels && activeReels.length > 0) {
-      await supabase
+    const fetchActiveCandidates = async (senderFilter: 'exact' | 'unattributed'): Promise<SavedReel[]> => {
+      let query = supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .eq('watch_status', 'watch_later')
+        .order('updated_at', { ascending: false })
+        .order('last_reminded_at', { ascending: false, nullsFirst: false })
+        .order('created_at', { ascending: false });
+
+      if (senderFilter === 'exact') {
+        query = query.eq('instagram_sender_id', trimmedSender);
+      } else {
+        query = query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+
+      const { data, error } = await query;
+      if (error) {
+        throw new Error(`Failed to fetch active watch-later reels: ${error.message}`);
+      }
+      return (data || []) as SavedReel[];
+    };
+
+    let candidates = trimmedSender
+      ? await fetchActiveCandidates('exact')
+      : [];
+
+    if (allowUnattributedFallback && candidates.length === 0) {
+      candidates = await fetchActiveCandidates('unattributed');
+    }
+
+    if (candidates.length === 0) {
+      return { updatedReels: [], remainingCount: 0 };
+    }
+
+    const ordered = sortWatchLaterReelsMostRecentFirst(candidates);
+    const targets = markAll ? ordered : [ordered[0]];
+    const targetIds = targets.map((r) => r.id);
+    const orderIndex = new Map(targetIds.map((id, idx) => [id, idx]));
+
+    const UPDATE_CHUNK_SIZE = 100;
+    const allUpdatedRows: SavedReel[] = [];
+    for (let i = 0; i < targetIds.length; i += UPDATE_CHUNK_SIZE) {
+      const idChunk = targetIds.slice(i, i + UPDATE_CHUNK_SIZE);
+      const { data: updatedRows, error: updateErr } = await supabase
         .from('saved_reels')
         .update({
           watch_status: 'watched',
@@ -1328,34 +1505,24 @@ export class Repository {
           awaiting_reminder_choice_until: null,
           updated_at: now,
         })
-        .eq('instagram_sender_id', senderId)
-        .eq('watch_status', 'watch_later');
-      return activeReels as SavedReel[];
+        .in('id', idChunk)
+        .eq('watch_status', 'watch_later')
+        .select('*, creator:creators(*)');
+
+      if (updateErr) {
+        throw new Error(`Failed to mark watch-later reels as watched: ${updateErr.message}`);
+      }
+      if (Array.isArray(updatedRows)) {
+        allUpdatedRows.push(...(updatedRows as SavedReel[]));
+      }
     }
 
-    // 2. Fallback: match any active watch_later reel
-    const { data: latest } = await supabase
-      .from('saved_reels')
-      .select('*, creator:creators(*)')
-      .eq('watch_status', 'watch_later')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const updatedReels = allUpdatedRows.sort(
+      (a, b) => (orderIndex.get(a.id) ?? 0) - (orderIndex.get(b.id) ?? 0)
+    );
+    const remainingCount = Math.max(0, ordered.length - updatedReels.length);
 
-    if (latest) {
-      await supabase
-        .from('saved_reels')
-        .update({
-          watch_status: 'watched',
-          next_reminder_at: null,
-          awaiting_reminder_choice_until: null,
-          updated_at: now,
-        })
-        .eq('id', latest.id);
-      return [latest as SavedReel];
-    }
-
-    return [];
+    return { updatedReels, remainingCount };
   }
 
   static async getReelsAwaitingChoiceDue(): Promise<SavedReel[]> {

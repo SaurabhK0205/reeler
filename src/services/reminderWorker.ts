@@ -4,6 +4,13 @@ import { InstagramActionClient } from './instagramActionClient.ts';
 import type { InboundMessage } from './instagramActionClient.ts';
 import { MetaInstagramBotService } from './metaInstagramBotService.ts';
 import { formatTargetTime } from '../utils/duration.ts';
+import {
+  parseWatchedStopCommand,
+  formatAddedToWatchLaterCreatorBlock,
+  formatWatchedConfirmationMessage,
+  formatWatchLaterReminderMessage,
+  formatDefaultReminderNotice,
+} from '../utils/reelMessages.ts';
 
 export class ReminderWorker {
   private actionClient = new InstagramActionClient();
@@ -146,22 +153,24 @@ export class ReminderWorker {
 
       // 4. Send immediate confirmation DM to admin
       if (this.adminUserId) {
-        const confirmText = `🎬 Saved to Watch Later & bookmarked to your Instagram Saved!\n\nI will remind you about this in ${intervalHours} hours ⏰\n(Reply "done" when you've watched it)`;
+        const creatorLine = formatAddedToWatchLaterCreatorBlock(creator);
+        const confirmText = `🎬 Saved to Watch Later & bookmarked to your Instagram Saved!${creatorLine}\n\nI will remind you about this in ${intervalHours} hours ⏰\n(Reply "done" when you've watched it)`;
         await this.actionClient.sendDirectMessage(this.adminUserId, confirmText);
       }
       return;
     }
 
-    // Case 2: Text command (e.g. "done", "watched", "remind in 5h")
+    // Case 2: Text command (e.g. "done", "watched", "stop all")
     if (msg.text) {
-      const lower = msg.text.toLowerCase().trim();
-      const isWatched = /\b(watched|watch|done|seen|finish|finished|stop|cancel|halt)\b/i.test(lower);
-      if (isWatched) {
-        const updated = await Repository.markWatchedForInstagramSender(this.adminUserId || '');
-        if (updated.length > 0 && this.adminUserId) {
-          await this.actionClient.sendDirectMessage(this.adminUserId, `✅ Marked "${updated[0].shortcode}" as watched! Reminders stopped.`);
-        } else if (this.adminUserId) {
-          await this.actionClient.sendDirectMessage(this.adminUserId, `👍 All set! No pending watch-later reminders right now.`);
+      const { isCommand, markAll } = parseWatchedStopCommand(msg.text);
+      if (isCommand) {
+        const { updatedReels, remainingCount } = await Repository.markWatchedForInstagramSender(
+          this.adminUserId || '',
+          { markAll, includeUnattributedFallback: true }
+        );
+        if (this.adminUserId) {
+          const reply = formatWatchedConfirmationMessage(updatedReels, remainingCount, markAll);
+          await this.actionClient.sendDirectMessage(this.adminUserId, reply);
         }
         return;
       }
@@ -204,13 +213,7 @@ export class ReminderWorker {
       console.log(`[ReminderWorker] 🔔 Found ${allDueReels.length} Reel(s) due for reminder (dispatching batch of ${dueReels.length}).`);
 
       for (const reel of dueReels) {
-        const creatorTag =
-          reel.creator && reel.creator.username && reel.creator.username !== 'instagram_creator'
-            ? `@${reel.creator.username}`
-            : (reel.creator?.display_name && reel.creator.display_name !== 'instagram_creator' ? reel.creator.display_name : 'Instagram Reel');
-        const rawCaption = reel.caption ? reel.caption.slice(0, 70).replace(/\n/g, ' ') : '';
-        const captionPreview = rawCaption ? `"${rawCaption}..."\n` : '';
-        const reminderText = `🔔 Watch Later Reminder!\n\n🎬 ${creatorTag}\n${captionPreview}👉 ${reel.reel_url}\n\nReply "watched" when done, or reply e.g. "5m" or "snooze 1h" to delay!`;
+        const reminderText = formatWatchLaterReminderMessage(reel);
 
         let delivered = false;
 
@@ -293,11 +296,7 @@ export class ReminderWorker {
       const { targetTime } = await Repository.activateDefaultReminder(reel.id, defaultHours);
       const targetStr = formatTargetTime(targetTime);
 
-      const creatorTag =
-        reel.creator && reel.creator.username && reel.creator.username !== 'instagram_creator'
-          ? `@${reel.creator.username}`
-          : (reel.creator?.display_name && reel.creator.display_name !== 'instagram_creator' ? reel.creator.display_name : 'your reel');
-      const defaultNotice = `⏰ No reminder time received for ${creatorTag} — I've scheduled your reminder for ${defaultHours} hours from now (${targetStr}).\n\nReply e.g. "2h" or "tomorrow 5pm" anytime to change it, or "watched" when done!`;
+      const defaultNotice = formatDefaultReminderNotice(reel, defaultHours, targetStr);
 
       console.log(`[ReminderWorker] ⏰ 10-minute wait expired for reel ${reel.shortcode}. Set default ${defaultHours}h reminder (${targetStr}).`);
 

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
   <title>Reeler — Saved Reels Vault</title>
-  <link rel="stylesheet" href="style.css?v=3.8">
+  <link rel="stylesheet" href="style.css?v=4.0">
 </head>
 <body>
   <div class="app-layout">
@@ -130,12 +130,12 @@
       <!-- Filter & Search Toolbar -->
       <section class="toolbar-section" aria-label="Search and filter controls">
         <div class="search-field">
-          <label for="search-input" class="sr-only">Search saved reels by caption, creator handle, or shortcode</label>
+          <label for="search-input" class="sr-only">Search saved reels by caption or creator handle</label>
           <svg class="search-glyph" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="11" cy="11" r="8"></circle>
             <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
           </svg>
-          <input type="text" id="search-input" placeholder="Search reels, creators, ID" autocomplete="off">
+          <input type="text" id="search-input" placeholder="Search captions or @creators" autocomplete="off">
           <button type="button" id="clear-search" class="clear-search-btn" aria-label="Clear search" hidden>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <line x1="18" y1="6" x2="6" y2="18"></line>
@@ -292,7 +292,6 @@
         <h2 class="sr-only" id="feed-modal-title">Reels Vertical Stream</h2>
         <div class="feed-counter-wrap">
           <span class="feed-counter-kicker" id="feed-counter-kicker">REEL 1 OF 1</span>
-          <span class="feed-shortcode-tag" id="feed-shortcode-tag">ID: ...</span>
           <span class="feed-shortcuts-hint" aria-hidden="true"><kbd>w</kbd> Watched · <kbd>l</kbd> Later · <kbd>c</kbd> Copy · <kbd>j</kbd>/<kbd>k</kbd> Scroll · <kbd>Esc</kbd> Close</span>
         </div>
         <div class="feed-top-actions">
@@ -316,6 +315,6 @@
   </div>
 
   <script src="playerGeometry.js?v=1.3"></script>
-  <script src="app.js?v=3.8"></script>
+  <script src="app.js?v=4.0"></script>
 </body>
 </html>

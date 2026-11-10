@@ -114,10 +114,11 @@ src/
    - Always use `src/utils/duration.ts` (`parseDurationOrDateInput`).
    - Never write ad-hoc date/regex parsing in services or route handlers.
 5. **Instagram In-App DM UX Rules:**
-   - **Never** format creator profiles as web links (`https://instagram.com/user`).
-   - **Always** format creator handles as clean in-app `@username` mentions with clear spacing so mobile users open native profile sheets without leaving the app.
+   - **Creator Profile Links**: Meta Graph API DMs do NOT automatically linkify plain `@username` mentions on Instagram Web or reliably across mobile clients. Whenever a valid Instagram handle exists (never for placeholder fallbacks like `Instagram Creator` or spaced display names), include a clean clickable profile URL (`https://www.instagram.com/<username>/`) paired with `@<username>` in Watch Later save confirmations, custom/default schedule replies, reminder DMs, and creator-search replies (short `"watched"` / `"stop"` confirmation DMs intentionally omit profile link cards to keep the reply compact).
+   - **Link Preview Priority**: In reminder DMs that contain a Reel URL, always place the Reel URL **before** the creator profile URL so Instagram unfurls the Reel video thumbnail card rather than overriding it with a profile card.
+   - **Human-Readable Reel Labels**: Never expose raw shortcodes (e.g. `Da1iWbSMAOz`) in user-facing DM copy or the frontend UI; identify reels by creator handle, caption snippet, save date, or plain `"your saved reel"`.
    - When a user shares a reel, prompt them for custom reminder timing with a **10-minute window**. If no reply within 10 minutes, default to **10 hours**.
-   - When a user sends "watched", immediately mark the reel as watched and clear both `next_reminder_at` and `awaiting_reminder_choice_until`.
+   - When a user sends `"watched"` / `"done"` / `"stop"`, mark the **most recently reminded / latest active** Watch Later reel as watched and clear both `next_reminder_at` and `awaiting_reminder_choice_until` (using `"stop all"` / `"watched all"` for bulk clearing all pending Watch Later reels).
 
 ---
 
@@ -183,7 +184,8 @@ For implementation, debugging, refactoring, review, and migrations:
 * **Merging a Pull Request without waiting for CodeRabbit review to complete**.
 * **Merging a Pull Request with unresolved CodeRabbit review comments or findings**.
 * **Direct database `.from(...)` query inside `src/api/` or `src/server.ts`**.
-* **Sending `https://instagram.com/...` web URLs for creator profiles in Instagram DMs**.
+* **Exposing raw Instagram shortcodes (`"ID: ..."`) in user-facing DM replies or UI copy instead of human-readable creator/caption labels**.
+* **Placing creator profile URLs before Reel URLs in reminder DMs (breaks Reel video preview unfurling)**.
 * **Reinventing date/duration parsing outside `src/utils/duration.ts`**.
 * **Altering database tables without a corresponding migration in `supabase/migrations/`**.
 * **Modifying files in `/Users/thismac/rea/`**.
