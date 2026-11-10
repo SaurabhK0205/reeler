@@ -113,8 +113,16 @@ export class ReminderWorker {
     // Case 1: Reel or Post was shared!
     if (msg.reel) {
       const { mediaId, shortcode, authorUsername, caption, thumbnailUrl, mediaType, reelUrl } = msg.reel;
-      const resolvedMediaType = classifySavedMediaType({ mediaType, reelUrl });
-      const canonicalUrl = formatCanonicalInstagramUrl(shortcode, resolvedMediaType, reelUrl);
+      const existingItem = !mediaId && shortcode ? await Repository.getSavedItemByShortcode(shortcode) : null;
+      const isTextFallbackReel = !mediaId && mediaType === 'reel' && !/\/p\//i.test(reelUrl || '');
+      const resolvedMediaType =
+        isTextFallbackReel && existingItem
+          ? classifySavedMediaType({ mediaType: existingItem.media_type, reelUrl: existingItem.reel_url })
+          : classifySavedMediaType({ mediaType, reelUrl });
+      const canonicalUrl =
+        isTextFallbackReel && existingItem
+          ? formatCanonicalInstagramUrl(shortcode, resolvedMediaType, existingItem.reel_url)
+          : formatCanonicalInstagramUrl(shortcode, resolvedMediaType, reelUrl);
       console.log(`[ReminderWorker] ${resolvedMediaType === 'post' ? '🖼️' : '🎬'} Detected shared ${resolvedMediaType} from admin: ${shortcode} (Media ID: ${mediaId})`);
 
       // 1. Save to native Instagram Saved collection
@@ -128,27 +136,27 @@ export class ReminderWorker {
       }
 
       // 2. Upsert creator
-      const creatorUsername = authorUsername || 'instagram_user';
+      const creatorUsername = authorUsername || existingItem?.creator?.username || 'instagram_user';
       const creator = await Repository.upsertCreator({
-        instagram_user_id: creatorUsername,
+        instagram_user_id: existingItem?.creator?.instagram_user_id || creatorUsername,
         username: creatorUsername,
-        display_name: creatorUsername,
+        display_name: existingItem?.creator?.display_name || creatorUsername,
       });
 
       // 3. Upsert item into Supabase with watch_status = 'watch_later'
       const nextReminderDate = new Date(Date.now() + intervalHours * 60 * 60 * 1000).toISOString();
       await Repository.upsertSavedReel({
-        instagram_media_id: mediaId || `id_${shortcode}`,
+        instagram_media_id: existingItem?.instagram_media_id || mediaId || `id_${shortcode}`,
         shortcode,
         reel_url: canonicalUrl,
         media_type: resolvedMediaType,
         creator_id: creator.id,
-        caption: caption || null,
-        thumbnail_url: thumbnailUrl || null,
-        taken_at: new Date().toISOString(),
-        saved_at: new Date().toISOString(),
-        first_detected_at: new Date().toISOString(),
-        save_order_rank: 1,
+        caption: caption || existingItem?.caption || null,
+        thumbnail_url: thumbnailUrl || existingItem?.thumbnail_url || null,
+        taken_at: existingItem?.taken_at || new Date().toISOString(),
+        saved_at: existingItem?.saved_at || new Date().toISOString(),
+        first_detected_at: existingItem?.first_detected_at || new Date().toISOString(),
+        save_order_rank: existingItem?.save_order_rank ?? 1,
         watch_status: 'watch_later',
         reminder_interval_hours: intervalHours,
         next_reminder_at: nextReminderDate,

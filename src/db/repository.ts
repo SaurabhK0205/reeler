@@ -1791,4 +1791,43 @@ export class Repository {
 
     return Boolean(data?.id);
   }
+
+  /**
+   * Looks up a saved item (with creator attribution) by its unique Instagram shortcode across both
+   * Supabase and in-memory fallback storage.
+   */
+  static async getSavedItemByShortcode(shortcode: string): Promise<SavedReel | null> {
+    const cleanCode = String(shortcode || '').trim();
+    if (!cleanCode) return null;
+
+    if (!isSupabaseConfigured()) {
+      for (const reel of memoryStore.reels.values()) {
+        if (reel.shortcode === cleanCode) {
+          return {
+            ...reel,
+            media_type: classifySavedMediaType({ mediaType: reel.media_type, reelUrl: reel.reel_url }),
+            creator: memoryStore.creators.get(reel.creator_id),
+          };
+        }
+      }
+      return null;
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('shortcode', cleanCode)
+      .maybeSingle();
+
+    if (error || !data) {
+      return null;
+    }
+
+    const row = data as SavedReel;
+    return {
+      ...row,
+      media_type: classifySavedMediaType({ mediaType: row.media_type, reelUrl: row.reel_url }),
+    };
+  }
 }

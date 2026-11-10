@@ -8,6 +8,7 @@ import {
   classifySavedMediaType,
   extractInstagramShortcodeAndPath,
   formatCanonicalInstagramUrl,
+  resolveInboundMediaClassification,
 } from '../utils/mediaType.ts';
 import {
   parseWatchedStopCommand,
@@ -301,45 +302,59 @@ export class MetaInstagramBotService {
     // Check for Reel or Post URL
     const mediaLink = extractInstagramShortcodeAndPath(text);
     if (mediaLink) {
-      const { shortcode, pathType, mediaType: linkMediaType, matchedText } = mediaLink;
+      const { shortcode, pathType, matchedText } = mediaLink;
       const remaining = text.replace(matchedText, '').trim();
       const customDuration = parseDuration(remaining);
 
       // Fetch public metadata (probe /p/ first for post links, /reel/ first for reel/tv links)
       const preferredPath = pathType === 'p' ? 'p' : 'reel';
-      const meta = await fetchReelMetadata(shortcode, undefined, preferredPath);
+      const [meta, existingItem] = await Promise.all([
+        fetchReelMetadata(shortcode, undefined, preferredPath),
+        Repository.getSavedItemByShortcode(shortcode),
+      ]);
 
-      let mediaType = linkMediaType;
-      if (pathType === 'p') {
-        mediaType = meta.isClips === true ? 'reel' : 'post';
-      } else if (meta.isClips === false) {
-        mediaType = 'post';
+      const { mediaType, canonicalUrl } = resolveInboundMediaClassification({
+        shortcode,
+        pathType,
+        matchedText,
+        isClips: meta.isClips,
+        mediaKind: meta.mediaKind,
+        attachmentType,
+        existing: existingItem,
+      });
+
+      const validHandle = extractPublicCreatorUsername({ username: meta.username });
+      const existingCreator = existingItem?.creator;
+      const existingHandle = extractPublicCreatorUsername(existingCreator);
+
+      let creator: NonNullable<typeof existingCreator>;
+      if (!validHandle && !meta.displayName && existingCreator) {
+        creator = existingCreator;
       } else {
-        mediaType = classifySavedMediaType({
-          mediaType: linkMediaType,
-          isClips: meta.isClips,
-          mediaKind: meta.mediaKind,
-          attachmentType,
+        const resolvedHandle = validHandle || existingHandle;
+        const matchesExistingHandle =
+          Boolean(resolvedHandle && existingHandle && resolvedHandle.toLowerCase() === existingHandle.toLowerCase());
+        const reuseExistingCreatorId = matchesExistingHandle || (!validHandle && Boolean(existingCreator));
+        const creatorExternalId = reuseExistingCreatorId
+          ? existingCreator!.instagram_user_id
+          : resolvedHandle
+            ? `creator_${resolvedHandle}`
+            : `creator_unattributed_${shortcode}`;
+
+        creator = await Repository.upsertCreator({
+          instagram_user_id: creatorExternalId,
+          username: resolvedHandle || existingCreator?.username || 'Instagram Creator',
+          display_name: meta.displayName || existingCreator?.display_name || resolvedHandle || 'Instagram Creator',
+          profile_picture_url: existingCreator?.profile_picture_url || meta.thumbnailUrl || null,
         });
       }
 
-      const existingHint = pathType === 'tv' ? `https://www.instagram.com/tv/${shortcode}/` : matchedText;
-      const canonicalUrl = formatCanonicalInstagramUrl(shortcode, mediaType, existingHint);
-
-      const validHandle = extractPublicCreatorUsername({ username: meta.username });
-      const username = validHandle || 'Instagram Creator';
-      const displayName = meta.displayName || validHandle || username;
-      const creatorExternalId = validHandle
-        ? `creator_${validHandle}`
-        : `creator_unattributed_${shortcode}`;
-
-      // Upsert Creator
-      const creator = await Repository.upsertCreator({
-        instagram_user_id: creatorExternalId,
-        username: username,
-        display_name: displayName,
-        profile_picture_url: meta.thumbnailUrl || null,
-      });
+      const instagramMediaId = existingItem?.instagram_media_id || `shortcode_${shortcode}`;
+      const caption = meta.caption || existingItem?.caption || null;
+      const thumbnailUrl = meta.thumbnailUrl || existingItem?.thumbnail_url || null;
+      const takenAt = existingItem?.taken_at || new Date().toISOString();
+      const firstDetectedAt = existingItem?.first_detected_at || new Date().toISOString();
+      const saveOrderRank = existingItem?.save_order_rank ?? 1;
 
       const creatorLine = formatAddedToWatchLaterCreatorBlock({
         username: creator.username,
@@ -352,16 +367,16 @@ export class MetaInstagramBotService {
         // User provided a specific time along with the item!
         const nextReminder = customDuration.targetDate.toISOString();
         await Repository.upsertSavedReel({
-          instagram_media_id: `shortcode_${shortcode}`,
+          instagram_media_id: instagramMediaId,
           shortcode,
           reel_url: canonicalUrl,
           media_type: mediaType,
           creator_id: creator.id,
-          caption: meta.caption || null,
-          thumbnail_url: meta.thumbnailUrl || null,
-          taken_at: new Date().toISOString(),
-          first_detected_at: new Date().toISOString(),
-          save_order_rank: 1,
+          caption,
+          thumbnail_url: thumbnailUrl,
+          taken_at: takenAt,
+          first_detected_at: firstDetectedAt,
+          save_order_rank: saveOrderRank,
           watch_status: 'watch_later',
           reminder_interval_seconds: customDuration.seconds,
           next_reminder_at: nextReminder,
@@ -376,16 +391,16 @@ export class MetaInstagramBotService {
         // No time provided — wait up to 10 minutes for user choice before defaulting to 10 hours
         const awaitingUntil = new Date(Date.now() + 10 * 60 * 1000).toISOString();
         await Repository.upsertSavedReel({
-          instagram_media_id: `shortcode_${shortcode}`,
+          instagram_media_id: instagramMediaId,
           shortcode,
           reel_url: canonicalUrl,
           media_type: mediaType,
           creator_id: creator.id,
-          caption: meta.caption || null,
-          thumbnail_url: meta.thumbnailUrl || null,
-          taken_at: new Date().toISOString(),
-          first_detected_at: new Date().toISOString(),
-          save_order_rank: 1,
+          caption,
+          thumbnail_url: thumbnailUrl,
+          taken_at: takenAt,
+          first_detected_at: firstDetectedAt,
+          save_order_rank: saveOrderRank,
           watch_status: 'watch_later',
           reminder_interval_seconds: null,
           next_reminder_at: null,

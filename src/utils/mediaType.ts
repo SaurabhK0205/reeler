@@ -1,4 +1,4 @@
-import type { SavedMediaType } from '../types.ts';
+import type { SavedMediaType, SavedReel } from '../types.ts';
 
 export type InstagramPathType = 'reel' | 'p' | 'tv';
 
@@ -131,4 +131,79 @@ export function formatCanonicalInstagramUrl(
     return `https://www.instagram.com/tv/${cleanCode}/`;
   }
   return `https://www.instagram.com/reel/${cleanCode}/`;
+}
+
+/**
+ * Resolves `media_type` and canonical Instagram URL for an inbound DM link while preserving any
+ * previously recovered `'post'` classification and `/p/` URL if live metadata lookup is inconclusive
+ * on a legacy `/reel/` URL, while allowing conclusive metadata to update classification.
+ */
+export function resolveInboundMediaClassification(params: {
+  shortcode: string;
+  pathType: InstagramPathType;
+  matchedText: string;
+  isClips?: boolean | null;
+  mediaKind?: string | null;
+  attachmentType?: string | null;
+  existing?: Pick<SavedReel, 'media_type' | 'reel_url'> | null;
+}): { mediaType: SavedMediaType; canonicalUrl: string } {
+  const attType = typeof params.attachmentType === 'string' ? params.attachmentType.trim().toLowerCase() : '';
+  const hasPostAttachment = attType === 'image' || attType === 'photo' || attType === 'carousel' || attType === 'ig_post';
+  const kind = typeof params.mediaKind === 'string' ? params.mediaKind.trim().toUpperCase() : '';
+  const hasConclusiveMeta =
+    typeof params.isClips === 'boolean' || kind === 'FEED' || kind === 'CAROUSEL_ITEM' || kind === 'CLIPS';
+  const existingHint =
+    params.pathType === 'tv' ? `https://www.instagram.com/tv/${encodeURIComponent(params.shortcode)}/` : params.matchedText;
+
+  if (params.pathType === 'p') {
+    const mediaType: SavedMediaType = params.isClips === true || kind === 'CLIPS' ? 'reel' : 'post';
+    const canonicalUrl = formatCanonicalInstagramUrl(
+      params.shortcode,
+      mediaType,
+      mediaType === 'post' ? 'https://www.instagram.com/p/' : existingHint
+    );
+    return { mediaType, canonicalUrl };
+  }
+
+  if (hasConclusiveMeta) {
+    const mediaType = classifySavedMediaType({
+      isClips: params.isClips,
+      mediaKind: params.mediaKind,
+    });
+    const canonicalUrl = formatCanonicalInstagramUrl(
+      params.shortcode,
+      mediaType,
+      mediaType === 'post' ? undefined : existingHint
+    );
+    return { mediaType, canonicalUrl };
+  }
+
+  if (hasPostAttachment) {
+    return {
+      mediaType: 'post',
+      canonicalUrl: formatCanonicalInstagramUrl(params.shortcode, 'post'),
+    };
+  }
+
+  if (params.existing) {
+    const preservedType = classifySavedMediaType({
+      mediaType: params.existing.media_type,
+      reelUrl: params.existing.reel_url,
+    });
+    return {
+      mediaType: preservedType,
+      canonicalUrl: formatCanonicalInstagramUrl(params.shortcode, preservedType, params.existing.reel_url),
+    };
+  }
+
+  const fallbackType = classifySavedMediaType({
+    mediaType: params.pathType === 'p' ? 'post' : 'reel',
+    isClips: params.isClips,
+    mediaKind: params.mediaKind,
+    attachmentType: params.attachmentType,
+  });
+  return {
+    mediaType: fallbackType,
+    canonicalUrl: formatCanonicalInstagramUrl(params.shortcode, fallbackType, existingHint),
+  };
 }

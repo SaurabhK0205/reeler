@@ -986,3 +986,201 @@ test('MetaInstagramBotService isolates /p/ posts vs /reel/ reels across save, re
     if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
   }
 });
+
+test('MetaInstagramBotService preserves recovered post classification on inconclusive legacy /reel/ resends while allowing conclusive updates', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  const originalFetch = globalThis.fetch;
+  try {
+    const { Repository } = await import('../src/db/repository.ts');
+    Repository.resetMemoryStoreForTests();
+
+    const creator = await Repository.upsertCreator({
+      instagram_user_id: 'export_creator_compass',
+      username: 'the_political_compass',
+      display_name: 'The Political Compass',
+    });
+
+    // Recovered legacy post already repaired to media_type='post' & /p/ URL
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'export_DS1goOmjhUi',
+      shortcode: 'DS1goOmjhUi',
+      reel_url: 'https://www.instagram.com/p/DS1goOmjhUi/',
+      media_type: 'post',
+      creator_id: creator.id,
+      caption: 'Preserved quadrant post',
+      thumbnail_url: 'https://scontent.cdninstagram.com/v/t51.2885-15/saved-post.jpg',
+      taken_at: '2026-11-10T09:00:00Z',
+      first_detected_at: '2026-11-10T09:00:00Z',
+      save_order_rank: 1,
+    });
+
+    // Existing row whose metadata will conclusively classify it as CLIPS/reel
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'export_DUpgradeReel',
+      shortcode: 'DUpgradeReel',
+      reel_url: 'https://www.instagram.com/p/DUpgradeReel/',
+      media_type: 'post',
+      creator_id: creator.id,
+      caption: 'Upgraded clip item',
+      taken_at: '2026-11-10T08:00:00Z',
+      first_detected_at: '2026-11-10T08:00:00Z',
+      save_order_rank: 2,
+    });
+
+    // Legacy misclassified row whose metadata conclusively identifies it as a /p/ post (and omits @handle)
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'export_DRetroPost',
+      shortcode: 'DRetroPost',
+      reel_url: 'https://www.instagram.com/reel/DRetroPost/',
+      media_type: 'reel',
+      creator_id: creator.id,
+      caption: 'Legacy misclassified post',
+      taken_at: '2026-11-10T07:00:00Z',
+      first_detected_at: '2026-11-10T07:00:00Z',
+      save_order_rank: 3,
+    });
+
+    globalThis.fetch = (async (url: unknown) => {
+      const target = String(url);
+      if (target.includes('DUpgradeReel')) {
+        return new Response(
+          `<html><head>
+            <meta property="og:url" content="https://www.instagram.com/the_political_compass/reel/DUpgradeReel/" />
+            <meta property="og:title" content="The Political Compass (@the_political_compass) on Instagram" />
+            <meta property="og:description" content="50 likes: &quot;Upgraded clip item&quot;." />
+          </head></html>`,
+          { status: 200, headers: { 'Content-Type': 'text/html' } }
+        );
+      }
+      if (target.includes('DRetroPost')) {
+        return new Response(
+          `<html><head>
+            <meta property="og:url" content="https://www.instagram.com/the_political_compass/p/DRetroPost/" />
+            <meta property="og:title" content="The Political Compass on Instagram: &quot;Retro post&quot;" />
+          </head></html>`,
+          { status: 200, headers: { 'Content-Type': 'text/html' } }
+        );
+      }
+      // Inconclusive / empty response simulating rate-limited or login-walled Instagram fetch
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+
+    const sentMessages: Array<{ recipientId: string; text: string }> = [];
+    const bot = new MetaInstagramBotService();
+    bot.sendDirectMessage = async (recipientId: string, text: string) => {
+      sentMessages.push({ recipientId, text });
+      return true;
+    };
+
+    // 1. Resend legacy /reel/ URL for DS1goOmjhUi when metadata is unavailable
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_preserve' },
+              message: { text: 'https://www.instagram.com/reel/DS1goOmjhUi/ 30m' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('🖼️ Added post to your Watch Later!'), `Got: ${sentMessages[0].text}`);
+    assert.ok(sentMessages[0].text.includes('Creator: @the_political_compass'), `Got: ${sentMessages[0].text}`);
+
+    const preserved = await Repository.getSavedItemByShortcode('DS1goOmjhUi');
+    assert.ok(preserved);
+    assert.strictEqual(preserved.media_type, 'post');
+    assert.strictEqual(preserved.reel_url, 'https://www.instagram.com/p/DS1goOmjhUi/');
+    assert.strictEqual(preserved.instagram_media_id, 'export_DS1goOmjhUi');
+    assert.strictEqual(preserved.caption, 'Preserved quadrant post');
+    assert.strictEqual(preserved.taken_at, '2026-11-10T09:00:00Z');
+    assert.strictEqual(preserved.first_detected_at, '2026-11-10T09:00:00Z');
+
+    const postFiltered = await Repository.getReels({ mediaType: 'post', limit: 10 });
+    assert.strictEqual(postFiltered.reels.some((r) => r.shortcode === 'DS1goOmjhUi'), true);
+
+    // 2. Resend /reel/ URL for DUpgradeReel when metadata conclusively identifies CLIPS
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_preserve' },
+              message: { text: 'https://www.instagram.com/reel/DUpgradeReel/ 30m' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 2);
+    assert.ok(sentMessages[1].text.includes('🎬 Added to your Watch Later!'), `Got: ${sentMessages[1].text}`);
+
+    const upgraded = await Repository.getSavedItemByShortcode('DUpgradeReel');
+    assert.ok(upgraded);
+    assert.strictEqual(upgraded.media_type, 'reel');
+    assert.strictEqual(upgraded.reel_url, 'https://www.instagram.com/reel/DUpgradeReel/');
+
+    // 3. Resend legacy /reel/ URL for DRetroPost when metadata conclusively resolves /p/ without @handle
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_preserve' },
+              message: { text: 'https://www.instagram.com/reel/DRetroPost/ 30m' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 3);
+    assert.ok(sentMessages[2].text.includes('🖼️ Added post to your Watch Later!'), `Got: ${sentMessages[2].text}`);
+    assert.ok(sentMessages[2].text.includes('Creator: @the_political_compass'), `Got: ${sentMessages[2].text}`);
+
+    const retroFixed = await Repository.getSavedItemByShortcode('DRetroPost');
+    assert.ok(retroFixed);
+    assert.strictEqual(retroFixed.media_type, 'post');
+    assert.strictEqual(retroFixed.reel_url, 'https://www.instagram.com/p/DRetroPost/');
+    assert.strictEqual(retroFixed.creator?.username, 'the_political_compass');
+
+    // 4. New unknown /reel/ link with unavailable metadata still defaults to reel
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_preserve' },
+              message: { text: 'https://www.instagram.com/reel/DBrandNewReel/ 30m' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 4);
+    assert.ok(sentMessages[3].text.includes('🎬 Added to your Watch Later!'), `Got: ${sentMessages[3].text}`);
+    const freshReel = await Repository.getSavedItemByShortcode('DBrandNewReel');
+    assert.ok(freshReel);
+    assert.strictEqual(freshReel.media_type, 'reel');
+    assert.strictEqual(freshReel.reel_url, 'https://www.instagram.com/reel/DBrandNewReel/');
+
+    Repository.resetMemoryStoreForTests();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+  }
+});
