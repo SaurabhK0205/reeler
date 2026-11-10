@@ -85,6 +85,9 @@ class InMemoryStore {
     return newCreator;
   }
 
+  /**
+   * Inserts or updates a saved reel/post in the in-memory store, preserving existing `saved_at` when appropriate.
+   */
   async upsertSavedReel(data: {
     instagram_media_id: string;
     shortcode: string;
@@ -205,6 +208,9 @@ class InMemoryStore {
     return result;
   }
 
+  /**
+   * Batch-upserts saved items into the in-memory store with optional duplicate-skipping and `saved_at` backfill.
+   */
   async upsertSavedReelsBatch(reels: Array<{
     instagram_media_id: string;
     shortcode: string;
@@ -378,6 +384,9 @@ class InMemoryStore {
     return list;
   }
 
+  /**
+   * Computes library totals, weekly/monthly save counts via `effective_saved_at`, and top creators from memory.
+   */
   async getStats(): Promise<LibraryStats> {
     const allReels = Array.from(this.reels.values());
     const now = Date.now();
@@ -828,6 +837,9 @@ export class Repository {
     }
   }
 
+  /**
+   * Batch-upserts saved reels/posts and optionally backfills missing or earlier archive `saved_at` timestamps.
+   */
   static async upsertSavedReelsBatch(reels: Array<{
     instagram_media_id: string;
     shortcode: string;
@@ -1448,6 +1460,9 @@ export class Repository {
     };
   }
 
+  /**
+   * Retrieves a creator's saved reels and posts ordered chronologically by `effective_saved_at` descending.
+   */
   static async getReelsByCreatorUsername(
     username: string,
     options?: { mediaType?: SavedMediaType | 'all' }
@@ -1583,6 +1598,9 @@ export class Repository {
     };
   }
 
+  /**
+   * Computes aggregate library counts, weekly/monthly `effective_saved_at` activity, and top creators.
+   */
   static async getStats(): Promise<LibraryStats> {
     if (!isSupabaseConfigured()) {
       return memoryStore.getStats();

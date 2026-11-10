@@ -8,6 +8,9 @@ delete process.env.SUPABASE_ANON_KEY;
 const { ArchiveImportService, normalizeMetaExportText } = await import('../src/services/archiveImportService.ts');
 const { Repository } = await import('../src/db/repository.ts');
 
+/**
+ * Runs regression checks covering Instagram archive parsing, post/reel isolation, and `saved_at` backfill/sorting.
+ */
 async function runTests() {
   console.log('--- Running ArchiveImportService Regression Tests ---');
 

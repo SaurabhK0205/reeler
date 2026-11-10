@@ -2,6 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ArchiveImportService } from '../src/services/archiveImportService.ts';
 
+/**
+ * CLI entrypoint for importing saved items and backfilling missing `saved_at` timestamps from an Instagram JSON export.
+ */
 async function main() {
   const filePath = process.argv[2];
   if (!filePath) {
