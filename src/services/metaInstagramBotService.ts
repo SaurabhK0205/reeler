@@ -4,6 +4,14 @@ import { Repository } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
 import { parseDuration, formatTargetTime } from '../utils/duration.ts';
 import { extractCreatorQuery } from '../utils/creatorQuery.ts';
+import {
+  parseWatchedStopCommand,
+  extractPublicCreatorUsername,
+  formatAddedToWatchLaterCreatorBlock,
+  formatWatchedConfirmationMessage,
+  formatReminderSetMessage,
+  formatCreatorSearchMessages,
+} from '../utils/reelMessages.ts';
 
 export class MetaInstagramBotService {
   private accessToken: string;
@@ -288,22 +296,27 @@ export class MetaInstagramBotService {
       const remaining = text.replace(reelMatch[0], '').trim();
       const customDuration = parseDuration(remaining);
 
-      // Fetch public metadata
+      // Fetch public metadata (keep arbitrary displayName out of username so placeholders stay clean)
       const meta = await fetchReelMetadata(shortcode);
-      const username = meta.username || meta.displayName || 'Instagram Creator';
-      const displayName = meta.displayName || username;
+      const validHandle = extractPublicCreatorUsername({ username: meta.username });
+      const username = validHandle || 'Instagram Creator';
+      const displayName = meta.displayName || validHandle || username;
+      const creatorExternalId = validHandle
+        ? `creator_${validHandle}`
+        : `creator_display_${displayName.toLowerCase().replace(/[^a-z0-9_]+/g, '_').slice(0, 48) || 'unknown'}`;
 
       // Upsert Creator
       const creator = await Repository.upsertCreator({
-        instagram_user_id: `creator_${username}`,
+        instagram_user_id: creatorExternalId,
         username: username,
         display_name: displayName,
         profile_picture_url: meta.thumbnailUrl || null,
       });
 
-      const creatorLine = meta.username
-        ? `\nCreator: @${meta.username}`
-        : (meta.displayName ? `\nCreator: ${meta.displayName}` : '');
+      const creatorLine = formatAddedToWatchLaterCreatorBlock({
+        username: creator.username,
+        display_name: creator.display_name,
+      });
 
       if (customDuration) {
         // User provided a specific time along with the reel!
@@ -358,19 +371,13 @@ export class MetaInstagramBotService {
       return;
     }
 
-    const lower = text.toLowerCase().trim();
-
     // 1. Mark as watched / stop command
-    // Handles: "watched", "watched!", "watched.", "done", "seen", "stop", "i watched it", "done with it", "cancel", "clear", etc.
-    const isWatchedOrStop = /\b(watched|watch|done|seen|finish|finished|stop|cancel|halt|unsub|quit)\b/i.test(lower);
-    if (isWatchedOrStop) {
-      const updatedReels = await Repository.markWatchedForInstagramSender(senderId);
-      if (updatedReels.length > 0) {
-        const title = updatedReels[0].shortcode ? `"${updatedReels[0].shortcode}"` : 'your reel';
-        await this.sendDirectMessage(senderId, `✅ Marked ${title} as watched! Reminders stopped.`);
-      } else {
-        await this.sendDirectMessage(senderId, `👍 All set! No pending reels right now.`);
-      }
+    // Handles single ("watched", "done", "stop") and bulk ("stop all", "watched all", "clear all", "unsub")
+    const { isCommand, markAll } = parseWatchedStopCommand(text);
+    if (isCommand) {
+      const { updatedReels, remainingCount } = await Repository.markWatchedForInstagramSender(senderId, { markAll });
+      const reply = formatWatchedConfirmationMessage(updatedReels, remainingCount, markAll);
+      await this.sendDirectMessage(senderId, reply);
       return;
     }
 
@@ -384,13 +391,8 @@ export class MetaInstagramBotService {
       if (targetReel) {
         const nextDate = customDuration.targetDate.toISOString();
         await Repository.updateReminderSchedule(targetReel.id, nextDate, customDuration.seconds);
-        const creatorTag = targetReel.creator?.username && targetReel.creator.username !== 'instagram_creator'
-          ? `@${targetReel.creator.username}`
-          : (targetReel.creator?.display_name || targetReel.shortcode);
-        await this.sendDirectMessage(
-          senderId,
-          `⏰ Reminder set for ${creatorTag}: ${customDuration.label} (${customDuration.formattedTarget})!\n\nReply "watched" when done.`
-        );
+        const reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget);
+        await this.sendDirectMessage(senderId, reply);
       } else {
         await this.sendDirectMessage(
           senderId,
@@ -406,22 +408,22 @@ export class MetaInstagramBotService {
       const { creator, reels } = await Repository.getReelsByCreatorUsername(creatorQuery);
       const cleanHandle = creatorQuery.replace(/^@/, '').trim();
       const resolvedUsername = creator?.username || cleanHandle;
+      const totalCount = reels.length;
+      const limit = Math.min(reels.length, 5);
+      const searchCopy = formatCreatorSearchMessages({
+        username: resolvedUsername,
+        displayName: creator?.display_name,
+        totalCount,
+        limit,
+      });
 
       if (!creator || reels.length === 0) {
-        await this.sendDirectMessage(
-          senderId,
-          `🔍 No saved reels found for Creator: @${resolvedUsername} yet!\n\nShare any Reel link from them here to start tracking.`
-        );
+        await this.sendDirectMessage(senderId, searchCopy.notFound);
         return;
       }
 
-      const totalCount = reels.length;
-      const countLabel = totalCount === 1 ? '1 saved reel' : `${totalCount} saved reels`;
-      const limit = Math.min(reels.length, 5);
-
-      // 1. Send header message with clean @mention formatted on its own line like Watch Later confirmation
-      const headerMsg = `🎬 Saved Reels\nCreator: @${creator.username}\nFound: ${countLabel}\n\nHere are the latest ${limit} reels:`;
-      const headerSent = await this.sendDirectMessage(senderId, headerMsg);
+      // 1. Send header message with clean @mention and clickable profile link
+      const headerSent = await this.sendDirectMessage(senderId, searchCopy.header);
       if (!headerSent) {
         console.warn(`[MetaIG] Failed to send creator query header to ${senderId}`);
         return;
@@ -441,9 +443,7 @@ export class MetaInstagramBotService {
       // 3. Send footer message if additional reels exist in the user's library
       if (reels.length > limit) {
         await new Promise((resolve) => setTimeout(resolve, 350));
-        const remaining = reels.length - limit;
-        const footerMsg = `... and ${remaining} more reels from @${creator.username} in your library!\n\nSearch "${creator.username}" on your web dashboard to see all.`;
-        await this.sendDirectMessage(senderId, footerMsg);
+        await this.sendDirectMessage(senderId, searchCopy.footer);
       }
       return;
     }

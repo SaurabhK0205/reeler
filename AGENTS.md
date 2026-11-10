@@ -41,7 +41,7 @@ Follow GRAVITAS invariants for implementation, debugging, refactoring, review, a
 3. **Secrets**: Never commit `.env`, credentials, or access tokens.
 4. **Architecture**: Endpoints call services; services call repository (`src/db/repository.ts`). No raw database calls in endpoints.
 5. **Database**: All schema changes require a migration in `supabase/migrations/` and an update to `src/types.ts`.
-6. **Instagram UX**: Use clean in-app `@username` mentions for creator profiles (no web URLs).
+6. **Instagram UX**: Include clickable creator profile links (`https://www.instagram.com/<username>/` paired with `@<username>`) when a valid Instagram handle exists (placing Reel URLs before profile URLs in reminders to preserve video card previews), never leak raw shortcodes in user-facing DMs or UI, and treat `"watched"` as single-latest-reel unless `"stop all"` / `"watched all"` is requested.
 7. **Workspace Isolation**: Work strictly within `/Users/thismac/projects/instagram-saved-reels/`. Do not touch `/Users/thismac/rea/`.
 8. **CodeRabbit Review Gate (MANDATORY & BLOCKING)**:
    - **NEVER merge a Pull Request immediately.**
