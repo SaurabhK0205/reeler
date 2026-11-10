@@ -42,16 +42,20 @@ export function parseWatchedStopCommand(text: string): WatchedStopCommand {
       withoutMentions
     ) ||
     /^watch[!.\s]*$/i.test(withoutMentions) ||
-    /(?<![\w.@])clear\s+(?:all|everything|reminders?)(?![\w]|(?:\.[a-z0-9_]))/i.test(withoutMentions) ||
-    /(?<![\w.@])mark\s+all(?![\w]|(?:\.[a-z0-9_]))/i.test(withoutMentions);
+    /(?<![\w.@])clear\s+(?:them\s+)?(?:all|everything|reminders?)(?![\w]|(?:\.[a-z0-9_]))/i.test(withoutMentions) ||
+    /(?<![\w.@])mark\s+(?:them\s+)?(?:all|everything)(?![\w]|(?:\.[a-z0-9_]))/i.test(withoutMentions);
 
   if (!isCommand) {
     return { isCommand: false, markAll: false };
   }
 
-  const markAll = /(?<![\w.@])(?:all|everything|unsub|unsubscribe|(?:stop|cancel|halt|clear)\s+reminders)(?![\w]|(?:\.[a-z0-9_]))/i.test(
-    withoutMentions
-  );
+  const markAll =
+    /(?<![\w.@])(?:watched|done|seen|finish|finished|stop|cancel|halt|clear|mark)\s+(?:them\s+)?(?:all|everything)(?![\w]|(?:\.[a-z0-9_]))/i.test(
+      withoutMentions
+    ) ||
+    /(?<![\w.@])(?:unsub|unsubscribe|(?:stop|cancel|halt|clear)\s+reminders)(?![\w]|(?:\.[a-z0-9_]))/i.test(
+      withoutMentions
+    );
   return { isCommand: true, markAll };
 }
 

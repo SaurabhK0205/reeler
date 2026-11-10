@@ -84,12 +84,20 @@ test('reelMessages - parseWatchedStopCommand separates single vs bulk commands w
 
   assert.deepStrictEqual(parseWatchedStopCommand('stop all'), { isCommand: true, markAll: true });
   assert.deepStrictEqual(parseWatchedStopCommand('watched all'), { isCommand: true, markAll: true });
+  assert.deepStrictEqual(parseWatchedStopCommand('watched them all'), { isCommand: true, markAll: true });
   assert.deepStrictEqual(parseWatchedStopCommand('mark all as watched'), { isCommand: true, markAll: true });
+  assert.deepStrictEqual(parseWatchedStopCommand('mark everything as watched'), { isCommand: true, markAll: true });
   assert.deepStrictEqual(parseWatchedStopCommand('clear all'), { isCommand: true, markAll: true });
+  assert.deepStrictEqual(parseWatchedStopCommand('clear everything'), { isCommand: true, markAll: true });
   assert.deepStrictEqual(parseWatchedStopCommand('stop reminders'), { isCommand: true, markAll: true });
   assert.deepStrictEqual(parseWatchedStopCommand('cancel reminders'), { isCommand: true, markAll: true });
   assert.deepStrictEqual(parseWatchedStopCommand('unsub'), { isCommand: true, markAll: true });
   assert.deepStrictEqual(parseWatchedStopCommand('unsubscribe'), { isCommand: true, markAll: true });
+
+  // Single-reel completions mentioning "all" incidentally must NOT wipe the entire Watch Later queue
+  assert.deepStrictEqual(parseWatchedStopCommand('Watched! Thanks for all the reminders'), { isCommand: true, markAll: false });
+  assert.deepStrictEqual(parseWatchedStopCommand('done with it all'), { isCommand: true, markAll: false });
+  assert.deepStrictEqual(parseWatchedStopCommand('all done'), { isCommand: true, markAll: false });
 
   // Creator-lookup handles must NOT be misclassified as watched/stop commands
   assert.deepStrictEqual(parseWatchedStopCommand('@stop.motion'), { isCommand: false, markAll: false });
@@ -536,25 +544,62 @@ test('Repository.getLastReelForInstagramSender - ignores non-watch_later archive
     const lastForAlpha = await Repository.getLastReelForInstagramSender('sender_alpha');
     assert.strictEqual(lastForAlpha?.shortcode, 'WLOLDER1');
 
-    // Empty senderId must NEVER touch sender_alpha's attributed rows when unattributed queue is empty
+    // Empty senderId must NEVER touch sender_alpha's attributed rows or unattributed rows without explicit opt-in
     const emptySenderResult = await Repository.getLastReelForInstagramSender('');
     assert.strictEqual(emptySenderResult, null);
 
-    // Unattributed watch_later reel IS visible for empty sender without touching sender_alpha
+    // Unattributed watch_later reel must NOT be accessible or modifiable by external webhook senders
     await Repository.upsertSavedReel({
       instagram_media_id: 'shortcode_WLUNATTR',
       shortcode: 'WLUNATTR',
       reel_url: 'https://www.instagram.com/reel/WLUNATTR/',
       creator_id: c.id,
-      caption: 'Unattributed watch later',
+      caption: 'Unattributed admin watch later',
       taken_at: '2026-11-10T12:00:00Z',
       first_detected_at: '2026-11-10T12:00:00Z',
       save_order_rank: 1,
       watch_status: 'watch_later',
       instagram_sender_id: null,
     });
-    const unattrResult = await Repository.getLastReelForInstagramSender('');
+
+    assert.strictEqual(await Repository.getLastReelForInstagramSender('external_sender_without_queue'), null);
+    const blockedMark = await Repository.markWatchedForInstagramSender('external_sender_without_queue', { markAll: true });
+    assert.strictEqual(blockedMark.updatedReels.length, 0);
+
+    // Webhook duration or "stop all" from a user with no queue must NOT reschedule or disclose unattributed admin reels
+    const sentMessages: Array<{ recipientId: string; text: string }> = [];
+    const bot = new MetaInstagramBotService();
+    bot.sendDirectMessage = async (recipientId: string, text: string) => {
+      sentMessages.push({ recipientId, text });
+      return true;
+    };
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: 'external_sender_without_queue' }, message: { text: 'stop all' } },
+            { sender: { id: 'external_sender_without_queue' }, message: { text: '5m' } },
+          ],
+        },
+      ],
+    });
+    assert.ok(!sentMessages.some((m) => m.text.includes('Unattributed admin watch later')));
+    assert.ok(!sentMessages.some((m) => m.text.includes('@iso_creator')));
+
+    // Explicit opt-in (used by ReminderWorker.handleAdminMessage) still finds and marks unattributed admin reels
+    const unattrResult = await Repository.getLastReelForInstagramSender('', { includeUnattributedFallback: true });
     assert.strictEqual(unattrResult?.shortcode, 'WLUNATTR');
+    const adminMarked = await Repository.markWatchedForInstagramSender('', {
+      markAll: true,
+      includeUnattributedFallback: true,
+    });
+    assert.strictEqual(adminMarked.updatedReels.length, 1);
+    assert.strictEqual(adminMarked.updatedReels[0].shortcode, 'WLUNATTR');
+
+    // sender_alpha's attributed reels remain completely untouched
+    const alphaStillActive = await Repository.getLastReelForInstagramSender('sender_alpha');
+    assert.strictEqual(alphaStillActive?.shortcode, 'WLOLDER1');
 
     Repository.resetMemoryStoreForTests();
   } finally {
@@ -615,6 +660,40 @@ test('MetaInstagramBotService.handleWebhookPayload - displayName-only metadata s
     assert.strictEqual(stored.reels.length, 1);
     assert.strictEqual(stored.reels[0].creator?.username, 'Instagram Creator');
     assert.strictEqual(stored.reels[0].creator?.display_name, 'Creative Studio');
+    assert.strictEqual(stored.reels[0].creator?.instagram_user_id, 'creator_unattributed_DNoUser1234');
+
+    // A second handle-less reel (e.g. non-ASCII display name) must NOT collide or overwrite Creative Studio
+    globalThis.fetch = async () =>
+      new Response(
+        `<html><head>
+          <meta property="og:url" content="https://www.instagram.com/reel/DNonAscii123/" />
+          <meta property="og:title" content="ज़रणेश on Instagram" />
+          <meta property="og:description" content="50 likes: &quot;Second clip&quot;." />
+        </head></html>`,
+        { status: 200, headers: { 'Content-Type': 'text/html' } }
+      );
+
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_meta_only' },
+              message: { text: 'https://www.instagram.com/reel/DNonAscii123/ 15m' },
+            },
+          ],
+        },
+      ],
+    });
+
+    const bothStored = await Repository.getReels({ page: 1, limit: 10 });
+    assert.strictEqual(bothStored.reels.length, 2);
+    const firstReel = bothStored.reels.find((r) => r.shortcode === 'DNoUser1234');
+    const secondReel = bothStored.reels.find((r) => r.shortcode === 'DNonAscii123');
+    assert.strictEqual(firstReel?.creator?.display_name, 'Creative Studio');
+    assert.strictEqual(secondReel?.creator?.display_name, 'ज़रणेश');
+    assert.notStrictEqual(firstReel?.creator_id, secondReel?.creator_id);
 
     Repository.resetMemoryStoreForTests();
   } finally {

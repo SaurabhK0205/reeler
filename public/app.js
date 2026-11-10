@@ -1290,7 +1290,7 @@ function renderReels() {
     const creatorFilterTitle = escapeHtml(
       creatorId
         ? (isCreatorFiltered ? `Showing ${creatorFilterSubject} (click to clear filter)` : `Filter vault by ${creatorFilterSubject}`)
-        : `${creatorInfo.displayText} (unattributed creator)`
+        : 'Unattributed reel (creator filter unavailable)'
     );
     const creatorFilterAria = escapeHtml(
       isCreatorFiltered ? `Clear creator filter ${creatorFilterSubject}` : `Filter saved reels by ${creatorFilterSubject}`

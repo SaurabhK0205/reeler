@@ -166,7 +166,7 @@ export class ReminderWorker {
       if (isCommand) {
         const { updatedReels, remainingCount } = await Repository.markWatchedForInstagramSender(
           this.adminUserId || '',
-          { markAll }
+          { markAll, includeUnattributedFallback: true }
         );
         if (this.adminUserId) {
           const reply = formatWatchedConfirmationMessage(updatedReels, remainingCount, markAll);

@@ -906,18 +906,26 @@ export class Repository {
     return (data as SavedReel) || null;
   }
 
-  static async getLastReelForInstagramSender(senderId: string): Promise<SavedReel | null> {
+  static async getLastReelForInstagramSender(
+    senderId: string,
+    options?: { includeUnattributedFallback?: boolean }
+  ): Promise<SavedReel | null> {
     const trimmedSender = String(senderId || '').trim();
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    if (!trimmedSender && !allowUnattributedFallback) {
+      return null;
+    }
+
     if (!isSupabaseConfigured()) {
       const activeWatchLater = Array.from(memoryStore.reels.values()).filter(
         (r) => r.watch_status === 'watch_later'
       );
       let candidates = trimmedSender
         ? activeWatchLater.filter((r) => r.instagram_sender_id === trimmedSender)
-        : activeWatchLater.filter((r) => !r.instagram_sender_id);
+        : [];
 
-      // Fallback strictly scoped to unattributed active Watch Later reels so archive imports or other senders are never touched
-      if (trimmedSender && candidates.length === 0) {
+      // Unattributed fallback is strictly opt-in (admin workflow only) so webhook senders cannot access other queues
+      if (allowUnattributedFallback && candidates.length === 0) {
         candidates = activeWatchLater.filter((r) => !r.instagram_sender_id);
       }
 
@@ -947,7 +955,11 @@ export class Repository {
       }
     }
 
-    // Fallback strictly scoped to unattributed active Watch Later reels
+    if (!allowUnattributedFallback) {
+      return null;
+    }
+
+    // Opt-in fallback strictly scoped to unattributed active Watch Later reels
     const { data: fallbackCandidates, error: fbErr } = await supabase
       .from('saved_reels')
       .select('*, creator:creators(*)')
@@ -1391,11 +1403,16 @@ export class Repository {
    */
   static async markWatchedForInstagramSender(
     senderId: string,
-    options?: { markAll?: boolean }
+    options?: { markAll?: boolean; includeUnattributedFallback?: boolean }
   ): Promise<MarkWatchedResult> {
     const trimmedSender = String(senderId || '').trim();
     const markAll = Boolean(options?.markAll);
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
     const now = new Date().toISOString();
+
+    if (!trimmedSender && !allowUnattributedFallback) {
+      return { updatedReels: [], remainingCount: 0 };
+    }
 
     if (!isSupabaseConfigured()) {
       const activeWatchLater = Array.from(memoryStore.reels.values()).filter(
@@ -1403,10 +1420,10 @@ export class Repository {
       );
       let candidates = trimmedSender
         ? activeWatchLater.filter((r) => r.instagram_sender_id === trimmedSender)
-        : activeWatchLater.filter((r) => !r.instagram_sender_id);
+        : [];
 
-      // Fallback only matches unattributed reels so another sender's queue is never altered
-      if (trimmedSender && candidates.length === 0) {
+      // Unattributed fallback is strictly opt-in (admin workflow only) so webhook senders cannot mark or view admin/UI reels
+      if (allowUnattributedFallback && candidates.length === 0) {
         candidates = activeWatchLater.filter((r) => !r.instagram_sender_id);
       }
 
@@ -1461,9 +1478,9 @@ export class Repository {
 
     let candidates = trimmedSender
       ? await fetchActiveCandidates('exact')
-      : await fetchActiveCandidates('unattributed');
+      : [];
 
-    if (trimmedSender && candidates.length === 0) {
+    if (allowUnattributedFallback && candidates.length === 0) {
       candidates = await fetchActiveCandidates('unattributed');
     }
 

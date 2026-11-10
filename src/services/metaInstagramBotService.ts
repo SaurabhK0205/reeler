@@ -303,7 +303,7 @@ export class MetaInstagramBotService {
       const displayName = meta.displayName || validHandle || username;
       const creatorExternalId = validHandle
         ? `creator_${validHandle}`
-        : `creator_display_${displayName.toLowerCase().replace(/[^a-z0-9_]+/g, '_').slice(0, 48) || 'unknown'}`;
+        : `creator_unattributed_${shortcode}`;
 
       // Upsert Creator
       const creator = await Repository.upsertCreator({
