@@ -1,6 +1,7 @@
 import { loadConfig } from '../config.ts';
-import type { Result } from '../types.ts';
+import type { Result, SavedMediaType } from '../types.ts';
 import { ok, err } from '../types.ts';
+import { extractInstagramShortcodeAndPath, formatCanonicalInstagramUrl } from '../utils/mediaType.ts';
 import crypto from 'node:crypto';
 
 export interface InboundMessage {
@@ -12,6 +13,8 @@ export interface InboundMessage {
   reel?: {
     mediaId: string;
     shortcode: string;
+    mediaType?: SavedMediaType;
+    reelUrl?: string;
     caption?: string;
     authorUsername?: string;
     thumbnailUrl?: string;
@@ -135,28 +138,51 @@ export class InstagramActionClient {
         // Clip / Reel share
         if (itemType === 'clip' && item.clip?.media) {
           const m = item.clip.media;
+          const productType = String(m.product_type || '').toLowerCase();
+          const rawMediaType = Number(m.media_type || 0);
+          const resolvedType: SavedMediaType =
+            productType === 'feed' || productType === 'carousel_container' || rawMediaType === 1 || rawMediaType === 8
+              ? 'post'
+              : 'reel';
+          const shortcode = m.code || '';
           reel = {
             mediaId: String(m.id || ''),
-            shortcode: m.code || '',
+            shortcode,
+            mediaType: resolvedType,
+            reelUrl: shortcode ? formatCanonicalInstagramUrl(shortcode, resolvedType) : undefined,
             caption: m.caption?.text,
             authorUsername: m.user?.username,
             thumbnailUrl: m.image_versions2?.candidates?.[0]?.url,
           };
         } else if ((itemType === 'reel_share' || itemType === 'media_share') && (item.reel_share?.media || item.media_share)) {
           const m = item.reel_share?.media || item.media_share;
+          const productType = String(m.product_type || '').toLowerCase();
+          const rawMediaType = Number(m.media_type || 0);
+          const isPost =
+            (itemType === 'media_share' && productType !== 'clips') ||
+            productType === 'feed' ||
+            productType === 'carousel_container' ||
+            rawMediaType === 1 ||
+            rawMediaType === 8;
+          const resolvedType: SavedMediaType = isPost ? 'post' : 'reel';
+          const shortcode = m.code || '';
           reel = {
             mediaId: String(m.id || ''),
-            shortcode: m.code || '',
+            shortcode,
+            mediaType: resolvedType,
+            reelUrl: shortcode ? formatCanonicalInstagramUrl(shortcode, resolvedType) : undefined,
             caption: m.caption?.text,
             authorUsername: m.user?.username,
             thumbnailUrl: m.image_versions2?.candidates?.[0]?.url,
           };
         } else if (item.text) {
-          const match = item.text.match(/https?:\/\/(?:www\.)?instagram\.com\/(?:reel|p)\/([A-Za-z0-9_-]+)/i);
-          if (match) {
+          const parsedLink = extractInstagramShortcodeAndPath(item.text);
+          if (parsedLink) {
             reel = {
               mediaId: '',
-              shortcode: match[1],
+              shortcode: parsedLink.shortcode,
+              mediaType: parsedLink.mediaType,
+              reelUrl: formatCanonicalInstagramUrl(parsedLink.shortcode, parsedLink.mediaType, parsedLink.matchedText),
             };
           }
         }

@@ -2,7 +2,7 @@
 
 Stack: Node.js (v22+ with native `--experimental-strip-types`) + Express.js + Supabase (PostgreSQL) + Meta Graph API (Instagram Messaging Webhooks) + Cloudflare Tunnel
 Repository: SaurabhK0205/reeler
-Last updated: November 8, 2026
+Last updated: November 10, 2026
 
 ---
 
@@ -71,7 +71,10 @@ Before writing any code or executing commands:
 ## 3. Shared Metaphor — Use these exact terms everywhere
 
 ```
-Saved Reel              → saved_reel, saved_reels (not post, media, bookmark, video)
+Saved Reel / Post       → saved_reel, saved_reels with media_type ('reel' | 'post')
+Collection Source       → is_saved_on_instagram (boolean) / SavedCollectionSource ('instagram' | 'bot')
+Collection Filter       → ReelQueryFilters.source ('all' | 'instagram' | 'bot')
+Media Type              → media_type ('reel' for /reel/, /reels/, /tv/; 'post' for /p/ photo & carousel posts)
 Creator                 → creator, creators (not author, user, influencer)
 Shortcode               → shortcode (exact 11-char Instagram identifier, e.g. Db4eVUcsoTh)
 Instagram Sender ID     → instagram_sender_id (exact IGSID string from webhook, not chat_id, user_id)
@@ -114,14 +117,58 @@ src/
    - Always use `src/utils/duration.ts` (`parseDurationOrDateInput`).
    - Never write ad-hoc date/regex parsing in services or route handlers.
 5. **Instagram In-App DM UX Rules:**
-   - **Never** format creator profiles as web links (`https://instagram.com/user`).
-   - **Always** format creator handles as clean in-app `@username` mentions with clear spacing so mobile users open native profile sheets without leaving the app.
+   - **Creator Profile Links**: Meta Graph API DMs do NOT automatically linkify plain `@username` mentions on Instagram Web or reliably across mobile clients. Whenever a valid Instagram handle exists (never for placeholder fallbacks like `Instagram Creator` or spaced display names), include a clean clickable profile URL (`https://www.instagram.com/<username>/`) paired with `@<username>` in Watch Later save confirmations, custom/default schedule replies, reminder DMs, and creator-search replies (short `"watched"` / `"stop"` confirmation DMs intentionally omit profile link cards to keep the reply compact).
+   - **Link Preview Priority**: In reminder DMs that contain a Reel or Post URL, always place the Item URL **before** the creator profile URL so Instagram unfurls the media thumbnail card rather than overriding it with a profile card.
+   - **Canonical Media URLs & Type Isolation**: Preserve canonical `/p/` URLs for photo/carousel Posts and `/reel/` (or `/tv/`) URLs for Reels—never rewrite a `/p/` shortcode to `/reel/`. When a creator has both saved Reels and saved Posts, split creator-search DMs into separate `🎬 Latest Reels` and `🖼️ Latest Posts` sections and support explicit `"reels by @username"` / `"posts by @username"` filters.
+   - **Human-Readable Reel Labels**: Never expose raw shortcodes (e.g. `Da1iWbSMAOz`) in user-facing DM copy or the frontend UI; identify items by creator handle, media type (`reel` vs `post`), caption snippet, save/send date, or `"your saved reel"` / `"that reel"` based on collection membership.
+   - **Saved on IG vs Sent to Bot Integrity**: New DM webhook items MUST set `is_saved_on_instagram = false` and `saved_at = null` (category `'bot'`), preserve existing IG-saved flags/dates when a previously saved item is shared to the bot, never claim an item was bookmarked to Instagram Saved unless `saveMedia` succeeded (`savedOnIg === true`), support full triage/Watch Later/reminder parity on both categories, and automatically promote `'bot'` items (`false -> true`, backfilling archive `saved_at` while preserving `watch_status`, reminders, captions, and `instagram_sender_id`) when a subsequent `saved_posts.json` archive import includes matching shortcodes.
    - When a user shares a reel, prompt them for custom reminder timing with a **10-minute window**. If no reply within 10 minutes, default to **10 hours**.
-   - When a user sends "watched", immediately mark the reel as watched and clear both `next_reminder_at` and `awaiting_reminder_choice_until`.
+   - When a user sends `"watched"` / `"done"` / `"stop"`, mark the **most recently reminded / latest active** Watch Later reel as watched and clear both `next_reminder_at` and `awaiting_reminder_choice_until` (using `"stop all"` / `"watched all"` for bulk clearing all pending Watch Later reels).
 
 ---
 
-## 5. Security & Boundary Rules
+## 5. Frontend Work — Impeccable Design Review (MANDATORY)
+
+**Setup (once per environment):** Install Impeccable via `npx impeccable install` (see the [Impeccable installation guide](https://github.com/pbakaus/impeccable#installation)) and reload your coding tool so `/impeccable` passes (or `$impeccable` passes on Codex) are available.
+
+Whenever you modify anything under `public/` (HTML, CSS, or JS) or any user-facing template, run Impeccable design review passes **before committing any frontend change** (including fixes requested during PR review before pushing or updating the PR). On Codex, invoke `$impeccable <pass>` (for example `$impeccable critique`) instead of `/impeccable <pass>`.
+
+### Required Passes
+
+| Pass | Slash Command | Codex Invocation | Focus Area |
+|------|---------------|------------------|------------|
+| **Critique** | `/impeccable critique` | `$impeccable critique` | Full audit: contrast ratios, spacing, visual hierarchy, accessibility |
+| **Layout** | `/impeccable layout` | `$impeccable layout` | Grid density, spacing scale, visual scanning paths |
+| **Typeset** | `/impeccable typeset` | `$impeccable typeset` | Font hierarchy, pairings, line-height, vertical rhythm |
+| **Animate** | `/impeccable animate` | `$impeccable animate` | Purposeful micro-interactions, transitions, reduced-motion support |
+| **Adapt** | `/impeccable adapt` | `$impeccable adapt` | Responsive breakpoints, mobile density (≥44px touch targets), SE/landscape |
+| **Harden** | `/impeccable harden` | `$impeccable harden` | Empty states, error states, long captions, offline / skeleton edge cases |
+| **Polish** | `/impeccable polish` | `$impeccable polish` | Final craft pass: alignment, interactive states, focus rings, hover states |
+
+### Rules
+
+1. Run the required passes **before each frontend commit** — when opening a PR and when pushing review follow-up commits.
+2. Run the full 7-pass suite above for feature, layout, or UI changes; for small isolated CSS/JS tweaks, run at minimum `/impeccable critique`, `/impeccable polish`, and `/impeccable harden` (or `$impeccable critique`, `$impeccable polish`, and `$impeccable harden` on Codex).
+3. For every finding either: implement the fix, or document in the PR body why it was intentionally waived with a rationale.
+4. Never push a frontend commit that leaves a `critique` or `harden` finding unaddressed without an explicit documented reason.
+5. `audit`, `clarify`, `colorize`, `bolder`, `quieter`, `distill`, and `onboard` are optional but recommended when auditing or redesigning a surface.
+
+---
+
+## 6. Engineering Reliability — GRAVITAS Workflow (MANDATORY)
+
+**Setup (once per environment):** Install the GRAVITAS skill via `npx skills add udaysharmadev/Gravitas --skill gravitas --agent antigravity --yes` (or `--agent claude-code` for Claude Code; see [udaysharmadev/Gravitas](https://github.com/udaysharmadev/Gravitas)) and reload your coding tool. Keep project-local symlinks under `.agents/skills/` or `.claude/skills/` (both gitignored).
+
+For implementation, debugging, refactoring, review, and migrations:
+1. **Ground before mutating:** Read the target file, its callers, and relevant tests before editing. Never act on assumed file state.
+2. **Adaptive planning:** Scale rigor to blast radius (`direct` for localized 1-file edits, `compact` for multi-file dependencies, `deep` for architecture, security, or database migrations). Track acceptance criteria for non-trivial changes.
+3. **Evidence-backed verification:** Run executable checks (`npm test`, runtime/repro checks, and/or GRAVITAS `scripts/run-checks.sh`) **after the final edit**. Never rely on stale results or self-review alone; state an explicit `VERDICT: PASS` or `VERDICT: FAIL`.
+4. **Never exact-retry a failure:** After a failed command or patch, diagnose what changed and adapt strategy before retrying.
+5. **State unknowns honestly:** Explicitly label unverified checks or environment limitations rather than claiming pass without proof.
+
+---
+
+## 7. Security & Boundary Rules
 
 1. **NEVER commit `.env` or credentials:**
    - Strictly exclude `.env`, `.env.*`, `token.json`, `credentials.json`, `*.pem`, `*.key`.
@@ -134,7 +181,7 @@ src/
 
 ---
 
-## 6. BLOCK Violations (NEVER generate code or execute actions that do this)
+## 8. BLOCK Violations (NEVER generate code or execute actions that do this)
 
 * **Direct push to `main` branch** (strictly forbidden).
 * **Committing code directly onto `main`** instead of a topic branch.
@@ -142,7 +189,10 @@ src/
 * **Merging a Pull Request without waiting for CodeRabbit review to complete**.
 * **Merging a Pull Request with unresolved CodeRabbit review comments or findings**.
 * **Direct database `.from(...)` query inside `src/api/` or `src/server.ts`**.
-* **Sending `https://instagram.com/...` web URLs for creator profiles in Instagram DMs**.
+* **Exposing raw Instagram shortcodes (`"ID: ..."`) in user-facing DM replies or UI copy instead of human-readable creator/caption labels**.
+* **Placing creator profile URLs before Reel URLs in reminder DMs (breaks Reel video preview unfurling)**.
 * **Reinventing date/duration parsing outside `src/utils/duration.ts`**.
 * **Altering database tables without a corresponding migration in `supabase/migrations/`**.
 * **Modifying files in `/Users/thismac/rea/`**.
+* **Committing frontend changes (`public/`) without running at minimum `/impeccable critique`, `/impeccable polish`, and `/impeccable harden`**.
+* **Claiming a task or fix is verified without post-edit command/test evidence (per GRAVITAS)**.

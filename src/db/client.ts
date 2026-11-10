@@ -28,3 +28,7 @@ export function getSupabase(): SupabaseClient {
 export function isSupabaseConfigured(): boolean {
   return loadConfig().supabase.isConfigured;
 }
+
+export function resetSupabaseClientForTests(): void {
+  supabaseClient = null;
+}

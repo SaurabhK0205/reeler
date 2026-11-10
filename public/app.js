@@ -33,6 +33,151 @@ const ASPECT_CACHE_STORAGE_KEY = 'reeler_aspect_cache_v1';
 const ASPECT_CACHE_MAX_ENTRIES = 300;
 const CREATOR_TOP_LIMIT = 6;
 const CREATOR_SEARCH_LIMIT = 15;
+const INSTAGRAM_HANDLE_REGEX = /^[a-zA-Z0-9._]{1,30}$/;
+const PLACEHOLDER_CREATOR_HANDLES = new Set([
+  'instagram_user',
+  'instagram_creator',
+  'instagram creator',
+  'instagram reel',
+  'instagram',
+  'unattributed',
+]);
+
+/**
+ * Extracts a validated public Instagram handle when present, returning null for placeholders
+ * (such as `instagram_user`, `Instagram Creator`, `unattributed`) or malformed handles.
+ * @param {string | null | undefined} username
+ * @returns {string | null}
+ */
+function extractPublicCreatorHandle(username) {
+  const raw = String(username || '').trim().replace(/^@+/, '');
+  if (!raw || PLACEHOLDER_CREATOR_HANDLES.has(raw.toLowerCase())) {
+    return null;
+  }
+  if (
+    !INSTAGRAM_HANDLE_REGEX.test(raw) ||
+    !/[a-zA-Z0-9]/.test(raw) ||
+    raw.includes('..') ||
+    raw.startsWith('.') ||
+    raw.endsWith('.')
+  ) {
+    return null;
+  }
+  return raw;
+}
+
+/**
+ * Resolves unified display text, initial badge letter, accessible label, and attribution flags
+ * for any creator record or missing/placeholder creator metadata.
+ * @param {object | null | undefined} creator
+ * @returns {{ publicHandle: string | null, displayText: string, accessibleName: string, initial: string, hasPublicHandle: boolean, isAttributedName: boolean }}
+ */
+function getCreatorDisplayInfo(creator) {
+  const publicHandle = extractPublicCreatorHandle(creator?.username);
+  if (publicHandle) {
+    const label = `@${publicHandle}`;
+    return {
+      publicHandle,
+      displayText: label,
+      accessibleName: label,
+      initial: (publicHandle.replace(/[^a-zA-Z0-9]/g, '')[0] || 'R').toUpperCase(),
+      hasPublicHandle: true,
+      isAttributedName: true,
+    };
+  }
+
+  const rawDisplay = stripPrivateUseChars(String(creator?.display_name || ''))
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const safeDisplay = rawDisplay && !PLACEHOLDER_CREATOR_HANDLES.has(rawDisplay.toLowerCase())
+    ? rawDisplay
+    : '';
+
+  if (safeDisplay) {
+    return {
+      publicHandle: null,
+      displayText: safeDisplay,
+      accessibleName: safeDisplay,
+      initial: (safeDisplay.replace(/[^a-zA-Z0-9]/g, '')[0] || 'R').toUpperCase(),
+      hasPublicHandle: false,
+      isAttributedName: true,
+    };
+  }
+
+  return {
+    publicHandle: null,
+    displayText: 'Instagram Creator',
+    accessibleName: 'this item',
+    initial: 'R',
+    hasPublicHandle: false,
+    isAttributedName: false,
+  };
+}
+
+/**
+ * Resolves explicit saved media classification ('reel' | 'post') from record field or URL path.
+ * @param {object | null | undefined} reel
+ * @returns {'reel' | 'post'}
+ */
+function getSavedMediaType(reel) {
+  const explicit = typeof reel?.media_type === 'string' ? reel.media_type.trim().toLowerCase() : '';
+  if (explicit === 'post' || explicit === 'reel') {
+    return explicit;
+  }
+  const url = typeof reel?.reel_url === 'string' ? reel.reel_url : '';
+  if (/instagram\.com\/(?:[a-zA-Z0-9._]+\/)?p\//i.test(url)) {
+    return 'post';
+  }
+  return 'reel';
+}
+
+/**
+ * Returns localized singular/plural nouns for the active media type and collection category filters.
+ * @param {string} mediaType
+ * @param {'all' | 'instagram' | 'bot'} [source='all']
+ * @returns {{ singular: string, plural: string, titlePlural: string, scopedPlural: string, scopedUnit: (count: number) => string }}
+ */
+function getMediaUnitLabels(mediaType, source = 'all') {
+  let singular = 'item';
+  let plural = 'items';
+  let nounTitle = 'Items';
+  if (mediaType === 'post') {
+    singular = 'post';
+    plural = 'posts';
+    nounTitle = 'Posts';
+  } else if (mediaType === 'reel') {
+    singular = 'reel';
+    plural = 'reels';
+    nounTitle = 'Reels';
+  }
+
+  if (source === 'instagram') {
+    return {
+      singular,
+      plural,
+      titlePlural: `Saved ${nounTitle}`,
+      scopedPlural: `saved ${plural}`,
+      scopedUnit: (count) => `saved ${count === 1 ? singular : plural}`,
+    };
+  }
+  if (source === 'bot') {
+    return {
+      singular,
+      plural,
+      titlePlural: `Bot-Sent ${nounTitle}`,
+      scopedPlural: `bot-sent ${plural}`,
+      scopedUnit: (count) => `bot-sent ${count === 1 ? singular : plural}`,
+    };
+  }
+  return {
+    singular,
+    plural,
+    titlePlural: nounTitle,
+    scopedPlural: `tracked ${plural}`,
+    scopedUnit: (count) => (count === 1 ? singular : plural),
+  };
+}
 
 /**
  * Loads previously measured embed aspect ratios from localStorage (best effort).
@@ -89,7 +234,9 @@ function persistAspectCacheEntry(shortcode, entry) {
 
 const state = {
   filters: {
+    source: 'all',
     creatorId: '',
+    mediaType: 'all',
     datePreset: 'all',
     watchStatus: 'all',
     sortBy: 'newest_saved',
@@ -133,12 +280,19 @@ const metricFilterWeek = document.getElementById('metric-filter-week');
 const metricFilterLater = document.getElementById('metric-filter-later');
 const metricFilterWatched = document.getElementById('metric-filter-watched');
 const statTotal = document.getElementById('stat-total');
+const statMediaSplit = document.getElementById('stat-media-split');
 const statCreators = document.getElementById('stat-creators');
 const statWeek = document.getElementById('stat-week');
 const statWatchLater = document.getElementById('stat-watch-later');
 const statWatched = document.getElementById('stat-watched');
+const sourceTabsButtons = Array.from(document.querySelectorAll('.source-tab-btn'));
+const sourceCountAll = document.getElementById('source-count-all');
+const sourceCountInstagram = document.getElementById('source-count-instagram');
+const sourceCountBot = document.getElementById('source-count-bot');
+const collectionSourceHint = document.getElementById('collection-source-hint');
 const searchInput = document.getElementById('search-input');
 const clearSearchBtn = document.getElementById('clear-search');
+const mediaTypeButtons = Array.from(document.querySelectorAll('.media-type-btn'));
 const datePresetSelect = document.getElementById('date-preset');
 const watchFilterSelect = document.getElementById('watch-filter');
 const sortBySelect = document.getElementById('sort-by');
@@ -170,7 +324,6 @@ const viewModeListBtn = document.getElementById('view-mode-list');
 const feedModal = document.getElementById('reels-feed-modal');
 const feedScrollTrack = document.getElementById('feed-scroll-track');
 const feedCounterKicker = document.getElementById('feed-counter-kicker');
-const feedShortcodeTag = document.getElementById('feed-shortcode-tag');
 const feedArrowUp = document.getElementById('feed-arrow-up');
 const feedArrowDown = document.getElementById('feed-arrow-down');
 const feedCloseBtn = document.getElementById('feed-close-btn');
@@ -196,6 +349,8 @@ function restoreFiltersFromUrl() {
   let hasUrlView = false;
   try {
     const params = new URLSearchParams(window.location.search);
+    const validSources = new Set(['all', 'instagram', 'bot']);
+    const validMediaTypes = new Set(['all', 'reel', 'post']);
     const validDates = new Set(['all', 'today', 'yesterday', '7d', '30d', '3m', '6m', 'year']);
     const validStatuses = new Set(['all', 'unwatched', 'watch_later', 'watched']);
     const validSorts = new Set(['newest_saved', 'oldest_saved', 'newest_published', 'oldest_published']);
@@ -206,8 +361,14 @@ function restoreFiltersFromUrl() {
       hasUrlView = true;
     }
 
+    const source = params.get('source');
+    if (source && validSources.has(source)) state.filters.source = source;
+
     const creator = params.get('creator');
     if (creator) state.filters.creatorId = creator;
+
+    const type = params.get('type');
+    if (type && validMediaTypes.has(type)) state.filters.mediaType = type;
 
     const date = params.get('date');
     if (date && validDates.has(date)) state.filters.datePreset = date;
@@ -234,6 +395,8 @@ function restoreFiltersFromUrl() {
   datePresetSelect.value = state.filters.datePreset;
   watchFilterSelect.value = state.filters.watchStatus;
   sortBySelect.value = state.filters.sortBy;
+  syncSourceTabsUi();
+  syncMediaTypeToggleUi();
   syncKpiActiveStates();
   setCreatorsExpanded(false);
   return { hasUrlView };
@@ -245,7 +408,9 @@ function restoreFiltersFromUrl() {
 function syncUrlState() {
   try {
     const params = new URLSearchParams();
+    if (state.filters.source !== 'all') params.set('source', state.filters.source);
     if (state.filters.creatorId) params.set('creator', state.filters.creatorId);
+    if (state.filters.mediaType !== 'all') params.set('type', state.filters.mediaType);
     if (state.filters.datePreset !== 'all') params.set('date', state.filters.datePreset);
     if (state.filters.watchStatus !== 'all') params.set('status', state.filters.watchStatus);
     if (state.filters.sortBy !== 'newest_saved') params.set('sort', state.filters.sortBy);
@@ -264,16 +429,54 @@ function syncUrlState() {
 }
 
 /**
- * Returns true if any search, creator, date, or status filter is currently active.
+ * Returns true if any catalog filter (excluding collection category when `includeSource` is false) is active.
+ * @param {boolean} [includeSource=true]
  * @returns {boolean}
  */
-function hasActiveFilters() {
+function hasActiveFilters(includeSource = true) {
   return Boolean(
+    (includeSource && state.filters.source !== 'all') ||
     state.filters.creatorId ||
+    state.filters.mediaType !== 'all' ||
     state.filters.datePreset !== 'all' ||
     state.filters.watchStatus !== 'all' ||
     state.filters.search.trim()
   );
+}
+
+/**
+ * Synchronizes active highlight, pressed state, and contextual sync explanation across the Collection Category tabs.
+ */
+function syncSourceTabsUi() {
+  const current = state.filters.source || 'all';
+  sourceTabsButtons.forEach((btn) => {
+    const value = btn.dataset.source || 'all';
+    const isActive = value === current;
+    btn.classList.toggle('active', isActive);
+    btn.setAttribute('aria-pressed', String(isActive));
+  });
+  if (collectionSourceHint) {
+    if (current === 'instagram') {
+      collectionSourceHint.textContent = 'Instagram Saved archive: re-import saved_posts.json to sync newly saved posts.';
+    } else if (current === 'bot') {
+      collectionSourceHint.textContent = 'DMed to Reeler Bot only: not added to your Instagram Saved collection.';
+    } else {
+      collectionSourceHint.textContent = 'Instagram Saved (re-import saved_posts.json to sync) & items DMed to Reeler Bot.';
+    }
+  }
+}
+
+/**
+ * Synchronizes active highlight and pressed states across the Content Type segmented toggle.
+ */
+function syncMediaTypeToggleUi() {
+  const current = state.filters.mediaType || 'all';
+  mediaTypeButtons.forEach((btn) => {
+    const value = btn.dataset.mediaType || 'all';
+    const isActive = value === current;
+    btn.classList.toggle('active', isActive);
+    btn.setAttribute('aria-pressed', String(isActive));
+  });
 }
 
 /**
@@ -318,7 +521,7 @@ function setCreatorsExpanded(expanded) {
         labelEl.textContent = 'Hide';
       } else if (state.filters.creatorId) {
         const selected = findCreatorById(state.filters.creatorId);
-        labelEl.textContent = selected ? `@${selected.username}` : 'Filtered';
+        labelEl.textContent = selected ? getCreatorDisplayInfo(selected).displayText : 'Filtered';
       } else {
         labelEl.textContent = 'Browse';
       }
@@ -367,21 +570,29 @@ function findCreatorById(id) {
 function resolveActiveCreatorLabel() {
   if (!state.filters.creatorId) return '';
   const match = findCreatorById(state.filters.creatorId);
-  return match?.username ? `@${match.username}` : 'Selected';
+  return match ? getCreatorDisplayInfo(match).displayText : 'Selected';
 }
 
 /**
  * Clears one active filter dimension while preserving remaining filters and focus continuity.
- * @param {'creator' | 'date' | 'status' | 'search'} key
+ * @param {'source' | 'creator' | 'mediaType' | 'date' | 'status' | 'search'} key
  * @param {boolean} [fromKeyboard=false]
  */
 function removeSingleFilter(key, fromKeyboard = false) {
   let message = 'Filter removed.';
-  if (key === 'creator') {
+  if (key === 'source') {
+    state.filters.source = 'all';
+    syncSourceTabsUi();
+    message = 'Cleared collection category filter.';
+  } else if (key === 'creator') {
     state.filters.creatorId = '';
     state.selectedCreator = null;
     renderCreatorStrip();
     message = 'Cleared creator filter.';
+  } else if (key === 'mediaType') {
+    state.filters.mediaType = 'all';
+    syncMediaTypeToggleUi();
+    message = 'Cleared content type filter.';
   } else if (key === 'date') {
     state.filters.datePreset = 'all';
     datePresetSelect.value = 'all';
@@ -423,6 +634,15 @@ function renderActiveFilterChips() {
   activeFilterChips.innerHTML = '';
   const items = [];
 
+  if (state.filters.source !== 'all') {
+    const sourceLabel = state.filters.source === 'bot' ? 'Sent to Bot' : 'Saved on IG';
+    items.push({
+      key: 'source',
+      label: `Category: ${sourceLabel}`,
+      ariaLabel: `Remove collection category filter ${sourceLabel}`,
+      title: `Remove collection category filter ${sourceLabel}`,
+    });
+  }
   if (state.filters.creatorId) {
     const handle = resolveActiveCreatorLabel();
     items.push({
@@ -430,6 +650,15 @@ function renderActiveFilterChips() {
       label: `Creator: ${handle}`,
       ariaLabel: `Remove creator filter ${handle}`,
       title: `Remove creator filter ${handle}`,
+    });
+  }
+  if (state.filters.mediaType !== 'all') {
+    const typeLabel = state.filters.mediaType === 'post' ? 'Posts' : 'Reels';
+    items.push({
+      key: 'mediaType',
+      label: `Type: ${typeLabel}`,
+      ariaLabel: `Remove content type filter ${typeLabel}`,
+      title: `Remove content type filter ${typeLabel}`,
     });
   }
   if (state.filters.datePreset !== 'all') {
@@ -475,7 +704,7 @@ function renderActiveFilterChips() {
     btn.dataset.filterKey = item.key;
     btn.setAttribute('aria-label', item.ariaLabel);
     btn.title = item.title;
-    btn.innerHTML = `<span>${escapeHtml(item.label)}</span>${CHIP_REMOVE_SVG}`;
+    btn.innerHTML = `<span class="chip-label">${escapeHtml(item.label)}</span>${CHIP_REMOVE_SVG}`;
     btn.addEventListener('click', (e) => removeSingleFilter(item.key, e.detail === 0));
     activeFilterChips.appendChild(btn);
   });
@@ -499,7 +728,7 @@ function renderActiveFilterChips() {
 }
 
 /**
- * Resets all active search, creator, date, and watch-status filters to defaults and reloads page 1.
+ * Resets all active collection, search, creator, date, and watch-status filters to defaults and reloads page 1.
  */
 function clearAllFilters() {
   clearTimeout(searchTimeout);
@@ -509,7 +738,9 @@ function clearAllFilters() {
     creatorsFetchController = null;
   }
   isCreatorSearching = false;
+  state.filters.source = 'all';
   state.filters.creatorId = '';
+  state.filters.mediaType = 'all';
   state.filters.datePreset = 'all';
   state.filters.watchStatus = 'all';
   state.filters.search = '';
@@ -528,6 +759,8 @@ function clearAllFilters() {
   if (creatorFilterInput) creatorFilterInput.value = '';
   if (clearCreatorFilterBtn) clearCreatorFilterBtn.hidden = true;
 
+  syncSourceTabsUi();
+  syncMediaTypeToggleUi();
   syncKpiActiveStates();
   syncUrlState();
   renderCreatorStrip();
@@ -580,7 +813,7 @@ function renderInitialSkeletons() {
     reelsTableBody.innerHTML = Array.from({ length: rowCount }, () => `
       <tr class="table-row table-skeleton-row" aria-hidden="true">
         <td class="table-rank"><div class="skeleton-bar skeleton-bar-xs"></div></td>
-        <td>
+        <td class="table-creator-td">
           <div class="table-creator-cell">
             <div class="skeleton-avatar"></div>
             <div class="skeleton-bar skeleton-bar-sm"></div>
@@ -588,8 +821,8 @@ function renderInitialSkeletons() {
         </td>
         <td class="table-caption-cell"><div class="skeleton-bar skeleton-bar-lg"></div></td>
         <td class="table-date-cell"><div class="skeleton-bar skeleton-bar-sm"></div></td>
-        <td><div class="skeleton-bar skeleton-bar-pill"></div></td>
-        <td>
+        <td class="table-status-td"><div class="skeleton-bar skeleton-bar-pill"></div></td>
+        <td class="table-actions-td">
           <div class="table-actions-cell">
             <div class="skeleton-btn"></div>
             <div class="skeleton-btn"></div>
@@ -684,12 +917,32 @@ async function loadStats() {
     statsLoadErrorNotified = false;
 
     const totalReels = Number(stats.totalReels || 0);
+    const savedOnIgCount = stats.savedOnInstagramCount !== undefined ? Number(stats.savedOnInstagramCount) : null;
+    const botSentCount = stats.botSentCount !== undefined ? Number(stats.botSentCount) : null;
     const totalCreators = Number(stats.totalCreators || 0);
     const savedWeek = Number(stats.savedThisWeek || 0);
     const watchLaterCount = Number(stats.watchLaterCount || 0);
     const watchedCount = Number(stats.watchedCount || 0);
+    const reelsCount = stats.reelsCount !== undefined ? Number(stats.reelsCount) : null;
+    const postsCount = stats.postsCount !== undefined ? Number(stats.postsCount) : null;
 
     statTotal.textContent = totalReels.toLocaleString();
+    if (sourceCountAll) sourceCountAll.textContent = totalReels.toLocaleString();
+    if (sourceCountInstagram) {
+      sourceCountInstagram.textContent = savedOnIgCount !== null ? savedOnIgCount.toLocaleString() : '—';
+    }
+    if (sourceCountBot) {
+      sourceCountBot.textContent = botSentCount !== null ? botSentCount.toLocaleString() : '—';
+    }
+    if (statMediaSplit) {
+      if (reelsCount !== null && postsCount !== null && totalReels > 0) {
+        const reelWord = reelsCount === 1 ? 'reel' : 'reels';
+        const postWord = postsCount === 1 ? 'post' : 'posts';
+        statMediaSplit.textContent = `${reelsCount.toLocaleString()} ${reelWord} · ${postsCount.toLocaleString()} ${postWord}`;
+      } else {
+        statMediaSplit.textContent = '';
+      }
+    }
     statCreators.textContent = totalCreators.toLocaleString();
     statWeek.textContent = savedWeek.toLocaleString();
     statWatchLater.textContent = watchLaterCount.toLocaleString();
@@ -707,6 +960,10 @@ async function loadStats() {
     statsBar?.classList.remove('is-initial-loading');
     if (!state.stats) {
       statTotal.textContent = '—';
+      if (sourceCountAll) sourceCountAll.textContent = '—';
+      if (sourceCountInstagram) sourceCountInstagram.textContent = '—';
+      if (sourceCountBot) sourceCountBot.textContent = '—';
+      if (statMediaSplit) statMediaSplit.textContent = '';
       statCreators.textContent = '—';
       statWeek.textContent = '—';
       statWatchLater.textContent = '—';
@@ -870,7 +1127,7 @@ function renderCreatorStrip() {
     }
 
     const name = document.createElement('span');
-    name.textContent = `@${c.username}`;
+    name.textContent = getCreatorDisplayInfo(c).displayText;
     chip.appendChild(name);
 
     if (c.saved_count) {
@@ -932,10 +1189,13 @@ async function fetchReels() {
   const { signal } = fetchReelsAbortController;
 
   renderActiveFilterChips();
-  resultsCount.textContent = 'Querying saved reels...';
+  const queryLabels = getMediaUnitLabels(state.filters.mediaType, state.filters.source);
+  resultsCount.textContent = `Querying ${queryLabels.scopedPlural}...`;
 
   const params = new URLSearchParams();
+  if (state.filters.source && state.filters.source !== 'all') params.set('source', state.filters.source);
   if (state.filters.creatorId) params.set('creatorId', state.filters.creatorId);
+  if (state.filters.mediaType && state.filters.mediaType !== 'all') params.set('mediaType', state.filters.mediaType);
   if (state.filters.datePreset !== 'all') params.set('datePreset', state.filters.datePreset);
   if (state.filters.watchStatus !== 'all') params.set('watchStatus', state.filters.watchStatus);
   if (state.filters.sortBy) params.set('sortBy', state.filters.sortBy);
@@ -985,7 +1245,7 @@ async function fetchReels() {
  */
 function renderFetchErrorState(errorDetail) {
   hasInitialReelsSettled = true;
-  resultsCount.textContent = 'Could not load saved reels.';
+  resultsCount.textContent = 'Could not load tracked items.';
   paginationBar.classList.add('is-hidden');
 
   const safeDetail = escapeHtml(errorDetail);
@@ -994,7 +1254,7 @@ function renderFetchErrorState(errorDetail) {
     : '';
   const errorHtml = `
     <div class="vault-error-state" role="alert">
-      <div class="empty-title-text">Couldn&rsquo;t Load Saved Reels</div>
+      <div class="empty-title-text">Couldn&rsquo;t Load Tracked Items</div>
       <div class="empty-desc-text">The vault query failed (${safeDetail}). Your current search and filters are preserved.</div>
       <div class="state-actions-row">
         <button type="button" class="nav-btn nav-btn-primary" data-action="retry-fetch">Retry Query</button>
@@ -1021,9 +1281,10 @@ function renderFetchErrorState(errorDetail) {
 }
 
 /**
- * Selects the authoritative timestamp string to display for a reel card/slide based on sort context.
+ * Selects the authoritative timestamp and truthful label prefix (`Saved` vs `Sent` vs `Published`)
+ * for a grid card, list row, or fullscreen slide.
  * @param {object} reel
- * @returns {{ labelPrefix: 'Saved' | 'Published', iso: string }}
+ * @returns {{ labelPrefix: 'Saved' | 'Sent' | 'Published', iso: string }}
  */
 function getReelDisplayDate(reel) {
   const sort = state.filters.sortBy;
@@ -1031,6 +1292,12 @@ function getReelDisplayDate(reel) {
     return {
       labelPrefix: 'Published',
       iso: reel.taken_at || reel.saved_at || reel.first_detected_at || '',
+    };
+  }
+  if (reel?.is_saved_on_instagram === false) {
+    return {
+      labelPrefix: 'Sent',
+      iso: reel.first_detected_at || reel.saved_at || reel.taken_at || '',
     };
   }
   return {
@@ -1078,39 +1345,41 @@ function getLaterButtonTitle(status, surface = 'card') {
     return surface === 'feed' ? 'Move to Watch Later (clears Watched) (l)' : 'Move to Watch Later (clears Watched)';
   }
   if (surface === 'feed') return 'Watch Later (l)';
-  return surface === 'list' ? 'Add to Watch Later' : 'Save to Watch Later';
+  return 'Add to Watch Later';
 }
 
 /**
  * Returns screen-reader label describing Watch Later button state and mutual exclusion behavior.
  * @param {string} status
- * @param {string} creatorName
+ * @param {string} targetLabel
  * @param {'card' | 'list' | 'feed'} [surface='card']
  * @returns {string}
  */
-function getLaterButtonAriaLabel(status, creatorName, surface = 'card') {
+function getLaterButtonAriaLabel(status, targetLabel, surface = 'card') {
+  const safeTarget = targetLabel || 'this item';
   if (status === 'watch_later') {
-    return surface === 'feed' ? 'Remove from Watch Later' : `Remove @${creatorName} from Watch Later`;
+    return surface === 'feed' ? 'Remove from Watch Later' : `Remove ${safeTarget} from Watch Later`;
   }
   if (status === 'watched') {
     return surface === 'feed'
       ? 'Move to Watch Later (clears Watched)'
-      : `Move @${creatorName} to Watch Later (clears Watched)`;
+      : `Move ${safeTarget} to Watch Later (clears Watched)`;
   }
   if (surface === 'feed') return 'Watch Later';
-  return surface === 'list' ? `Add @${creatorName} to Watch Later` : `Save @${creatorName} to Watch Later`;
+  return `Add ${safeTarget} to Watch Later`;
 }
 
 /**
  * Returns screen-reader label describing both the 1-click Watched toggle action and current state.
  * @param {string} status
- * @param {string} creatorName
+ * @param {string} targetLabel
  * @returns {string}
  */
-function getStatusPillAriaLabel(status, creatorName) {
-  if (status === 'watched') return `Mark @${creatorName} as Unwatched`;
-  if (status === 'watch_later') return `Mark @${creatorName} as Watched (currently Watch Later)`;
-  return `Mark @${creatorName} as Watched`;
+function getStatusPillAriaLabel(status, targetLabel) {
+  const safeTarget = targetLabel || 'this reel';
+  if (status === 'watched') return `Mark ${safeTarget} as Unwatched`;
+  if (status === 'watch_later') return `Mark ${safeTarget} as Watched (currently Watch Later)`;
+  return `Mark ${safeTarget} as Watched`;
 }
 
 /**
@@ -1121,17 +1390,31 @@ function renderReels() {
   renderActiveFilterChips();
   reelsGrid.innerHTML = '';
   reelsTableBody.innerHTML = '';
+  const typeLabels = getMediaUnitLabels(state.filters.mediaType, state.filters.source);
 
   if (state.reels.length === 0) {
-    resultsCount.textContent = '0 saved reels match your view';
+    resultsCount.textContent = `0 ${typeLabels.scopedPlural} match your view`;
     const filtersActive = hasActiveFilters();
-    const emptyTitle = filtersActive ? 'No Matching Saved Reels' : 'Your Vault Is Empty';
-    const emptyDesc = filtersActive
-      ? 'No saved reels match the active creator, date, status, or keyword filters.'
-      : 'Import Instagram’s saved_posts.json export to start browsing and organizing your saved reels.';
-    const emptyActionHtml = filtersActive
-      ? '<button type="button" class="nav-btn nav-btn-primary" data-action="reset-all-filters">Reset Filters</button>'
-      : '<button type="button" class="nav-btn nav-btn-primary" data-action="empty-import">Import saved_posts.json</button>';
+    const subFiltersActive = hasActiveFilters(false);
+    let emptyTitle = 'Your Vault Is Empty';
+    let emptyDesc = 'Import Instagram’s saved_posts.json export to bring in your Instagram Saved collection, or DM reels and posts to Reeler Bot.';
+    let emptyActionHtml = '<button type="button" class="nav-btn nav-btn-primary" data-action="empty-import">Import saved_posts.json</button>';
+
+    if (subFiltersActive) {
+      emptyTitle = `No Matching ${typeLabels.titlePlural}`;
+      emptyDesc = `No ${typeLabels.scopedPlural} match the active category, type, creator, date, status, or keyword filters.`;
+      emptyActionHtml = '<button type="button" class="nav-btn nav-btn-primary" data-action="reset-all-filters">Reset Filters</button>';
+    } else if (state.filters.source === 'bot') {
+      emptyTitle = 'No Bot-Sent Items Yet';
+      emptyDesc = 'DM any Reel or Post link to your Reeler Bot to track it here with Watch Later reminders, without adding it to your Instagram Saved collection.';
+      emptyActionHtml = filtersActive
+        ? '<button type="button" class="nav-btn nav-btn-primary" data-action="reset-all-filters">Show All Items</button>'
+        : emptyActionHtml;
+    } else if (state.filters.source === 'instagram') {
+      emptyTitle = 'No Saved on IG Items Yet';
+      emptyDesc = 'Import Instagram’s saved_posts.json export to populate your Instagram Saved collection. Re-import exports anytime to sync new saves.';
+      emptyActionHtml = '<button type="button" class="nav-btn nav-btn-primary" data-action="empty-import">Import saved_posts.json</button>';
+    }
 
     const emptyHtml = `
       <div class="vault-empty-state">
@@ -1168,27 +1451,36 @@ function renderReels() {
 
   const rangeStart = (state.filters.page - 1) * state.filters.limit + 1;
   const rangeEnd = Math.min(state.filters.page * state.filters.limit, state.total);
-  const unit = state.total === 1 ? 'reel' : 'reels';
-  resultsCount.textContent = `Showing ${rangeStart.toLocaleString()}–${rangeEnd.toLocaleString()} of ${state.total.toLocaleString()} saved ${unit}`;
+  resultsCount.textContent = `Showing ${rangeStart.toLocaleString()}–${rangeEnd.toLocaleString()} of ${state.total.toLocaleString()} ${typeLabels.scopedUnit(state.total)}`;
 
   for (let idx = 0; idx < state.reels.length; idx++) {
     const reel = state.reels[idx];
     const effectiveStatus = pendingStatusValues.has(reel.id) ? pendingStatusValues.get(reel.id) : reel.watch_status;
     const isPending = pendingStatusIds.has(reel.id);
-    const creatorName = reel.creator?.username || 'instagram_user';
-    const safeCreator = escapeHtml(creatorName);
+    const isBotSent = reel.is_saved_on_instagram === false;
+    const itemType = getSavedMediaType(reel);
+    const isPost = itemType === 'post';
+    const badgeLabel = isPost ? 'Post' : 'Reel';
+    const badgeClass = isPost ? 'media-type-post' : 'media-type-reel';
+    const itemWord = isPost ? 'post' : 'reel';
+    const sourcePillHtml = isBotSent ? '<span class="card-source-pill is-bot">Bot</span>' : '';
+    const creatorInfo = getCreatorDisplayInfo(reel.creator);
+    const safeCreator = escapeHtml(creatorInfo.displayText);
+    const ariaTarget = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `this ${itemWord}`;
+    const safeAriaTarget = escapeHtml(ariaTarget);
+    const creatorFilterSubject = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `unattributed ${itemWord}s`;
     const safeReelUrl = escapeHtml(sanitizeExternalHref(reel.reel_url, 'https://www.instagram.com/'));
-    const initial = (creatorName.replace(/[^a-zA-Z0-9]/g, '')[0] || 'R').toUpperCase();
+    const { initial } = creatorInfo;
     const dateInfo = getReelDisplayDate(reel);
     const dateFormatted = formatShortDate(dateInfo.iso);
     const isWatchLater = effectiveStatus === 'watch_later';
     const isWatched = effectiveStatus === 'watched';
     const pillTitle = escapeHtml(getStatusPillTitle(effectiveStatus));
-    const pillAria = escapeHtml(getStatusPillAriaLabel(effectiveStatus, creatorName));
+    const pillAria = escapeHtml(getStatusPillAriaLabel(effectiveStatus, ariaTarget));
     const cardLaterTitle = escapeHtml(getLaterButtonTitle(effectiveStatus, 'card'));
-    const cardLaterAria = escapeHtml(getLaterButtonAriaLabel(effectiveStatus, creatorName, 'card'));
+    const cardLaterAria = escapeHtml(getLaterButtonAriaLabel(effectiveStatus, ariaTarget, 'card'));
     const listLaterTitle = escapeHtml(getLaterButtonTitle(effectiveStatus, 'list'));
-    const listLaterAria = escapeHtml(getLaterButtonAriaLabel(effectiveStatus, creatorName, 'list'));
+    const listLaterAria = escapeHtml(getLaterButtonAriaLabel(effectiveStatus, ariaTarget, 'list'));
     const cleanCaption = stripPrivateUseChars(reel.caption).trim();
     const rawCaption = cleanCaption || 'No caption provided';
     const safeCaption = escapeHtml(rawCaption);
@@ -1198,29 +1490,42 @@ function renderReels() {
     const thumbMeta = ReelerGeometry.parseThumbMeta(cleanThumbnail);
     const posterKindLabel = thumbMeta.mediaKind === 'CAROUSEL_ITEM'
       ? 'Carousel'
-      : (thumbMeta.isClips === false ? 'Saved Post' : 'Saved Reel');
-    const touchCueLabel = thumbMeta.isClips === false ? 'Open' : 'Watch';
+      : ((isPost || thumbMeta.isClips === false)
+        ? (isBotSent ? 'Bot Post' : 'Saved Post')
+        : (isBotSent ? 'Bot Reel' : 'Saved Reel'));
+    const touchCueLabel = (isPost || thumbMeta.isClips === false) ? 'Open' : 'Watch';
     const creatorId = reel.creator?.id ? String(reel.creator.id) : '';
     const isCreatorFiltered = Boolean(creatorId && state.filters.creatorId === creatorId);
     const creatorFilterTitle = escapeHtml(
       creatorId
-        ? (isCreatorFiltered ? `Showing @${creatorName} (click to clear filter)` : `Filter vault by @${creatorName}`)
-        : `@${creatorName} (unattributed creator)`
+        ? (isCreatorFiltered ? `Showing ${creatorFilterSubject} (click to clear filter)` : `Filter vault by ${creatorFilterSubject}`)
+        : `Unattributed ${itemWord} (creator filter unavailable)`
     );
     const creatorFilterAria = escapeHtml(
-      isCreatorFiltered ? `Clear creator filter @${creatorName}` : `Filter saved reels by @${creatorName}`
+      isCreatorFiltered ? `Clear creator filter ${creatorFilterSubject}` : `Filter items by ${creatorFilterSubject}`
     );
 
     // 1. Grid Poster Card (<article> + separate sibling play trigger, bookmark, creator filter handle, Later badge, and 1-click Watched toggle)
     const card = document.createElement('article');
     card.className = `vault-poster-card ${hasRealThumbnail ? 'has-thumbnail' : 'is-monogram'}`;
     card.setAttribute('data-id', reel.id);
+    card.setAttribute('data-media-type', itemType);
+    card.setAttribute('data-source', isBotSent ? 'bot' : 'instagram');
+
+    const hasDateLabel = Boolean(dateFormatted && dateFormatted !== 'Unknown');
+    const monogramTitleHtml = creatorInfo.isAttributedName
+      ? `<div class="art-creator-handle">${safeCreator}</div>`
+      : (cleanCaption
+        ? `<div class="art-caption-preview">${escapeHtml(cleanCaption)}</div>`
+        : (hasDateLabel
+          ? `<div class="art-creator-handle">${escapeHtml(`${dateInfo.labelPrefix} ${dateFormatted}`)}</div>`
+          : ''));
 
     const monogramArtHtml = `
-      <div class="monochrome-poster-art">
+      <div class="monochrome-poster-art"${hasRealThumbnail ? ' aria-hidden="true"' : ''}>
         <div class="art-center-block">
           <div class="art-monogram-circle" aria-hidden="true">${initial}</div>
-          <div class="art-reel-id">${escapeHtml(reel.shortcode || 'Saved Reel')}</div>
+          ${monogramTitleHtml}
           <div class="art-poster-kind">${posterKindLabel}</div>
         </div>
         <div class="poster-bottom-scrim"></div>
@@ -1229,7 +1534,7 @@ function renderReels() {
 
     const imageLayerHtml = hasRealThumbnail
       ? `
-        <img class="poster-actual-img" src="${escapeHtml(cleanThumbnail)}" alt="Reel poster by @${safeCreator}" loading="lazy" />
+        <img class="poster-actual-img" src="${escapeHtml(cleanThumbnail)}" alt="${creatorInfo.isAttributedName ? `${badgeLabel} poster by ${safeAriaTarget}` : `${isBotSent ? 'Tracked' : 'Saved'} ${itemWord} poster`}" loading="lazy" />
         <div class="poster-top-scrim"></div>
         <div class="poster-bottom-scrim"></div>
       `
@@ -1239,7 +1544,7 @@ function renderReels() {
       <div class="poster-media-box">
         ${monogramArtHtml}
         ${imageLayerHtml}
-        <button type="button" class="poster-play-trigger" aria-label="Play reel #${rankNum} by @${safeCreator} in fullscreen feed">
+        <button type="button" class="poster-play-trigger" aria-label="Open ${itemWord} #${rankNum}${creatorInfo.isAttributedName ? ` by ${safeAriaTarget}` : ''} in fullscreen feed">
           <span class="play-hover-trigger" aria-hidden="true">
             <span class="play-icon-box">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -1255,7 +1560,10 @@ function renderReels() {
           <span class="poster-cue-thumb" aria-hidden="true">${touchCueLabel}</span>
         </button>
         <div class="card-header-overlay">
-          <span class="rank-tag" aria-hidden="true">#${rankNum}</span>
+          <div class="card-header-badges">
+            <span class="rank-tag" aria-hidden="true">#${rankNum}</span>
+            <span class="media-type-badge ${badgeClass}">${badgeLabel}</span>
+          </div>
           <button type="button" class="card-bookmark-btn ${isWatchLater ? 'active' : ''}" title="${cardLaterTitle}" aria-label="${cardLaterAria}" aria-pressed="${isWatchLater}"${isPending ? ' disabled aria-busy="true"' : ''}>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" aria-hidden="true">
               <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path>
@@ -1265,12 +1573,13 @@ function renderReels() {
       </div>
       <div class="card-details-box">
         <div class="card-creator-row">
-          <button type="button" class="card-creator-filter-btn ${isCreatorFiltered ? 'is-active' : ''}" data-action="filter-creator" title="${creatorFilterTitle}" aria-label="${creatorFilterAria}" aria-pressed="${isCreatorFiltered}"${creatorId ? '' : ' disabled'}><span class="handle-text">@${safeCreator}</span></button>
+          <button type="button" class="card-creator-filter-btn ${isCreatorFiltered ? 'is-active' : ''}" data-action="filter-creator" title="${creatorFilterTitle}" aria-label="${creatorFilterAria}" aria-pressed="${isCreatorFiltered}"${creatorId ? '' : ' disabled'}><span class="handle-text">${safeCreator}</span></button>
         </div>
         <div class="card-caption-line">${safeCaption}</div>
         <div class="card-footer-meta">
           <div class="card-meta-left">
             <span class="card-date-label">${dateInfo.labelPrefix} ${dateFormatted}</span>
+            ${sourcePillHtml}
             <span class="card-later-badge"${isWatchLater ? '' : ' hidden'}>Later</span>
           </div>
           <button type="button" class="status-pill-toggle ${isWatched ? 'status-pill-watched' : 'status-pill-unwatched'}" data-id="${reel.id}" title="${pillTitle}" aria-label="${pillAria}" aria-pressed="${isWatched}"${isPending ? ' disabled aria-busy="true"' : ''}>
@@ -1294,7 +1603,7 @@ function renderReels() {
           state.selectedCreator = reel.creator;
         }
         selectCreator(nextId);
-        announceStatus(nextId ? `Filtered saved reels by @${creatorName}.` : 'Cleared creator filter.');
+        announceStatus(nextId ? `Filtered items by ${creatorFilterSubject}.` : 'Cleared creator filter.');
       });
     }
 
@@ -1319,6 +1628,7 @@ function renderReels() {
         cardImg.hidden = true;
         card.classList.remove('has-thumbnail');
         card.classList.add('is-monogram');
+        card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
       }, { once: true });
       if (reel.shortcode) {
         /**
@@ -1343,18 +1653,23 @@ function renderReels() {
     const row = document.createElement('tr');
     row.className = 'table-row';
     row.setAttribute('data-id', reel.id);
+    row.setAttribute('data-media-type', itemType);
+    row.setAttribute('data-source', isBotSent ? 'bot' : 'instagram');
+    const tableDateLabel = dateInfo.labelPrefix === 'Published'
+      ? `Pub ${dateFormatted}`
+      : `${dateInfo.labelPrefix} ${dateFormatted}`;
 
     row.innerHTML = `
-      <td class="table-rank">#${rankNum}</td>
-      <td>
+      <td class="table-rank"><div class="table-rank-wrap"><span>#${rankNum}</span><span class="media-type-badge ${badgeClass}">${badgeLabel}</span></div></td>
+      <td class="table-creator-td">
         <div class="table-creator-cell">
           <div class="table-creator-avatar" aria-hidden="true">${initial}</div>
-          <button type="button" class="table-creator-filter-btn ${isCreatorFiltered ? 'is-active' : ''}" data-action="filter-creator" title="${creatorFilterTitle}" aria-label="${creatorFilterAria}" aria-pressed="${isCreatorFiltered}"${creatorId ? '' : ' disabled'}><span class="handle-text">@${safeCreator}</span></button>
+          <button type="button" class="table-creator-filter-btn ${isCreatorFiltered ? 'is-active' : ''}" data-action="filter-creator" title="${creatorFilterTitle}" aria-label="${creatorFilterAria}" aria-pressed="${isCreatorFiltered}"${creatorId ? '' : ' disabled'}><span class="handle-text">${safeCreator}</span></button>
         </div>
       </td>
       <td class="table-caption-cell"><div class="table-caption-clamp" title="${safeCaption}">${safeCaption}</div></td>
-      <td class="table-date-cell">${dateFormatted}</td>
-      <td>
+      <td class="table-date-cell"><div class="table-date-wrap"><span class="table-date-text">${escapeHtml(tableDateLabel)}</span>${sourcePillHtml}</div></td>
+      <td class="table-status-td">
         <div class="table-status-group">
           <span class="table-later-badge"${isWatchLater ? '' : ' hidden'}>Later</span>
           <button type="button" class="status-pill-toggle ${isWatched ? 'status-pill-watched' : 'status-pill-unwatched'}" data-id="${reel.id}" title="${pillTitle}" aria-label="${pillAria}" aria-pressed="${isWatched}"${isPending ? ' disabled aria-busy="true"' : ''}>
@@ -1362,15 +1677,15 @@ function renderReels() {
           </button>
         </div>
       </td>
-      <td>
+      <td class="table-actions-td">
         <div class="table-actions-cell">
-          <button type="button" class="table-action-icon-btn btn-table-play" title="Play Reel in Feed" aria-label="Play reel by @${safeCreator} in feed">
+          <button type="button" class="table-action-icon-btn btn-table-play" title="Open ${badgeLabel} in Feed" aria-label="Open ${itemWord}${creatorInfo.isAttributedName ? ` by ${safeAriaTarget}` : ''} in feed">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
           </button>
           <button type="button" class="table-action-icon-btn btn-table-bookmark ${isWatchLater ? 'active' : ''}" title="${listLaterTitle}" aria-label="${listLaterAria}" aria-pressed="${isWatchLater}"${isPending ? ' disabled aria-busy="true"' : ''}>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
           </button>
-          <a class="table-action-icon-btn" href="${safeReelUrl}" target="_blank" rel="noopener noreferrer" title="Open post on Instagram" aria-label="Open reel by @${safeCreator} on Instagram">
+          <a class="table-action-icon-btn" href="${safeReelUrl}" target="_blank" rel="noopener noreferrer" title="Open ${badgeLabel} on Instagram" aria-label="Open ${itemWord}${creatorInfo.isAttributedName ? ` by ${safeAriaTarget}` : ''} on Instagram">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
           </a>
         </div>
@@ -1391,7 +1706,7 @@ function renderReels() {
           state.selectedCreator = reel.creator;
         }
         selectCreator(nextId);
-        announceStatus(nextId ? `Filtered saved reels by @${creatorName}.` : 'Cleared creator filter.');
+        announceStatus(nextId ? `Filtered items by ${creatorFilterSubject}.` : 'Cleared creator filter.');
       });
     }
 
@@ -1429,9 +1744,11 @@ function syncCatalogReelStatus(reelId, newStatus) {
   const isWatchLater = newStatus === 'watch_later';
   const isWatched = newStatus === 'watched';
   const reel = state.reels.find((r) => r.id === reelId);
-  const creatorName = reel?.creator?.username || 'instagram_user';
+  const itemWord = getSavedMediaType(reel) === 'post' ? 'post' : 'reel';
+  const creatorInfo = getCreatorDisplayInfo(reel?.creator);
+  const ariaTarget = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `this ${itemWord}`;
   const pillTitle = getStatusPillTitle(newStatus);
-  const pillAria = getStatusPillAriaLabel(newStatus, creatorName);
+  const pillAria = getStatusPillAriaLabel(newStatus, ariaTarget);
   const pillHtml = renderStatusPillContent(newStatus);
 
   const card = reelsGrid.querySelector(`.vault-poster-card[data-id="${escapedId}"]`);
@@ -1441,7 +1758,7 @@ function syncCatalogReelStatus(reelId, newStatus) {
       bookmark.classList.toggle('active', isWatchLater);
       bookmark.setAttribute('aria-pressed', String(isWatchLater));
       bookmark.setAttribute('title', getLaterButtonTitle(newStatus, 'card'));
-      bookmark.setAttribute('aria-label', getLaterButtonAriaLabel(newStatus, creatorName, 'card'));
+      bookmark.setAttribute('aria-label', getLaterButtonAriaLabel(newStatus, ariaTarget, 'card'));
       const svg = bookmark.querySelector('svg');
       if (svg) svg.setAttribute('fill', isWatchLater ? 'currentColor' : 'none');
     }
@@ -1466,7 +1783,7 @@ function syncCatalogReelStatus(reelId, newStatus) {
       bookmark.classList.toggle('active', isWatchLater);
       bookmark.setAttribute('aria-pressed', String(isWatchLater));
       bookmark.setAttribute('title', getLaterButtonTitle(newStatus, 'list'));
-      bookmark.setAttribute('aria-label', getLaterButtonAriaLabel(newStatus, creatorName, 'list'));
+      bookmark.setAttribute('aria-label', getLaterButtonAriaLabel(newStatus, ariaTarget, 'list'));
       const svg = bookmark.querySelector('svg');
       if (svg) svg.setAttribute('fill', isWatchLater ? 'currentColor' : 'none');
     }
@@ -1551,7 +1868,8 @@ async function updateReelStatus(reelId, newStatus, options = {}) {
 
     syncFeedSlideStatus(reelId, newStatus);
     syncCatalogReelStatus(reelId, newStatus);
-    announceStatus(`Marked @${target?.creator?.username || 'reel'} as ${formatStatusLabel(newStatus)}.`);
+    const liveTarget = getCreatorDisplayInfo(target?.creator).accessibleName;
+    announceStatus(`Marked ${liveTarget} as ${formatStatusLabel(newStatus)}.`);
     loadStats();
 
     const swappedFrom = (previousStatus === 'watched' && newStatus === 'watch_later')
@@ -1599,9 +1917,10 @@ const metaInFlightMap = new Map();
  * Deduplicates concurrent requests and caches non-empty resolutions in state.metaCache.
  * @param {string} shortcode
  * @param {AbortSignal} [signal]
+ * @param {'p' | 'reel'} [preferredType]
  * @returns {Promise<{ isClips: boolean | null, mediaKind: string, thumbAspectRatio: number | null, thumbnailUrl: string | null } | null>}
  */
-async function fetchShortcodeMeta(shortcode, signal) {
+async function fetchShortcodeMeta(shortcode, signal, preferredType) {
   if (!shortcode) return null;
   if (state.metaCache.has(shortcode)) {
     return state.metaCache.get(shortcode);
@@ -1612,7 +1931,8 @@ async function fetchShortcodeMeta(shortcode, signal) {
 
   const reqPromise = (async () => {
     try {
-      const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}/meta`, { signal });
+      const qs = preferredType === 'p' || preferredType === 'reel' ? `?type=${encodeURIComponent(preferredType)}` : '';
+      const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}/meta${qs}`, { signal });
       if (!res.ok) return null;
       const data = await res.json();
       if (data && (data.thumbnailUrl !== null || data.isClips !== null)) {
@@ -1640,10 +1960,11 @@ function getSlideAspectInput(reel) {
   const serverMeta = state.metaCache.get(shortcode);
   const cleanThumb = sanitizeMediaUrl(reel?.thumbnail_url);
   const thumbMeta = ReelerGeometry.parseThumbMeta(cleanThumb);
+  const savedTypeHint = getSavedMediaType(reel) === 'post' ? false : null;
 
   return {
     embedRatio: cached?.embedRatio ?? null,
-    isClips: cached?.isClips ?? serverMeta?.isClips ?? thumbMeta.isClips ?? null,
+    isClips: cached?.isClips ?? serverMeta?.isClips ?? thumbMeta.isClips ?? savedTypeHint,
     thumbAspectRatio: cached?.thumbAspectRatio ?? serverMeta?.thumbAspectRatio ?? state.thumbRatioCache.get(shortcode) ?? null,
   };
 }
@@ -1773,8 +2094,10 @@ function mountFeedIframe(slide, reel) {
   const cleanThumb = sanitizeMediaUrl(reel.thumbnail_url);
   const hasRealThumbnail = Boolean(cleanThumb && !isPlaceholderMediaUrl(cleanThumb));
   const thumbMeta = ReelerGeometry.parseThumbMeta(cleanThumb);
+  const preferredType = getSavedMediaType(reel) === 'post' ? 'p' : 'reel';
+  const savedTypeHint = preferredType === 'p' ? false : null;
 
-  let knownIsClips = cached?.isClips ?? state.metaCache.get(shortcode)?.isClips ?? thumbMeta.isClips ?? null;
+  let knownIsClips = cached?.isClips ?? state.metaCache.get(shortcode)?.isClips ?? thumbMeta.isClips ?? savedTypeHint;
   let knownThumbRatio = cached?.thumbAspectRatio ?? state.metaCache.get(shortcode)?.thumbAspectRatio ?? state.thumbRatioCache.get(shortcode) ?? null;
 
   const viewport = slide.querySelector('.reel-media-viewport');
@@ -1800,12 +2123,16 @@ function mountFeedIframe(slide, reel) {
   iframe.setAttribute('scrolling', 'no');
   iframe.setAttribute('allowtransparency', 'true');
   iframe.setAttribute('loading', 'eager');
-  iframe.setAttribute('title', `Instagram post by @${reel.creator?.username || 'creator'}`);
+  const frameCreator = getCreatorDisplayInfo(reel.creator);
+  iframe.setAttribute(
+    'title',
+    frameCreator.isAttributedName ? `Instagram post by ${frameCreator.accessibleName}` : 'Embedded Instagram post'
+  );
 
   const abortController = new AbortController();
   let metaPromise = null;
   if (knownIsClips === null || !hasRealThumbnail || posterBroken) {
-    metaPromise = fetchShortcodeMeta(shortcode, abortController.signal).then((meta) => {
+    metaPromise = fetchShortcodeMeta(shortcode, abortController.signal, preferredType).then((meta) => {
       if (!meta || abortController.signal.aborted) return meta;
       if (knownIsClips === null && meta.isClips !== undefined) {
         knownIsClips = meta.isClips;
@@ -2087,15 +2414,27 @@ function renderFeedSlides() {
   state.reels.forEach((reel, index) => {
     const effectiveStatus = pendingStatusValues.has(reel.id) ? pendingStatusValues.get(reel.id) : reel.watch_status;
     const isPending = pendingStatusIds.has(reel.id);
-    const creatorName = reel.creator?.username || 'instagram_user';
-    const safeCreator = escapeHtml(creatorName);
+    const isBotSent = reel.is_saved_on_instagram === false;
+    const isPost = getSavedMediaType(reel) === 'post';
+    const itemWord = isPost ? 'post' : 'reel';
+    const itemBadgeTitle = isPost ? 'Post' : 'Reel';
+    const feedMonogramFallback = isBotSent
+      ? (isPost ? 'Bot Post' : 'Bot Reel')
+      : (isPost ? 'Saved Post' : 'Saved Reel');
+    const feedSourcePill = isBotSent ? '<span class="feed-source-pill is-bot">Sent to Bot</span>' : '';
+    const creatorInfo = getCreatorDisplayInfo(reel.creator);
+    const ariaTarget = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `this ${itemWord}`;
+    const safeCreator = escapeHtml(creatorInfo.displayText);
     const safeReelUrl = escapeHtml(sanitizeExternalHref(reel.reel_url, 'https://www.instagram.com/'));
-    const hasPublicHandle = Boolean(creatorName && creatorName !== 'unattributed' && creatorName !== 'instagram_user');
-    const safeCreatorHref = escapeHtml(getSafeCreatorProfileHref(creatorName, reel.reel_url));
+    const safeCreatorHref = escapeHtml(getSafeCreatorProfileHref(reel.creator, reel.reel_url));
     const creatorLinkTitle = escapeHtml(
-      hasPublicHandle ? `Open @${creatorName}'s profile on Instagram` : `Open @${creatorName}'s post on Instagram`
+      creatorInfo.hasPublicHandle
+        ? `Open ${creatorInfo.displayText}'s profile on Instagram`
+        : (creatorInfo.isAttributedName
+          ? `Open ${creatorInfo.displayText}'s ${itemWord} on Instagram`
+          : `Open ${itemWord} on Instagram`)
     );
-    const initial = (creatorName.replace(/[^a-zA-Z0-9]/g, '')[0] || 'R').toUpperCase();
+    const { initial } = creatorInfo;
     const isWatchLater = effectiveStatus === 'watch_later';
     const isWatched = effectiveStatus === 'watched';
     const cleanThumbnail = sanitizeMediaUrl(reel.thumbnail_url);
@@ -2103,7 +2442,7 @@ function renderFeedSlides() {
     const dateInfo = getReelDisplayDate(reel);
     const dateFormatted = formatShortDate(dateInfo.iso);
     const cleanSlideCaption = stripPrivateUseChars(reel.caption).trim();
-    const captionText = cleanSlideCaption || 'No caption available for this reel.';
+    const captionText = cleanSlideCaption || `No caption available for this ${itemWord}.`;
 
     const slide = document.createElement('div');
     slide.className = 'feed-reel-slide';
@@ -2117,7 +2456,7 @@ function renderFeedSlides() {
           <div class="reel-media-viewport">
             <div class="reel-monogram-underlay" aria-hidden="true">
               <div class="feed-monogram-circle">${initial}</div>
-              <div class="feed-monogram-handle">@${safeCreator}</div>
+              <div class="feed-monogram-handle">${creatorInfo.isAttributedName ? safeCreator : feedMonogramFallback}</div>
             </div>
             <div class="reel-probe-indicator" aria-hidden="true">
               <span class="reel-probe-spinner"></span>
@@ -2130,7 +2469,7 @@ function renderFeedSlides() {
                 <a href="${safeReelUrl}" target="_blank" rel="noopener noreferrer" class="nav-btn nav-btn-primary">Open on Instagram</a>
               </div>
             </div>
-            <button type="button" class="feed-focus-player-btn" data-action="focus-embed-player" disabled>Focus video player</button>
+            <button type="button" class="feed-focus-player-btn" data-action="focus-embed-player" disabled>${isPost ? 'Focus Instagram post embed' : 'Focus video player'}</button>
             <!-- Boundary-Masked Clean Iframe Container (Zero white Instagram chrome) -->
             <div class="reel-iframe-container" id="feed-iframe-box-${reel.id}"></div>
           </div>
@@ -2145,14 +2484,14 @@ function renderFeedSlides() {
             </div>
 
             <div class="rail-action-item">
-              <button type="button" class="rail-action-btn ${isWatchLater ? 'active-later' : ''}" data-action="feed-toggle-later" title="${escapeHtml(getLaterButtonTitle(effectiveStatus, 'feed'))}" aria-label="${escapeHtml(getLaterButtonAriaLabel(effectiveStatus, creatorName, 'feed'))}" aria-pressed="${isWatchLater}"${isPending ? ' disabled aria-busy="true"' : ''}>
+              <button type="button" class="rail-action-btn ${isWatchLater ? 'active-later' : ''}" data-action="feed-toggle-later" title="${escapeHtml(getLaterButtonTitle(effectiveStatus, 'feed'))}" aria-label="${escapeHtml(getLaterButtonAriaLabel(effectiveStatus, ariaTarget, 'feed'))}" aria-pressed="${isWatchLater}"${isPending ? ' disabled aria-busy="true"' : ''}>
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
               </button>
               <span class="rail-action-sublabel">Later</span>
             </div>
 
             <div class="rail-action-item">
-              <button type="button" class="rail-action-btn" data-action="feed-copy-link" title="Copy Reel Link (c)" aria-label="Copy Reel Link">
+              <button type="button" class="rail-action-btn" data-action="feed-copy-link" title="Copy ${itemBadgeTitle} Link (c)" aria-label="Copy ${itemBadgeTitle} Link">
                 <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
               </button>
               <span class="rail-action-sublabel copy-label">Copy</span>
@@ -2172,8 +2511,8 @@ function renderFeedSlides() {
           <div class="reel-overlay-creator">
             <div class="reel-creator-avatar" aria-hidden="true">${initial}</div>
             <div class="reel-creator-meta">
-              <a href="${safeCreatorHref}" target="_blank" rel="noopener noreferrer" class="reel-creator-handle" title="${creatorLinkTitle}"><span class="handle-text">@${safeCreator}</span></a>
-              <span class="reel-saved-badge">${dateInfo.labelPrefix} ${dateFormatted}</span>
+              <a href="${safeCreatorHref}" target="_blank" rel="noopener noreferrer" class="reel-creator-handle" title="${creatorLinkTitle}"><span class="handle-text">${safeCreator}</span></a>
+              <span class="reel-saved-badge">${dateInfo.labelPrefix} ${dateFormatted}${feedSourcePill}</span>
             </div>
           </div>
           <div class="reel-caption-wrap" id="caption-wrap-${reel.id}">
@@ -2258,11 +2597,12 @@ function renderFeedSlides() {
 async function copySlideLink(slide, reel) {
   const copyLabel = slide?.querySelector('.copy-label');
   const url = sanitizeExternalHref(reel?.reel_url, 'https://www.instagram.com/');
+  const isPost = getSavedMediaType(reel) === 'post';
   try {
     if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable');
     await navigator.clipboard.writeText(url);
     if (copyLabel) copyLabel.textContent = 'Copied!';
-    announceStatus('Reel link copied to clipboard.');
+    announceStatus(`${isPost ? 'Post' : 'Reel'} link copied to clipboard.`);
   } catch (err) {
     console.warn('Clipboard write failed:', err);
     if (copyLabel) copyLabel.textContent = 'Failed';
@@ -2317,7 +2657,6 @@ function setupFeedIntersectionObserver() {
         syncActiveSlideInert(index);
 
         feedCounterKicker.textContent = formatFeedCounterKicker(reel, index, state.reels.length);
-        feedShortcodeTag.textContent = `ID: ${reel?.shortcode || '—'}`;
         updateFeedNavArrows(index);
 
         if (reel) {
@@ -2367,7 +2706,6 @@ function openReelsFeed(startReel, triggerEl = null) {
   state.currentFeedIndex = startIndex;
   state.currentFeedReelId = startReel?.id || null;
   feedCounterKicker.textContent = formatFeedCounterKicker(startReel, startIndex, state.reels.length);
-  feedShortcodeTag.textContent = `ID: ${startReel?.shortcode || '—'}`;
   updateFeedNavArrows(startIndex);
 
   renderFeedSlides();
@@ -2462,7 +2800,9 @@ function syncFeedSlideStatus(reelId, newStatus) {
   const watchedBtn = slide.querySelector('[data-action="feed-toggle-watched"]');
   const laterBtn = slide.querySelector('[data-action="feed-toggle-later"]');
   const reel = state.reels.find((r) => r.id === reelId);
-  const creatorName = reel?.creator?.username || 'instagram_user';
+  const itemWord = getSavedMediaType(reel) === 'post' ? 'post' : 'reel';
+  const creatorInfo = getCreatorDisplayInfo(reel?.creator);
+  const ariaTarget = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `this ${itemWord}`;
   const isWatched = newStatus === 'watched';
   const isLater = newStatus === 'watch_later';
 
@@ -2476,7 +2816,7 @@ function syncFeedSlideStatus(reelId, newStatus) {
     laterBtn.classList.toggle('active-later', isLater);
     laterBtn.setAttribute('aria-pressed', String(isLater));
     laterBtn.setAttribute('title', getLaterButtonTitle(newStatus, 'feed'));
-    laterBtn.setAttribute('aria-label', getLaterButtonAriaLabel(newStatus, creatorName, 'feed'));
+    laterBtn.setAttribute('aria-label', getLaterButtonAriaLabel(newStatus, ariaTarget, 'feed'));
     const svg = laterBtn.querySelector('svg');
     if (svg) {
       svg.setAttribute('fill', isLater ? 'currentColor' : 'none');
@@ -2592,15 +2932,18 @@ function stripPrivateUseChars(str) {
 }
 
 /**
- * Resolves consistent outbound Instagram profile URLs for `@handle` links across Grid, List, and Modal views,
- * falling back cleanly to the saved reel URL for unattributed entries.
- * @param {string | null | undefined} creatorName
+ * Resolves consistent outbound Instagram profile URLs for validated `@handle` links across Grid, List, and Modal views,
+ * falling back cleanly to the saved reel URL for unattributed or placeholder entries (or spaced display names without a handle).
+ * @param {object | string | null | undefined} creatorOrHandle
  * @param {string | null | undefined} reelUrl
  * @returns {string}
  */
-function getSafeCreatorProfileHref(creatorName, reelUrl) {
-  const cleanHandle = String(creatorName || '').trim();
-  if (cleanHandle && cleanHandle !== 'unattributed' && cleanHandle !== 'instagram_user') {
+function getSafeCreatorProfileHref(creatorOrHandle, reelUrl) {
+  const rawUsername = typeof creatorOrHandle === 'string'
+    ? creatorOrHandle
+    : creatorOrHandle?.username;
+  const cleanHandle = extractPublicCreatorHandle(rawUsername);
+  if (cleanHandle) {
     return `https://www.instagram.com/${encodeURIComponent(cleanHandle)}/`;
   }
   return sanitizeExternalHref(reelUrl, 'https://www.instagram.com/');
@@ -2824,6 +3167,40 @@ function setupEventListeners() {
   viewModeGridBtn.addEventListener('click', () => applyViewMode('grid'));
   viewModeListBtn.addEventListener('click', () => applyViewMode('list'));
 
+  sourceTabsButtons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const nextSource = btn.dataset.source || 'all';
+      if (state.filters.source === nextSource) return;
+      state.filters.source = nextSource;
+      state.filters.page = 1;
+      syncSourceTabsUi();
+      syncKpiActiveStates();
+      syncUrlState();
+      fetchReels();
+      const label = nextSource === 'bot'
+        ? 'Showing items sent to Reeler Bot.'
+        : (nextSource === 'instagram' ? 'Showing Instagram Saved items only.' : 'Showing all Instagram Saved and bot-sent items.');
+      announceStatus(label);
+    });
+  });
+
+  mediaTypeButtons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const nextType = btn.dataset.mediaType || 'all';
+      if (state.filters.mediaType === nextType) return;
+      state.filters.mediaType = nextType;
+      state.filters.page = 1;
+      syncMediaTypeToggleUi();
+      syncKpiActiveStates();
+      syncUrlState();
+      fetchReels();
+      const label = nextType === 'post'
+        ? 'Showing tracked posts only.'
+        : (nextType === 'reel' ? 'Showing tracked reels only.' : 'Showing all reels and posts.');
+      announceStatus(label);
+    });
+  });
+
   if (creatorsMobileToggle && creatorsStripContainer) {
     creatorsMobileToggle.addEventListener('click', () => {
       const nextExpanded = !creatorsStripContainer.classList.contains('is-expanded');
@@ -2835,7 +3212,7 @@ function setupEventListeners() {
     metricFilterAll.addEventListener('click', () => {
       if (hasActiveFilters()) {
         clearAllFilters();
-        announceStatus('Filters reset. Showing all saved reels.');
+        announceStatus('Filters reset. Showing all tracked items.');
       } else {
         syncKpiActiveStates();
       }
@@ -2850,7 +3227,7 @@ function setupEventListeners() {
       syncKpiActiveStates();
       syncUrlState();
       fetchReels();
-      announceStatus(state.filters.datePreset === '7d' ? 'Filtered to reels saved in the last 7 days.' : 'Cleared date filter.');
+      announceStatus(state.filters.datePreset === '7d' ? 'Filtered to items added in the last 7 days.' : 'Cleared date filter.');
     });
   }
 
@@ -2874,7 +3251,7 @@ function setupEventListeners() {
       syncKpiActiveStates();
       syncUrlState();
       fetchReels();
-      announceStatus(state.filters.watchStatus === 'watched' ? 'Filtered to Watched reels.' : 'Cleared Watched filter.');
+      announceStatus(state.filters.watchStatus === 'watched' ? 'Filtered to Watched items.' : 'Cleared Watched filter.');
     });
   }
 
@@ -3207,8 +3584,21 @@ function setupEventListeners() {
 
       const imported = data?.reelsImported ?? 0;
       const alreadyIn = data?.alreadyPresent ?? 0;
+      const backfilled = data?.savedAtBackfilled ?? 0;
+      const promoted = data?.promotedToSaved ?? 0;
       const errCount = data?.errors?.length ?? 0;
-      const summary = `Archive processed!\n• New reels imported: ${imported}\n• Already present: ${alreadyIn}`;
+      const summaryLines = [
+        'Archive processed!',
+        `• New items imported: ${imported}`,
+        `• Already present: ${alreadyIn}`,
+      ];
+      if (promoted > 0) {
+        summaryLines.push(`• Moved to Saved on IG: ${promoted}`);
+      }
+      if (backfilled > 0) {
+        summaryLines.push(`• Saved dates backfilled: ${backfilled}`);
+      }
+      const summary = summaryLines.join('\n');
       if (data?.status === 'partial' || errCount > 0) {
         showToast(`${summary}\n• Items with errors: ${errCount}`, 'error');
       } else {

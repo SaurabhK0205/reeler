@@ -2,6 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ArchiveImportService } from '../src/services/archiveImportService.ts';
 
+/**
+ * CLI entrypoint for importing saved items and backfilling missing `saved_at` timestamps from an Instagram JSON export.
+ */
 async function main() {
   const filePath = process.argv[2];
   if (!filePath) {
@@ -26,11 +29,13 @@ async function main() {
   const result = await ArchiveImportService.importArchive(fileContent);
 
   console.log('\n✅ Import Completed!');
-  console.log(`- Total Items Scanned:  ${result.totalProcessed}`);
-  console.log(`- Newly Imported Reels: ${result.reelsImported}`);
-  console.log(`- Already in Library:   ${result.alreadyPresent}`);
-  console.log(`- Creators Added:       ${result.creatorsAdded}`);
-  console.log(`- Skipped / Non-reels:  ${result.skipped}`);
+  console.log(`- Total Items Scanned:     ${result.totalProcessed}`);
+  console.log(`- Newly Imported Reels:    ${result.reelsImported}`);
+  console.log(`- Already in Library:      ${result.alreadyPresent}`);
+  console.log(`- Saved Dates Backfilled:  ${result.savedAtBackfilled}`);
+  console.log(`- Promoted to IG Saved:    ${result.promotedToSaved}`);
+  console.log(`- Creators Added:          ${result.creatorsAdded}`);
+  console.log(`- Skipped / Non-reels:     ${result.skipped}`);
 
   if (result.errors.length > 0) {
     console.log('\n⚠️ Errors encountered during import:');

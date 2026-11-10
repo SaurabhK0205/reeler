@@ -1,5 +1,6 @@
 import { Repository } from '../db/repository.ts';
-import type { Creator } from '../types.ts';
+import type { Creator, SavedMediaType } from '../types.ts';
+import { formatCanonicalInstagramUrl, parseCanonicalInstagramMediaUrl } from '../utils/mediaType.ts';
 
 export interface RawSavedExportItem {
   title?: string;
@@ -15,6 +16,8 @@ export interface ArchiveImportResult {
   totalProcessed: number;
   reelsImported: number;
   alreadyPresent: number;
+  savedAtBackfilled: number;
+  promotedToSaved: number;
   creatorsAdded: number;
   skipped: number;
   errors: string[];
@@ -69,6 +72,8 @@ export class ArchiveImportService {
           totalProcessed: 0,
           reelsImported: 0,
           alreadyPresent: 0,
+          savedAtBackfilled: 0,
+          promotedToSaved: 0,
           creatorsAdded: 0,
           skipped: 0,
           errors: ['Failed to parse JSON file: malformed JSON format.'],
@@ -116,6 +121,8 @@ export class ArchiveImportService {
         totalProcessed: 0,
         reelsImported: 0,
         alreadyPresent: 0,
+        savedAtBackfilled: 0,
+        promotedToSaved: 0,
         creatorsAdded: 0,
         skipped: 0,
         errors: ['No saved media items found in the provided export file.'],
@@ -130,6 +137,7 @@ export class ArchiveImportService {
       mediaId: string;
       shortcode: string;
       reel_url: string;
+      media_type: SavedMediaType;
       creatorHandle: string;
       creatorDisplayName: string | null;
       caption: string | null;
@@ -237,31 +245,18 @@ export class ArchiveImportService {
         continue;
       }
 
-      // Anchored URL parse: validate host and reel/post/tv path
-      let shortcode: string | null = null;
-      let mediaType: 'reel' | 'p' | 'tv' = 'reel';
-      try {
-        const parsedUrl = new URL(href);
-        const host = parsedUrl.hostname.toLowerCase();
-        if (host !== 'instagram.com' && host !== 'www.instagram.com') {
-          continue;
-        }
-        const pathMatch = parsedUrl.pathname.match(/^\/(reel|reels|p|tv)\/([A-Za-z0-9_-]+)\/?$/i);
-        if (!pathMatch) {
-          continue;
-        }
-        const matchedType = pathMatch[1].toLowerCase();
-        mediaType = matchedType === 'p' ? 'p' : (matchedType === 'tv' ? 'tv' : 'reel');
-        shortcode = pathMatch[2];
-      } catch {
+      // Anchored URL parse: validate host and optional username + reel/post/tv path
+      const parsedMedia = parseCanonicalInstagramMediaUrl(href);
+      if (!parsedMedia) {
         continue;
       }
 
-      if (!shortcode) {
-        continue;
+      const shortcode = parsedMedia.shortcode;
+      const resolvedMediaType: SavedMediaType = parsedMedia.mediaType;
+      const reel_url = formatCanonicalInstagramUrl(shortcode, resolvedMediaType, href);
+      if (creatorHandle === UNKNOWN_CREATOR_HANDLE && parsedMedia.creatorHandleFromPath) {
+        creatorHandle = parsedMedia.creatorHandleFromPath;
       }
-
-      const reel_url = `https://www.instagram.com/${mediaType}/${shortcode}/`;
       if (!mediaId) {
         mediaId = `export_${shortcode}`;
       }
@@ -284,6 +279,7 @@ export class ArchiveImportService {
         mediaId,
         shortcode,
         reel_url,
+        media_type: resolvedMediaType,
         creatorHandle,
         creatorDisplayName: normalizedDisplayName,
         caption: normalizedCaption,
@@ -309,6 +305,8 @@ export class ArchiveImportService {
 
     let reelsImported = 0;
     let alreadyPresent = 0;
+    let savedAtBackfilled = 0;
+    let promotedToSaved = 0;
     const creatorsSeen = new Set<string>();
     const parsedCandidates = Array.from(candidatesByShortcode.values());
 
@@ -350,6 +348,7 @@ export class ArchiveImportService {
           instagram_media_id: string;
           shortcode: string;
           reel_url: string;
+          media_type: SavedMediaType;
           creator_id: string;
           caption: string | null;
           thumbnail_url: string | null;
@@ -374,6 +373,7 @@ export class ArchiveImportService {
               instagram_media_id: c.mediaId,
               shortcode: c.shortcode,
               reel_url: c.reel_url,
+              media_type: c.media_type,
               creator_id: creator.id,
               caption: c.caption,
               thumbnail_url: null,
@@ -392,6 +392,7 @@ export class ArchiveImportService {
                 instagram_media_id: c.mediaId,
                 shortcode: c.shortcode,
                 reel_url: c.reel_url,
+                media_type: c.media_type,
                 creator_id: fallback.id,
                 caption: c.caption,
                 thumbnail_url: null,
@@ -410,10 +411,15 @@ export class ArchiveImportService {
           }
         }
 
-        // Batch upsert saved reels
-        const batchResult = await Repository.upsertSavedReelsBatch(reelsPayload, { ignoreDuplicates: true });
+        // Batch upsert saved reels (backfilling missing saved_at on already-synced/DMed items)
+        const batchResult = await Repository.upsertSavedReelsBatch(reelsPayload, {
+          ignoreDuplicates: true,
+          backfillMissingSavedAt: true,
+        });
         reelsImported = batchResult.newlyImported;
         alreadyPresent = batchResult.alreadyPresent;
+        savedAtBackfilled = batchResult.savedAtBackfilled;
+        promotedToSaved = batchResult.promotedToSaved;
 
         if (batchResult.failedShortcodes.length > 0) {
           for (const sc of batchResult.failedShortcodes) {
@@ -445,6 +451,8 @@ export class ArchiveImportService {
       totalProcessed,
       reelsImported,
       alreadyPresent,
+      savedAtBackfilled,
+      promotedToSaved,
       creatorsAdded: creatorsSeen.size,
       skipped: totalProcessed - totalRecognized,
       errors: errors.slice(0, 5),

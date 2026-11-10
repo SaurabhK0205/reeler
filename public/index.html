@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <title>Reeler — Saved Reels Vault</title>
-  <link rel="stylesheet" href="style.css?v=3.8">
+  <title>Reeler | Reels &amp; Posts Vault</title>
+  <link rel="stylesheet" href="style.css?v=4.3">
 </head>
 <body>
   <div class="app-layout">
@@ -27,7 +27,7 @@
         </div>
         <div class="vault-identity">
           <h1 class="vault-brand">REELER</h1>
-          <div class="vault-tag">Personal Saved Reels Vault</div>
+          <div class="vault-tag">Saved &amp; Bot-Tracked Vault</div>
         </div>
       </div>
 
@@ -91,8 +91,8 @@
           </div>
 
           <div class="shortcuts-section shortcuts-import-note">
-            <div class="shortcuts-section-title">Importing &amp; Playback</div>
-            <p class="shortcuts-note-copy">Upload Instagram&rsquo;s <code>saved_posts.json</code> export (Account Center &rarr; Your Information &amp; Permissions &rarr; Saved). Existing statuses stay intact.</p>
+            <div class="shortcuts-section-title">Collections, Sync &amp; Playback</div>
+            <p class="shortcuts-note-copy"><strong>Saved on IG</strong> holds your Instagram archive from <code>saved_posts.json</code> (re-import exports anytime to sync newly saved posts and auto-promote matching bot items). <strong>Sent to Bot</strong> tracks reels and posts you DMed to the bot.</p>
             <p class="shortcuts-note-copy">Posts without cached covers appear as monogram cards; if an embed prompts a login gate, use <strong>Open</strong> to view on Instagram.</p>
             <button type="button" id="popover-import-btn" class="nav-btn nav-btn-secondary shortcuts-import-cta">Choose saved_posts.json</button>
           </div>
@@ -105,37 +105,57 @@
       <!-- Stats Overview & Quick-Filter Bar -->
       <section class="stats-bar is-initial-loading" aria-label="Library Overview and Quick Filters" aria-busy="true">
         <h2 class="sr-only">Library Overview</h2>
-        <button type="button" class="metric-cell metric-filter-btn is-filter-active" id="metric-filter-all" aria-pressed="true" title="Show all saved reels (resets active filters)">
-          <span class="metric-label"><span class="metric-label-full">Total Reels</span><span class="metric-label-short" aria-hidden="true">All</span></span>
-          <span class="metric-num" id="stat-total">&mdash;</span>
+        <button type="button" class="metric-cell metric-filter-btn is-filter-active" id="metric-filter-all" aria-pressed="true" title="Show all tracked items (resets active filters)">
+          <span class="metric-label"><span class="metric-label-full">All Items</span><span class="metric-label-short" aria-hidden="true">All</span></span>
+          <span class="metric-num" id="stat-total">--</span>
+          <span class="metric-subsplit" id="stat-media-split" aria-hidden="true"></span>
         </button>
         <div class="metric-cell metric-cell-static" id="metric-cell-creators">
           <span class="metric-label"><span class="metric-label-full">Active Creators:</span><span class="metric-label-short" aria-hidden="true">Creators:</span></span>
-          <span class="metric-num" id="stat-creators">&mdash;</span>
+          <span class="metric-num" id="stat-creators">--</span>
         </div>
-        <button type="button" class="metric-cell metric-filter-btn" id="metric-filter-week" aria-pressed="false" title="Toggle filter: Saved in Last 7 Days">
-          <span class="metric-label"><span class="metric-label-full">Saved This Week</span><span class="metric-label-short" aria-hidden="true">Week</span></span>
-          <span class="metric-num" id="stat-week">&mdash;</span>
+        <button type="button" class="metric-cell metric-filter-btn" id="metric-filter-week" aria-pressed="false" title="Toggle filter: Added in Last 7 Days">
+          <span class="metric-label"><span class="metric-label-full">Added This Week</span><span class="metric-label-short" aria-hidden="true">Week</span></span>
+          <span class="metric-num" id="stat-week">--</span>
         </button>
         <button type="button" class="metric-cell metric-filter-btn metric-filter-later" id="metric-filter-later" aria-pressed="false" title="Toggle filter: Watch Later">
           <span class="metric-label"><span class="metric-label-full">Watch Later</span><span class="metric-label-short" aria-hidden="true">Later</span></span>
-          <span class="metric-num metric-accent" id="stat-watch-later">&mdash;</span>
+          <span class="metric-num metric-accent" id="stat-watch-later">--</span>
         </button>
-        <button type="button" class="metric-cell metric-filter-btn metric-filter-watched" id="metric-filter-watched" aria-pressed="false" title="Toggle filter: Watched reels">
+        <button type="button" class="metric-cell metric-filter-btn metric-filter-watched" id="metric-filter-watched" aria-pressed="false" title="Toggle filter: Watched items">
           <span class="metric-label">Watched</span>
-          <span class="metric-num" id="stat-watched">&mdash;</span>
+          <span class="metric-num" id="stat-watched">--</span>
         </button>
+      </section>
+
+      <!-- Collection Category Switcher: All vs Saved on IG vs Sent to Bot -->
+      <section class="collection-source-bar" aria-label="Collection category">
+        <div class="collection-source-tabs" id="source-tabs" role="group" aria-label="Filter by collection category">
+          <button type="button" class="source-tab-btn active" data-source="all" aria-pressed="true">
+            <span class="source-tab-label"><span class="source-tab-label-full">All</span><span class="source-tab-label-short" aria-hidden="true">All</span></span>
+            <span class="source-tab-count" id="source-count-all">--</span>
+          </button>
+          <button type="button" class="source-tab-btn" data-source="instagram" aria-pressed="false">
+            <span class="source-tab-label"><span class="source-tab-label-full">Saved on IG</span><span class="source-tab-label-short" aria-hidden="true">IG Saved</span></span>
+            <span class="source-tab-count" id="source-count-instagram">--</span>
+          </button>
+          <button type="button" class="source-tab-btn" data-source="bot" aria-pressed="false">
+            <span class="source-tab-label"><span class="source-tab-label-full">Sent to Bot</span><span class="source-tab-label-short" aria-hidden="true">Bot Sent</span></span>
+            <span class="source-tab-count" id="source-count-bot">--</span>
+          </button>
+        </div>
+        <p class="collection-source-hint" id="collection-source-hint">Instagram Saved (re-import saved_posts.json to sync) &amp; items DMed to Reeler Bot.</p>
       </section>
 
       <!-- Filter & Search Toolbar -->
       <section class="toolbar-section" aria-label="Search and filter controls">
         <div class="search-field">
-          <label for="search-input" class="sr-only">Search saved reels by caption, creator handle, or shortcode</label>
+          <label for="search-input" class="sr-only">Search tracked reels and posts by caption or creator handle</label>
           <svg class="search-glyph" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="11" cy="11" r="8"></circle>
             <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
           </svg>
-          <input type="text" id="search-input" placeholder="Search reels, creators, ID" autocomplete="off">
+          <input type="text" id="search-input" placeholder="Search captions or @creators" autocomplete="off">
           <button type="button" id="clear-search" class="clear-search-btn" aria-label="Clear search" hidden>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <line x1="18" y1="6" x2="6" y2="18"></line>
@@ -145,8 +165,15 @@
         </div>
 
         <div class="filters-row">
-          <div class="select-wrapper">
-            <select id="date-preset" aria-label="Filter by saved date">
+          <!-- Content Type Filter: All vs Reels vs Posts -->
+          <div class="media-type-toggle" role="group" aria-label="Filter by content type">
+            <button type="button" class="media-type-btn active" data-media-type="all" aria-pressed="true">All</button>
+            <button type="button" class="media-type-btn" data-media-type="reel" aria-pressed="false">Reels</button>
+            <button type="button" class="media-type-btn" data-media-type="post" aria-pressed="false">Posts</button>
+          </div>
+
+          <div class="select-wrapper filter-date-wrap">
+            <select id="date-preset" aria-label="Filter by added or saved date">
               <option value="all">Date: All Time</option>
               <option value="today">Date: Today</option>
               <option value="yesterday">Date: Yesterday</option>
@@ -158,7 +185,7 @@
             </select>
           </div>
 
-          <div class="select-wrapper">
+          <div class="select-wrapper filter-status-wrap">
             <select id="watch-filter" aria-label="Filter by watch status">
               <option value="all">Status: All</option>
               <option value="unwatched">Unwatched</option>
@@ -167,10 +194,10 @@
             </select>
           </div>
 
-          <div class="select-wrapper">
-            <select id="sort-by" aria-label="Sort saved reels">
-              <option value="newest_saved">Sort: Newest Saved</option>
-              <option value="oldest_saved">Sort: Oldest Saved</option>
+          <div class="select-wrapper filter-sort-wrap">
+            <select id="sort-by" aria-label="Sort tracked items">
+              <option value="newest_saved">Sort: Newest Added</option>
+              <option value="oldest_saved">Sort: Oldest Added</option>
               <option value="newest_published">Published: Newest</option>
               <option value="oldest_published">Published: Oldest</option>
             </select>
@@ -234,9 +261,9 @@
 
       <!-- Main Reels Presentation View -->
       <main class="library-main">
-        <h2 class="sr-only">Saved Reels Catalog</h2>
+        <h2 class="sr-only">Media Catalog</h2>
         <div class="library-header-meta">
-          <div id="results-count" class="results-counter" aria-live="polite">Loading saved reels...</div>
+          <div id="results-count" class="results-counter" aria-live="polite">Loading tracked items...</div>
           <div id="active-filter-chips" class="active-filter-chips" aria-label="Active filters" hidden></div>
         </div>
 
@@ -253,7 +280,7 @@
                 <th class="col-rank">#</th>
                 <th class="col-creator">Creator</th>
                 <th class="col-caption">Caption</th>
-                <th class="col-date">Saved Date</th>
+                <th class="col-date">Saved / Sent</th>
                 <th class="col-status">Status</th>
                 <th class="col-actions">Actions</th>
               </tr>
@@ -285,24 +312,23 @@
       </main>
     </div>
 
-    <!-- Fullscreen Instagram Reels Vertical Snap-Feed -->
+    <!-- Fullscreen Instagram Media Vertical Snap-Feed -->
     <div id="reels-feed-modal" class="reels-feed-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="feed-modal-title">
       <!-- Top HUD Bar -->
       <div class="feed-top-bar">
-        <h2 class="sr-only" id="feed-modal-title">Reels Vertical Stream</h2>
+        <h2 class="sr-only" id="feed-modal-title">Tracked Media Vertical Stream</h2>
         <div class="feed-counter-wrap">
           <span class="feed-counter-kicker" id="feed-counter-kicker">REEL 1 OF 1</span>
-          <span class="feed-shortcode-tag" id="feed-shortcode-tag">ID: ...</span>
           <span class="feed-shortcuts-hint" aria-hidden="true"><kbd>w</kbd> Watched · <kbd>l</kbd> Later · <kbd>c</kbd> Copy · <kbd>j</kbd>/<kbd>k</kbd> Scroll · <kbd>Esc</kbd> Close</span>
         </div>
         <div class="feed-top-actions">
-          <button type="button" class="feed-nav-arrow-btn" id="feed-arrow-up" aria-label="Previous reel" title="Previous reel (↑ or k)">
+          <button type="button" class="feed-nav-arrow-btn" id="feed-arrow-up" aria-label="Previous item" title="Previous item (↑ or k)">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="18 15 12 9 6 15"></polyline></svg>
           </button>
-          <button type="button" class="feed-nav-arrow-btn" id="feed-arrow-down" aria-label="Next reel" title="Next reel (↓ or j)">
+          <button type="button" class="feed-nav-arrow-btn" id="feed-arrow-down" aria-label="Next item" title="Next item (↓ or j)">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
           </button>
-          <button type="button" class="feed-close-btn" id="feed-close-btn" aria-label="Close reels feed" title="Close feed (Esc)">
+          <button type="button" class="feed-close-btn" id="feed-close-btn" aria-label="Close feed" title="Close feed (Esc)">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
           </button>
         </div>
@@ -316,6 +342,6 @@
   </div>
 
   <script src="playerGeometry.js?v=1.3"></script>
-  <script src="app.js?v=3.8"></script>
+  <script src="app.js?v=4.3"></script>
 </body>
 </html>

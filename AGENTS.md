@@ -2,13 +2,46 @@
 
 See [CLAUDE.md](./CLAUDE.md) for the complete, canonical rules and conventions governing this repository.
 
+### Frontend Work — Impeccable Design Review (MANDATORY)
+
+**Setup (once per environment):** Install Impeccable via `npx impeccable install` (see the [Impeccable installation guide](https://github.com/pbakaus/impeccable#installation)) and reload your coding tool so `/impeccable` passes (or `$impeccable` passes on Codex) are available.
+
+Whenever you touch `public/` (HTML, CSS, JS) or any user-facing template, run Impeccable design review passes **before each frontend commit** (including PR review follow-ups before pushing/updating a PR). On Codex, invoke the matching `$impeccable <pass>` prompt (for example `$impeccable critique`) instead of `/impeccable <pass>`:
+
+| Pass | Slash Command | Codex Invocation | Focus |
+|------|---------------|------------------|-------|
+| Critique | `/impeccable critique` | `$impeccable critique` | Full audit: contrast, spacing, hierarchy, accessibility |
+| Layout | `/impeccable layout` | `$impeccable layout` | Grid density, spacing scale, visual scan paths |
+| Typeset | `/impeccable typeset` | `$impeccable typeset` | Font hierarchy, pairings, vertical rhythm |
+| Animate | `/impeccable animate` | `$impeccable animate` | Purposeful micro-interactions and transitions |
+| Adapt | `/impeccable adapt` | `$impeccable adapt` | Responsive breakpoints, mobile density (≥44px touch targets), SE/landscape |
+| Harden | `/impeccable harden` | `$impeccable harden` | Empty states, errors, long captions, edge cases |
+| Polish | `/impeccable polish` | `$impeccable polish` | Final craft pass: spacing, alignment, interactive states |
+
+Run the full 7-pass suite for feature/UI changes, and at minimum `critique` + `polish` + `harden` for small isolated tweaks. Address every finding or document why it was intentionally waived in the PR body. (Optional: `audit`, `clarify`, `colorize`, `bolder`, `quieter`, `distill`, `onboard`.)
+
+---
+
+### Engineering Reliability — GRAVITAS Workflow (MANDATORY)
+
+**Setup (once per environment):** Install the GRAVITAS skill via `npx skills add udaysharmadev/Gravitas --skill gravitas --agent antigravity --yes` (or `--agent claude-code` for Claude Code; see [udaysharmadev/Gravitas](https://github.com/udaysharmadev/Gravitas)) and reload your coding tool. In this repository, keep local skill symlinks under `.agents/skills/` or `.claude/skills/` (both gitignored).
+
+Follow GRAVITAS invariants for implementation, debugging, refactoring, review, and migrations:
+1. **Ground before mutating:** Read target files, their callers, and relevant tests before editing. Never act on assumed file state.
+2. **Adaptive planning:** Scale planning to risk (`direct` for localized 1-file edits, `compact` for multi-file dependencies, `deep` for architecture/security/schema work). Record scope and acceptance criteria for non-trivial changes.
+3. **Evidence-backed completion:** Run targeted and regression checks (`npm test`, typecheck, and/or GRAVITAS `scripts/run-checks.sh`) **after the final relevant edit** and base completion claims only on observed output (`VERDICT: PASS` / `VERDICT: FAIL`).
+4. **Never exact-retry a failure:** Change diagnosis, context, or strategy before retrying a failed command or edit.
+5. **State unknowns honestly:** Explicitly report anything not verified or runnable in the current environment instead of assuming it passes.
+
+---
+
 ### Summary of Strict Invariants:
 1. **Branching**: NEVER push or commit directly to `main` or `staging`. Every unit of work must live on a dedicated branch (`feat/*`, `fix/*`, `refactor/*`, `chore/*`, `db/*`).
 2. **Author Identity**: Commits must always be authored by `saurabhk0205 <saurabhk0205@gmail.com>`.
 3. **Secrets**: Never commit `.env`, credentials, or access tokens.
 4. **Architecture**: Endpoints call services; services call repository (`src/db/repository.ts`). No raw database calls in endpoints.
 5. **Database**: All schema changes require a migration in `supabase/migrations/` and an update to `src/types.ts`.
-6. **Instagram UX**: Use clean in-app `@username` mentions for creator profiles (no web URLs).
+6. **Instagram UX**: Include clickable creator profile links (`https://www.instagram.com/<username>/` paired with `@<username>`) when a valid Instagram handle exists (placing Reel URLs before profile URLs in reminders to preserve video card previews), never leak raw shortcodes in user-facing DMs or UI, and treat `"watched"` as single-latest-reel unless `"stop all"` / `"watched all"` is requested.
 7. **Workspace Isolation**: Work strictly within `/Users/thismac/projects/instagram-saved-reels/`. Do not touch `/Users/thismac/rea/`.
 8. **CodeRabbit Review Gate (MANDATORY & BLOCKING)**:
    - **NEVER merge a Pull Request immediately.**

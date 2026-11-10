@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import '../public/playerGeometry.js';
 import {
   feedMetaCacheControl,
+  fetchReelMetadata,
   isAllowedInstagramMediaHost,
   isValidShortcode,
   parseEfgMediaKind,
@@ -494,4 +495,64 @@ test('isPostgrestRangeNotSatisfiableError recognizes PostgREST PGRST103 and HTTP
   assert.equal(isPostgrestRangeNotSatisfiableError({ message: 'Requested range not satisfiable' }), true);
   assert.equal(isPostgrestRangeNotSatisfiableError({ code: '42P01', message: 'relation does not exist' }), false);
   assert.equal(isPostgrestRangeNotSatisfiableError(null), false);
+});
+
+test('fetchReelMetadata and resolveFeedMediaMetadata prioritize /p/ when hinted and fall back cleanly', async () => {
+  const originalFetch = globalThis.fetch;
+  const requestedUrls: string[] = [];
+
+  globalThis.fetch = (async (url: unknown) => {
+    const u = String(url);
+    requestedUrls.push(u);
+
+    if (u === 'https://www.instagram.com/p/DS1goOmjhUi/') {
+      const html = [
+        '<meta property="og:url" content="https://www.instagram.com/the_political_compass/p/DS1goOmjhUi/">',
+        '<meta property="og:title" content="The Political Compass (@the_political_compass) on Instagram">',
+        '<meta property="og:image" content="https://scontent.cdninstagram.com/v/t51.2885-15/post.jpg">',
+      ].join('');
+      return new Response(html, { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+
+    if (u === 'https://www.instagram.com/reel/DS1goOmjhUi/') {
+      return new Response('<html><title>Page not found</title></html>', {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      });
+    }
+
+    return new Response('', { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    resetFeedMetaResolverStateForTests();
+
+    // 1. When hinted with 'p', probes /p/ directly in 1 fetch call without hitting /reel/
+    const directPostMeta = await fetchReelMetadata('DS1goOmjhUi', undefined, 'p');
+    assert.deepEqual(requestedUrls, ['https://www.instagram.com/p/DS1goOmjhUi/']);
+    assert.equal(directPostMeta.username, 'the_political_compass');
+    assert.equal(directPostMeta.isClips, false);
+    assert.equal(directPostMeta.mediaKind, 'FEED');
+
+    // 2. When hinted with 'reel', skips non-OG shell on /reel/ and falls back to /p/
+    requestedUrls.length = 0;
+    const fallbackPostMeta = await fetchReelMetadata('DS1goOmjhUi', undefined, 'reel');
+    assert.deepEqual(requestedUrls, [
+      'https://www.instagram.com/reel/DS1goOmjhUi/',
+      'https://www.instagram.com/p/DS1goOmjhUi/',
+    ]);
+    assert.equal(fallbackPostMeta.username, 'the_political_compass');
+    assert.equal(fallbackPostMeta.isClips, false);
+
+    // 3. resolveFeedMediaMetadata('DS1goOmjhUi', undefined, 'p') resolves FEED / isClips=false
+    requestedUrls.length = 0;
+    const feedMeta = await resolveFeedMediaMetadata('DS1goOmjhUi', undefined, 'p');
+    assert.deepEqual(requestedUrls, ['https://www.instagram.com/p/DS1goOmjhUi/']);
+    assert.equal(feedMeta.isClips, false);
+    assert.equal(feedMeta.mediaKind, 'FEED');
+    assert.equal(feedMeta.thumbnailUrl, 'https://scontent.cdninstagram.com/v/t51.2885-15/post.jpg');
+  } finally {
+    resetFeedMetaResolverStateForTests();
+    globalThis.fetch = originalFetch;
+  }
 });

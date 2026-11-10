@@ -412,9 +412,14 @@ async function fetchImageDimensions(
 }
 
 /**
- * Fetches Instagram OpenGraph metadata for a saved reel or post shortcode.
+ * Fetches Instagram OpenGraph metadata for a saved reel or post shortcode,
+ * probing the preferred URL path (`/reel/` or `/p/`) first and falling back to the alternate path on non-OK HTTP status.
  */
-export async function fetchReelMetadata(shortcode: string, signal?: AbortSignal): Promise<ExtractedReelMetadata> {
+export async function fetchReelMetadata(
+  shortcode: string,
+  signal?: AbortSignal,
+  preferredPath?: 'reel' | 'p'
+): Promise<ExtractedReelMetadata> {
   if (!isValidShortcode(shortcode)) {
     return {};
   }
@@ -422,22 +427,42 @@ export async function fetchReelMetadata(shortcode: string, signal?: AbortSignal)
     return {};
   }
 
-  try {
-    const url = `https://www.instagram.com/reel/${encodeURIComponent(shortcode)}/`;
-    const res = await fetch(url, {
-      signal: createCombinedSignal(8000, signal),
-      headers: {
-        'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-    });
+  const pathsToTry: Array<'reel' | 'p'> = preferredPath === 'p' ? ['p', 'reel'] : ['reel', 'p'];
 
-    if (!res.ok) {
-      await res.body?.cancel().catch(() => {});
+  try {
+    let html: string | null = null;
+
+    for (const pathSegment of pathsToTry) {
+      if (signal?.aborted) {
+        return {};
+      }
+      const url = `https://www.instagram.com/${pathSegment}/${encodeURIComponent(shortcode)}/`;
+      const res = await fetch(url, {
+        signal: createCombinedSignal(8000, signal),
+        headers: {
+          'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+      });
+
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        continue;
+      }
+
+      const candidateHtml = await res.text();
+      if (!/<meta\s+(?:property|name)="(?:og:url|og:image|twitter:title|og:title)"/i.test(candidateHtml)) {
+        continue;
+      }
+
+      html = candidateHtml;
+      break;
+    }
+
+    if (!html) {
       return {};
     }
 
-    const html = await res.text();
     const ogUrl = decodeHtml(html.match(/<meta property="og:url" content="([^"]+)"/i)?.[1] || '');
     const rawTwitterTitle = html.match(/<meta name="twitter:title" content="([^"]+)"/i)?.[1] || '';
     const twitterTitle = decodeHtml(rawTwitterTitle);
@@ -451,7 +476,7 @@ export async function fetchReelMetadata(shortcode: string, signal?: AbortSignal)
     let username: string | undefined;
 
     // Strategy 1: og:url (e.g. "https://www.instagram.com/aapka_sanskari_pati_hu/reel/Db4eVUcsoTh/")
-    const urlMatch = ogUrl.match(/instagram\.com\/([a-zA-Z0-9._]+)\/(?:reel|p)\//i);
+    const urlMatch = ogUrl.match(/instagram\.com\/([a-zA-Z0-9._]+)\/(?:reel|reels|p|tv)\//i);
     if (urlMatch && !['reel', 'reels', 'p', 'tv', 'stories'].includes(urlMatch[1].toLowerCase())) {
       username = urlMatch[1];
     }
@@ -522,7 +547,7 @@ export async function fetchReelMetadata(shortcode: string, signal?: AbortSignal)
     let isClips: boolean | null = efgMeta.isClips;
 
     if (isClips === null && ogUrl) {
-      if (/\/reel\//i.test(ogUrl)) {
+      if (/\/(?:reel|reels|tv)\//i.test(ogUrl)) {
         mediaKind = 'CLIPS';
         isClips = true;
       } else if (/\/p\//i.test(ogUrl)) {
@@ -562,7 +587,8 @@ export function feedMetaCacheControl(meta: FeedMediaMetadata): string {
  */
 export async function resolveFeedMediaMetadata(
   shortcode: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  preferredPath?: 'reel' | 'p'
 ): Promise<FeedMediaMetadata> {
   if (!isValidShortcode(shortcode)) {
     throw new Error('Invalid shortcode format');
@@ -590,7 +616,7 @@ export async function resolveFeedMediaMetadata(
     const promise = (async (): Promise<FeedMediaMetadata> => {
       const releaseSlot = await acquireResolveSlot(controller.signal);
       try {
-        const meta = await fetchReelMetadata(shortcode, controller.signal);
+        const meta = await fetchReelMetadata(shortcode, controller.signal, preferredPath);
         const thumbnailUrl = meta.thumbnailUrl || null;
         const mediaKind: MediaKind = meta.mediaKind ?? 'UNKNOWN';
         const isClips: boolean | null = meta.isClips ?? null;
