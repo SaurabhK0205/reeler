@@ -37,8 +37,8 @@ function quotePostgrestLiteral(value: string): string {
 }
 
 /**
- * Returns true when an incoming sender attempts to schedule/overwrite an active `watch_later`
- * reminder currently owned by a different Instagram sender.
+ * Returns true when an incoming Instagram sender attempts to schedule/overwrite an active `watch_later`
+ * reminder that is currently owned by a different Instagram sender or unattributed (admin/UI queue).
  */
 function isConflictingActiveSenderReminder(
   existing: Pick<SavedReel, 'watch_status' | 'instagram_sender_id'>,
@@ -46,8 +46,9 @@ function isConflictingActiveSenderReminder(
 ): boolean {
   const incoming = String(incomingSenderId || '').trim();
   if (!incoming) return false;
+  if (existing.watch_status !== 'watch_later') return false;
   const owner = String(existing.instagram_sender_id || '').trim();
-  return Boolean(owner && owner !== incoming && existing.watch_status === 'watch_later');
+  return owner !== incoming;
 }
 
 /**
@@ -918,7 +919,7 @@ export class Repository {
       }
 
       const senderOwnershipGuard = incomingSender
-        ? `watch_status.neq.watch_later,instagram_sender_id.is.null,instagram_sender_id.eq.,instagram_sender_id.eq.${quotePostgrestLiteral(incomingSender)}`
+        ? `watch_status.neq.watch_later,instagram_sender_id.eq.${quotePostgrestLiteral(incomingSender)}`
         : null;
 
       let updateQuery = supabase
@@ -1944,13 +1945,15 @@ export class Repository {
       const activeWatchLater = Array.from(memoryStore.reels.values()).filter(
         (r) => r.watch_status === 'watch_later'
       );
+      let matchedScope: 'exact' | 'unattributed' = 'exact';
       let candidates = trimmedSender
         ? activeWatchLater.filter((r) => r.instagram_sender_id === trimmedSender)
         : [];
 
       // Unattributed fallback is strictly opt-in (admin workflow only) so webhook senders cannot mark or view admin/UI reels
       if (allowUnattributedFallback && candidates.length === 0) {
-        candidates = activeWatchLater.filter((r) => !r.instagram_sender_id);
+        matchedScope = 'unattributed';
+        candidates = activeWatchLater.filter((r) => !String(r.instagram_sender_id || '').trim());
       }
 
       if (candidates.length === 0) {
@@ -1965,7 +1968,10 @@ export class Repository {
 
       for (const target of targets) {
         const stored = memoryStore.reels.get(target.id);
-        if (stored && stored.watch_status === 'watch_later') {
+        const currentOwner = String(stored?.instagram_sender_id || '').trim();
+        const scopeMatches =
+          matchedScope === 'exact' ? currentOwner === trimmedSender : currentOwner === '';
+        if (stored && stored.watch_status === 'watch_later' && scopeMatches) {
           stored.watch_status = 'watched';
           stored.next_reminder_at = null;
           stored.awaiting_reminder_choice_until = null;
@@ -2002,11 +2008,13 @@ export class Repository {
       return (data || []) as SavedReel[];
     };
 
+    let matchedScope: 'exact' | 'unattributed' = 'exact';
     let candidates = trimmedSender
       ? await fetchActiveCandidates('exact')
       : [];
 
     if (allowUnattributedFallback && candidates.length === 0) {
+      matchedScope = 'unattributed';
       candidates = await fetchActiveCandidates('unattributed');
     }
 
@@ -2023,7 +2031,7 @@ export class Repository {
     const allUpdatedRows: SavedReel[] = [];
     for (let i = 0; i < targetIds.length; i += UPDATE_CHUNK_SIZE) {
       const idChunk = targetIds.slice(i, i + UPDATE_CHUNK_SIZE);
-      const { data: updatedRows, error: updateErr } = await supabase
+      let updateQuery = supabase
         .from('saved_reels')
         .update({
           watch_status: 'watched',
@@ -2032,8 +2040,15 @@ export class Repository {
           updated_at: now,
         })
         .in('id', idChunk)
-        .eq('watch_status', 'watch_later')
-        .select('*, creator:creators(*)');
+        .eq('watch_status', 'watch_later');
+
+      if (matchedScope === 'exact') {
+        updateQuery = updateQuery.eq('instagram_sender_id', trimmedSender);
+      } else {
+        updateQuery = updateQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+
+      const { data: updatedRows, error: updateErr } = await updateQuery.select('*, creator:creators(*)');
 
       if (updateErr) {
         throw new Error(`Failed to mark watch-later reels as watched: ${updateErr.message}`);

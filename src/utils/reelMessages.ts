@@ -453,13 +453,13 @@ export function formatWatchedConfirmationMessage(
 }
 
 /**
- * Formats an honest rejection DM when a different sender shares an item that already has
- * an active Watch Later reminder owned by another sender, without exposing shortcodes or IDs.
+ * Formats an honest rejection DM when a webhook sender shares an item that already has an active
+ * Watch Later reminder owned by another sender or the unattributed admin/UI queue, without exposing shortcodes or IDs.
  */
 export function formatSenderConflictRejectionMessage(mediaType?: SavedMediaType | string): string {
   const noun = mediaType === 'post' ? 'post' : 'reel';
   return (
-    `⚠️ Unable to schedule Watch Later for that ${noun} because it already has an active reminder for another sender. ` +
+    `⚠️ Unable to schedule Watch Later for that ${noun} because it already has an active reminder. ` +
     `Its existing reminder schedule was left unchanged.`
   );
 }

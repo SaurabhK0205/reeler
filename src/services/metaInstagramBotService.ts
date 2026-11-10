@@ -336,11 +336,10 @@ export class MetaInstagramBotService {
       if (
         existingItem &&
         existingItem.watch_status === 'watch_later' &&
-        activeOwner &&
         activeOwner !== senderId
       ) {
         console.warn(
-          `[MetaIG] Rejected Watch Later update for ${shortcode} from sender ${senderId}: active reminder belongs to another sender.`
+          `[MetaIG] Rejected Watch Later update for ${shortcode} from sender ${senderId}: active reminder already exists (${activeOwner ? 'another sender' : 'unattributed admin/UI'}).`
         );
         await this.sendDirectMessage(senderId, formatSenderConflictRejectionMessage(mediaType));
         return;
