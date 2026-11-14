@@ -5,7 +5,14 @@ import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
 import { feedMetaCacheControl, isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
-import { vaultAuthMiddleware } from '../services/vaultAuthService.ts';
+import {
+  vaultAuthMiddleware,
+  verifyOtp,
+  otpVerifyRateLimiter,
+  recordOtpFailure,
+  resetOtpAttempts,
+  requestOtpForUsername,
+} from '../services/vaultAuthService.ts';
 import type { ReelQueryFilters, WatchStatus, DateFilterPreset, SavedMediaType, SavedCollectionSource } from '../types.ts';
 
 /**
@@ -78,6 +85,62 @@ apiRouter.get('/session', (req: Request, res: Response) => {
     role: req.vaultUser?.role || 'anonymous',
     senderId: req.vaultUser?.senderId || null,
   });
+});
+
+/**
+ * Verifies a 6-digit login code and returns the user's permanent vault access key.
+ */
+apiRouter.post('/auth/otp/verify', otpVerifyRateLimiter, (req: Request, res: Response) => {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  if (typeof req.body?.code !== 'string' || req.body.code.length > 20) {
+    recordOtpFailure(ip);
+    res.status(400).json({
+      error: 'INVALID_REQUEST',
+      message: 'The code field must be a valid string.',
+    });
+    return;
+  }
+
+  const verification = verifyOtp(req.body.code);
+
+  if (!verification.valid || !verification.vaultKey) {
+    recordOtpFailure(ip);
+    res.status(400).json({
+      error: 'INVALID_OR_EXPIRED_CODE',
+      message: 'The 6-digit login code is invalid or has expired. Please message "code" to our Instagram bot to get a new code.',
+    });
+    return;
+  }
+
+  resetOtpAttempts(ip);
+  res.json({
+    success: true,
+    vaultKey: verification.vaultKey,
+    role: verification.session?.role,
+    senderId: verification.session?.senderId || null,
+  });
+});
+
+/**
+ * Dispatches a 6-digit login code to the user's Instagram DM if their handle is mapped.
+ */
+apiRouter.post('/auth/otp/request', async (req: Request, res: Response) => {
+  if (typeof req.body?.username !== 'string' || req.body.username.length > 50) {
+    res.status(400).json({
+      error: 'INVALID_REQUEST',
+      message: 'The username field must be a valid string.',
+    });
+    return;
+  }
+
+  const result = await requestOtpForUsername(
+    req.body.username,
+    (recipientId, text) => metaBotService.sendDirectMessage(recipientId, text),
+    metaBotService.adminUserId
+  );
+
+  const httpStatus = result.success ? 200 : result.code === 'DELIVERY_FAILED' ? 502 : 200;
+  res.status(httpStatus).json(result);
 });
 
 /**

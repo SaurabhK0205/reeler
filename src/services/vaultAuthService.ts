@@ -7,6 +7,224 @@ export interface VaultUserSession {
   senderId?: string;
 }
 
+interface PendingOtp {
+  code: string;
+  role: 'admin' | 'user';
+  senderId?: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+const pendingOtps = new Map<string, PendingOtp>();
+
+/**
+ * Default OTP Time-To-Live: 10 minutes.
+ */
+export const OTP_DEFAULT_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Removes expired OTPs from the in-memory store.
+ */
+function cleanupExpiredOtps(): void {
+  const now = Date.now();
+  for (const [code, item] of pendingOtps.entries()) {
+    if (item.expiresAt <= now) {
+      pendingOtps.delete(code);
+    }
+  }
+}
+
+/**
+ * Generates a cryptographically random 6-digit numeric login OTP bound to the given user session.
+ * Re-rolls candidates if a collision with an existing active OTP occurs to prevent overwriting active sessions.
+ */
+export function createOtp(session: VaultUserSession, ttlMs: number = OTP_DEFAULT_TTL_MS): string {
+  cleanupExpiredOtps();
+
+  let code: string;
+  let attempts = 0;
+  do {
+    code = String(crypto.randomInt(100000, 1000000));
+    attempts++;
+    if (attempts > 100) {
+      throw new Error('Failed to generate unique OTP code due to high concurrency');
+    }
+  } while (pendingOtps.has(code));
+
+  const now = Date.now();
+  pendingOtps.set(code, {
+    code,
+    role: session.role,
+    senderId: session.senderId,
+    createdAt: now,
+    expiresAt: now + ttlMs,
+  });
+
+  return code;
+}
+
+/**
+ * Verifies and consumes a 6-digit login OTP, returning the session and full vault key.
+ * One-time use: invalidates the OTP immediately upon successful verification.
+ */
+export function verifyOtp(code: string): { valid: boolean; session?: VaultUserSession; vaultKey?: string } {
+  cleanupExpiredOtps();
+
+  if (!code || typeof code !== 'string') {
+    return { valid: false };
+  }
+
+  const normalizedCode = code.trim().replace(/\s+/g, '');
+  if (!/^\d{6}$/.test(normalizedCode)) {
+    return { valid: false };
+  }
+
+  const record = pendingOtps.get(normalizedCode);
+  if (!record) {
+    return { valid: false };
+  }
+
+  if (record.expiresAt <= Date.now()) {
+    pendingOtps.delete(normalizedCode);
+    return { valid: false };
+  }
+
+  // Immediately delete upon consumption (one-time use)
+  pendingOtps.delete(normalizedCode);
+
+  const session: VaultUserSession = {
+    role: record.role,
+    ...(record.senderId ? { senderId: record.senderId } : {}),
+  };
+
+  const vaultKey = session.role === 'admin'
+    ? getAdminVaultKey()
+    : generateUserVaultKey(session.senderId!);
+
+  return {
+    valid: true,
+    session,
+    vaultKey,
+  };
+}
+
+/**
+ * Clears in-memory OTPs (for testing only).
+ */
+export function clearOtpsForTesting(): void {
+  pendingOtps.clear();
+}
+
+const MAX_OTP_VERIFY_ATTEMPTS = 5;
+const OTP_RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
+const MAX_TRACKED_OTP_IPS = 1000;
+const otpIpAttempts = new Map<string, { count: number; resetAt: number }>();
+
+/**
+ * Express middleware protecting /api/auth/otp/verify with per-client-IP rate limiting (CWE-307 mitigation).
+ */
+export function otpVerifyRateLimiter(req: Request, res: Response, next: NextFunction): void {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  const now = Date.now();
+
+  const record = otpIpAttempts.get(ip);
+  if (record && record.resetAt > now) {
+    if (record.count >= MAX_OTP_VERIFY_ATTEMPTS) {
+      const retryAfterSec = Math.ceil((record.resetAt - now) / 1000);
+      res.set('Retry-After', String(retryAfterSec));
+      res.status(429).json({
+        error: 'TOO_MANY_ATTEMPTS',
+        message: `Too many failed verification attempts. Please wait ${retryAfterSec} seconds before trying again.`,
+      });
+      return;
+    }
+  } else {
+    if (otpIpAttempts.size >= MAX_TRACKED_OTP_IPS) {
+      res.status(429).json({
+        error: 'RATE_LIMIT_CAPACITY_REACHED',
+        message: 'Too many verification attempts in progress. Please retry later.',
+      });
+      return;
+    }
+    otpIpAttempts.set(ip, { count: 0, resetAt: now + OTP_RATE_LIMIT_WINDOW_MS });
+  }
+
+  next();
+}
+
+/**
+ * Records a failed verification attempt against the client IP.
+ */
+export function recordOtpFailure(ip: string): void {
+  const now = Date.now();
+  const record = otpIpAttempts.get(ip);
+  if (record && record.resetAt > now) {
+    record.count++;
+  } else {
+    otpIpAttempts.set(ip, { count: 1, resetAt: now + OTP_RATE_LIMIT_WINDOW_MS });
+  }
+}
+
+/**
+ * Resets failed attempt counter upon successful OTP verification.
+ */
+export function resetOtpAttempts(ip: string): void {
+  otpIpAttempts.delete(ip);
+}
+
+/**
+ * Clears rate limiter tracking (for testing only).
+ */
+export function clearOtpRateLimitsForTesting(): void {
+  otpIpAttempts.clear();
+}
+
+export interface RequestOtpResult {
+  success: boolean;
+  code?: string;
+  message: string;
+}
+
+/**
+ * Encapsulates OTP dispatch policy: checks whether the requested username is the admin,
+ * dispatches via Instagram DM, and validates actual delivery.
+ */
+export async function requestOtpForUsername(
+  usernameInput: string,
+  sendDm: (recipientId: string, message: string) => Promise<boolean>,
+  adminSenderId?: string | null
+): Promise<RequestOtpResult> {
+  const username = usernameInput.trim().replace(/^@/, '').toLowerCase();
+  const config = loadConfig();
+  const adminUser = (config.instagram.adminUsername || process.env.ADMIN_USERNAME || 'admin').toLowerCase().replace(/^@/, '');
+  const targetSenderId = adminSenderId || config.instagram.userId;
+
+  if (username && username === adminUser && targetSenderId) {
+    const code = createOtp({ role: 'admin' });
+    const message =
+      `🔐 Your Reeler Login Code:\n${code}\n\n` +
+      `Enter this 6-digit code on your PC or laptop browser to unlock your private vault (valid for 10 minutes).`;
+    const delivered = await sendDm(targetSenderId, message);
+    if (!delivered) {
+      return {
+        success: false,
+        code: 'DELIVERY_FAILED',
+        message: 'Failed to deliver login code to Instagram DM. Please check messaging permissions.',
+      };
+    }
+    return {
+      success: true,
+      message: 'Login code dispatched to your Instagram DM.',
+    };
+  }
+
+  return {
+    success: false,
+    code: 'DM_THE_BOT_DIRECTLY',
+    message: 'To receive a 6-digit login code, simply message "code" or "login" to our bot on Instagram.',
+  };
+}
+
 declare global {
   namespace Express {
     interface Request {
@@ -114,9 +332,14 @@ export function verifyVaultKey(key: string): { valid: boolean; session?: VaultUs
  * Automatically permits local development fallback when running outside production.
  */
 export function vaultAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
-  // Public bypass paths: Meta webhook, health check, and image dimension probe
+  // Public bypass paths: Meta webhook, health check, image dimension probe, and OTP verification
   const path = req.path || '';
-  if (path === '/health' || path.startsWith('/instagram/webhook') || path.includes('/meta')) {
+  if (
+    path === '/health' ||
+    path.startsWith('/instagram/webhook') ||
+    path.includes('/meta') ||
+    path.startsWith('/auth/otp')
+  ) {
     return next();
   }
 

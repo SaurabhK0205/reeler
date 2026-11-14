@@ -274,13 +274,50 @@
             </div>
             <h2 id="vault-gate-title" class="vault-gate-title">Private Vault</h2>
             <p class="vault-gate-desc">
-              Your saved library is private. To unlock your personal vault in this browser, send any Reel or message <kbd>vault</kbd> to our Instagram bot.
+              Your saved library is private. Unlock your personal vault with a 6-digit code or access key.
             </p>
-            <form id="vault-key-form" class="vault-key-form" novalidate>
-              <label for="vault-key-input" class="sr-only">Access key</label>
-              <input type="text" id="vault-key-input" class="vault-key-input" placeholder="Paste your access key" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
-              <button type="submit" id="vault-key-submit-btn" class="nav-btn nav-btn-primary">Unlock Vault</button>
-            </form>
+
+            <div class="vault-gate-tabs" role="tablist" aria-label="Vault unlock options">
+              <button type="button" class="vault-tab-btn active" id="tab-otp-btn" role="tab" aria-selected="true" aria-controls="vault-otp-panel">6-Digit Code</button>
+              <button type="button" class="vault-tab-btn" id="tab-key-btn" role="tab" aria-selected="false" aria-controls="vault-key-panel">Direct Key</button>
+            </div>
+
+            <!-- Panel 1: 6-Digit OTP Code (Default & Easiest for PC/Laptop) -->
+            <div id="vault-otp-panel" class="vault-gate-panel" role="tabpanel" aria-labelledby="tab-otp-btn">
+              <form id="vault-otp-form" class="vault-key-form" novalidate>
+                <label for="vault-otp-input" class="sr-only">6-digit login code</label>
+                <input
+                  type="text"
+                  id="vault-otp-input"
+                  class="vault-key-input vault-otp-input"
+                  placeholder="000000"
+                  maxlength="6"
+                  inputmode="numeric"
+                  pattern="[0-9]*"
+                  autocomplete="one-time-code"
+                  autocorrect="off"
+                  autocapitalize="off"
+                  spellcheck="false"
+                />
+                <button type="submit" id="vault-otp-submit-btn" class="nav-btn nav-btn-primary">Unlock Vault</button>
+              </form>
+              <p class="vault-panel-hint">
+                Message <kbd>code</kbd> to our Instagram bot to receive your 6-digit code.
+              </p>
+            </div>
+
+            <!-- Panel 2: Direct Access Key -->
+            <div id="vault-key-panel" class="vault-gate-panel is-hidden" role="tabpanel" aria-labelledby="tab-key-btn">
+              <form id="vault-key-form" class="vault-key-form" novalidate>
+                <label for="vault-key-input" class="sr-only">Access key</label>
+                <input type="text" id="vault-key-input" class="vault-key-input" placeholder="Paste your access key" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+                <button type="submit" id="vault-key-submit-btn" class="nav-btn nav-btn-primary">Unlock Vault</button>
+              </form>
+              <p class="vault-panel-hint">
+                Message <kbd>vault</kbd> to our Instagram bot to get your personal vault link.
+              </p>
+            </div>
+
             <p id="vault-gate-error" class="vault-gate-error" role="alert" hidden></p>
           </div>
         </section>

@@ -369,9 +369,44 @@ const reelsTableContainer = document.getElementById('reels-table-container');
 const reelsTable = document.getElementById('reels-table');
 const reelsTableBody = document.getElementById('reels-table-body');
 const vaultGateScreen = document.getElementById('vault-gate-screen');
+const tabOtpBtn = document.getElementById('tab-otp-btn');
+const tabKeyBtn = document.getElementById('tab-key-btn');
+const vaultOtpPanel = document.getElementById('vault-otp-panel');
+const vaultKeyPanel = document.getElementById('vault-key-panel');
+const vaultOtpForm = document.getElementById('vault-otp-form');
+const vaultOtpInput = document.getElementById('vault-otp-input');
+const vaultOtpSubmitBtn = document.getElementById('vault-otp-submit-btn');
 const vaultKeyForm = document.getElementById('vault-key-form');
 const vaultKeyInput = document.getElementById('vault-key-input');
+const vaultKeySubmitBtn = document.getElementById('vault-key-submit-btn');
 const vaultGateError = document.getElementById('vault-gate-error');
+
+/**
+ * Switches between 6-digit OTP code and direct access key tab in vault gate.
+ * @param {'otp' | 'key'} tab
+ */
+function switchVaultGateTab(tab) {
+  if (tab === 'otp') {
+    tabOtpBtn?.classList.add('active');
+    tabOtpBtn?.setAttribute('aria-selected', 'true');
+    tabKeyBtn?.classList.remove('active');
+    tabKeyBtn?.setAttribute('aria-selected', 'false');
+    vaultOtpPanel?.classList.remove('is-hidden');
+    vaultKeyPanel?.classList.add('is-hidden');
+    vaultOtpInput?.focus();
+  } else {
+    tabKeyBtn?.classList.add('active');
+    tabKeyBtn?.setAttribute('aria-selected', 'true');
+    tabOtpBtn?.classList.remove('active');
+    tabOtpBtn?.setAttribute('aria-selected', 'false');
+    vaultKeyPanel?.classList.remove('is-hidden');
+    vaultOtpPanel?.classList.add('is-hidden');
+    vaultKeyInput?.focus();
+  }
+}
+
+tabOtpBtn?.addEventListener('click', () => switchVaultGateTab('otp'));
+tabKeyBtn?.addEventListener('click', () => switchVaultGateTab('key'));
 
 /**
  * Shows the Zero-Login Vault Auth Gate when unauthenticated.
@@ -403,6 +438,45 @@ function hideVaultGateScreen() {
   if (vaultGateError) vaultGateError.hidden = true;
 }
 
+if (vaultOtpForm) {
+  vaultOtpForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const entered = (vaultOtpInput?.value || '').trim().replace(/\s+/g, '');
+    if (!entered || !/^\d{6}$/.test(entered)) {
+      showVaultGateScreen('Please enter the 6-digit code received from your Instagram DM.');
+      return;
+    }
+    if (vaultOtpSubmitBtn) {
+      vaultOtpSubmitBtn.disabled = true;
+      vaultOtpSubmitBtn.textContent = 'Verifying...';
+    }
+    try {
+      const res = await fetch('/api/auth/otp/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: entered }),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.vaultKey) {
+        setVaultAccessKey(data.vaultKey);
+        hideVaultGateScreen();
+        await loadStats();
+        await loadCreators();
+        await fetchReels();
+      } else {
+        showVaultGateScreen(data?.message || 'Invalid or expired code. Please message "code" to our bot to get a new code.');
+      }
+    } catch {
+      showVaultGateScreen('Unable to verify code. Please check your connection and try again.');
+    } finally {
+      if (vaultOtpSubmitBtn) {
+        vaultOtpSubmitBtn.disabled = false;
+        vaultOtpSubmitBtn.textContent = 'Unlock Vault';
+      }
+    }
+  });
+}
+
 if (vaultKeyForm) {
   vaultKeyForm.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -410,6 +484,10 @@ if (vaultKeyForm) {
     if (!entered) {
       showVaultGateScreen('Please enter your vault access key.');
       return;
+    }
+    if (vaultKeySubmitBtn) {
+      vaultKeySubmitBtn.disabled = true;
+      vaultKeySubmitBtn.textContent = 'Verifying...';
     }
     try {
       const res = await fetch('/api/session', {
@@ -419,12 +497,18 @@ if (vaultKeyForm) {
         setVaultAccessKey(entered);
         hideVaultGateScreen();
         await loadStats();
+        await loadCreators();
         await fetchReels();
       } else {
         showVaultGateScreen('Invalid access key. Please check the link from your Instagram DM.');
       }
     } catch {
       showVaultGateScreen('Unable to verify key. Please try again.');
+    } finally {
+      if (vaultKeySubmitBtn) {
+        vaultKeySubmitBtn.disabled = false;
+        vaultKeySubmitBtn.textContent = 'Unlock Vault';
+      }
     }
   });
 }
