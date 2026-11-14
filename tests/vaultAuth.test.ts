@@ -5,6 +5,9 @@ import {
   verifyVaultKey,
   getAdminVaultKey,
   vaultAuthMiddleware,
+  createOtp,
+  verifyOtp,
+  clearOtpsForTesting,
 } from '../src/services/vaultAuthService.ts';
 
 test('VaultAuthService - generateUserVaultKey produces URL-safe deterministic keys', () => {
@@ -172,4 +175,128 @@ test('Repository - enforces sender isolation when querying reels', async () => {
   const adminCodes = adminResults.reels.map((r) => r.shortcode);
   assert.ok(adminCodes.includes('UserOneReel01'), 'Admin can see User 1 reel');
   assert.ok(adminCodes.includes('UserTwoReel01'), 'Admin can see User 2 reel');
+});
+
+test('VaultAuthService - OTP generation, verification, and single-use invalidation', () => {
+  clearOtpsForTesting();
+
+  const userSession = { role: 'user' as const, senderId: 'user_otp_test_123' };
+  const code = createOtp(userSession);
+
+  assert.match(code, /^\d{6}$/, 'OTP must be a 6-digit numeric string');
+
+  // First verification: must succeed and return vault key and session
+  const verify1 = verifyOtp(code);
+  assert.equal(verify1.valid, true);
+  assert.equal(verify1.session?.role, 'user');
+  assert.equal(verify1.session?.senderId, 'user_otp_test_123');
+  assert.ok(verify1.vaultKey, 'Must return vault key');
+
+  // Verify that the issued vault key is valid
+  const keyCheck = verifyVaultKey(verify1.vaultKey!);
+  assert.equal(keyCheck.valid, true);
+  assert.equal(keyCheck.session?.senderId, 'user_otp_test_123');
+
+  // Second verification of same code: must fail (single-use consumption)
+  const verify2 = verifyOtp(code);
+  assert.equal(verify2.valid, false, 'OTP must be invalid after first use');
+});
+
+test('VaultAuthService - OTP expiration and invalid input rejection', async () => {
+  clearOtpsForTesting();
+
+  // Test invalid codes
+  assert.equal(verifyOtp('').valid, false);
+  assert.equal(verifyOtp('12345').valid, false);
+  assert.equal(verifyOtp('abcdef').valid, false);
+  assert.equal(verifyOtp('999999').valid, false);
+
+  // Test expiration with 1ms TTL
+  const fastCode = createOtp({ role: 'admin' }, 1);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const verifyExpired = verifyOtp(fastCode);
+  assert.equal(verifyExpired.valid, false, 'Expired OTP must be rejected');
+});
+
+test('VaultAuthService - vaultAuthMiddleware permits /auth/otp endpoints without existing vault key', () => {
+  const otpPaths = ['/auth/otp/verify', '/auth/otp/request'];
+
+  for (const path of otpPaths) {
+    let nextCalled = false;
+    const req: any = { path, headers: {}, query: {} };
+    const res: any = {
+      status: () => {
+        throw new Error(`Should not call status on public path: ${path}`);
+      },
+    };
+
+    vaultAuthMiddleware(req, res, () => {
+      nextCalled = true;
+    });
+
+    assert.equal(nextCalled, true, `Path ${path} must bypass vault auth middleware`);
+  }
+});
+
+test('API Router - /auth/otp/verify verifies code and issues permanent vault key', async () => {
+  const { apiRouter } = await import('../src/api/router.ts');
+  clearOtpsForTesting();
+
+  const code = createOtp({ role: 'user', senderId: 'user_http_test_99' });
+
+  // 1. Verify with valid OTP code
+  let statusSent = 200;
+  let jsonSent: any = null;
+  const mockReq: any = {
+    method: 'POST',
+    url: '/auth/otp/verify',
+    body: { code },
+    headers: {},
+  };
+  const mockRes: any = {
+    status: (code: number) => {
+      statusSent = code;
+      return mockRes;
+    },
+    json: (body: any) => {
+      jsonSent = body;
+    },
+  };
+
+  // Find the router stack layer for /auth/otp/verify
+  const routeLayer = (apiRouter.stack as any[]).find(
+    (layer) => layer.route?.path === '/auth/otp/verify' && layer.route?.methods?.post
+  );
+  assert.ok(routeLayer, 'Must find POST /auth/otp/verify route in apiRouter');
+
+  await routeLayer.route.stack[0].handle(mockReq, mockRes, () => {});
+
+  assert.equal(statusSent, 200);
+  assert.equal(jsonSent?.success, true);
+  assert.equal(jsonSent?.role, 'user');
+  assert.equal(jsonSent?.senderId, 'user_http_test_99');
+  assert.ok(jsonSent?.vaultKey, 'Must receive vaultKey');
+
+  // Verify that the returned key is legitimate
+  const verification = verifyVaultKey(jsonSent.vaultKey);
+  assert.equal(verification.valid, true);
+  assert.equal(verification.session?.senderId, 'user_http_test_99');
+
+  // 2. Immediate re-use of same code: must return 400 INVALID_OR_EXPIRED_CODE
+  let reuseStatus = 200;
+  let reuseJson: any = null;
+  const reuseRes: any = {
+    status: (c: number) => {
+      reuseStatus = c;
+      return reuseRes;
+    },
+    json: (b: any) => {
+      reuseJson = b;
+    },
+  };
+
+  await routeLayer.route.stack[0].handle(mockReq, reuseRes, () => {});
+  assert.equal(reuseStatus, 400);
+  assert.equal(reuseJson?.error, 'INVALID_OR_EXPIRED_CODE');
 });

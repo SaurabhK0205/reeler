@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { generateUserVaultKey, getAdminVaultKey } from './vaultAuthService.ts';
+import { generateUserVaultKey, getAdminVaultKey, createOtp } from './vaultAuthService.ts';
 import { loadConfig } from '../config.ts';
 import { Repository, SenderReminderConflictError } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
@@ -542,7 +542,21 @@ export class MetaInstagramBotService {
       const reply =
         `🎬 Your Personal Vault Link:\n${vaultUrl}\n\n` +
         `Tap to view your saved items in your browser. No login or password required!\n\n` +
+        `Tip: If opening on a PC or laptop, you can also message "code" to get a 6-digit login code.\n\n` +
         `Note: The web library is an optional companion—you can manage reminders and searches entirely here in DMs.`;
+      await this.sendDirectMessage(senderId, reply);
+      return;
+    }
+
+    // 2b. 6-Digit Login Code request for PC / Laptop browser vault access (e.g. "code", "otp", "login")
+    if (['code', 'otp', 'login', 'login code', 'get code', 'passcode'].includes(normalizedText)) {
+      const isSenderAdmin = Boolean(this.adminUserId && senderId === this.adminUserId);
+      const session = isSenderAdmin ? { role: 'admin' as const } : { role: 'user' as const, senderId };
+      const otpCode = createOtp(session);
+
+      const reply =
+        `🔐 Your Reeler Login Code:\n${otpCode}\n\n` +
+        `Enter this 6-digit code on your PC or laptop browser to unlock your private vault (valid for 10 minutes).`;
       await this.sendDirectMessage(senderId, reply);
       return;
     }
@@ -659,7 +673,7 @@ export class MetaInstagramBotService {
     }
 
     // Default welcome / help reply
-    const helpMsg = `👋 Hi! Whenever you see a Reel or Post you want to track or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username (or "reels by @name" / "posts by @name") to view your tracked items!\nType "vault" if you ever want to browse your saved items on the web.`;
+    const helpMsg = `👋 Hi! Whenever you see a Reel or Post you want to track or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username (or "reels by @name" / "posts by @name") to view your tracked items!\nType "vault" to browse your saved items on the web, or "code" to get a 6-digit login code for your laptop.`;
     await this.sendDirectMessage(senderId, helpMsg);
   }
 }

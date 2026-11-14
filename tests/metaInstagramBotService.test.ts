@@ -2403,3 +2403,32 @@ test('MetaInstagramBotService - responds to "vault" DM command with personalized
   assert.ok(sentMessages[0].text.includes('?key='), `Must contain magic key: ${sentMessages[0].text}`);
   assert.ok(sentMessages[0].text.includes('optional companion'), `Should remind that web is optional: ${sentMessages[0].text}`);
 });
+
+test('MetaInstagramBotService - responds to "code" / "login" DM command with 6-digit OTP code', async () => {
+  const service = new MetaInstagramBotService();
+  const sentMessages: { recipientId: string; text: string }[] = [];
+  (service as any).sendDirectMessage = async (recipientId: string, text: string) => {
+    sentMessages.push({ recipientId, text });
+    return true;
+  };
+
+  await service.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: 'sender_code_requester_456' },
+            message: { text: 'code' },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(sentMessages.length, 1);
+  assert.strictEqual(sentMessages[0].recipientId, 'sender_code_requester_456');
+  assert.ok(sentMessages[0].text.includes('Your Reeler Login Code:'), `Got: ${sentMessages[0].text}`);
+  assert.ok(/\b\d{6}\b/.test(sentMessages[0].text), `Must contain 6-digit numeric OTP: ${sentMessages[0].text}`);
+  assert.ok(sentMessages[0].text.includes('valid for 10 minutes'), `Must state validity: ${sentMessages[0].text}`);
+});

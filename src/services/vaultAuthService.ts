@@ -7,6 +7,106 @@ export interface VaultUserSession {
   senderId?: string;
 }
 
+interface PendingOtp {
+  code: string;
+  role: 'admin' | 'user';
+  senderId?: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+const pendingOtps = new Map<string, PendingOtp>();
+
+/**
+ * Default OTP Time-To-Live: 10 minutes.
+ */
+export const OTP_DEFAULT_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Removes expired OTPs from the in-memory store.
+ */
+function cleanupExpiredOtps(): void {
+  const now = Date.now();
+  for (const [code, item] of pendingOtps.entries()) {
+    if (item.expiresAt <= now) {
+      pendingOtps.delete(code);
+    }
+  }
+}
+
+/**
+ * Generates a cryptographically random 6-digit numeric login OTP bound to the given user session.
+ */
+export function createOtp(session: VaultUserSession, ttlMs: number = OTP_DEFAULT_TTL_MS): string {
+  cleanupExpiredOtps();
+
+  // Generate 6-digit numeric string (100000 - 999999)
+  const code = String(crypto.randomInt(100000, 1000000));
+  const now = Date.now();
+
+  pendingOtps.set(code, {
+    code,
+    role: session.role,
+    senderId: session.senderId,
+    createdAt: now,
+    expiresAt: now + ttlMs,
+  });
+
+  return code;
+}
+
+/**
+ * Verifies and consumes a 6-digit login OTP, returning the session and full vault key.
+ * One-time use: invalidates the OTP immediately upon successful verification.
+ */
+export function verifyOtp(code: string): { valid: boolean; session?: VaultUserSession; vaultKey?: string } {
+  cleanupExpiredOtps();
+
+  if (!code || typeof code !== 'string') {
+    return { valid: false };
+  }
+
+  const normalizedCode = code.trim().replace(/\s+/g, '');
+  if (!/^\d{6}$/.test(normalizedCode)) {
+    return { valid: false };
+  }
+
+  const record = pendingOtps.get(normalizedCode);
+  if (!record) {
+    return { valid: false };
+  }
+
+  if (record.expiresAt <= Date.now()) {
+    pendingOtps.delete(normalizedCode);
+    return { valid: false };
+  }
+
+  // Immediately delete upon consumption (one-time use)
+  pendingOtps.delete(normalizedCode);
+
+  const session: VaultUserSession = {
+    role: record.role,
+    ...(record.senderId ? { senderId: record.senderId } : {}),
+  };
+
+  const vaultKey = session.role === 'admin'
+    ? getAdminVaultKey()
+    : generateUserVaultKey(session.senderId!);
+
+  return {
+    valid: true,
+    session,
+    vaultKey,
+  };
+}
+
+/**
+ * Clears in-memory OTPs (for testing only).
+ */
+export function clearOtpsForTesting(): void {
+  pendingOtps.clear();
+}
+
 declare global {
   namespace Express {
     interface Request {
@@ -114,9 +214,14 @@ export function verifyVaultKey(key: string): { valid: boolean; session?: VaultUs
  * Automatically permits local development fallback when running outside production.
  */
 export function vaultAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
-  // Public bypass paths: Meta webhook, health check, and image dimension probe
+  // Public bypass paths: Meta webhook, health check, image dimension probe, and OTP verification
   const path = req.path || '';
-  if (path === '/health' || path.startsWith('/instagram/webhook') || path.includes('/meta')) {
+  if (
+    path === '/health' ||
+    path.startsWith('/instagram/webhook') ||
+    path.includes('/meta') ||
+    path.startsWith('/auth/otp')
+  ) {
     return next();
   }
 
