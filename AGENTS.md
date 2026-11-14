@@ -24,7 +24,7 @@ Run the full 7-pass suite for feature/UI changes, and at minimum `critique` + `p
 
 ### Design Engineering & Animation — Emil Kowalski Rules (MANDATORY)
 
-**Setup:** Skills installed in `/Users/thismac/.agents/skills/` and symlinked under `.agents/skills/`:
+**Setup (once per environment):** Install Emil Kowalski's design engineering skills (or link them under `.agents/skills/` or `.claude/skills/`, both gitignored):
 - `emil-design-eng`: Core philosophy, micro-states, tactile feedback, review format
 - `animate` & `improve-animations`: Physics, spring curves, easing, spatial choreography
 - `animation-performance`: GPU acceleration, zero layout thrashing, `will-change`, `contain: layout paint`
@@ -43,7 +43,7 @@ Run the full 7-pass suite for feature/UI changes, and at minimum `critique` + `p
 4. **Mandatory Review Format:**
    - When reviewing or proposing UI animation/craft changes, ALWAYS output a markdown table with `| Before | After | Why |` columns. Never use informal bullet lists.
 5. **Reduced Motion:**
-   - Every transform or spring animation MUST have a matching `@media (prefers-reduced-motion: reduce)` rule enforcing `transform: none !important;` and graceful linear opacity fallbacks.
+   - Respect `@media (prefers-reduced-motion: reduce)` by disabling transitions/animations or removing dynamic scale/movement (e.g. `transition: none` or resetting animating scales to 1), while strictly preserving static positioning transforms (such as `translate(-50%, -50%)` dialog centering) so layout never breaks.
 
 ---
 
