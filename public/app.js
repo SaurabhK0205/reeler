@@ -29,6 +29,67 @@ function saveViewMode(mode) {
   }
 }
 
+const VAULT_KEY_STORAGE = 'reeler_vault_key';
+
+/**
+ * Reads the stored private vault access key from localStorage.
+ * @returns {string}
+ */
+function getVaultAccessKey() {
+  try {
+    return localStorage.getItem(VAULT_KEY_STORAGE) || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+/**
+ * Stores or clears the private vault access key.
+ * @param {string | null | undefined} key
+ */
+function setVaultAccessKey(key) {
+  try {
+    if (key && key.trim()) {
+      localStorage.setItem(VAULT_KEY_STORAGE, key.trim());
+    } else {
+      localStorage.removeItem(VAULT_KEY_STORAGE);
+    }
+  } catch (_) {
+    /* non-fatal */
+  }
+}
+
+// Extract and store vault access key from URL query (?key=... or ?vault_key=...)
+try {
+  const urlParams = new URLSearchParams(window.location.search);
+  const keyFromUrl = urlParams.get('key') || urlParams.get('vault_key');
+  if (keyFromUrl && keyFromUrl.trim()) {
+    setVaultAccessKey(keyFromUrl.trim());
+    urlParams.delete('key');
+    urlParams.delete('vault_key');
+    const remainingQuery = urlParams.toString();
+    const cleanUrl = window.location.pathname + (remainingQuery ? `?${remainingQuery}` : '') + window.location.hash;
+    window.history.replaceState({}, document.title, cleanUrl);
+  }
+} catch (e) {
+  console.warn('Failed to parse URL vault key:', e);
+}
+
+/**
+ * Performs a fetch attaching the private X-Vault-Key header when stored.
+ * @param {string} url
+ * @param {RequestInit} [options]
+ * @returns {Promise<Response>}
+ */
+function vaultFetch(url, options = {}) {
+  const key = getVaultAccessKey();
+  const headers = new Headers(options.headers || {});
+  if (key) {
+    headers.set('X-Vault-Key', key);
+  }
+  return fetch(url, { ...options, headers });
+}
+
 const ASPECT_CACHE_STORAGE_KEY = 'reeler_aspect_cache_v1';
 const ASPECT_CACHE_MAX_ENTRIES = 300;
 const CREATOR_TOP_LIMIT = 6;
@@ -307,6 +368,66 @@ const reelsGrid = document.getElementById('reels-grid');
 const reelsTableContainer = document.getElementById('reels-table-container');
 const reelsTable = document.getElementById('reels-table');
 const reelsTableBody = document.getElementById('reels-table-body');
+const vaultGateScreen = document.getElementById('vault-gate-screen');
+const vaultKeyForm = document.getElementById('vault-key-form');
+const vaultKeyInput = document.getElementById('vault-key-input');
+const vaultGateError = document.getElementById('vault-gate-error');
+
+/**
+ * Shows the Zero-Login Vault Auth Gate when unauthenticated.
+ * @param {string} [errorMessage]
+ */
+function showVaultGateScreen(errorMessage) {
+  if (!vaultGateScreen) return;
+  vaultGateScreen.classList.remove('is-hidden');
+  if (resultsCount) resultsCount.textContent = 'Private Vault Locked';
+  if (reelsGrid) reelsGrid.innerHTML = '';
+  if (reelsTableContainer) reelsTableContainer.classList.add('is-hidden');
+  if (paginationBar) paginationBar.classList.add('is-hidden');
+  if (vaultGateError) {
+    if (errorMessage) {
+      vaultGateError.textContent = errorMessage;
+      vaultGateError.hidden = false;
+    } else {
+      vaultGateError.hidden = true;
+    }
+  }
+}
+
+/**
+ * Hides the Zero-Login Vault Auth Gate when authenticated.
+ */
+function hideVaultGateScreen() {
+  if (!vaultGateScreen) return;
+  vaultGateScreen.classList.add('is-hidden');
+  if (vaultGateError) vaultGateError.hidden = true;
+}
+
+if (vaultKeyForm) {
+  vaultKeyForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const entered = (vaultKeyInput?.value || '').trim();
+    if (!entered) {
+      showVaultGateScreen('Please enter your vault access key.');
+      return;
+    }
+    try {
+      const res = await fetch('/api/session', {
+        headers: { 'X-Vault-Key': entered },
+      });
+      if (res.ok) {
+        setVaultAccessKey(entered);
+        hideVaultGateScreen();
+        await loadStats();
+        await fetchReels();
+      } else {
+        showVaultGateScreen('Invalid access key. Please check the link from your Instagram DM.');
+      }
+    } catch {
+      showVaultGateScreen('Unable to verify key. Please try again.');
+    }
+  });
+}
 const reelsTableState = document.getElementById('reels-table-state');
 const resultsCount = document.getElementById('results-count');
 const activeFilterChips = document.getElementById('active-filter-chips');
@@ -908,7 +1029,11 @@ async function checkHealth() {
 async function loadStats() {
   statsBar?.setAttribute('aria-busy', 'true');
   try {
-    const res = await fetch('/api/stats');
+    const res = await vaultFetch('/api/stats');
+    if (res.status === 401) {
+      showVaultGateScreen();
+      return;
+    }
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
     }
@@ -1030,7 +1155,11 @@ async function loadCreators(query = state.creatorQuery) {
       }
     }
 
-    const res = await fetch(`/api/creators?${params.toString()}`, { signal });
+    const res = await vaultFetch(`/api/creators?${params.toString()}`, { signal });
+    if (res.status === 401) {
+      showVaultGateScreen();
+      return;
+    }
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
     }
@@ -1204,7 +1333,12 @@ async function fetchReels() {
   params.set('limit', String(state.filters.limit));
 
   try {
-    const res = await fetch(`/api/reels?${params.toString()}`, { signal });
+    const res = await vaultFetch(`/api/reels?${params.toString()}`, { signal });
+    if (res.status === 401) {
+      showVaultGateScreen();
+      return;
+    }
+    hideVaultGateScreen();
     if (!res.ok) {
       let errMsg = `HTTP ${res.status}`;
       try {
@@ -1847,7 +1981,7 @@ async function updateReelStatus(reelId, newStatus, options = {}) {
   syncReelStatusPendingState(reelId, true);
 
   try {
-    const res = await fetch(`/api/reels/${encodeURIComponent(reelId)}/status`, {
+    const res = await vaultFetch(`/api/reels/${encodeURIComponent(reelId)}/status`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: newStatus }),
@@ -3578,7 +3712,7 @@ function setupEventListeners() {
 
     try {
       const text = await file.text();
-      const res = await fetch('/api/archive/import', {
+      const res = await vaultFetch('/api/archive/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: text,

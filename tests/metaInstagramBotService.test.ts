@@ -2374,3 +2374,32 @@ test('MetaInstagramBotService.sendDirectMessage supports standard delivery and H
     else delete process.env.META_PAGE_ACCESS_TOKEN;
   }
 });
+
+test('MetaInstagramBotService - responds to "vault" DM command with personalized access link', async () => {
+  const service = new MetaInstagramBotService();
+  const sentMessages: { recipientId: string; text: string }[] = [];
+  (service as any).sendDirectMessage = async (recipientId: string, text: string) => {
+    sentMessages.push({ recipientId, text });
+    return true;
+  };
+
+  await service.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: 'sender_vault_requester_123' },
+            message: { text: 'vault' },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(sentMessages.length, 1);
+  assert.strictEqual(sentMessages[0].recipientId, 'sender_vault_requester_123');
+  assert.ok(sentMessages[0].text.includes('Your Personal Vault Link:'), `Got: ${sentMessages[0].text}`);
+  assert.ok(sentMessages[0].text.includes('?key='), `Must contain magic key: ${sentMessages[0].text}`);
+  assert.ok(sentMessages[0].text.includes('optional companion'), `Should remind that web is optional: ${sentMessages[0].text}`);
+});

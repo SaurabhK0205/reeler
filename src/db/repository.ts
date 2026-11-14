@@ -342,6 +342,11 @@ class InMemoryStore {
       creator: this.creators.get(r.creator_id)
     }));
 
+    // Filter by Instagram Sender ID (for non-admin scoped vaults)
+    if (filters.instagramSenderId && filters.instagramSenderId !== 'admin') {
+      list = list.filter(r => r.instagram_sender_id === filters.instagramSenderId);
+    }
+
     // Filter by Creator
     if (filters.creatorId) {
       list = list.filter(r => r.creator_id === filters.creatorId);
@@ -655,6 +660,7 @@ function applyReelQueryFilters(
   query: any,
   params: {
     creatorId?: string;
+    instagramSenderId?: string | null;
     source?: SavedCollectionSource | 'all';
     watchStatus?: WatchStatus | 'all';
     mediaType?: SavedMediaType | 'all';
@@ -664,6 +670,9 @@ function applyReelQueryFilters(
   }
 ): any {
   let next = query;
+  if (params.instagramSenderId && params.instagramSenderId !== 'admin') {
+    next = next.eq('instagram_sender_id', params.instagramSenderId);
+  }
   if (params.creatorId) {
     next = next.eq('creator_id', params.creatorId);
   }
@@ -1474,6 +1483,7 @@ export class Repository {
 
     const filterState = {
       creatorId: filters.creatorId,
+      instagramSenderId: filters.instagramSenderId,
       source: filters.source,
       watchStatus: filters.watchStatus,
       mediaType: filters.mediaType,

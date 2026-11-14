@@ -5,6 +5,7 @@ import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
 import { feedMetaCacheControl, isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
+import { vaultAuthMiddleware } from '../services/vaultAuthService.ts';
 import type { ReelQueryFilters, WatchStatus, DateFilterPreset, SavedMediaType, SavedCollectionSource } from '../types.ts';
 
 /**
@@ -12,6 +13,8 @@ import type { ReelQueryFilters, WatchStatus, DateFilterPreset, SavedMediaType, S
  */
 export const apiRouter = express.Router();
 const metaBotService = new MetaInstagramBotService();
+
+apiRouter.use(vaultAuthMiddleware);
 
 /**
  * Verifies Meta Instagram webhook subscriptions using the configured verify token.
@@ -67,11 +70,23 @@ apiRouter.get('/health', (_req: Request, res: Response) => {
 });
 
 /**
+ * Returns current authenticated session details.
+ */
+apiRouter.get('/session', (req: Request, res: Response) => {
+  res.json({
+    authenticated: Boolean(req.vaultUser),
+    role: req.vaultUser?.role || 'anonymous',
+    senderId: req.vaultUser?.senderId || null,
+  });
+});
+
+/**
  * Returns aggregate saved-reel and creator counts for the vault header telemetry.
  */
-apiRouter.get('/stats', async (_req: Request, res: Response) => {
+apiRouter.get('/stats', async (req: Request, res: Response) => {
   try {
-    const stats = await Repository.getStats();
+    const senderId = req.vaultUser?.role === 'admin' ? undefined : req.vaultUser?.senderId;
+    const stats = await Repository.getStats(senderId);
     res.json(stats);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -84,6 +99,7 @@ apiRouter.get('/stats', async (_req: Request, res: Response) => {
  */
 apiRouter.get('/creators', async (req: Request, res: Response) => {
   try {
+    const senderId = req.vaultUser?.role === 'admin' ? undefined : req.vaultUser?.senderId;
     const q = typeof req.query.q === 'string' ? req.query.q : undefined;
     const rawLimit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
     const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0
@@ -94,14 +110,19 @@ apiRouter.get('/creators', async (req: Request, res: Response) => {
       : undefined;
 
     if (q !== undefined || limit !== undefined || includeId !== undefined) {
-      const { creators, totalCount, matchCount } = await Repository.queryCreators({ q, limit, includeId });
+      const { creators, totalCount, matchCount } = await Repository.queryCreators({
+        q,
+        limit,
+        includeId,
+        instagramSenderId: senderId,
+      });
       res.setHeader('X-Total-Count', String(totalCount));
       res.setHeader('X-Match-Count', String(matchCount));
       res.json(creators);
       return;
     }
 
-    const creators = await Repository.getCreators();
+    const creators = await Repository.getCreators(senderId);
     res.setHeader('X-Total-Count', String(creators.length));
     res.setHeader('X-Match-Count', String(creators.length));
     res.json(creators);
@@ -115,6 +136,7 @@ apiRouter.get('/creators', async (req: Request, res: Response) => {
  */
 apiRouter.get('/reels', async (req: Request, res: Response) => {
   try {
+    const senderId = req.vaultUser?.role === 'admin' ? undefined : req.vaultUser?.senderId;
     const rawMediaType = typeof req.query.mediaType === 'string' ? req.query.mediaType.trim().toLowerCase() : '';
     if (rawMediaType && rawMediaType !== 'all' && rawMediaType !== 'reel' && rawMediaType !== 'post') {
       res.status(400).json({ error: 'Invalid mediaType filter' });
@@ -129,6 +151,7 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
 
     const filters: ReelQueryFilters = {
       creatorId: req.query.creatorId as string || undefined,
+      instagramSenderId: senderId,
       datePreset: (req.query.datePreset as DateFilterPreset) || 'all',
       startDate: req.query.startDate as string || undefined,
       endDate: req.query.endDate as string || undefined,
@@ -228,6 +251,10 @@ apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
  * Imports an official Instagram `saved_posts.json` archive export into the repository.
  */
 apiRouter.post('/archive/import', async (req: Request, res: Response) => {
+  if (req.vaultUser?.role !== 'admin') {
+    res.status(403).json({ success: false, error: 'Only the vault administrator can import archive files.' });
+    return;
+  }
   (req as any).markHandlerStarted?.();
   try {
     const rawData = req.body;
