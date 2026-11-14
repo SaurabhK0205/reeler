@@ -262,6 +262,29 @@
       <!-- Main Reels Presentation View -->
       <main class="library-main">
         <h2 class="sr-only">Media Catalog</h2>
+
+        <!-- Zero-Login Vault Auth Gate (Shown only when unauthenticated) -->
+        <section class="vault-gate-screen is-hidden" id="vault-gate-screen" aria-labelledby="vault-gate-title">
+          <div class="vault-gate-card">
+            <div class="vault-gate-icon" aria-hidden="true">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+              </svg>
+            </div>
+            <h2 id="vault-gate-title" class="vault-gate-title">Private Vault</h2>
+            <p class="vault-gate-desc">
+              Your saved library is private. To unlock your personal vault in this browser, send any Reel or message <kbd>vault</kbd> to our Instagram bot.
+            </p>
+            <form id="vault-key-form" class="vault-key-form" novalidate>
+              <label for="vault-key-input" class="sr-only">Access key</label>
+              <input type="text" id="vault-key-input" class="vault-key-input" placeholder="Paste your access key" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+              <button type="submit" id="vault-key-submit-btn" class="nav-btn nav-btn-primary">Unlock Vault</button>
+            </form>
+            <p id="vault-gate-error" class="vault-gate-error" role="alert" hidden></p>
+          </div>
+        </section>
+
         <div class="library-header-meta">
           <div id="results-count" class="results-counter" aria-live="polite">Loading tracked items...</div>
           <div id="active-filter-chips" class="active-filter-chips" aria-label="Active filters" hidden></div>

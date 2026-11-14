@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { generateUserVaultKey, getAdminVaultKey } from './vaultAuthService.ts';
 import { loadConfig } from '../config.ts';
 import { Repository, SenderReminderConflictError } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
@@ -530,7 +531,23 @@ export class MetaInstagramBotService {
       return;
     }
 
-    // 2. Custom duration command (e.g. "5s", "remind me in 5 days", "tomorrow at 5pm", "12 nov", etc.)
+    // 2. Personal Vault / Web library link request (e.g. "vault", "library", "web", "dashboard", "link")
+    const normalizedText = text.trim().toLowerCase();
+    if (['vault', 'library', 'web', 'dashboard', 'link', 'my vault'].includes(normalizedText)) {
+      const isSenderAdmin = Boolean(this.adminUserId && senderId === this.adminUserId);
+      const userKey = isSenderAdmin ? getAdminVaultKey() : generateUserVaultKey(senderId);
+      const baseUrl = process.env.APP_URL || process.env.PUBLIC_URL || 'https://reeler-bot.fly.dev';
+      const vaultUrl = `${baseUrl.replace(/\/+$/, '')}/?key=${userKey}`;
+
+      const reply =
+        `🎬 Your Personal Vault Link:\n${vaultUrl}\n\n` +
+        `Tap to view your saved items in your browser. No login or password required!\n\n` +
+        `Note: The web library is an optional companion—you can manage reminders and searches entirely here in DMs.`;
+      await this.sendDirectMessage(senderId, reply);
+      return;
+    }
+
+    // 3. Custom duration command (e.g. "5s", "remind me in 5 days", "tomorrow at 5pm", "12 nov", etc.)
     const customDuration = parseDuration(text);
     if (customDuration) {
       const targetReel =
@@ -642,7 +659,7 @@ export class MetaInstagramBotService {
     }
 
     // Default welcome / help reply
-    const helpMsg = `👋 Hi! Whenever you see a Reel or Post you want to track or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username (or "reels by @name" / "posts by @name") to view your tracked items!`;
+    const helpMsg = `👋 Hi! Whenever you see a Reel or Post you want to track or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username (or "reels by @name" / "posts by @name") to view your tracked items!\nType "vault" if you ever want to browse your saved items on the web.`;
     await this.sendDirectMessage(senderId, helpMsg);
   }
 }

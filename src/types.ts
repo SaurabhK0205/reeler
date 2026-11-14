@@ -56,6 +56,7 @@ export type DateFilterPreset =
 
 export interface ReelQueryFilters {
   creatorId?: string;
+  instagramSenderId?: string | null;
   datePreset?: DateFilterPreset;
   startDate?: string;
   endDate?: string;
