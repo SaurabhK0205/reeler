@@ -716,11 +716,16 @@ kbd {
   font-family: inherit;
   cursor: pointer;
   white-space: nowrap;
-  transition: background-color 0.14s ease, color 0.14s ease;
+  transition: background-color 0.14s ease, color 0.14s ease, transform 0.14s ease;
 }
 
 .source-tab-btn:hover {
   color: var(--ink-primary);
+}
+
+.source-tab-btn:active {
+  transform: scale(0.96);
+  transition-duration: 0.08s;
 }
 
 .source-tab-btn.active {
@@ -1111,13 +1116,18 @@ kbd {
   white-space: nowrap;
   font-family: inherit;
   flex-shrink: 0;
-  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, transform 0.14s ease;
 }
 
 .creator-chip:hover {
   background: var(--surface-card);
   border-color: var(--hairline-strong);
   color: var(--ink-primary);
+}
+
+.creator-chip:active {
+  transform: scale(0.95);
+  transition-duration: 0.08s;
 }
 
 .creator-chip.active {
@@ -1254,6 +1264,11 @@ kbd {
   transform: translateY(-2px);
 }
 
+.vault-poster-card:active {
+  transform: translateY(0) scale(0.985);
+  transition-duration: 0.08s;
+}
+
 .poster-media-box {
   position: relative;
   width: 100%;
@@ -1289,7 +1304,13 @@ kbd {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  transition: transform 0.24s ease;
+  opacity: 0;
+  transition: opacity 0.28s cubic-bezier(0.16, 1, 0.3, 1), transform 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: opacity, transform;
+}
+
+.poster-actual-img.is-loaded {
+  opacity: 1;
 }
 
 .poster-media-box:hover .poster-actual-img,
@@ -1328,6 +1349,12 @@ kbd {
   justify-content: center;
   background: linear-gradient(145deg, var(--surface-monogram-start) 0%, var(--surface-monogram-end) 100%);
   border-bottom: 1px solid var(--hairline);
+  transition: opacity 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.vault-poster-card.has-thumbnail .monochrome-poster-art {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .art-center-block {
@@ -1495,7 +1522,7 @@ kbd {
   padding: 2px 6px;
   border-radius: var(--radius-xs);
   font-family: var(--font-sans);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -1539,13 +1566,18 @@ kbd {
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, transform 0.14s ease;
 }
 
 .card-bookmark-btn:hover:not(:disabled) {
   background: var(--status-later);
   border-color: var(--status-later);
   color: var(--ink-inverse);
+}
+
+.card-bookmark-btn:active:not(:disabled) {
+  transform: scale(0.90);
+  transition-duration: 0.08s;
 }
 
 .card-bookmark-btn.active {
@@ -1780,7 +1812,12 @@ kbd {
   background: none;
   font-family: inherit;
   white-space: nowrap;
-  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, transform 0.14s ease;
+}
+
+.status-pill-toggle:active:not(:disabled) {
+  transform: scale(0.92);
+  transition-duration: 0.08s;
 }
 
 .status-pill-unwatched {
@@ -2041,7 +2078,7 @@ kbd {
   opacity: 0;
   pointer-events: none;
   visibility: hidden;
-  transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1), visibility 0s linear 0.2s;
+  transition: opacity 0.22s cubic-bezier(0.16, 1, 0.3, 1), visibility 0s linear 0.22s;
   overflow: hidden;
 }
 
@@ -2057,6 +2094,25 @@ kbd {
   pointer-events: none;
 }
 
+/* Modal Inner Spatial Choreography */
+.reels-feed-modal .feed-scroll-track {
+  opacity: 0;
+  transform: scale(0.96);
+  transition: opacity 0.22s cubic-bezier(0.16, 1, 0.3, 1), transform 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: transform, opacity;
+}
+
+.reels-feed-modal.active .feed-scroll-track {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.reels-feed-modal:not(.active) .feed-scroll-track {
+  opacity: 0;
+  transform: scale(0.98);
+  transition: opacity 0.16s ease-in, transform 0.16s ease-in;
+}
+
 /* Top HUD Bar */
 .feed-top-bar {
   position: absolute;
@@ -2070,6 +2126,22 @@ kbd {
   padding: 12px 24px;
   background: linear-gradient(180deg, var(--surface-hud-top) 0%, var(--surface-scrim-clear) 100%);
   pointer-events: none;
+  opacity: 0;
+  transform: translateY(-8px);
+  transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: transform, opacity;
+}
+
+.reels-feed-modal.active .feed-top-bar {
+  opacity: 1;
+  transform: translateY(0);
+  transition-delay: 0.04s;
+}
+
+.reels-feed-modal:not(.active) .feed-top-bar {
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity 0.14s ease-in, transform 0.14s ease-in;
 }
 
 .reels-feed-modal.active .feed-top-bar > * {
@@ -2139,6 +2211,12 @@ kbd {
   color: var(--ink-primary);
   border-color: var(--hairline-hover);
   transform: translateY(-1px);
+}
+
+.feed-nav-arrow-btn:active:not(:disabled),
+.feed-close-btn:active:not(:disabled) {
+  transform: scale(0.92);
+  transition-duration: 0.08s;
 }
 
 .feed-nav-arrow-btn:disabled {
@@ -2216,7 +2294,8 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: width 0.16s cubic-bezier(0.22, 1, 0.36, 1), height 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+  contain: layout paint;
+  transition: width 0.16s cubic-bezier(0.16, 1, 0.3, 1), height 0.16s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .feed-focus-player-btn {
@@ -2259,7 +2338,13 @@ kbd {
   height: 100%;
   object-fit: cover;
   filter: brightness(0.85);
-  transition: opacity 0.25s ease;
+  opacity: 0;
+  transition: opacity 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: opacity;
+}
+
+.reel-poster-underlay.is-loaded {
+  opacity: 1;
 }
 
 .reel-monogram-underlay {
@@ -2585,6 +2670,11 @@ kbd {
   color: var(--ink-primary);
   border-color: var(--hairline-hover);
   transform: scale(1.06);
+}
+
+.rail-action-btn:active:not(:disabled) {
+  transform: scale(0.92);
+  transition-duration: 0.08s;
 }
 
 .rail-action-btn.active-watched {
@@ -3496,7 +3586,7 @@ kbd {
   }
   .media-type-badge {
     padding: 2px 5px;
-    font-size: 9px;
+    font-size: 11px;
   }
   .table-status-group {
     flex-wrap: wrap;
@@ -3528,23 +3618,36 @@ kbd {
   }
   .vault-poster-card,
   .source-tab-btn,
+  .creator-chip,
+  .card-bookmark-btn,
+  .status-pill-toggle,
   .poster-actual-img,
   .play-icon-box,
   .rail-action-btn,
   .feed-nav-arrow-btn,
-  .feed-close-btn {
+  .feed-close-btn,
+  .feed-scroll-track,
+  .feed-top-bar {
     transition-property: opacity, background-color, border-color, color;
     transition-duration: 0.12s;
     transform: none !important;
   }
   .vault-poster-card:hover,
+  .vault-poster-card:active,
   .poster-media-box:hover .poster-actual-img,
   .poster-media-box:focus-within .poster-actual-img,
   .poster-play-trigger:hover .play-icon-box,
   .poster-play-trigger:focus-visible .play-icon-box,
   .rail-action-btn:hover,
+  .rail-action-btn:active,
   .feed-nav-arrow-btn:hover,
-  .feed-close-btn:hover {
+  .feed-nav-arrow-btn:active,
+  .feed-close-btn:hover,
+  .feed-close-btn:active,
+  .source-tab-btn:active,
+  .creator-chip:active,
+  .card-bookmark-btn:active,
+  .status-pill-toggle:active {
     transform: none !important;
   }
   .reel-media-viewport,

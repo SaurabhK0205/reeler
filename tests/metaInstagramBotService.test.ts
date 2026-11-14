@@ -1,6 +1,9 @@
 import assert from 'node:assert';
 import { test } from 'node:test';
-import { MetaInstagramBotService } from '../src/services/metaInstagramBotService.ts';
+import {
+  MetaInstagramBotService,
+  isMetaMessagingWindowError,
+} from '../src/services/metaInstagramBotService.ts';
 
 test('MetaInstagramBotService - splitMessageIntoChunks handles short and empty text', () => {
   const service = new MetaInstagramBotService();
@@ -2254,5 +2257,120 @@ test('Repository and MetaInstagramBotService protect unattributed active reminde
     else delete process.env.SUPABASE_SERVICE_ROLE_KEY;
     if (prevAnonKey !== undefined) process.env.SUPABASE_ANON_KEY = prevAnonKey;
     else delete process.env.SUPABASE_ANON_KEY;
+  }
+});
+
+test('isMetaMessagingWindowError accurately recognizes 24h messaging window errors', () => {
+  assert.strictEqual(isMetaMessagingWindowError(null), false);
+  assert.strictEqual(isMetaMessagingWindowError(undefined), false);
+  assert.strictEqual(isMetaMessagingWindowError({}), false);
+  assert.strictEqual(isMetaMessagingWindowError({ error: { code: 190, message: 'Invalid token' } }), false);
+
+  assert.strictEqual(
+    isMetaMessagingWindowError({
+      error: { code: 10, error_subcode: 2018278, message: 'This message is sent outside of allowed window.' },
+    }),
+    true
+  );
+
+  assert.strictEqual(
+    isMetaMessagingWindowError({
+      error: { code: 10, message: 'Cannot message user outside the 24 hour window' },
+    }),
+    true
+  );
+});
+
+test('MetaInstagramBotService.sendDirectMessage supports standard delivery and HUMAN_AGENT fallback', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalToken = process.env.META_PAGE_ACCESS_TOKEN;
+  process.env.META_PAGE_ACCESS_TOKEN = 'test_meta_token';
+
+  try {
+    const service = new MetaInstagramBotService();
+
+    // 1. Standard success scenario
+    const sentBodies: any[] = [];
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      sentBodies.push(JSON.parse((init?.body as string) || '{}'));
+      return new Response(JSON.stringify({ recipient_id: 'user_1', message_id: 'mid_1' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    const res1 = await service.sendDirectMessage('user_1', 'Hello standard');
+    assert.strictEqual(res1, true);
+    assert.strictEqual(sentBodies.length, 1);
+    assert.strictEqual(sentBodies[0].recipient.id, 'user_1');
+    assert.strictEqual(sentBodies[0].tag, undefined);
+
+    // 2. Window expired scenario -> automatic fallback to HUMAN_AGENT tag
+    const fallbackCalls: any[] = [];
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse((init?.body as string) || '{}');
+      fallbackCalls.push(body);
+      if (!body.tag) {
+        // First call without tag fails with 24h window error
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 10,
+              error_subcode: 2018278,
+              message: 'This message is sent outside of allowed window.',
+            },
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      // Second call with HUMAN_AGENT succeeds
+      return new Response(JSON.stringify({ recipient_id: 'user_2', message_id: 'mid_2' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    const res2 = await service.sendDirectMessage('user_2', 'Reminder after 24h');
+    assert.strictEqual(res2, true);
+    assert.strictEqual(fallbackCalls.length, 2, 'Must have attempted standard then HUMAN_AGENT retry');
+    assert.strictEqual(fallbackCalls[0].tag, undefined);
+    assert.strictEqual(fallbackCalls[1].tag, 'HUMAN_AGENT');
+
+    // 3. Explicit tag scenario
+    const explicitCalls: any[] = [];
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      explicitCalls.push(JSON.parse((init?.body as string) || '{}'));
+      return new Response(JSON.stringify({ recipient_id: 'user_3', message_id: 'mid_3' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    const res3 = await service.sendDirectMessage('user_3', 'Explicit agent message', { tag: 'HUMAN_AGENT' });
+    assert.strictEqual(res3, true);
+    assert.strictEqual(explicitCalls.length, 1);
+    assert.strictEqual(explicitCalls[0].tag, 'HUMAN_AGENT');
+
+    // 4. Fallback disabled scenario
+    const noFallbackCalls: any[] = [];
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      noFallbackCalls.push(JSON.parse((init?.body as string) || '{}'));
+      return new Response(
+        JSON.stringify({
+          error: { code: 10, error_subcode: 2018278, message: 'outside window' },
+        }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }) as typeof fetch;
+
+    const res4 = await service.sendDirectMessage('user_4', 'No fallback allowed', {
+      allowHumanAgentFallback: false,
+    });
+    assert.strictEqual(res4, false);
+    assert.strictEqual(noFallbackCalls.length, 1, 'Should not retry when fallback disabled');
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalToken !== undefined) process.env.META_PAGE_ACCESS_TOKEN = originalToken;
+    else delete process.env.META_PAGE_ACCESS_TOKEN;
   }
 });

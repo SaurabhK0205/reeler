@@ -1630,20 +1630,21 @@ function renderReels() {
         card.classList.add('is-monogram');
         card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
       }, { once: true });
-      if (reel.shortcode) {
-        /**
-         * Records natural thumbnail aspect ratio once loaded to inform pre-probe geometry.
-         */
-        const recordRatio = () => {
-          if (cardImg.naturalWidth > 0 && cardImg.naturalHeight > 0) {
-            state.thumbRatioCache.set(reel.shortcode, cardImg.naturalWidth / cardImg.naturalHeight);
-          }
-        };
-        if (cardImg.complete) {
-          recordRatio();
-        } else {
-          cardImg.addEventListener('load', recordRatio, { once: true });
+
+      /**
+       * Records natural thumbnail aspect ratio once loaded and triggers smooth cross-fade.
+       */
+      const handleCardImgLoaded = () => {
+        cardImg.classList.add('is-loaded');
+        if (reel.shortcode && cardImg.naturalWidth > 0 && cardImg.naturalHeight > 0) {
+          state.thumbRatioCache.set(reel.shortcode, cardImg.naturalWidth / cardImg.naturalHeight);
         }
+      };
+
+      if (cardImg.complete && cardImg.naturalWidth > 0) {
+        handleCardImgLoaded();
+      } else {
+        cardImg.addEventListener('load', handleCardImgLoaded, { once: true });
       }
     }
 
@@ -2041,8 +2042,10 @@ function setSlidePosterUrl(slide, reel, url, { recordRatio = true } = {}) {
     viewport.insertBefore(posterImg, iframeBox || null);
   }
   posterImg.hidden = false;
-  posterImg.src = url;
-  posterImg.addEventListener('load', () => {
+  posterImg.classList.remove('is-loaded');
+
+  const onPosterLoad = () => {
+    posterImg.classList.add('is-loaded');
     if (recordRatio && posterImg.naturalWidth > 0 && posterImg.naturalHeight > 0 && shortcode) {
       state.thumbRatioCache.set(shortcode, posterImg.naturalWidth / posterImg.naturalHeight);
       const iframe = slide.querySelector('.reel-player-iframe');
@@ -2050,9 +2053,17 @@ function setSlidePosterUrl(slide, reel, url, { recordRatio = true } = {}) {
         applySlideStage(slide, reel);
       }
     }
-  }, { once: true });
+  };
+
+  posterImg.src = url;
+  if (posterImg.complete && posterImg.naturalWidth > 0) {
+    onPosterLoad();
+  } else {
+    posterImg.addEventListener('load', onPosterLoad, { once: true });
+  }
   posterImg.addEventListener('error', () => {
     posterImg.hidden = true;
+    posterImg.classList.remove('is-loaded');
   }, { once: true });
 }
 
