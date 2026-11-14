@@ -2432,3 +2432,36 @@ test('MetaInstagramBotService - responds to "code" / "login" DM command with 6-d
   assert.ok(/\b\d{6}\b/.test(sentMessages[0].text), `Must contain 6-digit numeric OTP: ${sentMessages[0].text}`);
   assert.ok(sentMessages[0].text.includes('valid for 10 minutes'), `Must state validity: ${sentMessages[0].text}`);
 });
+
+test('MetaInstagramBotService - admin sender receiving "code" yields admin session upon verification', async () => {
+  const adminSenderId = 'admin_instagram_sender_777';
+  const service = new MetaInstagramBotService({ adminUserId: adminSenderId });
+  const sentMessages: { recipientId: string; text: string }[] = [];
+  (service as any).sendDirectMessage = async (recipientId: string, text: string) => {
+    sentMessages.push({ recipientId, text });
+    return true;
+  };
+
+  await service.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: adminSenderId },
+            message: { text: 'code' },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(sentMessages.length, 1);
+  const match = sentMessages[0].text.match(/\b\d{6}\b/);
+  assert.ok(match, 'Must find 6-digit OTP code in admin DM');
+
+  const { verifyOtp } = await import('../src/services/vaultAuthService.ts');
+  const verification = verifyOtp(match[0]);
+  assert.strictEqual(verification.valid, true);
+  assert.strictEqual(verification.session?.role, 'admin', 'Admin sender must receive admin role OTP');
+});

@@ -461,6 +461,7 @@ if (vaultOtpForm) {
         setVaultAccessKey(data.vaultKey);
         hideVaultGateScreen();
         await loadStats();
+        await loadCreators();
         await fetchReels();
       } else {
         showVaultGateScreen(data?.message || 'Invalid or expired code. Please message "code" to our bot to get a new code.');
@@ -496,6 +497,7 @@ if (vaultKeyForm) {
         setVaultAccessKey(entered);
         hideVaultGateScreen();
         await loadStats();
+        await loadCreators();
         await fetchReels();
       } else {
         showVaultGateScreen('Invalid access key. Please check the link from your Instagram DM.');

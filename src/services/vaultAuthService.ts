@@ -36,14 +36,22 @@ function cleanupExpiredOtps(): void {
 
 /**
  * Generates a cryptographically random 6-digit numeric login OTP bound to the given user session.
+ * Re-rolls candidates if a collision with an existing active OTP occurs to prevent overwriting active sessions.
  */
 export function createOtp(session: VaultUserSession, ttlMs: number = OTP_DEFAULT_TTL_MS): string {
   cleanupExpiredOtps();
 
-  // Generate 6-digit numeric string (100000 - 999999)
-  const code = String(crypto.randomInt(100000, 1000000));
-  const now = Date.now();
+  let code: string;
+  let attempts = 0;
+  do {
+    code = String(crypto.randomInt(100000, 1000000));
+    attempts++;
+    if (attempts > 100) {
+      throw new Error('Failed to generate unique OTP code due to high concurrency');
+    }
+  } while (pendingOtps.has(code));
 
+  const now = Date.now();
   pendingOtps.set(code, {
     code,
     role: session.role,
@@ -105,6 +113,116 @@ export function verifyOtp(code: string): { valid: boolean; session?: VaultUserSe
  */
 export function clearOtpsForTesting(): void {
   pendingOtps.clear();
+}
+
+const MAX_OTP_VERIFY_ATTEMPTS = 5;
+const OTP_RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
+const MAX_TRACKED_OTP_IPS = 1000;
+const otpIpAttempts = new Map<string, { count: number; resetAt: number }>();
+
+/**
+ * Express middleware protecting /api/auth/otp/verify with per-client-IP rate limiting (CWE-307 mitigation).
+ */
+export function otpVerifyRateLimiter(req: Request, res: Response, next: NextFunction): void {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  const now = Date.now();
+
+  const record = otpIpAttempts.get(ip);
+  if (record && record.resetAt > now) {
+    if (record.count >= MAX_OTP_VERIFY_ATTEMPTS) {
+      const retryAfterSec = Math.ceil((record.resetAt - now) / 1000);
+      res.set('Retry-After', String(retryAfterSec));
+      res.status(429).json({
+        error: 'TOO_MANY_ATTEMPTS',
+        message: `Too many failed verification attempts. Please wait ${retryAfterSec} seconds before trying again.`,
+      });
+      return;
+    }
+  } else {
+    if (otpIpAttempts.size >= MAX_TRACKED_OTP_IPS) {
+      res.status(429).json({
+        error: 'RATE_LIMIT_CAPACITY_REACHED',
+        message: 'Too many verification attempts in progress. Please retry later.',
+      });
+      return;
+    }
+    otpIpAttempts.set(ip, { count: 0, resetAt: now + OTP_RATE_LIMIT_WINDOW_MS });
+  }
+
+  next();
+}
+
+/**
+ * Records a failed verification attempt against the client IP.
+ */
+export function recordOtpFailure(ip: string): void {
+  const now = Date.now();
+  const record = otpIpAttempts.get(ip);
+  if (record && record.resetAt > now) {
+    record.count++;
+  } else {
+    otpIpAttempts.set(ip, { count: 1, resetAt: now + OTP_RATE_LIMIT_WINDOW_MS });
+  }
+}
+
+/**
+ * Resets failed attempt counter upon successful OTP verification.
+ */
+export function resetOtpAttempts(ip: string): void {
+  otpIpAttempts.delete(ip);
+}
+
+/**
+ * Clears rate limiter tracking (for testing only).
+ */
+export function clearOtpRateLimitsForTesting(): void {
+  otpIpAttempts.clear();
+}
+
+export interface RequestOtpResult {
+  success: boolean;
+  code?: string;
+  message: string;
+}
+
+/**
+ * Encapsulates OTP dispatch policy: checks whether the requested username is the admin,
+ * dispatches via Instagram DM, and validates actual delivery.
+ */
+export async function requestOtpForUsername(
+  usernameInput: string,
+  sendDm: (recipientId: string, message: string) => Promise<boolean>,
+  adminSenderId?: string | null
+): Promise<RequestOtpResult> {
+  const username = usernameInput.trim().replace(/^@/, '').toLowerCase();
+  const config = loadConfig();
+  const adminUser = (config.instagram.adminUsername || process.env.ADMIN_USERNAME || 'admin').toLowerCase().replace(/^@/, '');
+  const targetSenderId = adminSenderId || config.instagram.userId;
+
+  if (username && username === adminUser && targetSenderId) {
+    const code = createOtp({ role: 'admin' });
+    const message =
+      `🔐 Your Reeler Login Code:\n${code}\n\n` +
+      `Enter this 6-digit code on your PC or laptop browser to unlock your private vault (valid for 10 minutes).`;
+    const delivered = await sendDm(targetSenderId, message);
+    if (!delivered) {
+      return {
+        success: false,
+        code: 'DELIVERY_FAILED',
+        message: 'Failed to deliver login code to Instagram DM. Please check messaging permissions.',
+      };
+    }
+    return {
+      success: true,
+      message: 'Login code dispatched to your Instagram DM.',
+    };
+  }
+
+  return {
+    success: false,
+    code: 'DM_THE_BOT_DIRECTLY',
+    message: 'To receive a 6-digit login code, simply message "code" or "login" to our bot on Instagram.',
+  };
 }
 
 declare global {

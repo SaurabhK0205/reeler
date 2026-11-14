@@ -62,11 +62,21 @@ export class MetaInstagramBotService {
   private accessToken: string;
   private verifyToken: string;
   private appSecret: string;
+  public adminUserId: string | null = null;
 
-  constructor() {
+  constructor(options?: { adminUserId?: string | null }) {
     this.accessToken = process.env.META_PAGE_ACCESS_TOKEN || '';
     this.verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN || 'rea_instagram_saved_token';
     this.appSecret = process.env.META_APP_SECRET || '';
+    this.adminUserId =
+      options?.adminUserId ||
+      process.env.ADMIN_SENDER_ID ||
+      process.env.INSTAGRAM_ADMIN_SENDER_ID ||
+      null;
+  }
+
+  setAdminUserId(adminUserId: string | null): void {
+    this.adminUserId = adminUserId;
   }
 
   get isConfigured(): boolean {

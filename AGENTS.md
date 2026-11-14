@@ -77,6 +77,6 @@ Follow GRAVITAS invariants for implementation, debugging, refactoring, review, a
      2. For valid findings: implement fixes on the topic branch, verify tests (`npm test`), and push.
      3. For invalid findings or false positives: provide an evidence-based explanation and documented reasoning in the review reply.
      4. Reply to each CodeRabbit review comment thread explaining the resolution citing the commit.
-     5. Resolve every review thread using GitHub GraphQL `resolveReviewThread` after verifying the fix.
+     5. Resolve every review thread using GitHub GraphQL `resolveReviewThread` after verifying the fix, or after posting the evidence-based explanation for an invalid finding or false positive.
    - Recheck review status after every push. Only merge after CodeRabbit completes its review on the final head commit and all findings are confirmed resolved and verified.
    - **No tight polling loops**: Never run tight sleep loops polling GitHub or CodeRabbit status.
