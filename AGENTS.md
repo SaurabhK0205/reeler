@@ -22,6 +22,31 @@ Run the full 7-pass suite for feature/UI changes, and at minimum `critique` + `p
 
 ---
 
+### Design Engineering & Animation — Emil Kowalski Rules (MANDATORY)
+
+**Setup:** Skills installed in `/Users/thismac/.agents/skills/` and symlinked under `.agents/skills/`:
+- `emil-design-eng`: Core philosophy, micro-states, tactile feedback, review format
+- `animate` & `improve-animations`: Physics, spring curves, easing, spatial choreography
+- `animation-performance`: GPU acceleration, zero layout thrashing, `will-change`, `contain: layout paint`
+- `choreograph`: Staggered entrances, hierarchy, spatial consistency
+
+**Invariants for all UI & Motion work:**
+1. **The Decision Framework:**
+   - 100+ times/day actions (keyboard shortcuts, rapid feed paging): NEVER animate. Must feel instantaneous.
+   - Occasional actions (modals, drawers, dialogs): Spatial entrance (scale from 0.95-0.97 + opacity, never scale(0)).
+   - Always use `ease-out` (starts fast, feels responsive) on entering, and fast `ease-in` on exit.
+2. **Tactile Feedback Requirement:**
+   - Every interactive control (buttons, cards, chips, toggles) MUST have an `:active` state (typically `scale(0.92)` to `scale(0.97)` over ~0.08s) so users feel the interface heard and acknowledged their touch/click.
+3. **Performance & Containment:**
+   - Animate `transform` and `opacity` only. Never animate layout properties (`width`, `height`, `margin`, `padding`, `top`, `left`).
+   - When dynamic container resizing is required (e.g. adaptive video viewports), apply `contain: layout paint` to prevent document-wide reflows.
+4. **Mandatory Review Format:**
+   - When reviewing or proposing UI animation/craft changes, ALWAYS output a markdown table with `| Before | After | Why |` columns. Never use informal bullet lists.
+5. **Reduced Motion:**
+   - Every transform or spring animation MUST have a matching `@media (prefers-reduced-motion: reduce)` rule enforcing `transform: none !important;` and graceful linear opacity fallbacks.
+
+---
+
 ### Engineering Reliability — GRAVITAS Workflow (MANDATORY)
 
 **Setup (once per environment):** Install the GRAVITAS skill via `npx skills add udaysharmadev/Gravitas --skill gravitas --agent antigravity --yes` (or `--agent claude-code` for Claude Code; see [udaysharmadev/Gravitas](https://github.com/udaysharmadev/Gravitas)) and reload your coding tool. In this repository, keep local skill symlinks under `.agents/skills/` or `.claude/skills/` (both gitignored).
