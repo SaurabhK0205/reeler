@@ -126,7 +126,7 @@ app.get('*', (_req, res) => {
 const PORT = config.server.port;
 app.listen(PORT, () => {
   console.log('================================================================');
-  console.log(` 🚀 Reeler (Instagram Saved Reels Tracker) running on http://localhost:${PORT}`);
+  console.log(`Reeler (Instagram Saved Reels Tracker) running on http://localhost:${PORT}`);
   console.log('================================================================');
   console.log(`- Database:    ${config.supabase.isConfigured ? 'Supabase (' + config.supabase.url + ')' : 'In-Memory (Development/Demo Mode)'}`);
   console.log(`- Reminders:   Default interval: ${config.reminders.defaultIntervalHours} hours`);
