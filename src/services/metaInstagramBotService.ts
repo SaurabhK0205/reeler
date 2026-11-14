@@ -309,7 +309,7 @@ export class MetaInstagramBotService {
    * Handles incoming webhook event payload from Meta Graph API
    */
   async handleWebhookPayload(body: any): Promise<void> {
-    console.log('[MetaIG] 📥 Webhook received body:', JSON.stringify(body, null, 2));
+    console.log('[MetaIG] Webhook received body:', JSON.stringify(body, null, 2));
 
     // Official Meta Graph API Webhook format (handles both 'instagram' and 'page' objects)
     if ((body.object === 'instagram' || body.object === 'page') && Array.isArray(body.entry)) {
@@ -385,7 +385,7 @@ export class MetaInstagramBotService {
    * Processes incoming text/link from an Instagram user
    */
   private async processIncomingText(senderId: string, text: string, attachmentType?: string | null): Promise<void> {
-    console.log(`[MetaIG] 📩 Incoming DM from Instagram user ${senderId}: "${text}"`);
+    console.log(`[MetaIG] Incoming DM from Instagram user ${senderId}: "${text}"`);
 
     // Check for Reel or Post URL
     const mediaLink = extractInstagramShortcodeAndPath(text);

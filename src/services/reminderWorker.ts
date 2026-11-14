@@ -181,7 +181,7 @@ export class ReminderWorker {
         isTextFallbackReel && existingItem
           ? formatCanonicalInstagramUrl(shortcode, resolvedMediaType, existingItem.reel_url)
           : formatCanonicalInstagramUrl(shortcode, resolvedMediaType, reelUrl);
-      console.log(`[ReminderWorker] ${resolvedMediaType === 'post' ? '🖼️' : '🎬'} Detected shared ${resolvedMediaType} from admin: ${shortcode} (Media ID: ${mediaId})`);
+      console.log(`[ReminderWorker] Detected shared ${resolvedMediaType} from admin: ${shortcode} (Media ID: ${mediaId})`);
 
       // 1. Save to native Instagram Saved collection
       let savedOnIg = false;
@@ -189,7 +189,7 @@ export class ReminderWorker {
         const saveRes = await this.actionClient.saveMedia(mediaId);
         savedOnIg = saveRes.success && saveRes.data;
         if (savedOnIg) {
-          console.log(`[ReminderWorker] ✅ Saved ${resolvedMediaType} ${mediaId} natively on Instagram!`);
+          console.log(`[ReminderWorker] Saved ${resolvedMediaType} ${mediaId} natively on Instagram!`);
         }
       }
 
@@ -298,7 +298,7 @@ export class ReminderWorker {
       const config = loadConfig();
       const intervalHours = config.reminders.defaultIntervalHours;
 
-      console.log(`[ReminderWorker] 🔔 Found ${allDueReels.length} Reel(s) due for reminder (dispatching batch of ${dueReels.length}).`);
+      console.log(`[ReminderWorker] Found ${allDueReels.length} Reel(s) due for reminder (dispatching batch of ${dueReels.length}).`);
 
       for (const reel of dueReels) {
         const reminderText = formatWatchLaterReminderMessage(reel);
@@ -307,15 +307,15 @@ export class ReminderWorker {
 
         try {
           if (reel.instagram_sender_id && this.metaBot.isConfigured) {
-            console.log(`[ReminderWorker] 🔔 Dispatching Instagram DM reminder to ${reel.instagram_sender_id}...`);
+            console.log(`[ReminderWorker] Dispatching Instagram DM reminder to ${reel.instagram_sender_id}...`);
             delivered = await this.metaBot.sendDirectMessage(reel.instagram_sender_id, reminderText);
           } else if (!reel.instagram_sender_id && this.adminUserId && config.instagram.isConfigured) {
             // Supported delivery fallback for legacy or unattributed sender reels
-            console.log(`[ReminderWorker] 🔔 Dispatching fallback reminder to admin (${this.adminUserId})...`);
+            console.log(`[ReminderWorker] Dispatching fallback reminder to admin (${this.adminUserId})...`);
             const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reminderText);
             delivered = sendResult.success && sendResult.data === true;
           } else {
-            console.warn(`[ReminderWorker] ⚠️ No active delivery channel or recipient found for reel ${reel.shortcode}.`);
+            console.warn(`[ReminderWorker] No active delivery channel or recipient found for reel ${reel.shortcode}.`);
           }
         } catch (err: any) {
           console.error(`[ReminderWorker] Delivery error for reel ${reel.shortcode}:`, err.message || err);

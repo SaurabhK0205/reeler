@@ -16,19 +16,19 @@ async function main() {
 
   const resolved = path.resolve(process.cwd(), filePath);
   if (!fs.existsSync(resolved)) {
-    console.error(`❌ File not found at: ${resolved}`);
+    console.error(`File not found at: ${resolved}`);
     process.exit(1);
   }
 
   console.log('================================================================');
-  console.log(' 📥 Reeler Instagram Archive Importer');
+  console.log('Reeler Instagram Archive Importer');
   console.log('================================================================');
   console.log(`Reading archive: ${resolved}...`);
 
   const fileContent = fs.readFileSync(resolved, 'utf-8');
   const result = await ArchiveImportService.importArchive(fileContent);
 
-  console.log('\n✅ Import Completed!');
+  console.log('\nImport Completed!');
   console.log(`- Total Items Scanned:     ${result.totalProcessed}`);
   console.log(`- Newly Imported Reels:    ${result.reelsImported}`);
   console.log(`- Already in Library:      ${result.alreadyPresent}`);
@@ -38,10 +38,10 @@ async function main() {
   console.log(`- Skipped / Non-reels:     ${result.skipped}`);
 
   if (result.errors.length > 0) {
-    console.log('\n⚠️ Errors encountered during import:');
+    console.log('\nErrors encountered during import:');
     result.errors.forEach(e => console.log(`  • ${e}`));
     if (result.reelsImported === 0 && result.alreadyPresent === 0) {
-      console.error('\n❌ Import failed: No reels could be imported.');
+      console.error('\nImport failed: No reels could be imported.');
       process.exit(1);
     }
   }

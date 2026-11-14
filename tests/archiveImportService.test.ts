@@ -717,10 +717,10 @@ async function runTests() {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 
-  console.log('✅ All ArchiveImportService tests passed successfully!');
+  console.log('All ArchiveImportService tests passed successfully!');
 }
 
 runTests().catch((err) => {
-  console.error('❌ Test failed:', err);
+  console.error('Test failed:', err);
   process.exit(1);
 });
