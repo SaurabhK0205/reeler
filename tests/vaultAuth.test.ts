@@ -179,6 +179,101 @@ test('Repository - enforces sender isolation when querying reels', async () => {
   assert.ok(adminCodes.includes('UserTwoReel01'), 'Admin can see User 2 reel');
 });
 
+test('Repository - scopes stats, creators, and watch status to senderId for strict data isolation and deletion', async () => {
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+
+  const creatorA = await Repository.upsertCreator({
+    instagram_user_id: 'creator_iso_a',
+    username: 'creator_iso_a',
+  });
+  const creatorB = await Repository.upsertCreator({
+    instagram_user_id: 'creator_iso_b',
+    username: 'creator_iso_b',
+  });
+
+  const now = new Date().toISOString();
+
+  const reel1 = await Repository.upsertSavedReel({
+    instagram_media_id: 'media_scope_111',
+    creator_id: creatorA.id,
+    shortcode: 'UserOneScoped01',
+    reel_url: 'https://www.instagram.com/reel/UserOneScoped01/',
+    instagram_sender_id: 'user_scope_1',
+    is_saved_on_instagram: false,
+    taken_at: now,
+    first_detected_at: now,
+    save_order_rank: 1,
+  });
+
+  const reel2 = await Repository.upsertSavedReel({
+    instagram_media_id: 'media_scope_222',
+    creator_id: creatorB.id,
+    shortcode: 'UserTwoScoped01',
+    reel_url: 'https://www.instagram.com/reel/UserTwoScoped01/',
+    instagram_sender_id: 'user_scope_2',
+    is_saved_on_instagram: true,
+    taken_at: now,
+    first_detected_at: now,
+    save_order_rank: 2,
+  });
+
+  // 1. User 1 stats: should show total 1, 0 savedOnInstagram, 1 botSent, 1 creator (creatorA)
+  const user1Stats = await Repository.getStats('user_scope_1');
+  assert.equal(user1Stats.totalReels, 1);
+  assert.equal(user1Stats.savedOnInstagramCount, 0);
+  assert.equal(user1Stats.botSentCount, 1);
+  assert.equal(user1Stats.totalCreators, 1);
+  assert.equal(user1Stats.topCreators.length, 1);
+  assert.equal(user1Stats.topCreators[0].username, 'creator_iso_a');
+
+  // 2. User 1 creators: should return only creatorA
+  const user1Creators = await Repository.getCreators('user_scope_1');
+  assert.equal(user1Creators.length, 1);
+  assert.equal(user1Creators[0].username, 'creator_iso_a');
+
+  // 3. User 1 queryCreators: should return only creatorA
+  const user1Queried = await Repository.queryCreators({ instagramSenderId: 'user_scope_1' });
+  assert.equal(user1Queried.creators.length, 1);
+  assert.equal(user1Queried.creators[0].username, 'creator_iso_a');
+
+  // 4. Admin stats: should see all 2 reels and both creators
+  const adminStats = await Repository.getStats('admin');
+  assert.equal(adminStats.totalReels, 2);
+  assert.equal(adminStats.totalCreators, 2);
+
+  // 5. Watch status update isolation: user 2 cannot update user 1 reel
+  const crossUpdate = await Repository.updateWatchStatus(reel1.id, 'watched', 'user_scope_2');
+  assert.equal(crossUpdate, null, 'Updating another user reel must return null');
+
+  const validUpdate = await Repository.updateWatchStatus(reel1.id, 'watched', 'user_scope_1');
+  assert.ok(validUpdate, 'Updating own reel must succeed');
+  assert.equal(validUpdate.watch_status, 'watched');
+
+  // 6. Strict Deletion: deleting user 1 data purges stats and creators to 0
+  const deletedCount = await Repository.deleteUserDataForSender('user_scope_1');
+  assert.equal(deletedCount, 1);
+
+  const postDeletionStats = await Repository.getStats('user_scope_1');
+  assert.equal(postDeletionStats.totalReels, 0);
+  assert.equal(postDeletionStats.totalCreators, 0);
+  assert.equal(postDeletionStats.savedOnInstagramCount, 0);
+  assert.equal(postDeletionStats.botSentCount, 0);
+  assert.equal(postDeletionStats.topCreators.length, 0);
+
+  const postDeletionCreators = await Repository.getCreators('user_scope_1');
+  assert.equal(postDeletionCreators.length, 0);
+
+  const postDeletionQuery = await Repository.queryCreators({ instagramSenderId: 'user_scope_1' });
+  assert.equal(postDeletionQuery.creators.length, 0);
+  assert.equal(postDeletionQuery.totalCount, 0);
+
+  // User 2's data remains untouched
+  const user2Stats = await Repository.getStats('user_scope_2');
+  assert.equal(user2Stats.totalReels, 1);
+  assert.equal(user2Stats.savedOnInstagramCount, 1);
+});
+
 test('VaultAuthService - OTP generation, verification, and single-use invalidation', () => {
   clearOtpsForTesting();
 

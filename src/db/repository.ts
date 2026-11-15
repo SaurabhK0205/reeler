@@ -456,16 +456,23 @@ class InMemoryStore {
     return { reels: paged, total, page, limit };
   }
 
-  async getCreators(): Promise<Creator[]> {
+  async getCreators(senderId?: string): Promise<Creator[]> {
+    const trimmedSender = String(senderId || '').trim();
+    const activeReels = trimmedSender && trimmedSender !== 'admin'
+      ? Array.from(this.reels.values()).filter(r => r.instagram_sender_id === trimmedSender)
+      : Array.from(this.reels.values());
+
     const counts = new Map<string, number>();
-    for (const r of this.reels.values()) {
+    for (const r of activeReels) {
       counts.set(r.creator_id, (counts.get(r.creator_id) || 0) + 1);
     }
 
-    const list = Array.from(this.creators.values()).map(c => ({
-      ...c,
-      saved_count: counts.get(c.id) || 0
-    }));
+    const list = Array.from(this.creators.values())
+      .filter(c => counts.has(c.id))
+      .map(c => ({
+        ...c,
+        saved_count: counts.get(c.id) || 0
+      }));
 
     list.sort((a, b) => (b.saved_count || 0) - (a.saved_count || 0) || a.username.localeCompare(b.username));
     return list;
@@ -474,8 +481,12 @@ class InMemoryStore {
   /**
    * Computes library totals, weekly/monthly save counts via `effective_saved_at`, and top creators from memory.
    */
-  async getStats(): Promise<LibraryStats> {
-    const allReels = Array.from(this.reels.values());
+  async getStats(senderId?: string): Promise<LibraryStats> {
+    const trimmedSender = String(senderId || '').trim();
+    const allReels = trimmedSender && trimmedSender !== 'admin'
+      ? Array.from(this.reels.values()).filter(r => r.instagram_sender_id === trimmedSender)
+      : Array.from(this.reels.values());
+
     const now = Date.now();
     const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
     const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
@@ -512,7 +523,7 @@ class InMemoryStore {
       else if (r.watch_status === 'watch_later') watchLaterCount++;
     }
 
-    const creators = await this.getCreators();
+    const creators = await this.getCreators(senderId);
     const topCreators = creators.slice(0, 5).map(c => ({
       id: c.id,
       username: c.username,
@@ -527,7 +538,7 @@ class InMemoryStore {
       botSentCount,
       reelsCount,
       postsCount,
-      totalCreators: this.creators.size,
+      totalCreators: creators.length,
       savedThisWeek,
       savedThisMonth,
       unwatchedCount,
@@ -537,9 +548,13 @@ class InMemoryStore {
     };
   }
 
-  async updateWatchStatus(id: string, status: WatchStatus): Promise<SavedReel | null> {
+  async updateWatchStatus(id: string, status: WatchStatus, senderId?: string): Promise<SavedReel | null> {
     const reel = this.reels.get(id);
     if (!reel) return null;
+    const trimmedSender = String(senderId || '').trim();
+    if (trimmedSender && trimmedSender !== 'admin' && reel.instagram_sender_id !== trimmedSender) {
+      return null;
+    }
     reel.watch_status = status;
     if (status !== 'watch_later') {
       reel.next_reminder_at = null;
@@ -1575,10 +1590,82 @@ export class Repository {
   /**
    * Fetches all creators across PostgREST 1000-row pages with saved reel counts sorted descending,
    * coalescing concurrent initial scans (`/api/stats` + `/api/creators`) and caching briefly between writes.
+   * When `senderId` is provided (non-admin), filters strictly to creators attributed to that sender's reels.
    */
-  static async getCreators(): Promise<Creator[]> {
+  static async getCreators(senderId?: string): Promise<Creator[]> {
+    const trimmedSender = String(senderId || '').trim();
     if (!isSupabaseConfigured()) {
-      return memoryStore.getCreators();
+      return memoryStore.getCreators(trimmedSender || undefined);
+    }
+
+    if (trimmedSender && trimmedSender !== 'admin') {
+      const supabase = getSupabase();
+      const counts = new Map<string, number>();
+      const PAGE_SIZE = 1000;
+      let from = 0;
+
+      while (true) {
+        const { data: pageRows, error: reelsErr } = await supabase
+          .from('saved_reels')
+          .select('creator_id')
+          .eq('instagram_sender_id', trimmedSender)
+          .order('id', { ascending: true })
+          .range(from, from + PAGE_SIZE - 1);
+
+        if (reelsErr) {
+          throw new Error(`Supabase getCreators for sender failed: ${reelsErr.message}`);
+        }
+
+        if (!pageRows || pageRows.length === 0) {
+          break;
+        }
+
+        for (const row of pageRows) {
+          if (row.creator_id) {
+            counts.set(row.creator_id, (counts.get(row.creator_id) || 0) + 1);
+          }
+        }
+
+        if (pageRows.length < PAGE_SIZE) {
+          break;
+        }
+        from += PAGE_SIZE;
+      }
+
+      const creatorIds = Array.from(counts.keys());
+      if (creatorIds.length === 0) return [];
+
+      const BATCH_SIZE = 200;
+      const creatorRows: any[] = [];
+      for (let i = 0; i < creatorIds.length; i += BATCH_SIZE) {
+        const batchIds = creatorIds.slice(i, i + BATCH_SIZE);
+        const { data: batchData, error: creatorErr } = await supabase
+          .from('creators')
+          .select('*')
+          .in('id', batchIds);
+
+        if (creatorErr) {
+          throw new Error(`Supabase getCreators details for sender failed: ${creatorErr.message}`);
+        }
+
+        if (batchData) {
+          creatorRows.push(...batchData);
+        }
+      }
+
+      const result: Creator[] = creatorRows.map((c: any) => ({
+        id: c.id,
+        instagram_user_id: c.instagram_user_id,
+        username: c.username,
+        display_name: c.display_name,
+        profile_picture_url: c.profile_picture_url,
+        created_at: c.created_at,
+        updated_at: c.updated_at,
+        saved_count: counts.get(c.id) || 0,
+      }));
+
+      result.sort((a, b) => (b.saved_count || 0) - (a.saved_count || 0) || a.username.localeCompare(b.username));
+      return result;
     }
 
     const now = Date.now();
@@ -1681,7 +1768,7 @@ export class Repository {
    * download thousands of unused creator rows.
    */
   static async queryCreators(opts: CreatorQueryOptions = {}): Promise<CreatorQueryResult> {
-    const all = await Repository.getCreators();
+    const all = await Repository.getCreators(opts.instagramSenderId);
     const totalCount = all.length;
 
     const rawQ = String(opts.q || '').trim().toLowerCase();
@@ -1716,13 +1803,16 @@ export class Repository {
 
   /**
    * Retrieves a creator's saved reels and posts ordered chronologically by `effective_saved_at` descending.
+   * When `instagramSenderId` is provided (non-admin), filters items strictly to that sender.
    */
   static async getReelsByCreatorUsername(
     username: string,
-    options?: { mediaType?: SavedMediaType | 'all' }
+    options?: { mediaType?: SavedMediaType | 'all'; instagramSenderId?: string }
   ): Promise<{ creator: Creator | null; reels: SavedReel[]; totalReelsCount: number; totalPostsCount: number }> {
     const cleanUsername = username.replace(/^@/, '').trim().toLowerCase();
     const mediaFilter = options?.mediaType ?? 'all';
+    const trimmedSender = String(options?.instagramSenderId || '').trim();
+    const isScoped = Boolean(trimmedSender && trimmedSender !== 'admin');
     if (!cleanUsername) return { creator: null, reels: [], totalReelsCount: 0, totalPostsCount: 0 };
 
     const sortCreatorItems = (items: SavedReel[]): SavedReel[] =>
@@ -1758,7 +1848,7 @@ export class Repository {
 
       const allItems = sortCreatorItems(
         Array.from(memoryStore.reels.values())
-          .filter(r => creatorIds.has(r.creator_id))
+          .filter(r => creatorIds.has(r.creator_id) && (!isScoped || r.instagram_sender_id === trimmedSender))
           .map(r => ({
             ...r,
             media_type: classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }),
@@ -1808,12 +1898,18 @@ export class Repository {
 
     const creatorIds = creators.map(c => c.id);
 
+    const applySenderScope = (query: any) => {
+      return isScoped ? query.eq('instagram_sender_id', trimmedSender) : query;
+    };
+
     const buildTypeQuery = (type: SavedMediaType) =>
-      supabase
-        .from('saved_reels')
-        .select('*, creator:creators(*)')
-        .in('creator_id', creatorIds)
-        .eq('media_type', type)
+      applySenderScope(
+        supabase
+          .from('saved_reels')
+          .select('*, creator:creators(*)')
+          .in('creator_id', creatorIds)
+          .eq('media_type', type)
+      )
         .order('effective_saved_at', { ascending: false })
         .order('save_order_rank', { ascending: true })
         .order('created_at', { ascending: false })
@@ -1821,8 +1917,8 @@ export class Repository {
         .limit(25);
 
     const [reelsCountRes, postsCountRes, reelsRowsRes, postsRowsRes] = await Promise.all([
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).in('creator_id', creatorIds).eq('media_type', 'reel'),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).in('creator_id', creatorIds).eq('media_type', 'post'),
+      applySenderScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).in('creator_id', creatorIds).eq('media_type', 'reel')),
+      applySenderScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).in('creator_id', creatorIds).eq('media_type', 'post')),
       mediaFilter === 'post' ? Promise.resolve({ data: [], error: null }) : buildTypeQuery('reel'),
       mediaFilter === 'reel' ? Promise.resolve({ data: [], error: null }) : buildTypeQuery('post'),
     ]);
@@ -1854,16 +1950,23 @@ export class Repository {
 
   /**
    * Computes aggregate library counts, weekly/monthly `effective_saved_at` activity, and top creators.
+   * When `senderId` is provided (non-admin), scopes all counts and creator rankings strictly to that sender.
    */
-  static async getStats(): Promise<LibraryStats> {
+  static async getStats(senderId?: string): Promise<LibraryStats> {
+    const trimmedSender = String(senderId || '').trim();
     if (!isSupabaseConfigured()) {
-      return memoryStore.getStats();
+      return memoryStore.getStats(trimmedSender || undefined);
     }
 
+    const isScoped = Boolean(trimmedSender && trimmedSender !== 'admin');
     const supabase = getSupabase();
     const now = new Date();
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    const applyScope = (query: any) => {
+      return isScoped ? query.eq('instagram_sender_id', trimmedSender) : query;
+    };
 
     const [
       totalReelsRes,
@@ -1878,17 +1981,17 @@ export class Repository {
       watchedRes,
       watchLaterRes,
     ] = await Promise.all([
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('is_saved_on_instagram', true),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('is_saved_on_instagram', false),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'reel'),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'post'),
-      Repository.getCreators(),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('effective_saved_at', sevenDaysAgo),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('effective_saved_at', thirtyDaysAgo),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'unwatched'),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'watched'),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'watch_later'),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true })),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('is_saved_on_instagram', true)),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('is_saved_on_instagram', false)),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'reel')),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'post')),
+      Repository.getCreators(trimmedSender || undefined),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('effective_saved_at', sevenDaysAgo)),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('effective_saved_at', thirtyDaysAgo)),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'unwatched')),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'watched')),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'watch_later')),
     ]);
 
     const topCreators = creatorsRes.slice(0, 5).map(c => ({
@@ -1925,9 +2028,10 @@ export class Repository {
     }
   }
 
-  static async updateWatchStatus(id: string, status: WatchStatus): Promise<SavedReel | null> {
+  static async updateWatchStatus(id: string, status: WatchStatus, senderId?: string): Promise<SavedReel | null> {
+    const trimmedSender = String(senderId || '').trim();
     if (!isSupabaseConfigured()) {
-      return memoryStore.updateWatchStatus(id, status);
+      return memoryStore.updateWatchStatus(id, status, trimmedSender || undefined);
     }
 
     const supabase = getSupabase();
@@ -1940,18 +2044,20 @@ export class Repository {
       updatePayload.awaiting_reminder_choice_until = null;
     }
 
-    const { data, error } = await supabase
-      .from('saved_reels')
-      .update(updatePayload)
-      .eq('id', id)
-      .select('*, creator:creators(*)')
-      .single();
-
-    if (error || !data) {
-      throw new Error(`Failed to update watch status: ${error?.message}`);
+    let query = supabase.from('saved_reels').update(updatePayload).eq('id', id);
+    if (trimmedSender && trimmedSender !== 'admin') {
+      query = query.eq('instagram_sender_id', trimmedSender);
     }
 
-    return data as SavedReel;
+    const { data, error } = await query
+      .select('*, creator:creators(*)')
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to update watch status: ${error.message}`);
+    }
+
+    return (data as SavedReel) || null;
   }
 
   /**

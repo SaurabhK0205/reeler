@@ -623,9 +623,13 @@ export class MetaInstagramBotService {
     // 3. Creator reels & posts search (e.g. "@_docthor_", "reels by @_docthor_", "posts by @the_political_compass")
     const creatorQuery = extractCreatorQueryWithFilter(text);
     if (creatorQuery) {
+      const isSenderAdmin = Boolean(this.adminUserId && senderId === this.adminUserId);
       const { creator, reels, totalReelsCount, totalPostsCount } = await Repository.getReelsByCreatorUsername(
         creatorQuery.username,
-        { mediaType: creatorQuery.mediaFilter }
+        {
+          mediaType: creatorQuery.mediaFilter,
+          instagramSenderId: isSenderAdmin ? undefined : senderId,
+        }
       );
       const cleanHandle = creatorQuery.username.replace(/^@/, '').trim();
       const resolvedUsername = creator?.username || cleanHandle;

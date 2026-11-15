@@ -38,3 +38,13 @@ test('Compliance Pages - verify data-deletion.html exists and provides clear ins
   assert.ok(content.includes('delete my data'), 'Must mention permanent deletion command');
   assert.ok(content.includes('saurabhk0205@gmail.com'), 'Must provide contact email for manual deletion');
 });
+
+test('Compliance Pages - verify index.html links to privacy, terms, and data-deletion', () => {
+  const filePath = path.join(publicDir, 'index.html');
+  assert.ok(fs.existsSync(filePath), 'index.html must exist');
+
+  const content = fs.readFileSync(filePath, 'utf8');
+  assert.ok(content.includes('href="/privacy"'), 'index.html must link to /privacy');
+  assert.ok(content.includes('href="/terms"'), 'index.html must link to /terms');
+  assert.ok(content.includes('href="/data-deletion"'), 'index.html must link to /data-deletion');
+});
