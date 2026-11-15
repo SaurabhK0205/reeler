@@ -2512,15 +2512,36 @@ test('MetaInstagramBotService - "delete my data" permanently erases sender recor
   const lastReelAfter = await Repository.getLastReelForInstagramSender(purgeSenderId);
   assert.strictEqual(lastReelAfter, null, 'Reel must be permanently deleted');
 
-  // Verify deletion barrier prevents in-flight write race condition
-  const inFlightResult = await Repository.upsertSavedReel({
-    instagram_media_id: 'shortcode_CpurgeRaced',
-    shortcode: 'CpurgeRaced',
-    reel_url: 'https://www.instagram.com/reel/CpurgeRaced/',
-    instagram_sender_id: purgeSenderId,
-    watch_status: 'watch_later',
+  // Verify deletion barrier throws SenderDeletionBarrierError
+  const { SenderDeletionBarrierError } = await import('../src/db/repository.ts');
+  await assert.rejects(
+    () =>
+      Repository.upsertSavedReel({
+        instagram_media_id: 'shortcode_CpurgeRaced',
+        shortcode: 'CpurgeRaced',
+        reel_url: 'https://www.instagram.com/reel/CpurgeRaced/',
+        instagram_sender_id: purgeSenderId,
+        watch_status: 'watch_later',
+      }),
+    SenderDeletionBarrierError
+  );
+
+  // Verify bot sends helpful retry notification if user shares a reel during barrier
+  await service.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: purgeSenderId },
+            message: { text: 'https://www.instagram.com/reel/CpurgeRaced/' },
+          },
+        ],
+      },
+    ],
   });
-  assert.strictEqual(inFlightResult, null, 'In-flight write must be rejected during deletion barrier window');
+  assert.strictEqual(sentMessages.length, 2);
+  assert.ok(sentMessages[1].text.includes('Please wait 60 seconds'));
 });
 
 test('MetaInstagramBotService - "delete my data" sends error reply when deletion throws', async () => {

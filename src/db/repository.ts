@@ -30,6 +30,20 @@ export class SenderReminderConflictError extends Error {
 }
 
 /**
+ * Error thrown when a reel write is attempted for a sender whose account data was recently deleted,
+ * preventing race-condition re-creation from in-flight webhook requests.
+ */
+export class SenderDeletionBarrierError extends Error {
+  readonly senderId: string;
+
+  constructor(senderId: string) {
+    super(`Cannot save reel for sender ${senderId} during active deletion barrier window`);
+    this.name = 'SenderDeletionBarrierError';
+    this.senderId = senderId;
+  }
+}
+
+/**
  * Escapes and quotes a literal string value for inclusion inside a PostgREST filter expression.
  */
 function quotePostgrestLiteral(value: string): string {
@@ -795,7 +809,7 @@ export class Repository {
     const sender = String(data.instagram_sender_id || '').trim();
     if (sender && Repository.isSenderInRecentDeletion(sender)) {
       console.warn(`[Repository] Rejecting reel upsert for sender ${sender} due to active deletion window`);
-      return null;
+      throw new SenderDeletionBarrierError(sender);
     }
 
     Repository.invalidateCreatorsCache();

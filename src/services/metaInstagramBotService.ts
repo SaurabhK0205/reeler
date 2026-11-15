@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { generateUserVaultKey, getAdminVaultKey, createOtp } from './vaultAuthService.ts';
 import { loadConfig } from '../config.ts';
-import { Repository, SenderReminderConflictError } from '../db/repository.ts';
+import { Repository, SenderReminderConflictError, SenderDeletionBarrierError } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
 import { parseDuration, formatTargetTime } from '../utils/duration.ts';
 import { extractCreatorQueryWithFilter } from '../utils/creatorQuery.ts';
@@ -508,6 +508,16 @@ export class MetaInstagramBotService {
             `[MetaIG] Concurrent Watch Later conflict for ${shortcode} from sender ${senderId}; existing reminder preserved.`
           );
           await this.sendDirectMessage(senderId, formatSenderConflictRejectionMessage(mediaType));
+          return;
+        }
+        if (error instanceof SenderDeletionBarrierError) {
+          console.warn(
+            `[MetaIG] Reel save rejected for sender ${senderId}: deletion barrier active.`
+          );
+          await this.sendDirectMessage(
+            senderId,
+            `⏳ Your account data was recently deleted. Please wait 60 seconds before sharing new reels.`
+          );
           return;
         }
         throw error;
