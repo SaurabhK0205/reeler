@@ -113,6 +113,17 @@ app.use('/api', apiRouter);
 const publicDir = path.join(__dirname, '../public');
 app.use(express.static(publicDir));
 
+// Explicit compliance pages for Meta App Review and platform policies
+app.get(['/privacy', '/privacy.html'], (_req, res) => {
+  res.sendFile(path.join(publicDir, 'privacy.html'));
+});
+app.get(['/terms', '/terms.html'], (_req, res) => {
+  res.sendFile(path.join(publicDir, 'terms.html'));
+});
+app.get(['/data-deletion', '/data-deletion.html'], (_req, res) => {
+  res.sendFile(path.join(publicDir, 'data-deletion.html'));
+});
+
 // Avoid falling through to the 19 KB HTML SPA shell on browser favicon probes
 app.get('/favicon.ico', (_req, res) => {
   res.status(204).end();
