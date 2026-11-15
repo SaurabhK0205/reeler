@@ -1609,6 +1609,7 @@ export class Repository {
           .from('saved_reels')
           .select('creator_id')
           .eq('instagram_sender_id', trimmedSender)
+          .order('id', { ascending: true })
           .range(from, from + PAGE_SIZE - 1);
 
         if (reelsErr) {
