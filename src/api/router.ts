@@ -298,7 +298,8 @@ apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
       return;
     }
 
-    const updated = await Repository.updateWatchStatus(id, status as WatchStatus);
+    const senderId = req.vaultUser?.role === 'admin' ? undefined : req.vaultUser?.senderId;
+    const updated = await Repository.updateWatchStatus(id, status as WatchStatus, senderId);
     if (!updated) {
       res.status(404).json({ error: 'Reel not found' });
       return;

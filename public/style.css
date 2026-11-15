@@ -3855,3 +3855,65 @@ kbd {
   margin: var(--space-1) 0 0 0;
   min-height: 16px;
 }
+
+/* Vault Gate & Site Compliance Links */
+.vault-gate-footer-links {
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px 12px;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.vault-footer-link,
+.footer-link,
+.shortcuts-link {
+  color: var(--text-tertiary);
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+.vault-footer-link:hover,
+.footer-link:hover,
+.shortcuts-link:hover {
+  color: var(--text-primary);
+  text-decoration: underline;
+}
+
+.vault-footer-sep,
+.footer-sep {
+  color: var(--text-tertiary);
+  opacity: 0.5;
+  user-select: none;
+}
+
+.app-site-footer {
+  margin-top: 48px;
+  padding: 24px 0 32px 0;
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  text-align: center;
+}
+
+.site-footer-inner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px 12px;
+}
+
+.footer-brand {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.footer-copy {
+  color: var(--text-tertiary);
+}
