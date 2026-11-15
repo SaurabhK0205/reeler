@@ -544,11 +544,19 @@ export class MetaInstagramBotService {
     // 1b. User data deletion command (e.g. "delete my data", "delete account", "purge data", "erase my data")
     const normalizedText = text.trim().toLowerCase();
     if (['delete my data', 'delete account', 'purge data', 'purge my data', 'erase my data', 'delete all my data'].includes(normalizedText)) {
-      const deletedCount = await Repository.deleteUserDataForSender(senderId);
-      const reply =
-        `🗑️ Your data deletion request has been processed.\n\n` +
-        `Permanently removed ${deletedCount} saved item(s) and cleared your user records from our systems.`;
-      await this.sendDirectMessage(senderId, reply);
+      try {
+        const deletedCount = await Repository.deleteUserDataForSender(senderId);
+        const reply =
+          `🗑️ Your data deletion request has been processed.\n\n` +
+          `Permanently removed ${deletedCount} saved item(s) and cleared your user records from our systems.`;
+        await this.sendDirectMessage(senderId, reply);
+      } catch (error) {
+        console.error(`[MetaIG] Data deletion failed for sender ${senderId}:`, error);
+        await this.sendDirectMessage(
+          senderId,
+          `⚠️ We encountered an issue processing your data deletion request. Please try again or email saurabhk0205@gmail.com for manual assistance.`
+        );
+      }
       return;
     }
 

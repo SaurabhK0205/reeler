@@ -792,6 +792,12 @@ export class Repository {
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
   }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean }): Promise<SavedReel | null> {
+    const sender = String(data.instagram_sender_id || '').trim();
+    if (sender && Repository.isSenderInRecentDeletion(sender)) {
+      console.warn(`[Repository] Rejecting reel upsert for sender ${sender} due to active deletion window`);
+      return null;
+    }
+
     Repository.invalidateCreatorsCache();
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertSavedReel(data, options);
@@ -2269,6 +2275,31 @@ export class Repository {
     };
   }
 
+  private static senderDeletionTimestamps = new Map<string, number>();
+
+  static recordSenderDeletion(senderId: string): void {
+    const trimmed = String(senderId || '').trim();
+    if (trimmed) {
+      Repository.senderDeletionTimestamps.set(trimmed, Date.now());
+    }
+  }
+
+  static isSenderInRecentDeletion(senderId: string, windowMs = 60_000): boolean {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) return false;
+    const ts = Repository.senderDeletionTimestamps.get(trimmed);
+    if (!ts) return false;
+    if (Date.now() - ts > windowMs) {
+      Repository.senderDeletionTimestamps.delete(trimmed);
+      return false;
+    }
+    return true;
+  }
+
+  static resetDeletionTimestampsForTesting(): void {
+    Repository.senderDeletionTimestamps.clear();
+  }
+
   /**
    * Permanently deletes all saved reels and data associated with an Instagram sender ID
    * for compliance with Meta User Data Deletion requests.
@@ -2276,6 +2307,7 @@ export class Repository {
   static async deleteUserDataForSender(senderId: string): Promise<number> {
     const trimmed = String(senderId || '').trim();
     if (!trimmed) return 0;
+    Repository.recordSenderDeletion(trimmed);
 
     if (!isSupabaseConfigured()) {
       let count = 0;

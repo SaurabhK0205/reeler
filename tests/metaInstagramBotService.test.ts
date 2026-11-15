@@ -2511,4 +2511,51 @@ test('MetaInstagramBotService - "delete my data" permanently erases sender recor
   // Verify reel was eradicated
   const lastReelAfter = await Repository.getLastReelForInstagramSender(purgeSenderId);
   assert.strictEqual(lastReelAfter, null, 'Reel must be permanently deleted');
+
+  // Verify deletion barrier prevents in-flight write race condition
+  const inFlightResult = await Repository.upsertSavedReel({
+    instagram_media_id: 'shortcode_CpurgeRaced',
+    shortcode: 'CpurgeRaced',
+    reel_url: 'https://www.instagram.com/reel/CpurgeRaced/',
+    instagram_sender_id: purgeSenderId,
+    watch_status: 'watch_later',
+  });
+  assert.strictEqual(inFlightResult, null, 'In-flight write must be rejected during deletion barrier window');
+});
+
+test('MetaInstagramBotService - "delete my data" sends error reply when deletion throws', async () => {
+  const { Repository } = await import('../src/db/repository.ts');
+  const failingSenderId = 'failing_deletion_sender_999';
+  const service = new MetaInstagramBotService();
+  const sentMessages: { recipientId: string; text: string }[] = [];
+  (service as any).sendDirectMessage = async (recipientId: string, text: string) => {
+    sentMessages.push({ recipientId, text });
+    return true;
+  };
+
+  const originalDelete = Repository.deleteUserDataForSender;
+  try {
+    Repository.deleteUserDataForSender = async () => {
+      throw new Error('Simulated database network failure');
+    };
+
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: failingSenderId },
+              message: { text: 'delete my data' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('encountered an issue processing your data deletion request'));
+  } finally {
+    Repository.deleteUserDataForSender = originalDelete;
+  }
 });
