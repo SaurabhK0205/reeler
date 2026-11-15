@@ -7,8 +7,8 @@ app = 'reeler-bot'
 primary_region = 'sin'
 
 [env]
-  TZ = 'Asia/Kolkata'
-  APP_TIMEZONE = 'Asia/Kolkata'
+  TZ = 'UTC'
+  APP_TIMEZONE = 'UTC'
 
 [build]
 [http_service]

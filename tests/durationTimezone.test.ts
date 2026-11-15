@@ -1,49 +1,175 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseDuration, formatTargetTime } from '../src/utils/duration.ts';
+import { resolveTimeZone, getTimeZoneSummary, getTimeZoneAbbreviation } from '../src/utils/timezone.ts';
+import { Repository } from '../src/db/repository.ts';
+import { MetaInstagramBotService } from '../src/services/metaInstagramBotService.ts';
 
-test('Duration & Timezone - formats target times in Asia/Kolkata (IST)', () => {
-  const originalTZ = process.env.TZ;
-  try {
-    process.env.TZ = 'Asia/Kolkata';
+test('Timezone Resolution - resolves standard abbreviations, cities, and offsets', () => {
+  assert.strictEqual(resolveTimeZone('ist'), 'Asia/Kolkata');
+  assert.strictEqual(resolveTimeZone('EST'), 'America/New_York');
+  assert.strictEqual(resolveTimeZone('edt'), 'America/New_York');
+  assert.strictEqual(resolveTimeZone('pst'), 'America/Los_Angeles');
+  assert.strictEqual(resolveTimeZone('pdt'), 'America/Los_Angeles');
+  assert.strictEqual(resolveTimeZone('cst'), 'America/Chicago');
+  assert.strictEqual(resolveTimeZone('mst'), 'America/Denver');
+  assert.strictEqual(resolveTimeZone('bst'), 'Europe/London');
+  assert.strictEqual(resolveTimeZone('gmt'), 'UTC');
+  assert.strictEqual(resolveTimeZone('utc'), 'UTC');
+  assert.strictEqual(resolveTimeZone('jst'), 'Asia/Tokyo');
+  assert.strictEqual(resolveTimeZone('aest'), 'Australia/Sydney');
 
-    // 16:29:49 UTC is 21:59:49 IST (9:59 PM)
-    const now = new Date('2026-11-15T16:29:49.000Z');
-    // 30 seconds later: 16:30:19 UTC is 22:00:19 IST (10:00 PM)
-    const target30s = new Date('2026-11-15T16:30:19.000Z');
+  // Cities
+  assert.strictEqual(resolveTimeZone('London'), 'Europe/London');
+  assert.strictEqual(resolveTimeZone('New York'), 'America/New_York');
+  assert.strictEqual(resolveTimeZone('nyc'), 'America/New_York');
+  assert.strictEqual(resolveTimeZone('Los Angeles'), 'America/Los_Angeles');
+  assert.strictEqual(resolveTimeZone('San Francisco'), 'America/Los_Angeles');
+  assert.strictEqual(resolveTimeZone('Chicago'), 'America/Chicago');
+  assert.strictEqual(resolveTimeZone('Tokyo'), 'Asia/Tokyo');
+  assert.strictEqual(resolveTimeZone('Sydney'), 'Australia/Sydney');
+  assert.strictEqual(resolveTimeZone('Paris'), 'Europe/Paris');
+  assert.strictEqual(resolveTimeZone('Berlin'), 'Europe/Berlin');
+  assert.strictEqual(resolveTimeZone('Mumbai'), 'Asia/Kolkata');
+  assert.strictEqual(resolveTimeZone('Delhi'), 'Asia/Kolkata');
+  assert.strictEqual(resolveTimeZone('Dubai'), 'Asia/Dubai');
 
-    const formatted30s = formatTargetTime(target30s, now);
-    assert.strictEqual(formatted30s, 'today at 10:00:19 PM');
+  // Direct IANA
+  assert.strictEqual(resolveTimeZone('Europe/London'), 'Europe/London');
+  assert.strictEqual(resolveTimeZone('America/New_York'), 'America/New_York');
+  assert.strictEqual(resolveTimeZone('Asia/Kolkata'), 'Asia/Kolkata');
 
-    // 10 hours later: 02:29:49 UTC next day is 07:59:49 IST (7:59 AM next morning)
-    const target10h = new Date('2026-11-16T02:29:49.000Z');
-    const formatted10h = formatTargetTime(target10h, now);
-    assert.strictEqual(formatted10h, 'tomorrow at 7:59 AM');
-  } finally {
-    process.env.TZ = originalTZ;
-  }
+  // Offsets
+  assert.strictEqual(resolveTimeZone('+5:30'), 'Asia/Kolkata');
+  assert.strictEqual(resolveTimeZone('+05:30'), 'Asia/Kolkata');
+
+  // Invalid
+  assert.strictEqual(resolveTimeZone('mars/olympus_mons'), null);
+  assert.strictEqual(resolveTimeZone(''), null);
 });
 
-test('Duration & Timezone - parses natural language times under Asia/Kolkata', () => {
-  const originalTZ = process.env.TZ;
-  try {
-    process.env.TZ = 'Asia/Kolkata';
+test('Duration & Timezone - formats target times across multiple global regions', () => {
+  // 16:29:49 UTC is:
+  // - 21:59:49 IST (9:59 PM) in Asia/Kolkata
+  // - 11:29:49 EST (11:29 AM) in America/New_York
+  // - 16:29:49 GMT (4:29 PM) in Europe/London
+  // - 16:29:49 UTC in UTC
+  const now = new Date('2026-11-15T16:29:49.000Z');
+  const target30s = new Date('2026-11-15T16:30:19.000Z');
 
-    // Sunday Nov 15 2026 at 9:59 PM IST (16:29:49 UTC)
-    const now = new Date('2026-11-15T16:29:49.000Z');
+  // IST (India)
+  const formattedIst = formatTargetTime(target30s, now, 'Asia/Kolkata');
+  assert.strictEqual(formattedIst, 'today at 10:00:19 PM IST');
 
-    // "tomorrow at 5pm" -> Monday Nov 16 at 17:00 IST -> 11:30 UTC
-    const parsedTomorrow5pm = parseDuration('tomorrow at 5pm', now);
-    assert.ok(parsedTomorrow5pm);
-    assert.strictEqual(parsedTomorrow5pm.targetDate.toISOString(), '2026-11-16T11:30:00.000Z');
-    assert.strictEqual(parsedTomorrow5pm.formattedTarget, 'tomorrow at 5:00 PM');
+  // EST (New York)
+  const formattedEst = formatTargetTime(target30s, now, 'America/New_York');
+  assert.strictEqual(formattedEst, 'today at 11:30:19 AM EST');
 
-    // Relative duration "30 seconds"
-    const parsed30s = parseDuration('30 seconds', now);
-    assert.ok(parsed30s);
-    assert.strictEqual(parsed30s.seconds, 30);
-    assert.strictEqual(parsed30s.formattedTarget, 'today at 10:00:19 PM');
-  } finally {
-    process.env.TZ = originalTZ;
-  }
+  // GMT (London)
+  const formattedGmt = formatTargetTime(target30s, now, 'Europe/London');
+  assert.strictEqual(formattedGmt, 'today at 4:30:19 PM GMT');
+
+  // UTC
+  const formattedUtc = formatTargetTime(target30s, now, 'UTC');
+  assert.strictEqual(formattedUtc, 'today at 4:30:19 PM UTC');
+
+  // 10 hours later
+  const target10h = new Date('2026-11-16T02:29:49.000Z');
+  assert.strictEqual(formatTargetTime(target10h, now, 'Asia/Kolkata'), 'tomorrow at 7:59 AM IST');
+  assert.strictEqual(formatTargetTime(target10h, now, 'America/New_York'), 'today at 9:29 PM EST');
+  assert.strictEqual(formatTargetTime(target10h, now, 'Europe/London'), 'tomorrow at 2:29 AM GMT');
+  assert.strictEqual(formatTargetTime(target10h, now, 'UTC'), 'tomorrow at 2:29 AM UTC');
+});
+
+test('Duration & Timezone - parses natural language times in user local timezone', () => {
+  // Sunday Nov 15 2026 at 16:29:49 UTC
+  const now = new Date('2026-11-15T16:29:49.000Z');
+
+  // 1. User in New York says "tomorrow at 5pm" (5pm EST = 22:00 UTC)
+  const parsedNy = parseDuration('tomorrow at 5pm', now, 'America/New_York');
+  assert.ok(parsedNy);
+  assert.strictEqual(parsedNy.targetDate.toISOString(), '2026-11-16T22:00:00.000Z');
+  assert.strictEqual(parsedNy.formattedTarget, 'tomorrow at 5:00 PM EST');
+
+  // 2. User in London says "tomorrow at 5pm" (5pm GMT = 17:00 UTC)
+  const parsedLondon = parseDuration('tomorrow at 5pm', now, 'Europe/London');
+  assert.ok(parsedLondon);
+  assert.strictEqual(parsedLondon.targetDate.toISOString(), '2026-11-16T17:00:00.000Z');
+  assert.strictEqual(parsedLondon.formattedTarget, 'tomorrow at 5:00 PM GMT');
+
+  // 3. User in Kolkata says "tomorrow at 5pm" (5pm IST = 11:30 UTC)
+  const parsedKolkata = parseDuration('tomorrow at 5pm', now, 'Asia/Kolkata');
+  assert.ok(parsedKolkata);
+  assert.strictEqual(parsedKolkata.targetDate.toISOString(), '2026-11-16T11:30:00.000Z');
+  assert.strictEqual(parsedKolkata.formattedTarget, 'tomorrow at 5:00 PM IST');
+});
+
+test('Repository - persists and retrieves sender timezone preferences', async () => {
+  Repository.resetSenderTimezonesForTesting();
+
+  // Default fallback when not set
+  const defaultTz = await Repository.getSenderTimezone('user_default_123');
+  assert.ok(defaultTz === 'UTC' || defaultTz === process.env.APP_TIMEZONE || defaultTz === process.env.TZ);
+
+  // Set to New York
+  const setNy = await Repository.setSenderTimezone('user_ny_1', 'New York');
+  assert.strictEqual(setNy, 'America/New_York');
+  const fetchedNy = await Repository.getSenderTimezone('user_ny_1');
+  assert.strictEqual(fetchedNy, 'America/New_York');
+
+  // Set to London
+  const setLondon = await Repository.setSenderTimezone('user_london_1', 'London');
+  assert.strictEqual(setLondon, 'Europe/London');
+  const fetchedLondon = await Repository.getSenderTimezone('user_london_1');
+  assert.strictEqual(fetchedLondon, 'Europe/London');
+
+  // Set to IST
+  const setIst = await Repository.setSenderTimezone('user_ist_1', 'ist');
+  assert.strictEqual(setIst, 'Asia/Kolkata');
+  const fetchedIst = await Repository.getSenderTimezone('user_ist_1');
+  assert.strictEqual(fetchedIst, 'Asia/Kolkata');
+
+  // Data deletion wipes preferences
+  await Repository.deleteUserDataForSender('user_ny_1');
+  const postDeletionTz = await Repository.getSenderTimezone('user_ny_1');
+  assert.notStrictEqual(postDeletionTz, 'America/New_York');
+});
+
+test('MetaInstagramBotService - handles timezone DM commands (tz, timezone)', async () => {
+  Repository.resetSenderTimezonesForTesting();
+
+  const sentMessages: string[] = [];
+  const bot = new MetaInstagramBotService();
+  bot.sendDirectMessage = async (_recipientId, text) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  // 1. Check default timezone
+  sentMessages.length = 0;
+  await (bot as any).processIncomingText('sender_tz_test', 'tz');
+  assert.strictEqual(sentMessages.length, 1);
+  assert.ok(sentMessages[0].includes('Your timezone is currently set to:'));
+
+  // 2. Set timezone to New York
+  sentMessages.length = 0;
+  await (bot as any).processIncomingText('sender_tz_test', 'tz New York');
+  assert.strictEqual(sentMessages.length, 1);
+  assert.ok(sentMessages[0].includes('Timezone updated to America/New_York (EST'));
+
+  // Verify repository updated
+  const storedTz = await Repository.getSenderTimezone('sender_tz_test');
+  assert.strictEqual(storedTz, 'America/New_York');
+
+  // 3. Set timezone to London
+  sentMessages.length = 0;
+  await (bot as any).processIncomingText('sender_tz_test', 'timezone London');
+  assert.strictEqual(sentMessages.length, 1);
+  assert.ok(sentMessages[0].includes('Timezone updated to Europe/London (GMT'));
+
+  // 4. Invalid timezone
+  sentMessages.length = 0;
+  await (bot as any).processIncomingText('sender_tz_test', 'tz Atlantis');
+  assert.strictEqual(sentMessages.length, 1);
+  assert.ok(sentMessages[0].includes('Could not recognize timezone "Atlantis"'));
 });

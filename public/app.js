@@ -51,9 +51,32 @@ function setVaultAccessKey(key) {
   try {
     if (key && key.trim()) {
       localStorage.setItem(VAULT_KEY_STORAGE, key.trim());
+      syncBrowserTimezone();
     } else {
       localStorage.removeItem(VAULT_KEY_STORAGE);
     }
+  } catch (_) {
+    /* non-fatal */
+  }
+}
+
+/**
+ * Automatically syncs the user's browser timezone with their vault profile on the server.
+ */
+function syncBrowserTimezone() {
+  try {
+    const key = getVaultAccessKey();
+    if (!key) return;
+    const clientTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (!clientTz) return;
+    fetch('/api/user/timezone', {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vault-Key': key,
+      },
+      body: JSON.stringify({ timezone: clientTz }),
+    }).catch(() => {});
   } catch (_) {
     /* non-fatal */
   }
@@ -1048,6 +1071,7 @@ async function init() {
   renderActiveFilterChips();
   setupEventListeners();
   renderInitialSkeletons();
+  syncBrowserTimezone();
   await Promise.all([checkHealth(), loadStats(), loadCreators(), fetchReels()]);
 }
 

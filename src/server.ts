@@ -5,9 +5,9 @@ import { loadConfig } from './config.ts';
 import { apiRouter } from './api/router.ts';
 import { ReminderWorker } from './services/reminderWorker.ts';
 
-// Ensure consistent timezone (defaults to Asia/Kolkata / IST if not explicitly configured)
+// Server runtime defaults to UTC standard; user-specific timezones are dynamically resolved per session
 if (!process.env.TZ) {
-  process.env.TZ = process.env.APP_TIMEZONE || 'Asia/Kolkata';
+  process.env.TZ = process.env.APP_TIMEZONE || 'UTC';
 }
 
 const __filename = fileURLToPath(import.meta.url);

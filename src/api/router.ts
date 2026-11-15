@@ -4,6 +4,7 @@ import { Repository } from '../db/repository.ts';
 import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
+import { getTimeZoneSummary, resolveTimeZone } from '../utils/timezone.ts';
 import { feedMetaCacheControl, isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
 import {
   vaultAuthMiddleware,
@@ -345,3 +346,47 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
     (req as any).releaseImportSlot?.();
   }
 });
+
+/**
+ * Returns the active timezone for the authenticated vault user (or system default).
+ */
+apiRouter.get('/user/timezone', async (req: Request, res: Response) => {
+  const senderId = req.vaultUser?.senderId;
+  const timezone = senderId
+    ? await Repository.getSenderTimezone(senderId)
+    : process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+  res.json({
+    timezone,
+    summary: getTimeZoneSummary(timezone),
+  });
+});
+
+/**
+ * Updates the active timezone for the authenticated vault user.
+ */
+apiRouter.patch('/user/timezone', async (req: Request, res: Response) => {
+  const senderId = req.vaultUser?.senderId;
+  const rawTz = typeof req.body?.timezone === 'string' ? req.body.timezone.trim() : '';
+
+  if (!rawTz) {
+    res.status(400).json({ error: 'INVALID_REQUEST', message: 'Timezone string is required.' });
+    return;
+  }
+
+  const resolved = resolveTimeZone(rawTz);
+  if (!resolved) {
+    res.status(400).json({ error: 'INVALID_TIMEZONE', message: `Unrecognized timezone "${rawTz}".` });
+    return;
+  }
+
+  if (senderId) {
+    await Repository.setSenderTimezone(senderId, resolved);
+  }
+
+  res.json({
+    success: true,
+    timezone: resolved,
+    summary: getTimeZoneSummary(resolved),
+  });
+});
+

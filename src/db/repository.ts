@@ -10,6 +10,7 @@ import type {
   BatchReelsResult
 } from '../types.ts';
 import { classifySavedMediaType } from '../utils/mediaType.ts';
+import { resolveTimeZone } from '../utils/timezone.ts';
 import { getSupabase, isSupabaseConfigured } from './client.ts';
 
 /**
@@ -2396,6 +2397,83 @@ export class Repository {
   }
 
   private static senderDeletionTimestamps = new Map<string, number>();
+  private static senderTimezones = new Map<string, string>();
+
+  /**
+   * Clears in-memory caches for testing.
+   */
+  static resetSenderTimezonesForTesting(): void {
+    Repository.senderTimezones.clear();
+  }
+
+  /**
+   * Retrieves the configured timezone for an Instagram sender ID, falling back to
+   * APP_TIMEZONE or 'UTC'.
+   */
+  static async getSenderTimezone(senderId: string): Promise<string> {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) {
+      return process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+    }
+
+    if (Repository.senderTimezones.has(trimmed)) {
+      return Repository.senderTimezones.get(trimmed)!;
+    }
+
+    if (isSupabaseConfigured()) {
+      try {
+        const supabase = getSupabase();
+        const { data, error } = await supabase
+          .from('sender_preferences')
+          .select('timezone')
+          .eq('sender_id', trimmed)
+          .maybeSingle();
+
+        if (!error && data?.timezone) {
+          Repository.senderTimezones.set(trimmed, data.timezone);
+          return data.timezone;
+        }
+      } catch {
+        // Table may not exist yet in older Supabase instances; fall back gracefully
+      }
+    }
+
+    return process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+  }
+
+  /**
+   * Persists the preferred timezone for an Instagram sender ID.
+   * Resolves common abbreviations (e.g. IST, EST, PST, London) to canonical IANA names.
+   */
+  static async setSenderTimezone(senderId: string, timezoneInput: string): Promise<string | null> {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) return null;
+
+    const resolved = resolveTimeZone(timezoneInput);
+    if (!resolved) return null;
+
+    Repository.senderTimezones.set(trimmed, resolved);
+
+    if (isSupabaseConfigured()) {
+      try {
+        const supabase = getSupabase();
+        await supabase
+          .from('sender_preferences')
+          .upsert(
+            {
+              sender_id: trimmed,
+              timezone: resolved,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'sender_id' }
+          );
+      } catch (err) {
+        console.warn('[Repository] Failed to persist sender timezone preference to Supabase:', err);
+      }
+    }
+
+    return resolved;
+  }
 
   static recordSenderDeletion(senderId: string): void {
     const trimmed = String(senderId || '').trim();
@@ -2428,6 +2506,7 @@ export class Repository {
     const trimmed = String(senderId || '').trim();
     if (!trimmed) return 0;
     Repository.recordSenderDeletion(trimmed);
+    Repository.senderTimezones.delete(trimmed);
 
     if (!isSupabaseConfigured()) {
       let count = 0;
