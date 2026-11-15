@@ -6,6 +6,10 @@
 app = 'reeler-bot'
 primary_region = 'sin'
 
+[env]
+  TZ = 'Asia/Kolkata'
+  APP_TIMEZONE = 'Asia/Kolkata'
+
 [build]
 [http_service]
   internal_port = 3000

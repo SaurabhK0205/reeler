@@ -5,6 +5,11 @@ import { loadConfig } from './config.ts';
 import { apiRouter } from './api/router.ts';
 import { ReminderWorker } from './services/reminderWorker.ts';
 
+// Ensure consistent timezone (defaults to Asia/Kolkata / IST if not explicitly configured)
+if (!process.env.TZ) {
+  process.env.TZ = process.env.APP_TIMEZONE || 'Asia/Kolkata';
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
