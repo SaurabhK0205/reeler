@@ -958,6 +958,7 @@ test('MetaInstagramBotService isolates /p/ posts vs /reel/ reels across save, re
       creator_id: reelOnlyCreator.id,
       shortcode: 'DReelOnly01',
       reel_url: 'https://www.instagram.com/reel/DReelOnly01/',
+      instagram_sender_id: 'sender_media_isolation',
       media_type: 'reel',
       caption: 'Only a reel',
       thumbnail_url: null,

@@ -1600,39 +1600,59 @@ export class Repository {
 
     if (trimmedSender && trimmedSender !== 'admin') {
       const supabase = getSupabase();
-      const { data: userReels, error: reelsErr } = await supabase
-        .from('saved_reels')
-        .select('creator_id')
-        .eq('instagram_sender_id', trimmedSender);
-
-      if (reelsErr) {
-        throw new Error(`Supabase getCreators for sender failed: ${reelsErr.message}`);
-      }
-
-      if (!userReels || userReels.length === 0) {
-        return [];
-      }
-
       const counts = new Map<string, number>();
-      for (const row of userReels) {
-        if (row.creator_id) {
-          counts.set(row.creator_id, (counts.get(row.creator_id) || 0) + 1);
+      const PAGE_SIZE = 1000;
+      let from = 0;
+
+      while (true) {
+        const { data: pageRows, error: reelsErr } = await supabase
+          .from('saved_reels')
+          .select('creator_id')
+          .eq('instagram_sender_id', trimmedSender)
+          .range(from, from + PAGE_SIZE - 1);
+
+        if (reelsErr) {
+          throw new Error(`Supabase getCreators for sender failed: ${reelsErr.message}`);
         }
+
+        if (!pageRows || pageRows.length === 0) {
+          break;
+        }
+
+        for (const row of pageRows) {
+          if (row.creator_id) {
+            counts.set(row.creator_id, (counts.get(row.creator_id) || 0) + 1);
+          }
+        }
+
+        if (pageRows.length < PAGE_SIZE) {
+          break;
+        }
+        from += PAGE_SIZE;
       }
 
       const creatorIds = Array.from(counts.keys());
       if (creatorIds.length === 0) return [];
 
-      const { data: creatorRows, error: creatorErr } = await supabase
-        .from('creators')
-        .select('*')
-        .in('id', creatorIds);
+      const BATCH_SIZE = 200;
+      const creatorRows: any[] = [];
+      for (let i = 0; i < creatorIds.length; i += BATCH_SIZE) {
+        const batchIds = creatorIds.slice(i, i + BATCH_SIZE);
+        const { data: batchData, error: creatorErr } = await supabase
+          .from('creators')
+          .select('*')
+          .in('id', batchIds);
 
-      if (creatorErr) {
-        throw new Error(`Supabase getCreators details for sender failed: ${creatorErr.message}`);
+        if (creatorErr) {
+          throw new Error(`Supabase getCreators details for sender failed: ${creatorErr.message}`);
+        }
+
+        if (batchData) {
+          creatorRows.push(...batchData);
+        }
       }
 
-      const result: Creator[] = (creatorRows || []).map((c: any) => ({
+      const result: Creator[] = creatorRows.map((c: any) => ({
         id: c.id,
         instagram_user_id: c.instagram_user_id,
         username: c.username,
