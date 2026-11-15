@@ -35,6 +35,6 @@ test('Compliance Pages - verify data-deletion.html exists and provides clear ins
 
   const content = fs.readFileSync(filePath, 'utf8');
   assert.ok(content.includes('User Data Deletion Instructions'), 'Must have deletion instructions title');
-  assert.ok(content.includes('clear all') || content.includes('stop all'), 'Must mention in-chat deletion command');
+  assert.ok(content.includes('delete my data'), 'Must mention permanent deletion command');
   assert.ok(content.includes('saurabhk0205@gmail.com'), 'Must provide contact email for manual deletion');
 });

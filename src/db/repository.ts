@@ -2268,4 +2268,36 @@ export class Repository {
       media_type: classifySavedMediaType({ mediaType: row.media_type, reelUrl: row.reel_url }),
     };
   }
+
+  /**
+   * Permanently deletes all saved reels and data associated with an Instagram sender ID
+   * for compliance with Meta User Data Deletion requests.
+   */
+  static async deleteUserDataForSender(senderId: string): Promise<number> {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) return 0;
+
+    if (!isSupabaseConfigured()) {
+      let count = 0;
+      for (const [id, reel] of memoryStore.reels.entries()) {
+        if (reel.instagram_sender_id === trimmed) {
+          memoryStore.reels.delete(id);
+          count++;
+        }
+      }
+      return count;
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .delete()
+      .eq('instagram_sender_id', trimmed)
+      .select('id');
+
+    if (error) {
+      throw new Error(`Failed to delete user data for sender ${trimmed}: ${error.message}`);
+    }
+    return data?.length || 0;
+  }
 }

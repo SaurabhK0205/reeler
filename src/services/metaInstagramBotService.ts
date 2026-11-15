@@ -541,8 +541,18 @@ export class MetaInstagramBotService {
       return;
     }
 
-    // 2. Personal Vault / Web library link request (e.g. "vault", "library", "web", "dashboard", "link")
+    // 1b. User data deletion command (e.g. "delete my data", "delete account", "purge data", "erase my data")
     const normalizedText = text.trim().toLowerCase();
+    if (['delete my data', 'delete account', 'purge data', 'purge my data', 'erase my data', 'delete all my data'].includes(normalizedText)) {
+      const deletedCount = await Repository.deleteUserDataForSender(senderId);
+      const reply =
+        `🗑️ Your data deletion request has been processed.\n\n` +
+        `Permanently removed ${deletedCount} saved item(s) and cleared your user records from our systems.`;
+      await this.sendDirectMessage(senderId, reply);
+      return;
+    }
+
+    // 2. Personal Vault / Web library link request (e.g. "vault", "library", "web", "dashboard", "link")
     if (['vault', 'library', 'web', 'dashboard', 'link', 'my vault'].includes(normalizedText)) {
       const isSenderAdmin = Boolean(this.adminUserId && senderId === this.adminUserId);
       const userKey = isSenderAdmin ? getAdminVaultKey() : generateUserVaultKey(senderId);
