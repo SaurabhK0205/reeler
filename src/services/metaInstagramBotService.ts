@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { generateUserVaultKey, getAdminVaultKey, createOtp } from './vaultAuthService.ts';
 import { loadConfig } from '../config.ts';
-import { Repository, SenderReminderConflictError } from '../db/repository.ts';
+import { Repository, SenderReminderConflictError, SenderDeletionBarrierError } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
 import { parseDuration, formatTargetTime } from '../utils/duration.ts';
 import { extractCreatorQueryWithFilter } from '../utils/creatorQuery.ts';
@@ -510,6 +510,16 @@ export class MetaInstagramBotService {
           await this.sendDirectMessage(senderId, formatSenderConflictRejectionMessage(mediaType));
           return;
         }
+        if (error instanceof SenderDeletionBarrierError) {
+          console.warn(
+            `[MetaIG] Reel save rejected for sender ${senderId}: deletion barrier active.`
+          );
+          await this.sendDirectMessage(
+            senderId,
+            `⏳ Your account data was recently deleted. Please wait 60 seconds before sharing new reels.`
+          );
+          return;
+        }
         throw error;
       }
 
@@ -541,8 +551,26 @@ export class MetaInstagramBotService {
       return;
     }
 
-    // 2. Personal Vault / Web library link request (e.g. "vault", "library", "web", "dashboard", "link")
+    // 1b. User data deletion command (e.g. "delete my data", "delete account", "purge data", "erase my data")
     const normalizedText = text.trim().toLowerCase();
+    if (['delete my data', 'delete account', 'purge data', 'purge my data', 'erase my data', 'delete all my data'].includes(normalizedText)) {
+      try {
+        const deletedCount = await Repository.deleteUserDataForSender(senderId);
+        const reply =
+          `🗑️ Your data deletion request has been processed.\n\n` +
+          `Permanently removed ${deletedCount} saved item(s) and cleared your user records from our systems.`;
+        await this.sendDirectMessage(senderId, reply);
+      } catch (error) {
+        console.error(`[MetaIG] Data deletion failed for sender ${senderId}:`, error);
+        await this.sendDirectMessage(
+          senderId,
+          `⚠️ We encountered an issue processing your data deletion request. Please try again or email saurabhk0205@gmail.com for manual assistance.`
+        );
+      }
+      return;
+    }
+
+    // 2. Personal Vault / Web library link request (e.g. "vault", "library", "web", "dashboard", "link")
     if (['vault', 'library', 'web', 'dashboard', 'link', 'my vault'].includes(normalizedText)) {
       const isSenderAdmin = Boolean(this.adminUserId && senderId === this.adminUserId);
       const userKey = isSenderAdmin ? getAdminVaultKey() : generateUserVaultKey(senderId);

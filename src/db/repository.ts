@@ -30,6 +30,20 @@ export class SenderReminderConflictError extends Error {
 }
 
 /**
+ * Error thrown when a reel write is attempted for a sender whose account data was recently deleted,
+ * preventing race-condition re-creation from in-flight webhook requests.
+ */
+export class SenderDeletionBarrierError extends Error {
+  readonly senderId: string;
+
+  constructor(senderId: string) {
+    super(`Cannot save reel for sender ${senderId} during active deletion barrier window`);
+    this.name = 'SenderDeletionBarrierError';
+    this.senderId = senderId;
+  }
+}
+
+/**
  * Escapes and quotes a literal string value for inclusion inside a PostgREST filter expression.
  */
 function quotePostgrestLiteral(value: string): string {
@@ -792,6 +806,12 @@ export class Repository {
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
   }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean }): Promise<SavedReel | null> {
+    const sender = String(data.instagram_sender_id || '').trim();
+    if (sender && Repository.isSenderInRecentDeletion(sender)) {
+      console.warn(`[Repository] Rejecting reel upsert for sender ${sender} due to active deletion window`);
+      throw new SenderDeletionBarrierError(sender);
+    }
+
     Repository.invalidateCreatorsCache();
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertSavedReel(data, options);
@@ -2267,5 +2287,63 @@ export class Repository {
       ...row,
       media_type: classifySavedMediaType({ mediaType: row.media_type, reelUrl: row.reel_url }),
     };
+  }
+
+  private static senderDeletionTimestamps = new Map<string, number>();
+
+  static recordSenderDeletion(senderId: string): void {
+    const trimmed = String(senderId || '').trim();
+    if (trimmed) {
+      Repository.senderDeletionTimestamps.set(trimmed, Date.now());
+    }
+  }
+
+  static isSenderInRecentDeletion(senderId: string, windowMs = 60_000): boolean {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) return false;
+    const ts = Repository.senderDeletionTimestamps.get(trimmed);
+    if (!ts) return false;
+    if (Date.now() - ts > windowMs) {
+      Repository.senderDeletionTimestamps.delete(trimmed);
+      return false;
+    }
+    return true;
+  }
+
+  static resetDeletionTimestampsForTesting(): void {
+    Repository.senderDeletionTimestamps.clear();
+  }
+
+  /**
+   * Permanently deletes all saved reels and data associated with an Instagram sender ID
+   * for compliance with Meta User Data Deletion requests.
+   */
+  static async deleteUserDataForSender(senderId: string): Promise<number> {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) return 0;
+    Repository.recordSenderDeletion(trimmed);
+
+    if (!isSupabaseConfigured()) {
+      let count = 0;
+      for (const [id, reel] of memoryStore.reels.entries()) {
+        if (reel.instagram_sender_id === trimmed) {
+          memoryStore.reels.delete(id);
+          count++;
+        }
+      }
+      return count;
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .delete()
+      .eq('instagram_sender_id', trimmed)
+      .select('id');
+
+    if (error) {
+      throw new Error(`Failed to delete user data for sender ${trimmed}: ${error.message}`);
+    }
+    return data?.length || 0;
   }
 }

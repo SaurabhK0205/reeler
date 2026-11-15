@@ -2465,3 +2465,118 @@ test('MetaInstagramBotService - admin sender receiving "code" yields admin sessi
   assert.strictEqual(verification.valid, true);
   assert.strictEqual(verification.session?.role, 'admin', 'Admin sender must receive admin role OTP');
 });
+
+test('MetaInstagramBotService - "delete my data" permanently erases sender records and replies', async () => {
+  const { Repository } = await import('../src/db/repository.ts');
+  const purgeSenderId = 'purge_test_sender_888';
+  const service = new MetaInstagramBotService();
+  const sentMessages: { recipientId: string; text: string }[] = [];
+  (service as any).sendDirectMessage = async (recipientId: string, text: string) => {
+    sentMessages.push({ recipientId, text });
+    return true;
+  };
+
+  // Seed a reel for this sender
+  await Repository.upsertSavedReel({
+    instagram_media_id: 'shortcode_Cpurge123',
+    shortcode: 'Cpurge123',
+    reel_url: 'https://www.instagram.com/reel/Cpurge123/',
+    instagram_sender_id: purgeSenderId,
+    watch_status: 'watch_later',
+  });
+
+  // Verify reel exists
+  const lastReelBefore = await Repository.getLastReelForInstagramSender(purgeSenderId);
+  assert.ok(lastReelBefore, 'Reel must exist before deletion');
+
+  // Send deletion command
+  await service.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: purgeSenderId },
+            message: { text: 'delete my data' },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(sentMessages.length, 1);
+  assert.ok(sentMessages[0].text.includes('data deletion request has been processed'));
+  assert.ok(sentMessages[0].text.includes('Permanently removed'));
+
+  // Verify reel was eradicated
+  const lastReelAfter = await Repository.getLastReelForInstagramSender(purgeSenderId);
+  assert.strictEqual(lastReelAfter, null, 'Reel must be permanently deleted');
+
+  // Verify deletion barrier throws SenderDeletionBarrierError
+  const { SenderDeletionBarrierError } = await import('../src/db/repository.ts');
+  await assert.rejects(
+    () =>
+      Repository.upsertSavedReel({
+        instagram_media_id: 'shortcode_CpurgeRaced',
+        shortcode: 'CpurgeRaced',
+        reel_url: 'https://www.instagram.com/reel/CpurgeRaced/',
+        instagram_sender_id: purgeSenderId,
+        watch_status: 'watch_later',
+      }),
+    SenderDeletionBarrierError
+  );
+
+  // Verify bot sends helpful retry notification if user shares a reel during barrier
+  await service.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: purgeSenderId },
+            message: { text: 'https://www.instagram.com/reel/CpurgeRaced/' },
+          },
+        ],
+      },
+    ],
+  });
+  assert.strictEqual(sentMessages.length, 2);
+  assert.ok(sentMessages[1].text.includes('Please wait 60 seconds'));
+});
+
+test('MetaInstagramBotService - "delete my data" sends error reply when deletion throws', async () => {
+  const { Repository } = await import('../src/db/repository.ts');
+  const failingSenderId = 'failing_deletion_sender_999';
+  const service = new MetaInstagramBotService();
+  const sentMessages: { recipientId: string; text: string }[] = [];
+  (service as any).sendDirectMessage = async (recipientId: string, text: string) => {
+    sentMessages.push({ recipientId, text });
+    return true;
+  };
+
+  const originalDelete = Repository.deleteUserDataForSender;
+  try {
+    Repository.deleteUserDataForSender = async () => {
+      throw new Error('Simulated database network failure');
+    };
+
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: failingSenderId },
+              message: { text: 'delete my data' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('encountered an issue processing your data deletion request'));
+  } finally {
+    Repository.deleteUserDataForSender = originalDelete;
+  }
+});
