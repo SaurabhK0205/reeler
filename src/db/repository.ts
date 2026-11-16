@@ -2537,13 +2537,19 @@ export class Repository {
     }
 
     const supabase = getSupabase();
-    const { error: prefError } = await supabase
-      .from('sender_preferences')
-      .delete()
-      .eq('sender_id', trimmed);
+    try {
+      const { error: prefError } = await supabase
+        .from('sender_preferences')
+        .delete()
+        .eq('sender_id', trimmed);
 
-    if (prefError) {
-      throw new Error(`Failed to delete sender preferences for sender ${trimmed}: ${prefError.message}`);
+      if (prefError) {
+        throw new Error(`Failed to delete sender preferences for sender ${trimmed}: ${prefError.message}`);
+      }
+    } finally {
+      const postDeleteGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+      Repository.senderTimezoneGenerations.set(trimmed, postDeleteGen);
+      Repository.senderTimezones.delete(trimmed);
     }
 
     const { data, error } = await supabase

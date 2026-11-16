@@ -217,6 +217,13 @@ test('Repository - concurrent setSenderTimezone and deletion track generations',
   await Repository.deleteUserDataForSender(senderId);
   const fallback = await Repository.getSenderTimezone(senderId);
   assert.strictEqual(fallback, process.env.APP_TIMEZONE || process.env.TZ || 'UTC');
+
+  // Verify that lookups started during pending deletion are superseded by post-delete generation bump
+  const pendingLookupGen = (Repository as any).senderTimezoneGenerations.get(senderId) || 0;
+  await Repository.deleteUserDataForSender(senderId);
+  const postGen = (Repository as any).senderTimezoneGenerations.get(senderId) || 0;
+  assert.ok(postGen > pendingLookupGen, 'Post-delete generation must supersede lookups started during pending deletion');
+  assert.strictEqual(await Repository.getSenderTimezone(senderId), fallback);
 });
 
 test('API Router - /user/timezone persists admin preference and rejects sessions without identity', async () => {
