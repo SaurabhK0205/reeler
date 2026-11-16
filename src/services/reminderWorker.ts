@@ -78,8 +78,8 @@ export class ReminderWorker {
 
     // 2. Loop for dispatching due reminders and checking 10-minute awaiting choice windows
     console.log('[ReminderWorker] Starting reminder dispatcher and choice scheduler...');
-    this.checkDueReminders();
-    this.checkAwaitingChoices();
+    this.checkDueReminders().catch((err) => console.error('[ReminderWorker] Reminder dispatch error:', err.message));
+    this.checkAwaitingChoices().catch((err) => console.error('[ReminderWorker] Choice check error:', err.message));
     this.reminderInterval = setInterval(() => {
       this.checkDueReminders().catch((err) => console.error('[ReminderWorker] Reminder dispatch error:', err.message));
       this.checkAwaitingChoices().catch((err) => console.error('[ReminderWorker] Choice check error:', err.message));
