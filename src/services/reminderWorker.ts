@@ -55,26 +55,29 @@ export class ReminderWorker {
    */
   start() {
     const config = loadConfig();
-    if (!config.instagram.isConfigured) {
-      console.log('[ReminderWorker] Instagram credentials not configured. Inbound DM and reminder worker idle.');
-      return;
-    }
+    const hasScraperAuth = config.instagram.isConfigured && Boolean(config.instagram.adminUsername);
+    const hasMetaBotAuth = this.metaBot.isConfigured;
 
-    if (!config.instagram.adminUsername) {
-      console.log('[ReminderWorker] ADMIN_USERNAME not set in .env. DM listener will not know who to listen to.');
+    if (!hasScraperAuth && !hasMetaBotAuth) {
+      console.log('[ReminderWorker] Neither Instagram credentials nor Meta Bot credentials configured. Inbound DM and reminder worker idle.');
       return;
     }
 
     this.isRunning = true;
-    console.log(`[ReminderWorker] Starting DM listener & reminder scheduler for @${config.instagram.adminUsername}...`);
 
-    // 1. Initial check & loop for inbound DMs
-    this.pollInboundDMs();
-    this.dmInterval = setInterval(() => {
-      this.pollInboundDMs().catch((err) => console.error('[ReminderWorker] DM poll error:', err.message));
-    }, config.reminders.dmPollingIntervalMs);
+    // 1. Initial check & loop for inbound DMs (legacy scraper only)
+    if (hasScraperAuth) {
+      console.log(`[ReminderWorker] Starting DM listener for @${config.instagram.adminUsername}...`);
+      this.pollInboundDMs();
+      this.dmInterval = setInterval(() => {
+        this.pollInboundDMs().catch((err) => console.error('[ReminderWorker] DM poll error:', err.message));
+      }, config.reminders.dmPollingIntervalMs);
+    } else {
+      console.log('[ReminderWorker] Legacy DM scraper not configured. Relying on Meta Webhooks for inbound messages.');
+    }
 
     // 2. Loop for dispatching due reminders and checking 10-minute awaiting choice windows
+    console.log('[ReminderWorker] Starting reminder dispatcher and choice scheduler...');
     this.checkDueReminders();
     this.checkAwaitingChoices();
     this.reminderInterval = setInterval(() => {

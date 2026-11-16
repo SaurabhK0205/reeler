@@ -74,6 +74,7 @@ apiRouter.get('/health', (_req: Request, res: Response) => {
     status: 'ok',
     database: config.supabase.isConfigured ? 'supabase' : 'in-memory-demo',
     instagramConfigured: config.instagram.isConfigured,
+    metaBotConfigured: Boolean(process.env.META_PAGE_ACCESS_TOKEN),
   });
 });
 
