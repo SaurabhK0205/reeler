@@ -189,6 +189,16 @@ export function isValidTimeZone(timeZone: string): boolean {
   }
 }
 
+function lookupKnownAlias(key: string): string | null {
+  if (Object.hasOwn(TIMEZONE_ABBREVIATIONS, key)) {
+    return TIMEZONE_ABBREVIATIONS[key];
+  }
+  if (Object.hasOwn(COMMON_CITY_TIMEZONES, key)) {
+    return COMMON_CITY_TIMEZONES[key];
+  }
+  return null;
+}
+
 /**
  * Resolves user input (abbreviation, city, offset, or IANA name) to a canonical IANA timezone.
  * Returns null if the timezone cannot be resolved.
@@ -200,17 +210,13 @@ export function resolveTimeZone(input: string): string | null {
 
   const lowerRaw = raw.toLowerCase();
 
-  // 1. Explicit abbreviations take priority (maps legacy/ambiguous aliases to canonical IANA)
-  if (TIMEZONE_ABBREVIATIONS[lowerRaw]) {
-    return TIMEZONE_ABBREVIATIONS[lowerRaw];
+  // 1. Explicit abbreviations and city names take priority (restricted to own properties)
+  const directAlias = lookupKnownAlias(lowerRaw);
+  if (directAlias) {
+    return directAlias;
   }
 
-  // 2. City and region names
-  if (COMMON_CITY_TIMEZONES[lowerRaw]) {
-    return COMMON_CITY_TIMEZONES[lowerRaw];
-  }
-
-  // 3. UTC/GMT numeric offset parsing: e.g. "+5:30", "+05:30", "+5", "-5", "-04:00"
+  // 2. UTC/GMT numeric offset parsing: e.g. "+5:30", "+05:30", "+5", "-5", "-04:00"
   const offsetMatch = raw.match(/^(?:utc|gmt)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$/i);
   if (offsetMatch) {
     const sign = offsetMatch[1];
@@ -231,16 +237,14 @@ export function resolveTimeZone(input: string): string | null {
     }
   }
 
-  // 4. Clean prefixes e.g. "tz <val>", "in <city>"
+  // 3. Clean prefixes e.g. "tz <val>", "in <city>"
   const stripped = lowerRaw
     .replace(/^(?:timezone|tz|my timezone is|set timezone to|set tz to|in)\s+/i, '')
     .trim();
 
-  if (TIMEZONE_ABBREVIATIONS[stripped]) {
-    return TIMEZONE_ABBREVIATIONS[stripped];
-  }
-  if (COMMON_CITY_TIMEZONES[stripped]) {
-    return COMMON_CITY_TIMEZONES[stripped];
+  const strippedAlias = lookupKnownAlias(stripped);
+  if (strippedAlias) {
+    return strippedAlias;
   }
 
   // 4. Direct IANA match check
@@ -344,6 +348,7 @@ export function getTimeInZone(date: Date, timeZone: string): ZoneDateTimeParts {
 
 /**
  * Converts calendar year/month/day/hour/minute defined in a target timezone into a UTC Date.
+ * Uses iterative offset refinement to properly converge across daylight saving time (DST) transitions.
  */
 export function zonedDateTimeToUtc(parts: Partial<ZoneDateTimeParts>, timeZone: string): Date {
   const safeZone = isValidTimeZone(timeZone) ? timeZone : 'UTC';
@@ -354,12 +359,17 @@ export function zonedDateTimeToUtc(parts: Partial<ZoneDateTimeParts>, timeZone: 
   const minute = parts.minute ?? 0;
   const second = parts.second ?? 0;
 
-  // 1. Initial UTC timestamp guess
-  const guessUtc = Date.UTC(year, month, day, hour, minute, second);
-  // 2. Measure what safeZone reports for guessUtc
-  const inZone = getTimeInZone(new Date(guessUtc), safeZone);
-  const inZoneUtc = Date.UTC(inZone.year, inZone.month, inZone.day, inZone.hour, inZone.minute, inZone.second);
-  // 3. Offset difference adjusts guess to exact UTC target
-  const diff = inZoneUtc - guessUtc;
-  return new Date(guessUtc - diff);
+  const targetAsUtc = Date.UTC(year, month, day, hour, minute, second);
+  let currentEstimate = targetAsUtc;
+
+  // Refine guess up to 3 passes to converge across transition boundary shifts
+  for (let pass = 0; pass < 3; pass++) {
+    const inZone = getTimeInZone(new Date(currentEstimate), safeZone);
+    const inZoneAsUtc = Date.UTC(inZone.year, inZone.month, inZone.day, inZone.hour, inZone.minute, inZone.second);
+    const offset = inZoneAsUtc - targetAsUtc;
+    if (offset === 0) break;
+    currentEstimate -= offset;
+  }
+
+  return new Date(currentEstimate);
 }

@@ -11,3 +11,6 @@ CREATE TABLE IF NOT EXISTS public.sender_preferences (
 
 CREATE INDEX IF NOT EXISTS idx_sender_preferences_sender_id
 ON public.sender_preferences(sender_id);
+
+ALTER TABLE public.sender_preferences ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON public.sender_preferences FROM anon, authenticated;

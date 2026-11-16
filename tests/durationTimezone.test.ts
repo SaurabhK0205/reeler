@@ -44,9 +44,27 @@ test('Timezone Resolution - resolves standard abbreviations, cities, and offsets
   assert.strictEqual(resolveTimeZone('+5:30'), 'Asia/Kolkata');
   assert.strictEqual(resolveTimeZone('+05:30'), 'Asia/Kolkata');
 
+  // Inherited properties & prototype poisoning attempts must return null
+  assert.strictEqual(resolveTimeZone('__proto__'), null);
+  assert.strictEqual(resolveTimeZone('constructor'), null);
+  assert.strictEqual(resolveTimeZone('toString'), null);
+  assert.strictEqual(resolveTimeZone('valueOf'), null);
+  assert.strictEqual(resolveTimeZone('hasOwnProperty'), null);
+
   // Invalid
   assert.strictEqual(resolveTimeZone('mars/olympus_mons'), null);
   assert.strictEqual(resolveTimeZone(''), null);
+});
+
+test('Duration & Timezone - converges across Daylight Saving Time (DST) transitions', () => {
+  // Saturday March 7, 2026 at 15:00 UTC (10:00 AM EST in New York)
+  // DST starts in New York on Sunday March 8, 2026 at 2:00 AM (skipping to 3:00 AM EDT)
+  const march7 = new Date('2026-03-07T15:00:00.000Z');
+  const parsedDst = parseDuration('tomorrow at 3:30am', march7, 'America/New_York');
+  assert.ok(parsedDst);
+  // 3:30 AM EDT is UTC-4 => 07:30 UTC
+  assert.strictEqual(parsedDst.targetDate.toISOString(), '2026-03-08T07:30:00.000Z');
+  assert.strictEqual(parsedDst.formattedTarget, 'tomorrow at 3:30 AM EDT');
 });
 
 test('Duration & Timezone - formats target times across multiple global regions', () => {

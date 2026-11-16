@@ -2466,27 +2466,26 @@ export class Repository {
     const resolved = resolveTimeZone(timezoneInput);
     if (!resolved) return null;
 
+    if (isSupabaseConfigured()) {
+      const supabase = getSupabase();
+      const { error } = await supabase
+        .from('sender_preferences')
+        .upsert(
+          {
+            sender_id: trimmed,
+            timezone: resolved,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'sender_id' }
+        );
+      if (error) {
+        throw new Error(`Failed to persist sender timezone preference for ${trimmed}: ${error.message}`);
+      }
+    }
+
     const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
     Repository.senderTimezoneGenerations.set(trimmed, nextGen);
     Repository.senderTimezones.set(trimmed, resolved);
-
-    if (isSupabaseConfigured()) {
-      try {
-        const supabase = getSupabase();
-        await supabase
-          .from('sender_preferences')
-          .upsert(
-            {
-              sender_id: trimmed,
-              timezone: resolved,
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: 'sender_id' }
-          );
-      } catch (err) {
-        console.warn('[Repository] Failed to persist sender timezone preference to Supabase:', err);
-      }
-    }
 
     return resolved;
   }
@@ -2538,13 +2537,13 @@ export class Repository {
     }
 
     const supabase = getSupabase();
-    try {
-      await supabase
-        .from('sender_preferences')
-        .delete()
-        .eq('sender_id', trimmed);
-    } catch (err) {
-      console.warn('[Repository] Failed to delete sender preferences from Supabase:', err);
+    const { error: prefError } = await supabase
+      .from('sender_preferences')
+      .delete()
+      .eq('sender_id', trimmed);
+
+    if (prefError) {
+      throw new Error(`Failed to delete sender preferences for sender ${trimmed}: ${prefError.message}`);
     }
 
     const { data, error } = await supabase
