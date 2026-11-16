@@ -363,3 +363,51 @@ test('Repository - setSenderTimezone respects deletion barrier and coordinates i
   assert.strictEqual(status, 409);
   assert.strictEqual(body?.error, 'DELETION_IN_PROGRESS');
 });
+
+test('Repository - tracked write outlasting cooldown cannot recreate deleted preference', async () => {
+  Repository.resetSenderTimezonesForTesting();
+  Repository.resetDeletionTimestampsForTesting();
+
+  const senderId = 'user_slow_write_barrier';
+  await Repository.setSenderTimezone(senderId, 'America/New_York');
+
+  // Simulate an in-flight write for this sender
+  let finishInFlight!: () => void;
+  const inFlightPromise = new Promise<void>((resolve) => { finishInFlight = resolve; });
+  (Repository as any).trackInFlightPreferenceWrite(senderId, inFlightPromise);
+
+  // Start deletion in background (awaits in-flight writes)
+  const deletionPromise = Repository.deleteUserDataForSender(senderId);
+
+  // Verify sender is in active deletion
+  assert.strictEqual(Repository.isSenderInRecentDeletion(senderId), true);
+
+  // Expire the cooldown timestamp artificially (simulate time passing > 60 seconds)
+  (Repository as any).senderDeletionTimestamps.set(senderId, Date.now() - 100_000);
+
+  // Active deletion flag must still keep the barrier closed!
+  assert.strictEqual(
+    Repository.isSenderInRecentDeletion(senderId),
+    true,
+    'Barrier must stay active while deletion is in progress even if timestamp expired'
+  );
+
+  // setSenderTimezone must still be rejected
+  await assert.rejects(
+    async () => {
+      await Repository.setSenderTimezone(senderId, 'Europe/London');
+    },
+    (err: any) => err instanceof SenderDeletionBarrierError
+  );
+
+  // Release the in-flight write and finish deletion
+  finishInFlight();
+  await deletionPromise;
+
+  // After deletion completes, the preference is deleted and fresh cooldown window is active
+  assert.strictEqual(
+    await Repository.getSenderTimezone(senderId),
+    process.env.APP_TIMEZONE || process.env.TZ || 'UTC'
+  );
+  assert.strictEqual(Repository.isSenderInRecentDeletion(senderId), true);
+});

@@ -2397,6 +2397,7 @@ export class Repository {
   }
 
   private static senderDeletionTimestamps = new Map<string, number>();
+  private static activeSenderDeletions = new Set<string>();
   private static senderTimezones = new Map<string, string>();
   private static senderTimezoneGenerations = new Map<string, number>();
   private static inFlightPreferenceWrites = new Map<string, Set<Promise<any>>>();
@@ -2408,6 +2409,7 @@ export class Repository {
     Repository.senderTimezones.clear();
     Repository.senderTimezoneGenerations.clear();
     Repository.inFlightPreferenceWrites.clear();
+    Repository.activeSenderDeletions.clear();
   }
 
   private static trackInFlightPreferenceWrite(senderId: string, promise: Promise<any>): void {
@@ -2547,6 +2549,9 @@ export class Repository {
   static isSenderInRecentDeletion(senderId: string, windowMs = 60_000): boolean {
     const trimmed = String(senderId || '').trim();
     if (!trimmed) return false;
+    if (Repository.activeSenderDeletions.has(trimmed)) {
+      return true;
+    }
     const ts = Repository.senderDeletionTimestamps.get(trimmed);
     if (!ts) return false;
     if (Date.now() - ts > windowMs) {
@@ -2557,6 +2562,7 @@ export class Repository {
   }
 
   static resetDeletionTimestampsForTesting(): void {
+    Repository.activeSenderDeletions.clear();
     Repository.senderDeletionTimestamps.clear();
   }
 
@@ -2567,49 +2573,60 @@ export class Repository {
   static async deleteUserDataForSender(senderId: string): Promise<number> {
     const trimmed = String(senderId || '').trim();
     if (!trimmed) return 0;
+
+    Repository.activeSenderDeletions.add(trimmed);
     Repository.recordSenderDeletion(trimmed);
-    await Repository.waitForInFlightPreferenceWrites(trimmed);
 
-    const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
-    Repository.senderTimezoneGenerations.set(trimmed, nextGen);
-    Repository.senderTimezones.delete(trimmed);
-
-    if (!isSupabaseConfigured()) {
-      let count = 0;
-      for (const [id, reel] of memoryStore.reels.entries()) {
-        if (reel.instagram_sender_id === trimmed) {
-          memoryStore.reels.delete(id);
-          count++;
-        }
-      }
-      return count;
-    }
-
-    const supabase = getSupabase();
     try {
-      const { error: prefError } = await supabase
-        .from('sender_preferences')
-        .delete()
-        .eq('sender_id', trimmed);
+      await Repository.waitForInFlightPreferenceWrites(trimmed);
 
-      if (prefError) {
-        throw new Error(`Failed to delete sender preferences for sender ${trimmed}: ${prefError.message}`);
+      const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+      Repository.senderTimezoneGenerations.set(trimmed, nextGen);
+      Repository.senderTimezones.delete(trimmed);
+
+      if (!isSupabaseConfigured()) {
+        let count = 0;
+        for (const [id, reel] of memoryStore.reels.entries()) {
+          if (reel.instagram_sender_id === trimmed) {
+            memoryStore.reels.delete(id);
+            count++;
+          }
+        }
+        return count;
       }
+
+      const supabase = getSupabase();
+      try {
+        const { error: prefError } = await supabase
+          .from('sender_preferences')
+          .delete()
+          .eq('sender_id', trimmed);
+
+        if (prefError) {
+          throw new Error(`Failed to delete sender preferences for sender ${trimmed}: ${prefError.message}`);
+        }
+      } finally {
+        const postDeleteGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+        Repository.senderTimezoneGenerations.set(trimmed, postDeleteGen);
+        Repository.senderTimezones.delete(trimmed);
+      }
+
+      const { data, error } = await supabase
+        .from('saved_reels')
+        .delete()
+        .eq('instagram_sender_id', trimmed)
+        .select('id');
+
+      if (error) {
+        throw new Error(`Failed to delete user data for sender ${trimmed}: ${error.message}`);
+      }
+      return data?.length || 0;
     } finally {
-      const postDeleteGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
-      Repository.senderTimezoneGenerations.set(trimmed, postDeleteGen);
+      Repository.recordSenderDeletion(trimmed);
+      Repository.activeSenderDeletions.delete(trimmed);
+      const finalGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+      Repository.senderTimezoneGenerations.set(trimmed, finalGen);
       Repository.senderTimezones.delete(trimmed);
     }
-
-    const { data, error } = await supabase
-      .from('saved_reels')
-      .delete()
-      .eq('instagram_sender_id', trimmed)
-      .select('id');
-
-    if (error) {
-      throw new Error(`Failed to delete user data for sender ${trimmed}: ${error.message}`);
-    }
-    return data?.length || 0;
   }
 }
