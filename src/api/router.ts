@@ -1,9 +1,10 @@
 import express from 'express';
-import type { Request, Response } from 'express';
-import { Repository } from '../db/repository.ts';
+import type { Request, Response, NextFunction } from 'express';
+import { Repository, SenderDeletionBarrierError } from '../db/repository.ts';
 import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
+import { getTimeZoneSummary, resolveTimeZone } from '../utils/timezone.ts';
 import { feedMetaCacheControl, isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
 import {
   vaultAuthMiddleware,
@@ -345,3 +346,59 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
     (req as any).releaseImportSlot?.();
   }
 });
+
+/**
+ * Returns the active timezone for the authenticated vault user (or system default).
+ */
+apiRouter.get('/user/timezone', async (req: Request, res: Response) => {
+  const preferenceKey = req.vaultUser?.senderId || (req.vaultUser?.role === 'admin' ? 'admin' : null);
+  const timezone = preferenceKey
+    ? await Repository.getSenderTimezone(preferenceKey)
+    : process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+  res.json({
+    timezone,
+    summary: getTimeZoneSummary(timezone),
+  });
+});
+
+/**
+ * Updates the active timezone for the authenticated vault user.
+ */
+apiRouter.patch('/user/timezone', async (req: Request, res: Response, next: NextFunction) => {
+  const preferenceKey = req.vaultUser?.senderId || (req.vaultUser?.role === 'admin' ? 'admin' : null);
+  const rawTz = typeof req.body?.timezone === 'string' ? req.body.timezone.trim() : '';
+
+  if (!rawTz) {
+    res.status(400).json({ error: 'INVALID_REQUEST', message: 'Timezone string is required.' });
+    return;
+  }
+
+  const resolved = resolveTimeZone(rawTz);
+  if (!resolved) {
+    res.status(400).json({ error: 'INVALID_TIMEZONE', message: `Unrecognized timezone "${rawTz}".` });
+    return;
+  }
+
+  if (!preferenceKey) {
+    res.status(400).json({ error: 'SENDER_ID_REQUIRED', message: 'No sender ID or admin session associated with this request.' });
+    return;
+  }
+
+  try {
+    await Repository.setSenderTimezone(preferenceKey, resolved);
+  } catch (error) {
+    if (error instanceof SenderDeletionBarrierError) {
+      res.status(409).json({ error: 'DELETION_IN_PROGRESS', message: error.message });
+      return;
+    }
+    next(error);
+    return;
+  }
+
+  res.json({
+    success: true,
+    timezone: resolved,
+    summary: getTimeZoneSummary(resolved),
+  });
+});
+

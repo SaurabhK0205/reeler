@@ -1,3 +1,10 @@
+import {
+  getTimeInZone,
+  zonedDateTimeToUtc,
+  getTimeZoneAbbreviation,
+  isValidTimeZone,
+} from './timezone.ts';
+
 export interface ParsedDuration {
   ms: number;
   seconds: number;
@@ -31,23 +38,36 @@ const DAY_OF_WEEK_MAP: Record<string, number> = {
   saturday: 6, sat: 6,
 };
 
-export function formatTargetTime(target: Date, now: Date = new Date()): string {
-  const isSameDay =
-    target.getFullYear() === now.getFullYear() &&
-    target.getMonth() === now.getMonth() &&
-    target.getDate() === now.getDate();
+function getEffectiveTimeZone(explicitZone?: string): string {
+  if (explicitZone && isValidTimeZone(explicitZone)) return explicitZone;
+  if (process.env.APP_TIMEZONE && isValidTimeZone(process.env.APP_TIMEZONE)) return process.env.APP_TIMEZONE;
+  if (process.env.TZ && isValidTimeZone(process.env.TZ)) return process.env.TZ;
+  return 'UTC';
+}
 
-  const tomorrow = new Date(now);
-  tomorrow.setDate(now.getDate() + 1);
-  const isTomorrow =
-    target.getFullYear() === tomorrow.getFullYear() &&
-    target.getMonth() === tomorrow.getMonth() &&
-    target.getDate() === tomorrow.getDate();
+export function formatTargetTime(target: Date, now: Date = new Date(), timeZone?: string): string {
+  const safeZone = getEffectiveTimeZone(timeZone);
+  const nowParts = getTimeInZone(now, safeZone);
+  const targetParts = getTimeInZone(target, safeZone);
+
+  const isSameDay =
+    targetParts.year === nowParts.year &&
+    targetParts.month === nowParts.month &&
+    targetParts.day === nowParts.day;
+
+  const nowDateInZone = new Date(Date.UTC(nowParts.year, nowParts.month, nowParts.day));
+  const targetDateInZone = new Date(Date.UTC(targetParts.year, targetParts.month, targetParts.day));
+  const dayDiff = Math.round((targetDateInZone.getTime() - nowDateInZone.getTime()) / (1000 * 60 * 60 * 24));
+  const isTomorrow = dayDiff === 1;
+
+  const tzAbbr = getTimeZoneAbbreviation(target, safeZone);
+  const tzSuffix = tzAbbr ? ` ${tzAbbr}` : '';
 
   const timeStr = target.toLocaleTimeString('en-US', {
     hour: 'numeric',
     minute: '2-digit',
     hour12: true,
+    timeZone: safeZone,
   });
 
   if (isSameDay) {
@@ -58,27 +78,27 @@ export function formatTargetTime(target: Date, now: Date = new Date()): string {
         minute: '2-digit',
         second: '2-digit',
         hour12: true,
+        timeZone: safeZone,
       });
-      return `today at ${secTimeStr}`;
+      return `today at ${secTimeStr}${tzSuffix}`;
     }
-    return `today at ${timeStr}`;
+    return `today at ${timeStr}${tzSuffix}`;
   }
 
   if (isTomorrow) {
-    return `tomorrow at ${timeStr}`;
+    return `tomorrow at ${timeStr}${tzSuffix}`;
   }
 
-  const diffDays = Math.round((target.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
-  const monthName = target.toLocaleDateString('en-US', { month: 'short' });
-  const dayNum = target.getDate();
+  const monthName = target.toLocaleDateString('en-US', { month: 'short', timeZone: safeZone });
+  const dayNum = targetParts.day;
 
-  if (diffDays <= 7) {
-    const weekday = target.toLocaleDateString('en-US', { weekday: 'short' });
-    return `${weekday}, ${monthName} ${dayNum} at ${timeStr}`;
+  if (dayDiff <= 7 && dayDiff > 0) {
+    const weekday = target.toLocaleDateString('en-US', { weekday: 'short', timeZone: safeZone });
+    return `${weekday}, ${monthName} ${dayNum} at ${timeStr}${tzSuffix}`;
   }
 
-  const yearStr = target.getFullYear() !== now.getFullYear() ? ` ${target.getFullYear()}` : '';
-  return `${monthName} ${dayNum}${yearStr} at ${timeStr}`;
+  const yearStr = targetParts.year !== nowParts.year ? ` ${targetParts.year}` : '';
+  return `${monthName} ${dayNum}${yearStr} at ${timeStr}${tzSuffix}`;
 }
 
 function parseTimePart(text: string): { hour: number; minute: number } | null {
@@ -102,10 +122,17 @@ function parseTimePart(text: string): { hour: number; minute: number } | null {
  * - Natural: 'tomorrow', 'tomorrow at 5pm', 'tonight', 'friday at 6pm'
  * - Dates: '12 nov', 'nov 12 at 3pm', '15th november', '12/11', '2026-11-12'
  */
-export function parseDuration(rawText: string, now: Date = new Date()): ParsedDuration | null {
+export function parseDuration(
+  rawText: string,
+  now: Date = new Date(),
+  timeZone?: string
+): ParsedDuration | null {
   if (!rawText) return null;
+  const safeZone = getEffectiveTimeZone(timeZone);
 
-  let text = rawText.toLowerCase().trim()
+  let text = rawText
+    .toLowerCase()
+    .trim()
     .replace(/^(?:remind\s+(?:me\s+)?(?:in\s+|at\s+|on\s+)?|snooze\s+(?:for\s+|in\s+)?|set\s+reminder\s+(?:for\s+)?|in\s+|on\s+|at\s+)/i, '')
     .trim();
 
@@ -143,44 +170,58 @@ export function parseDuration(rawText: string, now: Date = new Date()): ParsedDu
           seconds: Math.round(ms / 1000),
           label,
           targetDate,
-          formattedTarget: formatTargetTime(targetDate, now),
+          formattedTarget: formatTargetTime(targetDate, now, safeZone),
         };
       }
     }
   }
 
+  const nowParts = getTimeInZone(now, safeZone);
+
   // 2. Tomorrow / Tonight / Today
   if (text.includes('tomorrow') || text.includes('tonight') || text.includes('today')) {
-    const target = new Date(now);
     const parsedTime = parseTimePart(text);
+    let targetParts: { year: number; month: number; day: number; hour: number; minute: number; second: number } = {
+      year: nowParts.year,
+      month: nowParts.month,
+      day: nowParts.day,
+      hour: 10,
+      minute: 0,
+      second: 0,
+    };
 
     if (text.includes('tomorrow')) {
-      target.setDate(now.getDate() + 1);
+      targetParts.day = nowParts.day + 1;
       if (parsedTime) {
-        target.setHours(parsedTime.hour, parsedTime.minute, 0, 0);
+        targetParts.hour = parsedTime.hour;
+        targetParts.minute = parsedTime.minute;
       } else if (text.includes('morning')) {
-        target.setHours(9, 0, 0, 0);
+        targetParts.hour = 9;
       } else if (text.includes('afternoon')) {
-        target.setHours(14, 0, 0, 0);
+        targetParts.hour = 14;
       } else if (text.includes('evening')) {
-        target.setHours(18, 0, 0, 0);
+        targetParts.hour = 18;
       } else if (text.includes('night')) {
-        target.setHours(21, 0, 0, 0);
+        targetParts.hour = 21;
       } else {
-        target.setHours(10, 0, 0, 0); // default 10:00 AM
+        targetParts.hour = 10;
       }
     } else if (text.includes('tonight')) {
-      target.setHours(21, 0, 0, 0);
-      if (target.getTime() <= now.getTime()) {
-        target.setTime(now.getTime() + 3 * 3600 * 1000); // 3 hours from now if already past 9pm
-      }
+      targetParts.hour = 21;
     } else if (text.includes('today')) {
       if (parsedTime) {
-        target.setHours(parsedTime.hour, parsedTime.minute, 0, 0);
-        if (target.getTime() <= now.getTime()) {
-          target.setDate(target.getDate() + 1); // roll over to tomorrow if time passed
-        }
+        targetParts.hour = parsedTime.hour;
+        targetParts.minute = parsedTime.minute;
       }
+    }
+
+    let target = zonedDateTimeToUtc(targetParts, safeZone);
+
+    if (text.includes('tonight') && target.getTime() <= now.getTime()) {
+      target = new Date(now.getTime() + 3 * 3600 * 1000); // 3 hours from now if already past 9pm
+    } else if (text.includes('today') && target.getTime() <= now.getTime()) {
+      targetParts.day += 1;
+      target = zonedDateTimeToUtc(targetParts, safeZone);
     }
 
     const ms = target.getTime() - now.getTime();
@@ -190,7 +231,7 @@ export function parseDuration(rawText: string, now: Date = new Date()): ParsedDu
         seconds: Math.round(ms / 1000),
         label: text.includes('tomorrow') ? 'Tomorrow' : 'Tonight',
         targetDate: target,
-        formattedTarget: formatTargetTime(target, now),
+        formattedTarget: formatTargetTime(target, now, safeZone),
       };
     }
   }
@@ -199,18 +240,21 @@ export function parseDuration(rawText: string, now: Date = new Date()): ParsedDu
   for (const [dayName, dayIndex] of Object.entries(DAY_OF_WEEK_MAP)) {
     const dayRegex = new RegExp(`\\b${dayName}\\b`, 'i');
     if (dayRegex.test(text)) {
-      const target = new Date(now);
-      let diff = (dayIndex - now.getDay() + 7) % 7;
+      const nowDayOfWeek = new Date(Date.UTC(nowParts.year, nowParts.month, nowParts.day)).getUTCDay();
+      let diff = (dayIndex - nowDayOfWeek + 7) % 7;
       if (diff === 0) diff = 7; // next week if same day
-      target.setDate(now.getDate() + diff);
 
       const parsedTime = parseTimePart(text);
-      if (parsedTime) {
-        target.setHours(parsedTime.hour, parsedTime.minute, 0, 0);
-      } else {
-        target.setHours(10, 0, 0, 0);
-      }
+      const targetParts = {
+        year: nowParts.year,
+        month: nowParts.month,
+        day: nowParts.day + diff,
+        hour: parsedTime ? parsedTime.hour : 10,
+        minute: parsedTime ? parsedTime.minute : 0,
+        second: 0,
+      };
 
+      const target = zonedDateTimeToUtc(targetParts, safeZone);
       const ms = target.getTime() - now.getTime();
       if (ms > 0) {
         return {
@@ -218,42 +262,48 @@ export function parseDuration(rawText: string, now: Date = new Date()): ParsedDu
           seconds: Math.round(ms / 1000),
           label: `${dayName.charAt(0).toUpperCase() + dayName.slice(1)}`,
           targetDate: target,
-          formattedTarget: formatTargetTime(target, now),
+          formattedTarget: formatTargetTime(target, now, safeZone),
         };
       }
     }
   }
 
   // 4. Particular dates (e.g. "12 nov", "nov 12", "12th november", "15 nov at 4pm", "12/11", "2026-11-12")
-  // Match ISO / Slash / Dash dates like "2026-11-12", "12/11/2026", "12/11"
   const numDateMatch = text.match(/\b(?:(\d{4})[-/](\d{1,2})[-/](\d{1,2})|(\d{1,2})[-/](\d{1,2})(?:[-/](\d{4}))?)\b/);
   if (numDateMatch) {
-    let year = now.getFullYear();
-    let month = now.getMonth();
-    let day = now.getDate();
+    let year = nowParts.year;
+    let month = nowParts.month;
+    let day = nowParts.day;
 
     if (numDateMatch[1]) {
-      // YYYY-MM-DD
       year = parseInt(numDateMatch[1], 10);
       month = parseInt(numDateMatch[2], 10) - 1;
       day = parseInt(numDateMatch[3], 10);
     } else {
-      // DD/MM or DD/MM/YYYY
       day = parseInt(numDateMatch[4], 10);
       month = parseInt(numDateMatch[5], 10) - 1;
       if (numDateMatch[6]) year = parseInt(numDateMatch[6], 10);
     }
 
-    const target = new Date(year, month, day);
     const parsedTime = parseTimePart(text.replace(numDateMatch[0], ''));
-    if (parsedTime) {
-      target.setHours(parsedTime.hour, parsedTime.minute, 0, 0);
-    } else {
-      target.setHours(10, 0, 0, 0);
-    }
+    let target = zonedDateTimeToUtc({
+      year,
+      month,
+      day,
+      hour: parsedTime ? parsedTime.hour : 10,
+      minute: parsedTime ? parsedTime.minute : 0,
+      second: 0,
+    }, safeZone);
 
     if (target.getTime() < now.getTime() && !numDateMatch[1] && !numDateMatch[6]) {
-      target.setFullYear(year + 1);
+      target = zonedDateTimeToUtc({
+        year: year + 1,
+        month,
+        day,
+        hour: parsedTime ? parsedTime.hour : 10,
+        minute: parsedTime ? parsedTime.minute : 0,
+        second: 0,
+      }, safeZone);
     }
 
     const ms = target.getTime() - now.getTime();
@@ -261,9 +311,9 @@ export function parseDuration(rawText: string, now: Date = new Date()): ParsedDu
       return {
         ms,
         seconds: Math.round(ms / 1000),
-        label: formatTargetTime(target, now),
+        label: formatTargetTime(target, now, safeZone),
         targetDate: target,
-        formattedTarget: formatTargetTime(target, now),
+        formattedTarget: formatTargetTime(target, now, safeZone),
       };
     }
   }
@@ -279,19 +329,27 @@ export function parseDuration(rawText: string, now: Date = new Date()): ParsedDu
     if (rawDay && rawMonth && MONTH_MAP[rawMonth] !== undefined) {
       const day = parseInt(rawDay, 10);
       const month = MONTH_MAP[rawMonth];
-      let year = rawYear ? parseInt(rawYear, 10) : now.getFullYear();
+      let year = rawYear ? parseInt(rawYear, 10) : nowParts.year;
 
-      const target = new Date(year, month, day);
       const parsedTime = parseTimePart(text.replace(dateMatch[0], ''));
-      if (parsedTime) {
-        target.setHours(parsedTime.hour, parsedTime.minute, 0, 0);
-      } else {
-        target.setHours(10, 0, 0, 0); // default to 10:00 AM
-      }
+      let target = zonedDateTimeToUtc({
+        year,
+        month,
+        day,
+        hour: parsedTime ? parsedTime.hour : 10,
+        minute: parsedTime ? parsedTime.minute : 0,
+        second: 0,
+      }, safeZone);
 
-      // If date is in past and year wasn't explicitly given, roll to next year
       if (!rawYear && target.getTime() < now.getTime()) {
-        target.setFullYear(year + 1);
+        target = zonedDateTimeToUtc({
+          year: year + 1,
+          month,
+          day,
+          hour: parsedTime ? parsedTime.hour : 10,
+          minute: parsedTime ? parsedTime.minute : 0,
+          second: 0,
+        }, safeZone);
       }
 
       const ms = target.getTime() - now.getTime();
@@ -301,7 +359,7 @@ export function parseDuration(rawText: string, now: Date = new Date()): ParsedDu
           seconds: Math.round(ms / 1000),
           label: `${rawDay} ${rawMonth.charAt(0).toUpperCase() + rawMonth.slice(1)}`,
           targetDate: target,
-          formattedTarget: formatTargetTime(target, now),
+          formattedTarget: formatTargetTime(target, now, safeZone),
         };
       }
     }
@@ -310,19 +368,34 @@ export function parseDuration(rawText: string, now: Date = new Date()): ParsedDu
   // 5. Standalone time today (e.g. "at 5pm", "5:30pm", "17:00")
   const standaloneTime = parseTimePart(text);
   if (standaloneTime && (text.includes('pm') || text.includes('am') || text.includes(':') || text.startsWith('at '))) {
-    const target = new Date(now);
-    target.setHours(standaloneTime.hour, standaloneTime.minute, 0, 0);
+    let target = zonedDateTimeToUtc({
+      year: nowParts.year,
+      month: nowParts.month,
+      day: nowParts.day,
+      hour: standaloneTime.hour,
+      minute: standaloneTime.minute,
+      second: 0,
+    }, safeZone);
+
     if (target.getTime() <= now.getTime()) {
-      target.setDate(target.getDate() + 1); // roll to tomorrow if already passed today
+      target = zonedDateTimeToUtc({
+        year: nowParts.year,
+        month: nowParts.month,
+        day: nowParts.day + 1,
+        hour: standaloneTime.hour,
+        minute: standaloneTime.minute,
+        second: 0,
+      }, safeZone);
     }
+
     const ms = target.getTime() - now.getTime();
     if (ms > 0) {
       return {
         ms,
         seconds: Math.round(ms / 1000),
-        label: formatTargetTime(target, now),
+        label: formatTargetTime(target, now, safeZone),
         targetDate: target,
-        formattedTarget: formatTargetTime(target, now),
+        formattedTarget: formatTargetTime(target, now, safeZone),
       };
     }
   }

@@ -10,6 +10,7 @@ import type {
   BatchReelsResult
 } from '../types.ts';
 import { classifySavedMediaType } from '../utils/mediaType.ts';
+import { resolveTimeZone } from '../utils/timezone.ts';
 import { getSupabase, isSupabaseConfigured } from './client.ts';
 
 /**
@@ -2396,6 +2397,147 @@ export class Repository {
   }
 
   private static senderDeletionTimestamps = new Map<string, number>();
+  private static activeSenderDeletions = new Map<string, number>();
+  private static senderTimezones = new Map<string, string>();
+  private static senderTimezoneGenerations = new Map<string, number>();
+  private static inFlightPreferenceWrites = new Map<string, Set<Promise<any>>>();
+
+  /**
+   * Clears in-memory caches for testing.
+   */
+  static resetSenderTimezonesForTesting(): void {
+    Repository.senderTimezones.clear();
+    Repository.senderTimezoneGenerations.clear();
+    Repository.inFlightPreferenceWrites.clear();
+    Repository.activeSenderDeletions.clear();
+  }
+
+  private static trackInFlightPreferenceWrite(senderId: string, promise: Promise<any>): void {
+    let set = Repository.inFlightPreferenceWrites.get(senderId);
+    if (!set) {
+      set = new Set();
+      Repository.inFlightPreferenceWrites.set(senderId, set);
+    }
+    set.add(promise);
+  }
+
+  private static untrackInFlightPreferenceWrite(senderId: string, promise: Promise<any>): void {
+    const set = Repository.inFlightPreferenceWrites.get(senderId);
+    if (set) {
+      set.delete(promise);
+      if (set.size === 0) {
+        Repository.inFlightPreferenceWrites.delete(senderId);
+      }
+    }
+  }
+
+  static async waitForInFlightPreferenceWrites(senderId: string): Promise<void> {
+    const set = Repository.inFlightPreferenceWrites.get(senderId);
+    if (set && set.size > 0) {
+      await Promise.allSettled(Array.from(set));
+    }
+  }
+
+  /**
+   * Retrieves the configured timezone for an Instagram sender ID, falling back to
+   * APP_TIMEZONE or 'UTC'.
+   */
+  static async getSenderTimezone(senderId: string): Promise<string> {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) {
+      return process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+    }
+
+    if (Repository.senderTimezones.has(trimmed)) {
+      return Repository.senderTimezones.get(trimmed)!;
+    }
+
+    const lookupGen = Repository.senderTimezoneGenerations.get(trimmed) || 0;
+
+    if (isSupabaseConfigured()) {
+      try {
+        const supabase = getSupabase();
+        const { data, error } = await supabase
+          .from('sender_preferences')
+          .select('timezone')
+          .eq('sender_id', trimmed)
+          .maybeSingle();
+
+        const currentGen = Repository.senderTimezoneGenerations.get(trimmed) || 0;
+        if (currentGen !== lookupGen) {
+          return Repository.senderTimezones.get(trimmed) || process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+        }
+
+        if (!error && data?.timezone) {
+          Repository.senderTimezones.set(trimmed, data.timezone);
+          return data.timezone;
+        }
+      } catch {
+        // Table may not exist yet in older Supabase instances; fall back gracefully
+      }
+    }
+
+    const currentGen = Repository.senderTimezoneGenerations.get(trimmed) || 0;
+    if (currentGen !== lookupGen) {
+      return Repository.senderTimezones.get(trimmed) || process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+    }
+
+    return process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+  }
+
+  /**
+   * Persists the preferred timezone for an Instagram sender ID.
+   * Resolves common abbreviations (e.g. IST, EST, PST, London) to canonical IANA names.
+   */
+  static async setSenderTimezone(senderId: string, timezoneInput: string): Promise<string | null> {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) return null;
+
+    if (Repository.isSenderInRecentDeletion(trimmed)) {
+      console.warn(`[Repository] Rejecting timezone upsert for sender ${trimmed} due to active deletion barrier window`);
+      throw new SenderDeletionBarrierError(trimmed);
+    }
+
+    const resolved = resolveTimeZone(timezoneInput);
+    if (!resolved) return null;
+
+    let resolveInFlight!: () => void;
+    const inFlightPromise = new Promise<void>((res) => { resolveInFlight = res; });
+    Repository.trackInFlightPreferenceWrite(trimmed, inFlightPromise);
+
+    try {
+      if (isSupabaseConfigured()) {
+        const supabase = getSupabase();
+        const { error } = await supabase
+          .from('sender_preferences')
+          .upsert(
+            {
+              sender_id: trimmed,
+              timezone: resolved,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'sender_id' }
+          );
+        if (error) {
+          throw new Error(`Failed to persist sender timezone preference for ${trimmed}: ${error.message}`);
+        }
+      }
+
+      if (Repository.isSenderInRecentDeletion(trimmed)) {
+        console.warn(`[Repository] Rejecting timezone cache commit for sender ${trimmed} due to active deletion barrier window`);
+        throw new SenderDeletionBarrierError(trimmed);
+      }
+
+      const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+      Repository.senderTimezoneGenerations.set(trimmed, nextGen);
+      Repository.senderTimezones.set(trimmed, resolved);
+
+      return resolved;
+    } finally {
+      Repository.untrackInFlightPreferenceWrite(trimmed, inFlightPromise);
+      resolveInFlight();
+    }
+  }
 
   static recordSenderDeletion(senderId: string): void {
     const trimmed = String(senderId || '').trim();
@@ -2407,6 +2549,9 @@ export class Repository {
   static isSenderInRecentDeletion(senderId: string, windowMs = 60_000): boolean {
     const trimmed = String(senderId || '').trim();
     if (!trimmed) return false;
+    if ((Repository.activeSenderDeletions.get(trimmed) || 0) > 0) {
+      return true;
+    }
     const ts = Repository.senderDeletionTimestamps.get(trimmed);
     if (!ts) return false;
     if (Date.now() - ts > windowMs) {
@@ -2417,6 +2562,7 @@ export class Repository {
   }
 
   static resetDeletionTimestampsForTesting(): void {
+    Repository.activeSenderDeletions.clear();
     Repository.senderDeletionTimestamps.clear();
   }
 
@@ -2427,29 +2573,66 @@ export class Repository {
   static async deleteUserDataForSender(senderId: string): Promise<number> {
     const trimmed = String(senderId || '').trim();
     if (!trimmed) return 0;
+
+    const currentActive = (Repository.activeSenderDeletions.get(trimmed) || 0) + 1;
+    Repository.activeSenderDeletions.set(trimmed, currentActive);
     Repository.recordSenderDeletion(trimmed);
 
-    if (!isSupabaseConfigured()) {
-      let count = 0;
-      for (const [id, reel] of memoryStore.reels.entries()) {
-        if (reel.instagram_sender_id === trimmed) {
-          memoryStore.reels.delete(id);
-          count++;
+    try {
+      await Repository.waitForInFlightPreferenceWrites(trimmed);
+
+      const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+      Repository.senderTimezoneGenerations.set(trimmed, nextGen);
+      Repository.senderTimezones.delete(trimmed);
+
+      if (!isSupabaseConfigured()) {
+        let count = 0;
+        for (const [id, reel] of memoryStore.reels.entries()) {
+          if (reel.instagram_sender_id === trimmed) {
+            memoryStore.reels.delete(id);
+            count++;
+          }
         }
+        return count;
       }
-      return count;
-    }
 
-    const supabase = getSupabase();
-    const { data, error } = await supabase
-      .from('saved_reels')
-      .delete()
-      .eq('instagram_sender_id', trimmed)
-      .select('id');
+      const supabase = getSupabase();
+      try {
+        const { error: prefError } = await supabase
+          .from('sender_preferences')
+          .delete()
+          .eq('sender_id', trimmed);
 
-    if (error) {
-      throw new Error(`Failed to delete user data for sender ${trimmed}: ${error.message}`);
+        if (prefError) {
+          throw new Error(`Failed to delete sender preferences for sender ${trimmed}: ${prefError.message}`);
+        }
+      } finally {
+        const postDeleteGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+        Repository.senderTimezoneGenerations.set(trimmed, postDeleteGen);
+        Repository.senderTimezones.delete(trimmed);
+      }
+
+      const { data, error } = await supabase
+        .from('saved_reels')
+        .delete()
+        .eq('instagram_sender_id', trimmed)
+        .select('id');
+
+      if (error) {
+        throw new Error(`Failed to delete user data for sender ${trimmed}: ${error.message}`);
+      }
+      return data?.length || 0;
+    } finally {
+      Repository.recordSenderDeletion(trimmed);
+      const remainingActive = (Repository.activeSenderDeletions.get(trimmed) || 1) - 1;
+      if (remainingActive <= 0) {
+        Repository.activeSenderDeletions.delete(trimmed);
+      } else {
+        Repository.activeSenderDeletions.set(trimmed, remainingActive);
+      }
+      const finalGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+      Repository.senderTimezoneGenerations.set(trimmed, finalGen);
+      Repository.senderTimezones.delete(trimmed);
     }
-    return data?.length || 0;
   }
 }

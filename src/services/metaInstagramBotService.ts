@@ -4,6 +4,7 @@ import { loadConfig } from '../config.ts';
 import { Repository, SenderReminderConflictError, SenderDeletionBarrierError } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
 import { parseDuration, formatTargetTime } from '../utils/duration.ts';
+import { getTimeZoneSummary } from '../utils/timezone.ts';
 import { extractCreatorQueryWithFilter } from '../utils/creatorQuery.ts';
 import {
   classifySavedMediaType,
@@ -397,13 +398,14 @@ export class MetaInstagramBotService {
    */
   private async processIncomingText(senderId: string, text: string, attachmentType?: string | null): Promise<void> {
     console.log(`[MetaIG] Incoming DM from Instagram user ${senderId}: "${text}"`);
+    const senderTz = await Repository.getSenderTimezone(senderId);
 
     // Check for Reel or Post URL
     const mediaLink = extractInstagramShortcodeAndPath(text);
     if (mediaLink) {
       const { shortcode, pathType, matchedText } = mediaLink;
       const remaining = text.replace(matchedText, '').trim();
-      const customDuration = parseDuration(remaining);
+      const customDuration = parseDuration(remaining, new Date(), senderTz);
 
       // Fetch public metadata (probe /p/ first for post links, /reel/ first for reel/tv links)
       const preferredPath = pathType === 'p' ? 'p' : 'reel';
@@ -525,17 +527,23 @@ export class MetaInstagramBotService {
 
       if (customDuration) {
         // User provided a specific time along with the item!
-        const reply = `${addedHeading}${creatorLine}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done!`;
+        let reply = `${addedHeading}${creatorLine}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done!`;
+        if (senderTz === 'UTC') {
+          reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
+        }
         await this.sendDirectMessage(senderId, reply);
       } else {
         // No time provided — wait up to 10 minutes for user choice before defaulting to 10 hours
         const defaultTriggerDate = new Date(Date.now() + (10 * 60 + 10 * 3600) * 1000);
-        const defaultTriggerStr = formatTargetTime(defaultTriggerDate);
+        const defaultTriggerStr = formatTargetTime(defaultTriggerDate, new Date(), senderTz);
         const promptQuestion = mediaType === 'post'
           ? '⏰ When should I remind you to view this?'
           : '⏰ When should I remind you to watch this?';
 
-        const reply = `${addedHeading}${creatorLine}\n\n${promptQuestion}\nReply with a time (e.g. "30m", "2h", "tomorrow at 5pm", or "remind me in 5 days").\n\n⏳ If you don't reply within 10 mins, I'll automatically set a reminder for 10 hours from now (${defaultTriggerStr})!`;
+        let reply = `${addedHeading}${creatorLine}\n\n${promptQuestion}\nReply with a time (e.g. "30m", "2h", "tomorrow at 5pm", or "remind me in 5 days").\n\n⏳ If you don't reply within 10 mins, I'll automatically set a reminder for 10 hours from now (${defaultTriggerStr})!`;
+        if (senderTz === 'UTC') {
+          reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz London" or "tz IST") to set your local timezone.`;
+        }
         await this.sendDirectMessage(senderId, reply);
       }
       return;
@@ -599,8 +607,41 @@ export class MetaInstagramBotService {
       return;
     }
 
+    // 2c. Timezone check command (e.g. "tz", "timezone", "my timezone", "what is my timezone")
+    if (['tz', 'timezone', 'my timezone', 'what is my timezone', 'time zone', 'my time'].includes(normalizedText)) {
+      const tzSummary = getTimeZoneSummary(senderTz);
+      const isDefault = senderTz === 'UTC';
+      const reply =
+        `🕒 Your timezone is currently set to: ${tzSummary}\n\n` +
+        (isDefault
+          ? `You are currently using default UTC.\nTo set your local timezone, reply with your city or timezone code:\n• "tz New York" or "tz EST"\n• "tz London" or "tz GMT"\n• "tz IST" or "tz Mumbai"\n• "tz Tokyo" or "tz Sydney"\n• "tz +5:30" or "tz -5"`
+          : `To update your timezone anytime, reply e.g.:\n• "tz New York"\n• "tz London"\n• "tz IST"\n• "tz +5:30"`);
+      await this.sendDirectMessage(senderId, reply);
+      return;
+    }
+
+    // 2d. Timezone set command (e.g. "tz IST", "tz America/New_York", "tz London", "timezone +5:30")
+    const tzSetMatch = text.match(/^(?:tz|timezone|set\s+tz|set\s+timezone)\s+(.+)$/i);
+    if (tzSetMatch) {
+      const rawInput = tzSetMatch[1].trim();
+      const updatedTz = await Repository.setSenderTimezone(senderId, rawInput);
+      if (updatedTz) {
+        const tzSummary = getTimeZoneSummary(updatedTz);
+        const reply =
+          `✅ Timezone updated to ${tzSummary}!\n\n` +
+          `All your reminders and scheduling choices will now be formatted and calculated in your local time.`;
+        await this.sendDirectMessage(senderId, reply);
+      } else {
+        const reply =
+          `❌ Could not recognize timezone "${rawInput}".\n\n` +
+          `Try replying with a major city or standard abbreviation, e.g.:\n• "tz New York"\n• "tz London"\n• "tz IST"\n• "tz Tokyo"\n• "tz +5:30"`;
+        await this.sendDirectMessage(senderId, reply);
+      }
+      return;
+    }
+
     // 3. Custom duration command (e.g. "5s", "remind me in 5 days", "tomorrow at 5pm", "12 nov", etc.)
-    const customDuration = parseDuration(text);
+    const customDuration = parseDuration(text, new Date(), senderTz);
     if (customDuration) {
       const targetReel =
         (await Repository.getActiveAwaitingReelForSender(senderId)) ||
@@ -609,13 +650,17 @@ export class MetaInstagramBotService {
       if (targetReel) {
         const nextDate = customDuration.targetDate.toISOString();
         await Repository.updateReminderSchedule(targetReel.id, nextDate, customDuration.seconds);
-        const reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget);
+        let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget);
+        if (senderTz === 'UTC') {
+          reply += `\n\n💡 Tip: Times are currently shown in UTC. Reply e.g. "tz New York" or "tz IST" to set your local time!`;
+        }
         await this.sendDirectMessage(senderId, reply);
       } else {
-        await this.sendDirectMessage(
-          senderId,
-          `⏰ Got it! Duration set to ${customDuration.label} (${customDuration.formattedTarget}). Share any Reel or Post to track it!`
-        );
+        let reply = `⏰ Got it! Duration set to ${customDuration.label} (${customDuration.formattedTarget}). Share any Reel or Post to track it!`;
+        if (senderTz === 'UTC') {
+          reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <your city>" to use your local time.`;
+        }
+        await this.sendDirectMessage(senderId, reply);
       }
       return;
     }
@@ -715,7 +760,7 @@ export class MetaInstagramBotService {
     }
 
     // Default welcome / help reply
-    const helpMsg = `👋 Hi! Whenever you see a Reel or Post you want to track or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username (or "reels by @name" / "posts by @name") to view your tracked items!\nType "vault" to browse your saved items on the web, or "code" to get a 6-digit login code for your laptop.`;
+    const helpMsg = `👋 Hi! Whenever you see a Reel or Post you want to track or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username (or "reels by @name" / "posts by @name") to view your tracked items!\nType "tz" to check or set your local timezone!\nType "vault" to browse your saved items on the web, or "code" to get a 6-digit login code for your laptop.`;
     await this.sendDirectMessage(senderId, helpMsg);
   }
 }

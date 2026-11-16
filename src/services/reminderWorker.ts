@@ -382,7 +382,10 @@ export class ReminderWorker {
 
     for (const reel of expiredReels) {
       const { targetTime } = await Repository.activateDefaultReminder(reel.id, defaultHours);
-      const targetStr = formatTargetTime(targetTime);
+      const senderTz = reel.instagram_sender_id
+        ? await Repository.getSenderTimezone(reel.instagram_sender_id)
+        : undefined;
+      const targetStr = formatTargetTime(targetTime, new Date(), senderTz);
 
       const defaultNotice = formatDefaultReminderNotice(reel, defaultHours, targetStr);
 

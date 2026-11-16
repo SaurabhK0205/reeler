@@ -5,6 +5,11 @@ import { loadConfig } from './config.ts';
 import { apiRouter } from './api/router.ts';
 import { ReminderWorker } from './services/reminderWorker.ts';
 
+// Server runtime defaults to UTC standard; user-specific timezones are dynamically resolved per session
+if (!process.env.TZ) {
+  process.env.TZ = process.env.APP_TIMEZONE || 'UTC';
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
