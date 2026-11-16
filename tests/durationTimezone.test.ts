@@ -411,3 +411,47 @@ test('Repository - tracked write outlasting cooldown cannot recreate deleted pre
   );
   assert.strictEqual(Repository.isSenderInRecentDeletion(senderId), true);
 });
+
+test('Repository - overlapping deletions keep barrier active until all deletions finish', async () => {
+  Repository.resetSenderTimezonesForTesting();
+  Repository.resetDeletionTimestampsForTesting();
+
+  const senderId = 'user_overlapping_deletions';
+  await Repository.setSenderTimezone(senderId, 'America/New_York');
+
+  // Simulate overlapping deletions: 2 deletions active concurrently
+  (Repository as any).activeSenderDeletions.set(senderId, 2);
+
+  // First deletion finishes, decrementing active count to 1 and setting timestamp
+  const remaining = ((Repository as any).activeSenderDeletions.get(senderId) || 1) - 1;
+  (Repository as any).activeSenderDeletions.set(senderId, remaining);
+  Repository.recordSenderDeletion(senderId);
+
+  // Artificially expire the first deletion's cooldown window (> 60s ago)
+  (Repository as any).senderDeletionTimestamps.set(senderId, Date.now() - 100_000);
+
+  // Second deletion is still active (active count = 1), so barrier MUST remain active!
+  assert.strictEqual(
+    Repository.isSenderInRecentDeletion(senderId),
+    true,
+    'Barrier must remain active while second deletion is running even after first cooldown expires'
+  );
+
+  // setSenderTimezone must reject
+  await assert.rejects(
+    async () => {
+      await Repository.setSenderTimezone(senderId, 'Asia/Kolkata');
+    },
+    (err: any) => err instanceof SenderDeletionBarrierError
+  );
+
+  // Second deletion finishes, clearing active count
+  const remaining2 = ((Repository as any).activeSenderDeletions.get(senderId) || 1) - 1;
+  if (remaining2 <= 0) {
+    (Repository as any).activeSenderDeletions.delete(senderId);
+  }
+  Repository.recordSenderDeletion(senderId);
+
+  // Now active count is 0 and fresh cooldown is active
+  assert.strictEqual(Repository.isSenderInRecentDeletion(senderId), true);
+});

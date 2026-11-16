@@ -2397,7 +2397,7 @@ export class Repository {
   }
 
   private static senderDeletionTimestamps = new Map<string, number>();
-  private static activeSenderDeletions = new Set<string>();
+  private static activeSenderDeletions = new Map<string, number>();
   private static senderTimezones = new Map<string, string>();
   private static senderTimezoneGenerations = new Map<string, number>();
   private static inFlightPreferenceWrites = new Map<string, Set<Promise<any>>>();
@@ -2549,7 +2549,7 @@ export class Repository {
   static isSenderInRecentDeletion(senderId: string, windowMs = 60_000): boolean {
     const trimmed = String(senderId || '').trim();
     if (!trimmed) return false;
-    if (Repository.activeSenderDeletions.has(trimmed)) {
+    if ((Repository.activeSenderDeletions.get(trimmed) || 0) > 0) {
       return true;
     }
     const ts = Repository.senderDeletionTimestamps.get(trimmed);
@@ -2574,7 +2574,8 @@ export class Repository {
     const trimmed = String(senderId || '').trim();
     if (!trimmed) return 0;
 
-    Repository.activeSenderDeletions.add(trimmed);
+    const currentActive = (Repository.activeSenderDeletions.get(trimmed) || 0) + 1;
+    Repository.activeSenderDeletions.set(trimmed, currentActive);
     Repository.recordSenderDeletion(trimmed);
 
     try {
@@ -2623,7 +2624,12 @@ export class Repository {
       return data?.length || 0;
     } finally {
       Repository.recordSenderDeletion(trimmed);
-      Repository.activeSenderDeletions.delete(trimmed);
+      const remainingActive = (Repository.activeSenderDeletions.get(trimmed) || 1) - 1;
+      if (remainingActive <= 0) {
+        Repository.activeSenderDeletions.delete(trimmed);
+      } else {
+        Repository.activeSenderDeletions.set(trimmed, remainingActive);
+      }
       const finalGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
       Repository.senderTimezoneGenerations.set(trimmed, finalGen);
       Repository.senderTimezones.delete(trimmed);
