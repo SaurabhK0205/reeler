@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseDuration, formatTargetTime } from '../src/utils/duration.ts';
 import { resolveTimeZone, getTimeZoneSummary, getTimeZoneAbbreviation } from '../src/utils/timezone.ts';
-import { Repository } from '../src/db/repository.ts';
+import { Repository, SenderDeletionBarrierError } from '../src/db/repository.ts';
 import { MetaInstagramBotService } from '../src/services/metaInstagramBotService.ts';
 import { apiRouter } from '../src/api/router.ts';
 
@@ -252,12 +252,14 @@ test('API Router - /user/timezone persists admin preference and rejects sessions
   const invokePatch = async (req: any) => {
     let statusCode = 200;
     let jsonBody: any = null;
+    let nextError: any = null;
     const res: any = {
       status: (c: number) => { statusCode = c; return res; },
       json: (b: any) => { jsonBody = b; },
     };
-    await patchRoute.route.stack[0].handle(req, res);
-    return { status: statusCode, body: jsonBody };
+    const next = (err?: any) => { nextError = err; };
+    await patchRoute.route.stack[0].handle(req, res, next);
+    return { status: statusCode, body: jsonBody, nextError };
   };
 
   // 1. Session without identity: should be rejected
@@ -306,4 +308,58 @@ test('API Router - /user/timezone persists admin preference and rejects sessions
   });
   assert.strictEqual(invalidPatchRes.status, 400);
   assert.strictEqual(invalidPatchRes.body?.error, 'INVALID_TIMEZONE');
+
+  // 5. Database persistence errors are forwarded to Express nextFunction
+  const origSet = Repository.setSenderTimezone;
+  try {
+    Repository.setSenderTimezone = async () => {
+      throw new Error('Supabase database connection failed');
+    };
+    const errRes = await invokePatch({
+      vaultUser: { role: 'admin' },
+      body: { timezone: 'Europe/Paris' },
+    });
+    assert.ok(errRes.nextError, 'Persistence error must be passed to Express next');
+    assert.strictEqual(errRes.nextError.message, 'Supabase database connection failed');
+  } finally {
+    Repository.setSenderTimezone = origSet;
+  }
+});
+
+test('Repository - setSenderTimezone respects deletion barrier and coordinates in-flight writes', async () => {
+  Repository.resetSenderTimezonesForTesting();
+  Repository.resetDeletionTimestampsForTesting();
+
+  const senderId = 'user_barrier_test';
+  await Repository.setSenderTimezone(senderId, 'America/Chicago');
+  assert.strictEqual(await Repository.getSenderTimezone(senderId), 'America/Chicago');
+
+  // Trigger deletion
+  await Repository.deleteUserDataForSender(senderId);
+
+  // Attempting to set timezone during active deletion barrier window must reject
+  await assert.rejects(
+    async () => {
+      await Repository.setSenderTimezone(senderId, 'Asia/Tokyo');
+    },
+    (err: any) => err instanceof SenderDeletionBarrierError
+  );
+
+  // API router returns 409 DELETION_IN_PROGRESS
+  const patchRoute = (apiRouter.stack as any[]).find(
+    (layer) => layer.route?.path === '/user/timezone' && layer.route?.methods?.patch
+  );
+  let status = 200;
+  let body: any = null;
+  const res: any = {
+    status: (c: number) => { status = c; return res; },
+    json: (b: any) => { body = b; },
+  };
+  await patchRoute.route.stack[0].handle(
+    { vaultUser: { role: 'user', senderId }, body: { timezone: 'Asia/Tokyo' } },
+    res,
+    () => {}
+  );
+  assert.strictEqual(status, 409);
+  assert.strictEqual(body?.error, 'DELETION_IN_PROGRESS');
 });

@@ -2399,6 +2399,7 @@ export class Repository {
   private static senderDeletionTimestamps = new Map<string, number>();
   private static senderTimezones = new Map<string, string>();
   private static senderTimezoneGenerations = new Map<string, number>();
+  private static inFlightPreferenceWrites = new Map<string, Set<Promise<any>>>();
 
   /**
    * Clears in-memory caches for testing.
@@ -2406,6 +2407,33 @@ export class Repository {
   static resetSenderTimezonesForTesting(): void {
     Repository.senderTimezones.clear();
     Repository.senderTimezoneGenerations.clear();
+    Repository.inFlightPreferenceWrites.clear();
+  }
+
+  private static trackInFlightPreferenceWrite(senderId: string, promise: Promise<any>): void {
+    let set = Repository.inFlightPreferenceWrites.get(senderId);
+    if (!set) {
+      set = new Set();
+      Repository.inFlightPreferenceWrites.set(senderId, set);
+    }
+    set.add(promise);
+  }
+
+  private static untrackInFlightPreferenceWrite(senderId: string, promise: Promise<any>): void {
+    const set = Repository.inFlightPreferenceWrites.get(senderId);
+    if (set) {
+      set.delete(promise);
+      if (set.size === 0) {
+        Repository.inFlightPreferenceWrites.delete(senderId);
+      }
+    }
+  }
+
+  static async waitForInFlightPreferenceWrites(senderId: string): Promise<void> {
+    const set = Repository.inFlightPreferenceWrites.get(senderId);
+    if (set && set.size > 0) {
+      await Promise.allSettled(Array.from(set));
+    }
   }
 
   /**
@@ -2463,31 +2491,50 @@ export class Repository {
     const trimmed = String(senderId || '').trim();
     if (!trimmed) return null;
 
+    if (Repository.isSenderInRecentDeletion(trimmed)) {
+      console.warn(`[Repository] Rejecting timezone upsert for sender ${trimmed} due to active deletion barrier window`);
+      throw new SenderDeletionBarrierError(trimmed);
+    }
+
     const resolved = resolveTimeZone(timezoneInput);
     if (!resolved) return null;
 
-    if (isSupabaseConfigured()) {
-      const supabase = getSupabase();
-      const { error } = await supabase
-        .from('sender_preferences')
-        .upsert(
-          {
-            sender_id: trimmed,
-            timezone: resolved,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: 'sender_id' }
-        );
-      if (error) {
-        throw new Error(`Failed to persist sender timezone preference for ${trimmed}: ${error.message}`);
+    let resolveInFlight!: () => void;
+    const inFlightPromise = new Promise<void>((res) => { resolveInFlight = res; });
+    Repository.trackInFlightPreferenceWrite(trimmed, inFlightPromise);
+
+    try {
+      if (isSupabaseConfigured()) {
+        const supabase = getSupabase();
+        const { error } = await supabase
+          .from('sender_preferences')
+          .upsert(
+            {
+              sender_id: trimmed,
+              timezone: resolved,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'sender_id' }
+          );
+        if (error) {
+          throw new Error(`Failed to persist sender timezone preference for ${trimmed}: ${error.message}`);
+        }
       }
+
+      if (Repository.isSenderInRecentDeletion(trimmed)) {
+        console.warn(`[Repository] Rejecting timezone cache commit for sender ${trimmed} due to active deletion barrier window`);
+        throw new SenderDeletionBarrierError(trimmed);
+      }
+
+      const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+      Repository.senderTimezoneGenerations.set(trimmed, nextGen);
+      Repository.senderTimezones.set(trimmed, resolved);
+
+      return resolved;
+    } finally {
+      Repository.untrackInFlightPreferenceWrite(trimmed, inFlightPromise);
+      resolveInFlight();
     }
-
-    const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
-    Repository.senderTimezoneGenerations.set(trimmed, nextGen);
-    Repository.senderTimezones.set(trimmed, resolved);
-
-    return resolved;
   }
 
   static recordSenderDeletion(senderId: string): void {
@@ -2521,6 +2568,8 @@ export class Repository {
     const trimmed = String(senderId || '').trim();
     if (!trimmed) return 0;
     Repository.recordSenderDeletion(trimmed);
+    await Repository.waitForInFlightPreferenceWrites(trimmed);
+
     const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
     Repository.senderTimezoneGenerations.set(trimmed, nextGen);
     Repository.senderTimezones.delete(trimmed);

@@ -1,6 +1,6 @@
 import express from 'express';
-import type { Request, Response } from 'express';
-import { Repository } from '../db/repository.ts';
+import type { Request, Response, NextFunction } from 'express';
+import { Repository, SenderDeletionBarrierError } from '../db/repository.ts';
 import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
@@ -364,7 +364,7 @@ apiRouter.get('/user/timezone', async (req: Request, res: Response) => {
 /**
  * Updates the active timezone for the authenticated vault user.
  */
-apiRouter.patch('/user/timezone', async (req: Request, res: Response) => {
+apiRouter.patch('/user/timezone', async (req: Request, res: Response, next: NextFunction) => {
   const preferenceKey = req.vaultUser?.senderId || (req.vaultUser?.role === 'admin' ? 'admin' : null);
   const rawTz = typeof req.body?.timezone === 'string' ? req.body.timezone.trim() : '';
 
@@ -384,7 +384,16 @@ apiRouter.patch('/user/timezone', async (req: Request, res: Response) => {
     return;
   }
 
-  await Repository.setSenderTimezone(preferenceKey, resolved);
+  try {
+    await Repository.setSenderTimezone(preferenceKey, resolved);
+  } catch (error) {
+    if (error instanceof SenderDeletionBarrierError) {
+      res.status(409).json({ error: 'DELETION_IN_PROGRESS', message: error.message });
+      return;
+    }
+    next(error);
+    return;
+  }
 
   res.json({
     success: true,
