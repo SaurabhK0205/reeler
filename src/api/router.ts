@@ -351,9 +351,9 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
  * Returns the active timezone for the authenticated vault user (or system default).
  */
 apiRouter.get('/user/timezone', async (req: Request, res: Response) => {
-  const senderId = req.vaultUser?.senderId;
-  const timezone = senderId
-    ? await Repository.getSenderTimezone(senderId)
+  const preferenceKey = req.vaultUser?.senderId || (req.vaultUser?.role === 'admin' ? 'admin' : null);
+  const timezone = preferenceKey
+    ? await Repository.getSenderTimezone(preferenceKey)
     : process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
   res.json({
     timezone,
@@ -365,7 +365,7 @@ apiRouter.get('/user/timezone', async (req: Request, res: Response) => {
  * Updates the active timezone for the authenticated vault user.
  */
 apiRouter.patch('/user/timezone', async (req: Request, res: Response) => {
-  const senderId = req.vaultUser?.senderId;
+  const preferenceKey = req.vaultUser?.senderId || (req.vaultUser?.role === 'admin' ? 'admin' : null);
   const rawTz = typeof req.body?.timezone === 'string' ? req.body.timezone.trim() : '';
 
   if (!rawTz) {
@@ -379,9 +379,12 @@ apiRouter.patch('/user/timezone', async (req: Request, res: Response) => {
     return;
   }
 
-  if (senderId) {
-    await Repository.setSenderTimezone(senderId, resolved);
+  if (!preferenceKey) {
+    res.status(400).json({ error: 'SENDER_ID_REQUIRED', message: 'No sender ID or admin session associated with this request.' });
+    return;
   }
+
+  await Repository.setSenderTimezone(preferenceKey, resolved);
 
   res.json({
     success: true,

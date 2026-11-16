@@ -4,6 +4,7 @@ import { parseDuration, formatTargetTime } from '../src/utils/duration.ts';
 import { resolveTimeZone, getTimeZoneSummary, getTimeZoneAbbreviation } from '../src/utils/timezone.ts';
 import { Repository } from '../src/db/repository.ts';
 import { MetaInstagramBotService } from '../src/services/metaInstagramBotService.ts';
+import { apiRouter } from '../src/api/router.ts';
 
 test('Timezone Resolution - resolves standard abbreviations, cities, and offsets', () => {
   assert.strictEqual(resolveTimeZone('ist'), 'Asia/Kolkata');
@@ -129,13 +130,25 @@ test('Repository - persists and retrieves sender timezone preferences', async ()
   const fetchedIst = await Repository.getSenderTimezone('user_ist_1');
   assert.strictEqual(fetchedIst, 'Asia/Kolkata');
 
-  // Data deletion wipes preferences
-  await Repository.deleteUserDataForSender('user_ny_1');
-  const postDeletionTz = await Repository.getSenderTimezone('user_ny_1');
-  assert.notStrictEqual(postDeletionTz, 'America/New_York');
+  // Data deletion wipes preferences and restores configured default
+  const originalAppTz = process.env.APP_TIMEZONE;
+  const originalTz = process.env.TZ;
+  try {
+    process.env.APP_TIMEZONE = 'UTC';
+    delete process.env.TZ;
+
+    await Repository.deleteUserDataForSender('user_ny_1');
+    const postDeletionTz = await Repository.getSenderTimezone('user_ny_1');
+    assert.strictEqual(postDeletionTz, 'UTC');
+  } finally {
+    if (originalAppTz !== undefined) process.env.APP_TIMEZONE = originalAppTz; else delete process.env.APP_TIMEZONE;
+    if (originalTz !== undefined) process.env.TZ = originalTz; else delete process.env.TZ;
+  }
 });
 
-test('MetaInstagramBotService - handles timezone DM commands (tz, timezone)', async () => {
+test('MetaInstagramBotService - handles timezone DM commands (tz, timezone)', async (t) => {
+  // Lock clock to winter date so America/New_York is guaranteed to resolve to EST (UTC-5)
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-01-15T12:00:00Z') });
   Repository.resetSenderTimezonesForTesting();
 
   const sentMessages: string[] = [];
@@ -172,4 +185,100 @@ test('MetaInstagramBotService - handles timezone DM commands (tz, timezone)', as
   await (bot as any).processIncomingText('sender_tz_test', 'tz Atlantis');
   assert.strictEqual(sentMessages.length, 1);
   assert.ok(sentMessages[0].includes('Could not recognize timezone "Atlantis"'));
+});
+
+test('Repository - concurrent setSenderTimezone and deletion track generations', async () => {
+  Repository.resetSenderTimezonesForTesting();
+
+  const senderId = 'user_concurrent_race';
+  await Repository.setSenderTimezone(senderId, 'America/Chicago');
+  const cached = await Repository.getSenderTimezone(senderId);
+  assert.strictEqual(cached, 'America/Chicago');
+
+  // Deletion increments generation and wipes cached value
+  await Repository.deleteUserDataForSender(senderId);
+  const fallback = await Repository.getSenderTimezone(senderId);
+  assert.strictEqual(fallback, process.env.APP_TIMEZONE || process.env.TZ || 'UTC');
+});
+
+test('API Router - /user/timezone persists admin preference and rejects sessions without identity', async () => {
+  Repository.resetSenderTimezonesForTesting();
+
+  const getRoute = (apiRouter.stack as any[]).find(
+    (layer) => layer.route?.path === '/user/timezone' && layer.route?.methods?.get
+  );
+  const patchRoute = (apiRouter.stack as any[]).find(
+    (layer) => layer.route?.path === '/user/timezone' && layer.route?.methods?.patch
+  );
+  assert.ok(getRoute, 'Must find GET /user/timezone');
+  assert.ok(patchRoute, 'Must find PATCH /user/timezone');
+
+  const invokeGet = async (req: any) => {
+    let statusCode = 200;
+    let jsonBody: any = null;
+    const res: any = {
+      status: (c: number) => { statusCode = c; return res; },
+      json: (b: any) => { jsonBody = b; },
+    };
+    await getRoute.route.stack[0].handle(req, res);
+    return { status: statusCode, body: jsonBody };
+  };
+
+  const invokePatch = async (req: any) => {
+    let statusCode = 200;
+    let jsonBody: any = null;
+    const res: any = {
+      status: (c: number) => { statusCode = c; return res; },
+      json: (b: any) => { jsonBody = b; },
+    };
+    await patchRoute.route.stack[0].handle(req, res);
+    return { status: statusCode, body: jsonBody };
+  };
+
+  // 1. Session without identity: should be rejected
+  const noIdentityRes = await invokePatch({
+    vaultUser: { role: 'user' },
+    body: { timezone: 'Europe/London' },
+  });
+  assert.strictEqual(noIdentityRes.status, 400);
+  assert.strictEqual(noIdentityRes.body?.error, 'SENDER_ID_REQUIRED');
+
+  // 2. Admin session without senderId: persists under 'admin'
+  const adminPatchRes = await invokePatch({
+    vaultUser: { role: 'admin' },
+    body: { timezone: 'America/New_York' },
+  });
+  assert.strictEqual(adminPatchRes.status, 200);
+  assert.strictEqual(adminPatchRes.body?.success, true);
+  assert.strictEqual(adminPatchRes.body?.timezone, 'America/New_York');
+
+  // Subsequent GET for admin session returns saved timezone
+  const adminGetRes = await invokeGet({
+    vaultUser: { role: 'admin' },
+  });
+  assert.strictEqual(adminGetRes.status, 200);
+  assert.strictEqual(adminGetRes.body?.timezone, 'America/New_York');
+
+  // 3. User session with senderId: persists under senderId
+  const userPatchRes = await invokePatch({
+    vaultUser: { role: 'user', senderId: 'sender_api_test' },
+    body: { timezone: 'Asia/Kolkata' },
+  });
+  assert.strictEqual(userPatchRes.status, 200);
+  assert.strictEqual(userPatchRes.body?.success, true);
+  assert.strictEqual(userPatchRes.body?.timezone, 'Asia/Kolkata');
+
+  const userGetRes = await invokeGet({
+    vaultUser: { role: 'user', senderId: 'sender_api_test' },
+  });
+  assert.strictEqual(userGetRes.status, 200);
+  assert.strictEqual(userGetRes.body?.timezone, 'Asia/Kolkata');
+
+  // 4. Invalid timezone returns 400
+  const invalidPatchRes = await invokePatch({
+    vaultUser: { role: 'admin' },
+    body: { timezone: 'Invalid/NonExistent_Zone' },
+  });
+  assert.strictEqual(invalidPatchRes.status, 400);
+  assert.strictEqual(invalidPatchRes.body?.error, 'INVALID_TIMEZONE');
 });

@@ -2398,12 +2398,14 @@ export class Repository {
 
   private static senderDeletionTimestamps = new Map<string, number>();
   private static senderTimezones = new Map<string, string>();
+  private static senderTimezoneGenerations = new Map<string, number>();
 
   /**
    * Clears in-memory caches for testing.
    */
   static resetSenderTimezonesForTesting(): void {
     Repository.senderTimezones.clear();
+    Repository.senderTimezoneGenerations.clear();
   }
 
   /**
@@ -2420,6 +2422,8 @@ export class Repository {
       return Repository.senderTimezones.get(trimmed)!;
     }
 
+    const lookupGen = Repository.senderTimezoneGenerations.get(trimmed) || 0;
+
     if (isSupabaseConfigured()) {
       try {
         const supabase = getSupabase();
@@ -2429,6 +2433,11 @@ export class Repository {
           .eq('sender_id', trimmed)
           .maybeSingle();
 
+        const currentGen = Repository.senderTimezoneGenerations.get(trimmed) || 0;
+        if (currentGen !== lookupGen) {
+          return Repository.senderTimezones.get(trimmed) || process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+        }
+
         if (!error && data?.timezone) {
           Repository.senderTimezones.set(trimmed, data.timezone);
           return data.timezone;
@@ -2436,6 +2445,11 @@ export class Repository {
       } catch {
         // Table may not exist yet in older Supabase instances; fall back gracefully
       }
+    }
+
+    const currentGen = Repository.senderTimezoneGenerations.get(trimmed) || 0;
+    if (currentGen !== lookupGen) {
+      return Repository.senderTimezones.get(trimmed) || process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
     }
 
     return process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
@@ -2452,6 +2466,8 @@ export class Repository {
     const resolved = resolveTimeZone(timezoneInput);
     if (!resolved) return null;
 
+    const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+    Repository.senderTimezoneGenerations.set(trimmed, nextGen);
     Repository.senderTimezones.set(trimmed, resolved);
 
     if (isSupabaseConfigured()) {
@@ -2506,6 +2522,8 @@ export class Repository {
     const trimmed = String(senderId || '').trim();
     if (!trimmed) return 0;
     Repository.recordSenderDeletion(trimmed);
+    const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+    Repository.senderTimezoneGenerations.set(trimmed, nextGen);
     Repository.senderTimezones.delete(trimmed);
 
     if (!isSupabaseConfigured()) {
@@ -2520,6 +2538,15 @@ export class Repository {
     }
 
     const supabase = getSupabase();
+    try {
+      await supabase
+        .from('sender_preferences')
+        .delete()
+        .eq('sender_id', trimmed);
+    } catch (err) {
+      console.warn('[Repository] Failed to delete sender preferences from Supabase:', err);
+    }
+
     const { data, error } = await supabase
       .from('saved_reels')
       .delete()
