@@ -101,7 +101,7 @@ function archiveImportGuard(req: express.Request, res: express.Response, next: e
 app.use('/api/archive/import', archiveImportGuard, express.json({ limit: '50mb' }));
 
 // Route-specific parser for Meta webhooks with raw body retention for HMAC verification (1MB)
-app.use('/api/instagram/webhook', express.json({
+app.use(['/api/instagram/webhook', '/webhook'], express.json({
   limit: '1mb',
   verify: (req: any, _res, buf) => {
     req.rawBody = buf;
@@ -113,6 +113,12 @@ app.use(express.json({ limit: '1mb' }));
 
 // API Routes
 app.use('/api', apiRouter);
+
+// Support root /webhook alias for Meta Instagram webhook callback
+app.use('/webhook', (req, res, next) => {
+  req.url = '/instagram/webhook' + (req.url === '/' ? '' : req.url);
+  apiRouter(req, res, next);
+});
 
 // Static Frontend files
 const publicDir = path.join(__dirname, '../public');
