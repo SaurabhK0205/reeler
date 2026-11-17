@@ -362,6 +362,7 @@ export class ArchiveImportService {
         }> = [];
 
         for (const c of parsedCandidates) {
+          const scopedMediaId = senderId ? `export_${senderId}_${c.shortcode}` : c.mediaId;
           if (c.creatorHandle !== UNKNOWN_CREATOR_HANDLE) {
             const creator = creatorMap.get(c.creatorHandle);
             if (!creator?.id) {
@@ -370,7 +371,7 @@ export class ArchiveImportService {
             }
             creatorsSeen.add(creator.id);
             reelsPayload.push({
-              instagram_media_id: c.mediaId,
+              instagram_media_id: scopedMediaId,
               shortcode: c.shortcode,
               reel_url: c.reel_url,
               media_type: c.media_type,
@@ -389,7 +390,7 @@ export class ArchiveImportService {
             const fallback = creatorMap.get(UNKNOWN_CREATOR_HANDLE) || fallbackCreator;
             if (fallback?.id) {
               reelsPayload.push({
-                instagram_media_id: c.mediaId,
+                instagram_media_id: scopedMediaId,
                 shortcode: c.shortcode,
                 reel_url: c.reel_url,
                 media_type: c.media_type,

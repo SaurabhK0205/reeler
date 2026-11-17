@@ -403,6 +403,16 @@ const vaultKeyForm = document.getElementById('vault-key-form');
 const vaultKeyInput = document.getElementById('vault-key-input');
 const vaultKeySubmitBtn = document.getElementById('vault-key-submit-btn');
 const vaultGateError = document.getElementById('vault-gate-error');
+const switchVaultBtn = document.getElementById('switch-vault-btn');
+
+/**
+ * Keeps the header Switch Vault button visible only while an active vault session is unlocked.
+ */
+function syncSwitchVaultButtonVisibility() {
+  if (!switchVaultBtn) return;
+  const gateOpen = Boolean(vaultGateScreen && !vaultGateScreen.classList.contains('is-hidden'));
+  switchVaultBtn.hidden = gateOpen || !getVaultAccessKey();
+}
 
 /**
  * Switches between 6-digit OTP code and direct access key tab in vault gate.
@@ -440,6 +450,7 @@ function showVaultGateScreen(errorMessage) {
   vaultGateScreen.classList.remove('is-hidden');
   if (resultsCount) resultsCount.textContent = 'Private Vault Locked';
   if (reelsGrid) reelsGrid.innerHTML = '';
+  if (reelsTableBody) reelsTableBody.innerHTML = '';
   if (reelsTableContainer) reelsTableContainer.classList.add('is-hidden');
   if (paginationBar) paginationBar.classList.add('is-hidden');
   if (vaultGateError) {
@@ -450,6 +461,7 @@ function showVaultGateScreen(errorMessage) {
       vaultGateError.hidden = true;
     }
   }
+  syncSwitchVaultButtonVisibility();
 }
 
 /**
@@ -459,7 +471,68 @@ function hideVaultGateScreen() {
   if (!vaultGateScreen) return;
   vaultGateScreen.classList.add('is-hidden');
   if (vaultGateError) vaultGateError.hidden = true;
+  syncSwitchVaultButtonVisibility();
 }
+
+/**
+ * Clears the stored vault key, resets displayed vault data, and reopens the auth gate
+ * so the user can switch to a different account/bot vault without clearing browser storage manually.
+ */
+function handleSwitchVault() {
+  if (fetchReelsAbortController) {
+    fetchReelsAbortController.abort();
+    fetchReelsAbortController = null;
+  }
+  if (creatorsFetchController) {
+    creatorsFetchController.abort();
+    creatorsFetchController = null;
+  }
+  if (statsFetchController) {
+    statsFetchController.abort();
+    statsFetchController = null;
+  }
+  setVaultAccessKey(null);
+  closeShortcutsPopover(false);
+  if (typeof state !== 'undefined' && state) {
+    state.reels = [];
+    state.total = 0;
+    state.stats = null;
+    state.creators = [];
+    state.topCreators = [];
+    state.totalCreators = 0;
+    state.creatorMatchTotal = 0;
+    state.selectedCreator = null;
+    state.creatorQuery = '';
+    if (state.filters) {
+      state.filters.creatorId = '';
+      state.filters.page = 1;
+    }
+  }
+  if (creatorFilterInput) creatorFilterInput.value = '';
+  if (typeof syncUrlState === 'function') {
+    syncUrlState();
+  }
+  if (statTotal) statTotal.textContent = '--';
+  if (statMediaSplit) statMediaSplit.textContent = '';
+  if (statCreators) statCreators.textContent = '--';
+  if (statWeek) statWeek.textContent = '--';
+  if (statWatchLater) statWatchLater.textContent = '--';
+  if (statWatched) statWatched.textContent = '--';
+  if (sourceCountAll) sourceCountAll.textContent = '--';
+  if (sourceCountInstagram) sourceCountInstagram.textContent = '--';
+  if (sourceCountBot) sourceCountBot.textContent = '--';
+  if (creatorPillsList) creatorPillsList.innerHTML = '';
+  if (vaultOtpInput) vaultOtpInput.value = '';
+  if (vaultKeyInput) vaultKeyInput.value = '';
+  showVaultGateScreen();
+  switchVaultGateTab('otp');
+  if (typeof announceStatus === 'function') {
+    announceStatus('Signed out of current vault. Enter a 6-digit code or vault key to switch vaults.');
+  }
+}
+
+switchVaultBtn?.addEventListener('click', handleSwitchVault);
+syncSwitchVaultButtonVisibility();
 
 if (vaultOtpForm) {
   vaultOtpForm.addEventListener('submit', async (e) => {
@@ -558,6 +631,7 @@ const feedCloseBtn = document.getElementById('feed-close-btn');
 
 let fetchReelsAbortController = null;
 let creatorsFetchController = null;
+let statsFetchController = null;
 let searchTimeout = null;
 let creatorSearchTimeout = null;
 let isCreatorSearching = false;
@@ -1135,9 +1209,15 @@ async function checkHealth() {
  * Fetches summary statistics from the server and populates metric cards.
  */
 async function loadStats() {
+  if (statsFetchController) {
+    statsFetchController.abort();
+  }
+  statsFetchController = new AbortController();
+  const { signal } = statsFetchController;
   statsBar?.setAttribute('aria-busy', 'true');
   try {
-    const res = await vaultFetch('/api/stats');
+    const res = await vaultFetch('/api/stats', { signal });
+    if (signal.aborted) return;
     if (res.status === 401) {
       showVaultGateScreen();
       return;
@@ -1146,6 +1226,7 @@ async function loadStats() {
       throw new Error(`HTTP ${res.status}`);
     }
     const stats = await res.json();
+    if (signal.aborted) return;
     state.stats = stats;
     statsLoadErrorNotified = false;
 
@@ -1189,6 +1270,7 @@ async function loadStats() {
     }
     statsBar?.classList.remove('is-initial-loading');
   } catch (e) {
+    if (e?.name === 'AbortError' || signal.aborted) return;
     console.error('Failed to load stats:', e);
     statsBar?.classList.remove('is-initial-loading');
     if (!state.stats) {
@@ -1442,6 +1524,7 @@ async function fetchReels() {
 
   try {
     const res = await vaultFetch(`/api/reels?${params.toString()}`, { signal });
+    if (signal.aborted) return;
     if (res.status === 401) {
       showVaultGateScreen();
       return;

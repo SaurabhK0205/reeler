@@ -340,11 +340,16 @@ export class MetaInstagramBotService {
           // Check for attachments (e.g. shared Reel clip, ig_reel, share, photo/carousel post)
           let reelUrl: string | null = null;
           let attachmentType: string | null = null;
+          let attachmentTitle: string | null = null;
           if (event.message?.attachments) {
             for (const att of event.message.attachments) {
               if (att.payload?.url) {
                 reelUrl = att.payload.url;
                 attachmentType = typeof att.type === 'string' ? att.type : null;
+                attachmentTitle =
+                  typeof att.payload.title === 'string' && att.payload.title.trim()
+                    ? att.payload.title.trim()
+                    : null;
                 break;
               }
             }
@@ -353,7 +358,7 @@ export class MetaInstagramBotService {
           const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
           if (combinedText) {
             try {
-              await this.processIncomingText(senderId, combinedText, attachmentType);
+              await this.processIncomingText(senderId, combinedText, attachmentType, attachmentTitle);
             } catch (error) {
               console.error(`[MetaIG] Failed to process messaging event for sender ${senderId}:`, error);
             }
@@ -370,11 +375,16 @@ export class MetaInstagramBotService {
             const text = val.message?.text || '';
             let reelUrl: string | null = null;
             let attachmentType: string | null = null;
+            let attachmentTitle: string | null = null;
             if (val.message?.attachments) {
               for (const att of val.message.attachments) {
                 if (att.payload?.url) {
                   reelUrl = att.payload.url;
                   attachmentType = typeof att.type === 'string' ? att.type : null;
+                  attachmentTitle =
+                    typeof att.payload.title === 'string' && att.payload.title.trim()
+                      ? att.payload.title.trim()
+                      : null;
                   break;
                 }
               }
@@ -382,7 +392,7 @@ export class MetaInstagramBotService {
             const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
             if (combinedText) {
               try {
-                await this.processIncomingText(senderId, combinedText, attachmentType);
+                await this.processIncomingText(senderId, combinedText, attachmentType, attachmentTitle);
               } catch (error) {
                 console.error(`[MetaIG] Failed to process change event for sender ${senderId}:`, error);
               }
@@ -396,7 +406,12 @@ export class MetaInstagramBotService {
   /**
    * Processes incoming text/link from an Instagram user
    */
-  private async processIncomingText(senderId: string, text: string, attachmentType?: string | null): Promise<void> {
+  private async processIncomingText(
+    senderId: string,
+    text: string,
+    attachmentType?: string | null,
+    attachmentTitle?: string | null
+  ): Promise<void> {
     console.log(`[MetaIG] Incoming DM from Instagram user ${senderId}: "${text}"`);
     const senderTz = await Repository.getSenderTimezone(senderId);
 
@@ -411,8 +426,14 @@ export class MetaInstagramBotService {
       const preferredPath = pathType === 'p' ? 'p' : 'reel';
       const [meta, existingItem] = await Promise.all([
         fetchReelMetadata(shortcode, undefined, preferredPath),
-        Repository.getSavedItemByShortcode(shortcode),
+        Repository.getSavedItemByShortcode(shortcode, senderId),
       ]);
+
+      // Read-only metadata reuse from another row with the same shortcode if this sender has no row yet
+      const metadataFallbackItem = existingItem
+        ? null
+        : await Repository.getSavedItemByShortcode(shortcode);
+      const metadataSeed = existingItem || metadataFallbackItem;
 
       const { mediaType, canonicalUrl } = resolveInboundMediaClassification({
         shortcode,
@@ -421,7 +442,7 @@ export class MetaInstagramBotService {
         isClips: meta.isClips,
         mediaKind: meta.mediaKind,
         attachmentType,
-        existing: existingItem,
+        existing: metadataSeed,
       });
 
       const activeOwner = String(existingItem?.instagram_sender_id || '').trim();
@@ -438,7 +459,7 @@ export class MetaInstagramBotService {
       }
 
       const validHandle = extractPublicCreatorUsername({ username: meta.username });
-      const existingCreator = existingItem?.creator;
+      const existingCreator = metadataSeed?.creator;
       const existingHandle = extractPublicCreatorUsername(existingCreator);
 
       let creator: NonNullable<typeof existingCreator>;
@@ -463,9 +484,19 @@ export class MetaInstagramBotService {
         });
       }
 
-      const instagramMediaId = existingItem?.instagram_media_id || `shortcode_${shortcode}`;
-      const caption = meta.caption || existingItem?.caption || null;
-      const thumbnailUrl = meta.thumbnailUrl || existingItem?.thumbnail_url || null;
+      const instagramMediaId = existingItem?.instagram_media_id || `dm_${senderId}_${shortcode}`;
+      const cleanAttachmentTitle = attachmentTitle?.trim() || null;
+      const caption =
+        meta.caption ||
+        cleanAttachmentTitle ||
+        existingItem?.caption ||
+        metadataFallbackItem?.caption ||
+        null;
+      const thumbnailUrl =
+        meta.thumbnailUrl ||
+        existingItem?.thumbnail_url ||
+        metadataFallbackItem?.thumbnail_url ||
+        null;
       const nowIso = new Date().toISOString();
       const takenAt = existingItem?.taken_at || nowIso;
       // Preserve native IG membership/save date for existing IG items; new DM shares live under "Sent to Bot" (false, saved_at=null)

@@ -1099,14 +1099,19 @@ test('MetaInstagramBotService preserves recovered post classification on inconcl
     assert.ok(sentMessages[0].text.includes('🖼️ Added post to your Watch Later!'), `Got: ${sentMessages[0].text}`);
     assert.ok(sentMessages[0].text.includes('Creator: @the_political_compass'), `Got: ${sentMessages[0].text}`);
 
-    const preserved = await Repository.getSavedItemByShortcode('DS1goOmjhUi');
+    const preserved = await Repository.getSavedItemByShortcode('DS1goOmjhUi', 'sender_preserve');
     assert.ok(preserved);
     assert.strictEqual(preserved.media_type, 'post');
     assert.strictEqual(preserved.reel_url, 'https://www.instagram.com/p/DS1goOmjhUi/');
-    assert.strictEqual(preserved.instagram_media_id, 'export_DS1goOmjhUi');
+    assert.strictEqual(preserved.instagram_media_id, 'dm_sender_preserve_DS1goOmjhUi');
     assert.strictEqual(preserved.caption, 'Preserved quadrant post');
-    assert.strictEqual(preserved.taken_at, '2026-11-10T09:00:00Z');
-    assert.strictEqual(preserved.first_detected_at, '2026-11-10T09:00:00Z');
+
+    // Original unattributed archive row must remain completely intact
+    const originalArchivePost = await Repository.getSavedItemByShortcode('DS1goOmjhUi', null);
+    assert.ok(originalArchivePost);
+    assert.strictEqual(originalArchivePost.instagram_media_id, 'export_DS1goOmjhUi');
+    assert.strictEqual(originalArchivePost.taken_at, '2026-11-10T09:00:00Z');
+    assert.strictEqual(originalArchivePost.first_detected_at, '2026-11-10T09:00:00Z');
 
     const postFiltered = await Repository.getReels({ mediaType: 'post', limit: 10 });
     assert.strictEqual(postFiltered.reels.some((r) => r.shortcode === 'DS1goOmjhUi'), true);
@@ -1129,7 +1134,7 @@ test('MetaInstagramBotService preserves recovered post classification on inconcl
     assert.strictEqual(sentMessages.length, 2);
     assert.ok(sentMessages[1].text.includes('🎬 Added to your Watch Later!'), `Got: ${sentMessages[1].text}`);
 
-    const upgraded = await Repository.getSavedItemByShortcode('DUpgradeReel');
+    const upgraded = await Repository.getSavedItemByShortcode('DUpgradeReel', 'sender_preserve');
     assert.ok(upgraded);
     assert.strictEqual(upgraded.media_type, 'reel');
     assert.strictEqual(upgraded.reel_url, 'https://www.instagram.com/reel/DUpgradeReel/');
@@ -1153,7 +1158,7 @@ test('MetaInstagramBotService preserves recovered post classification on inconcl
     assert.ok(sentMessages[2].text.includes('🖼️ Added post to your Watch Later!'), `Got: ${sentMessages[2].text}`);
     assert.ok(sentMessages[2].text.includes('Creator: @the_political_compass'), `Got: ${sentMessages[2].text}`);
 
-    const retroFixed = await Repository.getSavedItemByShortcode('DRetroPost');
+    const retroFixed = await Repository.getSavedItemByShortcode('DRetroPost', 'sender_preserve');
     assert.ok(retroFixed);
     assert.strictEqual(retroFixed.media_type, 'post');
     assert.strictEqual(retroFixed.reel_url, 'https://www.instagram.com/p/DRetroPost/');
@@ -1176,7 +1181,7 @@ test('MetaInstagramBotService preserves recovered post classification on inconcl
 
     assert.strictEqual(sentMessages.length, 4);
     assert.ok(sentMessages[3].text.includes('🎬 Added to your Watch Later!'), `Got: ${sentMessages[3].text}`);
-    const freshReel = await Repository.getSavedItemByShortcode('DBrandNewReel');
+    const freshReel = await Repository.getSavedItemByShortcode('DBrandNewReel', 'sender_preserve');
     assert.ok(freshReel);
     assert.strictEqual(freshReel.media_type, 'reel');
     assert.strictEqual(freshReel.reel_url, 'https://www.instagram.com/reel/DBrandNewReel/');
@@ -1805,8 +1810,8 @@ test('MetaInstagramBotService and Repository preserve existing sender Watch Late
       ],
     });
 
-    const reelBefore = await Repository.getSavedItemByShortcode('DConflictReel1');
-    const postBefore = await Repository.getSavedItemByShortcode('DConflictPost1');
+    const reelBefore = await Repository.getSavedItemByShortcode('DConflictReel1', 'sender_alpha');
+    const postBefore = await Repository.getSavedItemByShortcode('DConflictPost1', 'sender_alpha');
     assert.strictEqual(reelBefore?.instagram_sender_id, 'sender_alpha');
     assert.strictEqual(postBefore?.instagram_sender_id, 'sender_alpha');
     assert.ok(reelBefore?.next_reminder_at);
@@ -1814,7 +1819,7 @@ test('MetaInstagramBotService and Repository preserve existing sender Watch Late
 
     sentMessages.length = 0;
 
-    // 2. Conflicting Sender B tries to schedule both items with different schedules
+    // 2. Sender B shares the exact same items with different schedules -> gets isolated per-sender rows without collision
     await bot.handleWebhookPayload({
       object: 'instagram',
       entry: [
@@ -1827,60 +1832,66 @@ test('MetaInstagramBotService and Repository preserve existing sender Watch Late
       ],
     });
 
-    // Rejections sent with honest notice, never success confirmation or shortcodes
     assert.strictEqual(sentMessages.length, 2);
     assert.strictEqual(sentMessages[0].recipientId, 'sender_beta');
-    assert.ok(sentMessages[0].text.includes('already has an active reminder'));
-    assert.ok(!sentMessages[0].text.includes('Added to your Watch Later'));
+    assert.ok(sentMessages[0].text.includes('Added to your Watch Later'));
     assert.ok(!sentMessages[0].text.includes('DConflictReel1'));
 
     assert.strictEqual(sentMessages[1].recipientId, 'sender_beta');
-    assert.ok(sentMessages[1].text.includes('already has an active reminder'));
-    assert.ok(sentMessages[1].text.includes('post'));
-    assert.ok(!sentMessages[1].text.includes('Added post to your Watch Later'));
+    assert.ok(sentMessages[1].text.includes('Added post to your Watch Later'));
     assert.ok(!sentMessages[1].text.includes('DConflictPost1'));
 
-    // Sender A's schedule & ownership remain untouched
-    const reelAfter = await Repository.getSavedItemByShortcode('DConflictReel1');
-    const postAfter = await Repository.getSavedItemByShortcode('DConflictPost1');
+    // Sender A's schedule & ownership remain completely untouched
+    const reelAfter = await Repository.getSavedItemByShortcode('DConflictReel1', 'sender_alpha');
+    const postAfter = await Repository.getSavedItemByShortcode('DConflictPost1', 'sender_alpha');
     assert.strictEqual(reelAfter?.instagram_sender_id, 'sender_alpha');
     assert.strictEqual(reelAfter?.next_reminder_at, reelBefore?.next_reminder_at);
     assert.strictEqual(reelAfter?.reminder_interval_seconds, reelBefore?.reminder_interval_seconds);
     assert.strictEqual(postAfter?.instagram_sender_id, 'sender_alpha');
     assert.strictEqual(postAfter?.awaiting_reminder_choice_until, postBefore?.awaiting_reminder_choice_until);
 
-    // Same sender resending continues to update their own schedule cleanly
+    // Sender B has independent rows with its own schedule
+    const betaReel = await Repository.getSavedItemByShortcode('DConflictReel1', 'sender_beta');
+    const betaPost = await Repository.getSavedItemByShortcode('DConflictPost1', 'sender_beta');
+    assert.strictEqual(betaReel?.instagram_sender_id, 'sender_beta');
+    assert.strictEqual(betaReel?.reminder_interval_seconds, 7200);
+    assert.notStrictEqual(betaReel?.id, reelAfter?.id);
+    assert.strictEqual(betaPost?.instagram_sender_id, 'sender_beta');
+    assert.notStrictEqual(betaPost?.id, postAfter?.id);
+
+    // Same sender resending updates only their own schedule cleanly
     sentMessages.length = 0;
     await bot.handleWebhookPayload({
       object: 'instagram',
       entry: [
         {
           messaging: [
-            { sender: { id: 'sender_alpha' }, message: { text: 'https://www.instagram.com/reel/DConflictReel1/ 2h' } },
+            { sender: { id: 'sender_alpha' }, message: { text: 'https://www.instagram.com/reel/DConflictReel1/ 45m' } },
           ],
         },
       ],
     });
     assert.ok(sentMessages[0]?.text.includes('Added to your Watch Later!'));
-    const reelRescheduled = await Repository.getSavedItemByShortcode('DConflictReel1');
-    assert.strictEqual(reelRescheduled?.reminder_interval_seconds, 7200);
+    const reelRescheduled = await Repository.getSavedItemByShortcode('DConflictReel1', 'sender_alpha');
+    assert.strictEqual(reelRescheduled?.reminder_interval_seconds, 2700);
+    assert.strictEqual((await Repository.getSavedItemByShortcode('DConflictReel1', 'sender_beta'))?.reminder_interval_seconds, 7200);
 
-    // Once Sender A finishes watching, Sender B can schedule the same item cleanly
+    // Sender A stopping all reminders does NOT cancel Sender B's active reminder
     await bot.handleWebhookPayload({
       object: 'instagram',
       entry: [
         {
           messaging: [
             { sender: { id: 'sender_alpha' }, message: { text: 'stop all' } },
-            { sender: { id: 'sender_beta' }, message: { text: 'https://www.instagram.com/reel/DConflictReel1/ 45m' } },
           ],
         },
       ],
     });
-    const reelClaimedAfterWatched = await Repository.getSavedItemByShortcode('DConflictReel1');
-    assert.strictEqual(reelClaimedAfterWatched?.instagram_sender_id, 'sender_beta');
-    assert.strictEqual(reelClaimedAfterWatched?.watch_status, 'watch_later');
-    assert.strictEqual(reelClaimedAfterWatched?.reminder_interval_seconds, 2700);
+    const alphaAfterStop = await Repository.getSavedItemByShortcode('DConflictReel1', 'sender_alpha');
+    const betaAfterAlphaStop = await Repository.getSavedItemByShortcode('DConflictReel1', 'sender_beta');
+    assert.strictEqual(alphaAfterStop?.watch_status, 'watched');
+    assert.strictEqual(betaAfterAlphaStop?.watch_status, 'watch_later');
+    assert.strictEqual(betaAfterAlphaStop?.reminder_interval_seconds, 7200);
 
     Repository.resetMemoryStoreForTests();
 
@@ -2056,7 +2067,7 @@ test('Repository and MetaInstagramBotService protect unattributed active reminde
       is_saved_on_instagram: true,
     });
 
-    // 1. Outside sender sharing an unattributed active Watch Later item is rejected without altering reminder or ownership
+    // 1. Outside sender sharing the same shortcode gets their own isolated row without altering admin's unattributed reminder or ownership
     await bot.handleWebhookPayload({
       object: 'instagram',
       entry: [
@@ -2070,15 +2081,20 @@ test('Repository and MetaInstagramBotService protect unattributed active reminde
 
     assert.strictEqual(sentMessages.length, 1);
     assert.strictEqual(sentMessages[0].recipientId, 'outside_sender_1');
-    assert.ok(sentMessages[0].text.includes('already has an active reminder'));
-    assert.ok(!sentMessages[0].text.includes('Added to your Watch Later'));
+    assert.ok(sentMessages[0].text.includes('Added to your Watch Later'));
 
-    const untouchedAdminItem = await Repository.getSavedItemByShortcode('DAdminActive1');
+    const untouchedAdminItem = await Repository.getSavedItemByShortcode('DAdminActive1', null);
     assert.strictEqual(untouchedAdminItem?.watch_status, 'watch_later');
     assert.strictEqual(untouchedAdminItem?.instagram_sender_id, undefined);
     assert.strictEqual(untouchedAdminItem?.next_reminder_at, initialAdminReminderAt);
 
-    // Direct Repository upsert by outside sender must also fail closed on unattributed active reminder
+    const isolatedOutsideItem = await Repository.getSavedItemByShortcode('DAdminActive1', 'outside_sender_1');
+    assert.strictEqual(isolatedOutsideItem?.watch_status, 'watch_later');
+    assert.strictEqual(isolatedOutsideItem?.instagram_sender_id, 'outside_sender_1');
+    assert.strictEqual(isolatedOutsideItem?.reminder_interval_seconds, 900);
+    assert.notStrictEqual(isolatedOutsideItem?.id, untouchedAdminItem?.id);
+
+    // Direct Repository upsert targeting admin's exact instagram_media_id must still fail closed on unattributed active reminder
     await assert.rejects(
       () =>
         Repository.upsertSavedReel({
@@ -2094,6 +2110,29 @@ test('Repository and MetaInstagramBotService protect unattributed active reminde
           instagram_sender_id: 'outside_sender_1',
         }),
       (e: unknown) => e instanceof SenderReminderConflictError
+    );
+
+    // Direct unattributed/admin write targeting a sender-owned instagram_media_id must fail closed without clobbering sender's row
+    await assert.rejects(
+      () =>
+        Repository.upsertSavedReel({
+          instagram_media_id: isolatedOutsideItem!.instagram_media_id,
+          shortcode: 'DAdminActive1',
+          reel_url: 'https://www.instagram.com/reel/DAdminActive1/',
+          media_type: 'reel',
+          creator_id: creator.id,
+          taken_at: new Date().toISOString(),
+          first_detected_at: new Date().toISOString(),
+          save_order_rank: 1,
+          watch_status: 'watched',
+          reminder_interval_hours: 10,
+        }),
+      (e: unknown) => e instanceof SenderReminderConflictError
+    );
+    assert.strictEqual(
+      (await Repository.getSavedItemByShortcode('DAdminActive1', 'outside_sender_1'))?.watch_status,
+      'watch_later',
+      'Sender-owned row must remain untouched after rejected unattributed write'
     );
 
     // 2. Admin rescheduling (no incoming sender) still works on unattributed active reminder
@@ -2115,9 +2154,11 @@ test('Repository and MetaInstagramBotService protect unattributed active reminde
     assert.strictEqual(adminUpdated?.next_reminder_at, rescheduledAdminAt);
     assert.strictEqual(adminUpdated?.reminder_interval_hours, 2);
 
-    // 3. Once admin marks it watched, an external sender can schedule and claim it
+    // 3. Admin stopping unattributed reminders only stops admin's row, leaving outside_sender_1's row active
     const adminStop = await Repository.markWatchedForInstagramSender('', { includeUnattributedFallback: true });
     assert.strictEqual(adminStop.updatedReels.length, 1);
+    assert.strictEqual((await Repository.getSavedItemByShortcode('DAdminActive1', null))?.watch_status, 'watched');
+    assert.strictEqual((await Repository.getSavedItemByShortcode('DAdminActive1', 'outside_sender_1'))?.watch_status, 'watch_later');
 
     sentMessages.length = 0;
     await bot.handleWebhookPayload({
@@ -2130,10 +2171,10 @@ test('Repository and MetaInstagramBotService protect unattributed active reminde
         },
       ],
     });
-    const claimedItem = await Repository.getSavedItemByShortcode('DAdminActive1');
-    assert.strictEqual(claimedItem?.watch_status, 'watch_later');
-    assert.strictEqual(claimedItem?.instagram_sender_id, 'outside_sender_1');
-    assert.strictEqual(claimedItem?.reminder_interval_seconds, 2700);
+    const updatedOutsideItem = await Repository.getSavedItemByShortcode('DAdminActive1', 'outside_sender_1');
+    assert.strictEqual(updatedOutsideItem?.watch_status, 'watch_later');
+    assert.strictEqual(updatedOutsideItem?.instagram_sender_id, 'outside_sender_1');
+    assert.strictEqual(updatedOutsideItem?.reminder_interval_seconds, 2700);
     assert.ok(sentMessages[0]?.text.includes('Added to your Watch Later!'));
 
     Repository.resetMemoryStoreForTests();
@@ -2579,5 +2620,188 @@ test('MetaInstagramBotService - "delete my data" sends error reply when deletion
     assert.ok(sentMessages[0].text.includes('encountered an issue processing your data deletion request'));
   } finally {
     Repository.deleteUserDataForSender = originalDelete;
+  }
+});
+
+test('MetaInstagramBotService captures webhook attachment payload.title as fallback caption when HTML metadata is blocked', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const prevAnon = process.env.SUPABASE_ANON_KEY;
+  const prevMetaToken = process.env.META_PAGE_ACCESS_TOKEN;
+  const prevProxy = process.env.METADATA_PROXY_URL;
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  delete process.env.SUPABASE_ANON_KEY;
+  delete process.env.META_PAGE_ACCESS_TOKEN;
+  delete process.env.METADATA_PROXY_URL;
+
+  const originalFetch = globalThis.fetch;
+  const { Repository } = await import('../src/db/repository.ts');
+  const { resetFeedMetaResolverStateForTests } = await import('../src/services/reelMetadataResolver.ts');
+  try {
+    Repository.resetMemoryStoreForTests();
+    resetFeedMetaResolverStateForTests();
+    // Simulate Instagram login wall returning HTML without OG tags
+    globalThis.fetch = (async () => new Response('<html><head><title>Login • Instagram</title></head></html>', { status: 200 })) as typeof fetch;
+
+    const bot = new MetaInstagramBotService();
+    bot.sendDirectMessage = async () => true;
+
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_title_fallback' },
+              message: {
+                attachments: [
+                  {
+                    type: 'ig_reel',
+                    payload: {
+                      reel_video_id: '18105532976531077',
+                      title: 'Thank you Akira Toriyama #dragonball',
+                      url: 'https://www.instagram.com/reel/DTitleFallback1/',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const saved = await Repository.getSavedItemByShortcode('DTitleFallback1', 'sender_title_fallback');
+    assert.ok(saved, 'Reel should be saved for sender');
+    assert.strictEqual(saved.caption, 'Thank you Akira Toriyama #dragonball');
+    assert.strictEqual(saved.instagram_media_id, 'dm_sender_title_fallback_DTitleFallback1');
+
+    // Also verify entry.changes path preserves payload.title
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                sender: { id: 'sender_changes_title' },
+                message: {
+                  attachments: [
+                    {
+                      type: 'ig_reel',
+                      payload: {
+                        title: 'Changes event title fallback',
+                        url: 'https://www.instagram.com/reel/DChangesTitle1/',
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const savedFromChanges = await Repository.getSavedItemByShortcode('DChangesTitle1', 'sender_changes_title');
+    assert.ok(savedFromChanges, 'Changes reel should be saved for sender');
+    assert.strictEqual(savedFromChanges.caption, 'Changes event title fallback');
+    Repository.resetMemoryStoreForTests();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+    if (prevAnon !== undefined) process.env.SUPABASE_ANON_KEY = prevAnon;
+    if (prevMetaToken !== undefined) process.env.META_PAGE_ACCESS_TOKEN = prevMetaToken;
+    if (prevProxy !== undefined) process.env.METADATA_PROXY_URL = prevProxy;
+  }
+});
+
+test('fetchReelMetadata supports Meta oEmbed fallback with code-10 cooldown and METADATA_PROXY_URL relay', async () => {
+  const prevMetaToken = process.env.META_PAGE_ACCESS_TOKEN;
+  const prevProxy = process.env.METADATA_PROXY_URL;
+  const prevProxyToken = process.env.METADATA_PROXY_TOKEN;
+  const originalFetch = globalThis.fetch;
+
+  const { fetchReelMetadata, resetFeedMetaResolverStateForTests } = await import('../src/services/reelMetadataResolver.ts');
+
+  try {
+    // 1. Meta oEmbed success path
+    resetFeedMetaResolverStateForTests();
+    process.env.META_PAGE_ACCESS_TOKEN = 'test_oembed_token';
+    delete process.env.METADATA_PROXY_URL;
+
+    globalThis.fetch = (async (url: unknown) => {
+      const target = String(url);
+      if (target.includes('graph.facebook.com/v21.0/instagram_oembed')) {
+        return new Response(
+          JSON.stringify({
+            author_name: 'OEmbedCreator',
+            thumbnail_url: 'https://scontent.cdninstagram.com/v/thumb.jpg',
+            title: 'Official oEmbed caption',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('<html><title>Login</title></html>', { status: 200 });
+    }) as typeof fetch;
+
+    const oEmbedMeta = await fetchReelMetadata('DOEmbedOk1', undefined, 'reel');
+    assert.strictEqual(oEmbedMeta.username, 'oembedcreator');
+    assert.strictEqual(oEmbedMeta.thumbnailUrl, 'https://scontent.cdninstagram.com/v/thumb.jpg');
+    assert.strictEqual(oEmbedMeta.caption, 'Official oEmbed caption');
+    assert.strictEqual(oEmbedMeta.isClips, null, 'oEmbed without EFG must not assume isClips from preferredPath');
+    assert.strictEqual(oEmbedMeta.mediaKind, 'UNKNOWN');
+
+    // 2. Meta oEmbed code-10 cooldown + METADATA_PROXY_URL relay fallback even after direct network error
+    resetFeedMetaResolverStateForTests();
+    process.env.METADATA_PROXY_URL = 'https://proxy.example.workers.dev/';
+    process.env.METADATA_PROXY_TOKEN = 'secret_proxy_tok';
+    let oEmbedCalls = 0;
+    let proxyAuthHeader = '';
+
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const target = String(url);
+      if (target.includes('graph.facebook.com/v21.0/instagram_oembed')) {
+        oEmbedCalls++;
+        return new Response(
+          JSON.stringify({ error: { code: 10, message: 'Meta oEmbed Read requires review' } }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (target.startsWith('https://proxy.example.workers.dev/')) {
+        proxyAuthHeader = String((init?.headers as Record<string, string> | undefined)?.Authorization || '');
+        return new Response(
+          `<html><head>
+            <meta property="og:url" content="https://www.instagram.com/relay_creator/reel/DProxyOk1/" />
+            <meta property="og:title" content="Relay Creator (@relay_creator) on Instagram" />
+            <meta property="og:image" content="https://scontent.cdninstagram.com/v/proxy_thumb.jpg" />
+            <meta property="og:description" content="10 likes: &quot;Proxy caption&quot;." />
+          </head></html>`,
+          { status: 200, headers: { 'Content-Type': 'text/html' } }
+        );
+      }
+      throw new TypeError('Simulated direct network timeout');
+    }) as typeof fetch;
+
+    const proxied1 = await fetchReelMetadata('DProxyOk1', undefined, 'reel');
+    assert.strictEqual(proxied1.username, 'relay_creator');
+    assert.strictEqual(proxied1.thumbnailUrl, 'https://scontent.cdninstagram.com/v/proxy_thumb.jpg');
+    assert.strictEqual(proxyAuthHeader, 'Bearer secret_proxy_tok');
+    assert.strictEqual(oEmbedCalls, 1);
+
+    // Second call must skip oEmbed due to 1h cooldown after code 10
+    await fetchReelMetadata('DProxyOk2', undefined, 'reel');
+    assert.strictEqual(oEmbedCalls, 1, 'oEmbed should remain paused during cooldown after code 10');
+  } finally {
+    globalThis.fetch = originalFetch;
+    resetFeedMetaResolverStateForTests();
+    if (prevMetaToken !== undefined) process.env.META_PAGE_ACCESS_TOKEN = prevMetaToken;
+    else delete process.env.META_PAGE_ACCESS_TOKEN;
+    if (prevProxy !== undefined) process.env.METADATA_PROXY_URL = prevProxy;
+    else delete process.env.METADATA_PROXY_URL;
+    if (prevProxyToken !== undefined) process.env.METADATA_PROXY_TOKEN = prevProxyToken;
+    else delete process.env.METADATA_PROXY_TOKEN;
   }
 });

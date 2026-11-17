@@ -629,20 +629,20 @@ async function runTests() {
     ],
   };
 
-  const promoteRes = await ArchiveImportService.importArchive(promotionArchivePayload);
+  const promoteRes = await ArchiveImportService.importArchive(promotionArchivePayload, 'sender_parity_1');
   assert.equal(promoteRes.status, 'success');
   assert.equal(promoteRes.reelsImported, 1);
   assert.equal(promoteRes.alreadyPresent, 2);
   assert.equal(promoteRes.promotedToSaved, 2, 'Both matched bot items must promote to Saved on IG');
   assert.equal(promoteRes.savedAtBackfilled, 1, 'Only entry with archive timestamp backfills saved_at');
 
-  // Re-running import must be idempotent
-  const promoteRepeat = await ArchiveImportService.importArchive(promotionArchivePayload);
+  // Re-running same-sender import must be idempotent
+  const promoteRepeat = await ArchiveImportService.importArchive(promotionArchivePayload, 'sender_parity_1');
   assert.equal(promoteRepeat.promotedToSaved, 0);
   assert.equal(promoteRepeat.savedAtBackfilled, 0);
   assert.equal(promoteRepeat.reelsImported, 0);
 
-  const promotedItem1 = await Repository.getSavedItemByShortcode('DBotPromote1');
+  const promotedItem1 = await Repository.getSavedItemByShortcode('DBotPromote1', 'sender_parity_1');
   assert.equal(promotedItem1?.is_saved_on_instagram, true);
   assert.equal(promotedItem1?.saved_at, '2026-11-05T14:00:00.000Z');
   assert.equal(promotedItem1?.watch_status, 'watch_later', 'Promotion must preserve watch_status');
@@ -652,7 +652,7 @@ async function runTests() {
   assert.equal(promotedItem1?.caption, 'Bot caption worth keeping', 'Promotion must preserve existing caption');
   assert.equal(promotedItem1?.instagram_sender_id, 'sender_parity_1', 'Promotion must preserve DM sender attribution');
 
-  const promotedItem2 = await Repository.getSavedItemByShortcode('DBotNoDate2');
+  const promotedItem2 = await Repository.getSavedItemByShortcode('DBotNoDate2', 'sender_parity_1');
   assert.equal(promotedItem2?.is_saved_on_instagram, true);
   assert.equal(promotedItem2?.saved_at, null);
 
@@ -716,6 +716,27 @@ async function runTests() {
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+
+  // Unattributed archive import of a bot-only shortcode must create its own unattributed row without mutating sender_parity_1's bot row
+  const unattributedImport = await ArchiveImportService.importArchive({
+    saved_saved_media: [
+      {
+        title: 'parity_creator',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/reel/DBotOnly3/',
+            timestamp: Math.floor(Date.UTC(2026, 10, 8, 12, 0, 0) / 1000),
+          },
+        },
+      },
+    ],
+  });
+  assert.equal(unattributedImport.reelsImported, 1, 'Unattributed import must create its own unattributed row');
+  assert.equal(unattributedImport.promotedToSaved, 0, 'Unattributed import must not promote another sender row');
+  const senderBotStillBot = await Repository.getSavedItemByShortcode('DBotOnly3', 'sender_parity_1');
+  assert.equal(senderBotStillBot?.is_saved_on_instagram, false, 'Sender bot row must stay untouched by unattributed import');
+  const unattributedRow = await Repository.getSavedItemByShortcode('DBotOnly3', null);
+  assert.equal(unattributedRow?.is_saved_on_instagram, true, 'Unattributed archive row must be created separately');
 
   console.log('All ArchiveImportService tests passed successfully!');
 }
