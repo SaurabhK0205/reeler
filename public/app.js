@@ -403,6 +403,16 @@ const vaultKeyForm = document.getElementById('vault-key-form');
 const vaultKeyInput = document.getElementById('vault-key-input');
 const vaultKeySubmitBtn = document.getElementById('vault-key-submit-btn');
 const vaultGateError = document.getElementById('vault-gate-error');
+const switchVaultBtn = document.getElementById('switch-vault-btn');
+
+/**
+ * Keeps the header Switch Vault button visible only while an active vault session is unlocked.
+ */
+function syncSwitchVaultButtonVisibility() {
+  if (!switchVaultBtn) return;
+  const gateOpen = Boolean(vaultGateScreen && !vaultGateScreen.classList.contains('is-hidden'));
+  switchVaultBtn.hidden = gateOpen || !getVaultAccessKey();
+}
 
 /**
  * Switches between 6-digit OTP code and direct access key tab in vault gate.
@@ -440,6 +450,7 @@ function showVaultGateScreen(errorMessage) {
   vaultGateScreen.classList.remove('is-hidden');
   if (resultsCount) resultsCount.textContent = 'Private Vault Locked';
   if (reelsGrid) reelsGrid.innerHTML = '';
+  if (reelsTableBody) reelsTableBody.innerHTML = '';
   if (reelsTableContainer) reelsTableContainer.classList.add('is-hidden');
   if (paginationBar) paginationBar.classList.add('is-hidden');
   if (vaultGateError) {
@@ -450,6 +461,7 @@ function showVaultGateScreen(errorMessage) {
       vaultGateError.hidden = true;
     }
   }
+  syncSwitchVaultButtonVisibility();
 }
 
 /**
@@ -459,7 +471,41 @@ function hideVaultGateScreen() {
   if (!vaultGateScreen) return;
   vaultGateScreen.classList.add('is-hidden');
   if (vaultGateError) vaultGateError.hidden = true;
+  syncSwitchVaultButtonVisibility();
 }
+
+/**
+ * Clears the stored vault key, resets displayed vault data, and reopens the auth gate
+ * so the user can switch to a different account/bot vault without clearing browser storage manually.
+ */
+function handleSwitchVault() {
+  setVaultAccessKey(null);
+  closeShortcutsPopover(false);
+  if (typeof state !== 'undefined' && state) {
+    state.reels = [];
+    state.total = 0;
+  }
+  if (statTotal) statTotal.textContent = '--';
+  if (statMediaSplit) statMediaSplit.textContent = '';
+  if (statCreators) statCreators.textContent = '--';
+  if (statWeek) statWeek.textContent = '--';
+  if (statWatchLater) statWatchLater.textContent = '--';
+  if (statWatched) statWatched.textContent = '--';
+  if (sourceCountAll) sourceCountAll.textContent = '--';
+  if (sourceCountInstagram) sourceCountInstagram.textContent = '--';
+  if (sourceCountBot) sourceCountBot.textContent = '--';
+  if (creatorPillsList) creatorPillsList.innerHTML = '';
+  if (vaultOtpInput) vaultOtpInput.value = '';
+  if (vaultKeyInput) vaultKeyInput.value = '';
+  showVaultGateScreen();
+  switchVaultGateTab('otp');
+  if (typeof announceStatus === 'function') {
+    announceStatus('Signed out of current vault. Enter a 6-digit code or vault key to switch vaults.');
+  }
+}
+
+switchVaultBtn?.addEventListener('click', handleSwitchVault);
+syncSwitchVaultButtonVisibility();
 
 if (vaultOtpForm) {
   vaultOtpForm.addEventListener('submit', async (e) => {

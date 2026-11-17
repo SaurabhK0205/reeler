@@ -315,11 +315,15 @@ body {
   border-radius: var(--radius-sm);
   border: 1px solid transparent;
   cursor: pointer;
-  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, transform 0.08s ease-out;
   font-family: inherit;
   text-decoration: none;
   white-space: nowrap;
   flex-shrink: 0;
+}
+
+.nav-btn:active:not(:disabled) {
+  transform: scale(0.96);
 }
 
 .nav-btn:disabled {
@@ -3171,6 +3175,10 @@ kbd {
   .toast-dismiss-btn {
     min-width: 38px;
   }
+  .nav-btn-switch {
+    min-height: 44px;
+    min-width: 44px;
+  }
   .popover-close-btn {
     width: 38px;
     height: 38px;
@@ -3627,7 +3635,8 @@ kbd {
   .feed-nav-arrow-btn,
   .feed-close-btn,
   .feed-scroll-track,
-  .feed-top-bar {
+  .feed-top-bar,
+  .nav-btn {
     transition-property: opacity, background-color, border-color, color;
     transition-duration: 0.12s;
     transform: none !important;
@@ -3647,7 +3656,8 @@ kbd {
   .source-tab-btn:active,
   .creator-chip:active,
   .card-bookmark-btn:active,
-  .status-pill-toggle:active {
+  .status-pill-toggle:active,
+  .nav-btn:active {
     transform: none !important;
   }
   .reel-media-viewport,

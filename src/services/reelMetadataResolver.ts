@@ -59,6 +59,8 @@ const feedMetaInFlight = new Map<string, InFlightMetaEntry>();
 let activeUpstreamResolves = 0;
 const upstreamResolveQueue: ResolveQueueWaiter[] = [];
 const upstreamResolveTimestamps: number[] = [];
+const OEMBED_UNAPPROVED_COOLDOWN_MS = 60 * 60 * 1000;
+let oEmbedBlockedUntil = 0;
 
 /**
  * Clears cached feed metadata and upstream resolve budget state between isolated unit tests.
@@ -66,6 +68,7 @@ const upstreamResolveTimestamps: number[] = [];
 export function resetFeedMetaResolverStateForTests(): void {
   feedMetaCache.clear();
   upstreamResolveTimestamps.length = 0;
+  oEmbedBlockedUntil = 0;
 }
 
 /**
@@ -415,6 +418,116 @@ async function fetchImageDimensions(
  * Fetches Instagram OpenGraph metadata for a saved reel or post shortcode,
  * probing the preferred URL path (`/reel/` or `/p/`) first and falling back to the alternate path on non-OK HTTP status.
  */
+const OG_META_PATTERN = /<meta\s+(?:property|name)="(?:og:url|og:image|twitter:title|og:title)"/i;
+
+/**
+ * Resolves metadata via Meta's official Instagram oEmbed endpoint when a Page Access Token
+ * is configured and Meta oEmbed Read is approved. Applies a 1-hour cooldown if Meta returns
+ * error code 10 (feature not yet approved) to avoid redundant upstream requests.
+ */
+async function fetchViaMetaOEmbed(
+  shortcode: string,
+  preferredPath: 'reel' | 'p',
+  signal?: AbortSignal
+): Promise<ExtractedReelMetadata | null> {
+  const token = process.env.META_PAGE_ACCESS_TOKEN?.trim();
+  if (!token || Date.now() < oEmbedBlockedUntil || signal?.aborted) {
+    return null;
+  }
+
+  const targetUrl = `https://www.instagram.com/${preferredPath}/${encodeURIComponent(shortcode)}/`;
+  const oEmbedUrl = `https://graph.facebook.com/v21.0/instagram_oembed?url=${encodeURIComponent(targetUrl)}&access_token=${encodeURIComponent(token)}`;
+  try {
+    const res = await fetch(oEmbedUrl, {
+      signal: createCombinedSignal(6000, signal),
+    });
+    const data = (await res.json().catch(() => null)) as Record<string, any> | null;
+    if (!res.ok) {
+      if (data?.error?.code === 10) {
+        oEmbedBlockedUntil = Date.now() + OEMBED_UNAPPROVED_COOLDOWN_MS;
+        console.warn('[MetadataResolver] Meta oEmbed Read not approved yet (code 10); pausing oEmbed fallback for 1h.');
+      }
+      return null;
+    }
+    const authorName = typeof data?.author_name === 'string' ? data.author_name.trim().replace(/^@/, '') : '';
+    const thumbnailUrl = typeof data?.thumbnail_url === 'string' ? data.thumbnail_url.trim() : undefined;
+    const title = typeof data?.title === 'string' && data.title.trim() ? data.title.trim() : undefined;
+    if (!authorName && !thumbnailUrl && !title) {
+      return null;
+    }
+    const efgMeta = parseEfgMediaKind(thumbnailUrl);
+    const isClips = efgMeta.isClips ?? (preferredPath === 'reel' ? true : null);
+    const mediaKind: MediaKind =
+      efgMeta.mediaKind !== 'UNKNOWN'
+        ? efgMeta.mediaKind
+        : preferredPath === 'reel'
+          ? 'CLIPS'
+          : 'UNKNOWN';
+
+    return {
+      username: authorName ? authorName.toLowerCase() : undefined,
+      displayName: authorName || undefined,
+      caption: title,
+      thumbnailUrl,
+      mediaKind,
+      isClips,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetches Instagram HTML through an optional configured HTTPS metadata relay (e.g. a Cloudflare Worker)
+ * when cloud datacenter IPs receive login-walled HTML directly from Instagram.
+ */
+async function fetchHtmlViaProxy(
+  targetUrl: string,
+  signal?: AbortSignal
+): Promise<string | null> {
+  const rawProxy = process.env.METADATA_PROXY_URL?.trim();
+  if (!rawProxy || signal?.aborted) {
+    return null;
+  }
+
+  let parsedProxy: URL;
+  try {
+    parsedProxy = new URL(rawProxy);
+  } catch {
+    return null;
+  }
+  const isAllowedProtocol =
+    parsedProxy.protocol === 'https:' ||
+    (parsedProxy.protocol === 'http:' && (parsedProxy.hostname === 'localhost' || parsedProxy.hostname === '127.0.0.1'));
+  if (!isAllowedProtocol) {
+    return null;
+  }
+
+  parsedProxy.searchParams.set('url', targetUrl);
+  const headers: Record<string, string> = {
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+  const proxyToken = process.env.METADATA_PROXY_TOKEN?.trim();
+  if (proxyToken) {
+    headers.Authorization = `Bearer ${proxyToken}`;
+  }
+
+  try {
+    const res = await fetch(parsedProxy.toString(), {
+      signal: createCombinedSignal(8000, signal),
+      headers,
+    });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
+    const candidateHtml = await res.text();
+    return OG_META_PATTERN.test(candidateHtml) ? candidateHtml : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchReelMetadata(
   shortcode: string,
   signal?: AbortSignal,
@@ -431,6 +544,7 @@ export async function fetchReelMetadata(
 
   try {
     let html: string | null = null;
+    let lastStatus = 0;
 
     for (const pathSegment of pathsToTry) {
       if (signal?.aborted) {
@@ -444,6 +558,7 @@ export async function fetchReelMetadata(
           'Accept-Language': 'en-US,en;q=0.9',
         },
       });
+      lastStatus = res.status;
 
       if (!res.ok) {
         await res.body?.cancel().catch(() => {});
@@ -451,7 +566,7 @@ export async function fetchReelMetadata(
       }
 
       const candidateHtml = await res.text();
-      if (!/<meta\s+(?:property|name)="(?:og:url|og:image|twitter:title|og:title)"/i.test(candidateHtml)) {
+      if (!OG_META_PATTERN.test(candidateHtml)) {
         continue;
       }
 
@@ -460,7 +575,30 @@ export async function fetchReelMetadata(
     }
 
     if (!html) {
-      return {};
+      // Fallback 1: Official Meta Instagram oEmbed API (works automatically once Meta oEmbed Read is approved)
+      const oEmbedResult = await fetchViaMetaOEmbed(shortcode, pathsToTry[0], signal);
+      if (oEmbedResult) {
+        return oEmbedResult;
+      }
+
+      // Fallback 2: Optional external metadata relay (e.g. Cloudflare Worker) for cloud IPs blocked by Instagram
+      if (process.env.METADATA_PROXY_URL?.trim()) {
+        for (const pathSegment of pathsToTry) {
+          const url = `https://www.instagram.com/${pathSegment}/${encodeURIComponent(shortcode)}/`;
+          const proxiedHtml = await fetchHtmlViaProxy(url, signal);
+          if (proxiedHtml) {
+            html = proxiedHtml;
+            break;
+          }
+        }
+      }
+
+      if (!html) {
+        console.warn(
+          `[MetadataResolver] No OpenGraph metadata returned for ${shortcode} (lastStatus=${lastStatus}).`
+        );
+        return {};
+      }
     }
 
     const ogUrl = decodeHtml(html.match(/<meta property="og:url" content="([^"]+)"/i)?.[1] || '');

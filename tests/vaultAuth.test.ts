@@ -549,3 +549,21 @@ test('VaultAuthService - requestOtpForUsername checks delivery and returns struc
     process.env.ADMIN_USERNAME = origAdmin;
   }
 });
+
+test('Vault UI exposes Switch Vault control with reduced-motion and logout state reset wiring', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const root = path.resolve(process.cwd());
+
+  const html = fs.readFileSync(path.join(root, 'public/index.html'), 'utf8');
+  const js = fs.readFileSync(path.join(root, 'public/app.js'), 'utf8');
+  const css = fs.readFileSync(path.join(root, 'public/style.css'), 'utf8');
+
+  assert.ok(html.includes('id="switch-vault-btn"'), 'Header must include Switch Vault button');
+  assert.ok(html.includes('aria-label="Sign out and switch vault"'), 'Switch Vault button must have accessible aria-label');
+  assert.ok(js.includes('function handleSwitchVault()'), 'app.js must define handleSwitchVault');
+  assert.ok(js.includes('setVaultAccessKey(null)'), 'handleSwitchVault must clear stored vault key');
+  assert.ok(js.includes('syncSwitchVaultButtonVisibility()'), 'app.js must sync Switch Vault visibility with auth state');
+  assert.ok(css.includes('.nav-btn:active:not(:disabled)'), 'style.css must provide tactile :active feedback for nav buttons');
+  assert.ok(css.includes('.nav-btn:active'), 'style.css must respect prefers-reduced-motion for nav buttons');
+});

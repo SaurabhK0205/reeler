@@ -91,6 +91,7 @@ export function shouldBackfillSavedAt(
   if (!existing.saved_at) return true;
 
   const isDmIngested =
+    Boolean(existing.instagram_media_id?.startsWith('dm_')) ||
     Boolean(existing.instagram_media_id?.startsWith('shortcode_')) ||
     Boolean(existing.instagram_media_id?.startsWith('id_'));
   if (!isDmIngested) return false;
@@ -166,9 +167,19 @@ class InMemoryStore {
   }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean }): Promise<SavedReel | null> {
     let existing: SavedReel | undefined;
     for (const r of this.reels.values()) {
-      if (r.instagram_media_id === data.instagram_media_id || r.shortcode === data.shortcode) {
+      if (r.instagram_media_id === data.instagram_media_id) {
         existing = r;
         break;
+      }
+    }
+    if (!existing) {
+      const incomingSender = data.instagram_sender_id ? String(data.instagram_sender_id).trim() || null : null;
+      for (const r of this.reels.values()) {
+        const rowSender = r.instagram_sender_id ? String(r.instagram_sender_id).trim() || null : null;
+        if (r.shortcode === data.shortcode && rowSender === incomingSender) {
+          existing = r;
+          break;
+        }
       }
     }
 
@@ -895,6 +906,7 @@ export class Repository {
         return null;
       }
 
+      const incomingSender = String(data.instagram_sender_id || '').trim();
       const fetchExisting = async () => {
         const byMedia = await supabase
           .from('saved_reels')
@@ -906,11 +918,15 @@ export class Repository {
         }
         if (byMedia.data) return byMedia.data as SavedReel;
 
-        const byShortcode = await supabase
+        let byShortcodeQuery = supabase
           .from('saved_reels')
           .select('*, creator:creators(*)')
-          .eq('shortcode', data.shortcode)
-          .maybeSingle();
+          .eq('shortcode', data.shortcode);
+        byShortcodeQuery = incomingSender
+          ? byShortcodeQuery.eq('instagram_sender_id', incomingSender)
+          : byShortcodeQuery.is('instagram_sender_id', null);
+
+        const byShortcode = await byShortcodeQuery.maybeSingle();
         if (byShortcode.error) {
           throw new Error(`Supabase fetch existing reel failed: ${byShortcode.error.message}`);
         }
@@ -926,7 +942,6 @@ export class Repository {
         return existing;
       }
 
-      const incomingSender = String(data.instagram_sender_id || '').trim();
       if (isConflictingActiveSenderReminder(existing, incomingSender)) {
         throw new SenderReminderConflictError(data.shortcode);
       }
@@ -2355,32 +2370,70 @@ export class Repository {
   }
 
   /**
-   * Looks up a saved item (with creator attribution) by its unique Instagram shortcode across both
+   * Looks up a saved item (with creator attribution) by Instagram shortcode across both
    * Supabase and in-memory fallback storage.
+   *
+   * - When `senderId` is a non-empty string, matches only that sender's row.
+   * - When `senderId` is `null`, matches only an unattributed (admin/archive) row.
+   * - When `senderId` is `undefined`, returns a deterministic match (preferring unattributed rows).
    */
-  static async getSavedItemByShortcode(shortcode: string): Promise<SavedReel | null> {
+  static async getSavedItemByShortcode(shortcode: string, senderId?: string | null): Promise<SavedReel | null> {
     const cleanCode = String(shortcode || '').trim();
     if (!cleanCode) return null;
 
+    const hasExplicitScope = senderId !== undefined;
+    const normalizedSender =
+      senderId === null || senderId === undefined ? null : String(senderId).trim() || null;
+
     if (!isSupabaseConfigured()) {
+      let fallbackMatch: SavedReel | null = null;
       for (const reel of memoryStore.reels.values()) {
-        if (reel.shortcode === cleanCode) {
+        if (reel.shortcode !== cleanCode) continue;
+        const rowSender = reel.instagram_sender_id ? String(reel.instagram_sender_id).trim() || null : null;
+        if (hasExplicitScope) {
+          if (rowSender === normalizedSender) {
+            return {
+              ...reel,
+              media_type: classifySavedMediaType({ mediaType: reel.media_type, reelUrl: reel.reel_url }),
+              creator: memoryStore.creators.get(reel.creator_id),
+            };
+          }
+          continue;
+        }
+        if (rowSender === null) {
           return {
             ...reel,
             media_type: classifySavedMediaType({ mediaType: reel.media_type, reelUrl: reel.reel_url }),
             creator: memoryStore.creators.get(reel.creator_id),
           };
         }
+        if (!fallbackMatch) {
+          fallbackMatch = reel;
+        }
       }
-      return null;
+      if (!fallbackMatch) return null;
+      return {
+        ...fallbackMatch,
+        media_type: classifySavedMediaType({ mediaType: fallbackMatch.media_type, reelUrl: fallbackMatch.reel_url }),
+        creator: memoryStore.creators.get(fallbackMatch.creator_id),
+      };
     }
 
     const supabase = getSupabase();
-    const { data, error } = await supabase
+    let query = supabase
       .from('saved_reels')
       .select('*, creator:creators(*)')
-      .eq('shortcode', cleanCode)
-      .maybeSingle();
+      .eq('shortcode', cleanCode);
+
+    if (hasExplicitScope) {
+      query = normalizedSender
+        ? query.eq('instagram_sender_id', normalizedSender)
+        : query.is('instagram_sender_id', null);
+    } else {
+      query = query.order('instagram_sender_id', { ascending: true, nullsFirst: true }).limit(1);
+    }
+
+    const { data, error } = await query.maybeSingle();
 
     if (error) {
       throw new Error(`Failed to look up saved item ${cleanCode}: ${error.message}`);
