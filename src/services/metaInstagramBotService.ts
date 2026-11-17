@@ -582,7 +582,7 @@ export class MetaInstagramBotService {
     if (['vault', 'library', 'web', 'dashboard', 'link', 'my vault'].includes(normalizedText)) {
       const isSenderAdmin = Boolean(this.adminUserId && senderId === this.adminUserId);
       const userKey = isSenderAdmin ? getAdminVaultKey() : generateUserVaultKey(senderId);
-      const baseUrl = process.env.APP_URL || process.env.PUBLIC_URL || 'https://reeler-bot.fly.dev';
+      const baseUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || 'https://reeler-staging.onrender.com';
       const vaultUrl = `${baseUrl.replace(/\/+$/, '')}/?key=${userKey}`;
 
       const reply =
