@@ -17,6 +17,9 @@ test('Compliance Pages - verify privacy.html exists and contains essential Meta 
   assert.ok(content.includes('Instagram Scoped User ID'), 'Must state IGSID collection');
   assert.ok(content.includes('Data Retention and Deletion'), 'Must explain data retention');
   assert.ok(content.includes('saurabhk0205@gmail.com'), 'Must provide contact email');
+  assert.ok(content.includes("SAURABH'S"), 'Must state registered enterprise operator name');
+  assert.ok(content.includes('Render and Supabase'), 'Must list active infrastructure providers');
+  assert.ok(!content.includes('Fly.io'), 'Must not reference retired Fly.io hosting');
 });
 
 test('Compliance Pages - verify terms.html exists and contains essential terms', () => {
@@ -27,6 +30,7 @@ test('Compliance Pages - verify terms.html exists and contains essential terms',
   assert.ok(content.includes('Terms of Service'), 'Must have Terms of Service title');
   assert.ok(content.includes('Acceptable Use'), 'Must specify acceptable use');
   assert.ok(content.includes('Meta Platforms, Inc.'), 'Must state platform relation');
+  assert.ok(content.includes("SAURABH'S"), 'Must state registered enterprise operator name');
 });
 
 test('Compliance Pages - verify data-deletion.html exists and provides clear instructions', () => {
@@ -37,6 +41,7 @@ test('Compliance Pages - verify data-deletion.html exists and provides clear ins
   assert.ok(content.includes('User Data Deletion Instructions'), 'Must have deletion instructions title');
   assert.ok(content.includes('delete my data'), 'Must mention permanent deletion command');
   assert.ok(content.includes('saurabhk0205@gmail.com'), 'Must provide contact email for manual deletion');
+  assert.ok(content.includes("SAURABH'S"), 'Must state registered enterprise operator name');
 });
 
 test('Compliance Pages - verify index.html links to privacy, terms, and data-deletion', () => {
@@ -47,4 +52,5 @@ test('Compliance Pages - verify index.html links to privacy, terms, and data-del
   assert.ok(content.includes('href="/privacy"'), 'index.html must link to /privacy');
   assert.ok(content.includes('href="/terms"'), 'index.html must link to /terms');
   assert.ok(content.includes('href="/data-deletion"'), 'index.html must link to /data-deletion');
+  assert.ok(content.includes("SAURABH'S"), 'index.html footer must display registered enterprise name');
 });
