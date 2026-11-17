@@ -318,10 +318,22 @@ class InMemoryStore {
     for (const r of reels) {
       try {
         let existing: SavedReel | undefined;
+        const incomingSender = r.instagram_sender_id ? String(r.instagram_sender_id).trim() || null : null;
         for (const existingReel of this.reels.values()) {
-          if (existingReel.instagram_media_id === r.instagram_media_id || existingReel.shortcode === r.shortcode) {
+          if (existingReel.instagram_media_id === r.instagram_media_id) {
             existing = existingReel;
             break;
+          }
+        }
+        if (!existing) {
+          for (const existingReel of this.reels.values()) {
+            const rowSender = existingReel.instagram_sender_id
+              ? String(existingReel.instagram_sender_id).trim() || null
+              : null;
+            if (existingReel.shortcode === r.shortcode && rowSender === incomingSender) {
+              existing = existingReel;
+              break;
+            }
           }
         }
 
@@ -1140,10 +1152,17 @@ export class Repository {
       >();
 
       if (options?.ignoreDuplicates) {
-        const existingByShortcode = new Map<
-          string,
-          { id: string; instagram_media_id: string; saved_at: string | null; is_saved_on_instagram: boolean }
-        >();
+        type BatchExistingRow = {
+          id: string;
+          instagram_media_id: string;
+          saved_at: string | null;
+          is_saved_on_instagram: boolean;
+        };
+        const existingByMediaId = new Map<string, BatchExistingRow>();
+        const existingBySenderShortcode = new Map<string, BatchExistingRow>();
+        const makeSenderShortcodeKey = (sender: string | null | undefined, shortcode: string) =>
+          `${sender ? String(sender).trim() : ''}\u0000${shortcode}`;
+
         const allShortcodes = Array.from(new Set(reels.map(r => r.shortcode)));
         const LOOKUP_CHUNK = 500;
 
@@ -1151,7 +1170,7 @@ export class Repository {
           const slice = allShortcodes.slice(i, i + LOOKUP_CHUNK);
           const { data: matched, error } = await supabase
             .from('saved_reels')
-            .select('id, instagram_media_id, shortcode, saved_at, is_saved_on_instagram')
+            .select('id, instagram_media_id, shortcode, instagram_sender_id, saved_at, is_saved_on_instagram')
             .in('shortcode', slice);
 
           if (error) {
@@ -1159,19 +1178,26 @@ export class Repository {
           }
           if (matched) {
             for (const row of matched) {
-              existingByShortcode.set(row.shortcode, {
+              const entry: BatchExistingRow = {
                 id: String(row.id),
                 instagram_media_id: String(row.instagram_media_id),
                 saved_at: row.saved_at ? String(row.saved_at) : null,
                 is_saved_on_instagram: row.is_saved_on_instagram !== false,
-              });
+              };
+              existingByMediaId.set(entry.instagram_media_id, entry);
+              existingBySenderShortcode.set(
+                makeSenderShortcodeKey(row.instagram_sender_id, String(row.shortcode)),
+                entry
+              );
             }
           }
         }
 
         const freshReels: typeof reels = [];
         for (const r of reels) {
-          const existing = existingByShortcode.get(r.shortcode);
+          const existing =
+            existingByMediaId.get(r.instagram_media_id) ||
+            existingBySenderShortcode.get(makeSenderShortcodeKey(r.instagram_sender_id, r.shortcode));
           if (existing) {
             alreadyPresent++;
             const shouldPromote = r.is_saved_on_instagram !== false && existing.is_saved_on_instagram === false;

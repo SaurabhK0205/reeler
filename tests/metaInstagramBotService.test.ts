@@ -2653,6 +2653,37 @@ test('MetaInstagramBotService captures webhook attachment payload.title as fallb
     assert.ok(saved, 'Reel should be saved for sender');
     assert.strictEqual(saved.caption, 'Thank you Akira Toriyama #dragonball');
     assert.strictEqual(saved.instagram_media_id, 'dm_sender_title_fallback_DTitleFallback1');
+
+    // Also verify entry.changes path preserves payload.title
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                sender: { id: 'sender_changes_title' },
+                message: {
+                  attachments: [
+                    {
+                      type: 'ig_reel',
+                      payload: {
+                        title: 'Changes event title fallback',
+                        url: 'https://www.instagram.com/reel/DChangesTitle1/',
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const savedFromChanges = await Repository.getSavedItemByShortcode('DChangesTitle1', 'sender_changes_title');
+    assert.ok(savedFromChanges, 'Changes reel should be saved for sender');
+    assert.strictEqual(savedFromChanges.caption, 'Changes event title fallback');
     Repository.resetMemoryStoreForTests();
   } finally {
     globalThis.fetch = originalFetch;
@@ -2697,8 +2728,10 @@ test('fetchReelMetadata supports Meta oEmbed fallback with code-10 cooldown and 
     assert.strictEqual(oEmbedMeta.username, 'oembedcreator');
     assert.strictEqual(oEmbedMeta.thumbnailUrl, 'https://scontent.cdninstagram.com/v/thumb.jpg');
     assert.strictEqual(oEmbedMeta.caption, 'Official oEmbed caption');
+    assert.strictEqual(oEmbedMeta.isClips, null, 'oEmbed without EFG must not assume isClips from preferredPath');
+    assert.strictEqual(oEmbedMeta.mediaKind, 'UNKNOWN');
 
-    // 2. Meta oEmbed code-10 cooldown + METADATA_PROXY_URL relay fallback
+    // 2. Meta oEmbed code-10 cooldown + METADATA_PROXY_URL relay fallback even after direct network error
     resetFeedMetaResolverStateForTests();
     process.env.METADATA_PROXY_URL = 'https://proxy.example.workers.dev/';
     process.env.METADATA_PROXY_TOKEN = 'secret_proxy_tok';
@@ -2726,7 +2759,7 @@ test('fetchReelMetadata supports Meta oEmbed fallback with code-10 cooldown and 
           { status: 200, headers: { 'Content-Type': 'text/html' } }
         );
       }
-      return new Response('<html><title>Login</title></html>', { status: 200 });
+      throw new TypeError('Simulated direct network timeout');
     }) as typeof fetch;
 
     const proxied1 = await fetchReelMetadata('DProxyOk1', undefined, 'reel');

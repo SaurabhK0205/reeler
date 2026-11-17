@@ -456,21 +456,13 @@ async function fetchViaMetaOEmbed(
       return null;
     }
     const efgMeta = parseEfgMediaKind(thumbnailUrl);
-    const isClips = efgMeta.isClips ?? (preferredPath === 'reel' ? true : null);
-    const mediaKind: MediaKind =
-      efgMeta.mediaKind !== 'UNKNOWN'
-        ? efgMeta.mediaKind
-        : preferredPath === 'reel'
-          ? 'CLIPS'
-          : 'UNKNOWN';
-
     return {
       username: authorName ? authorName.toLowerCase() : undefined,
       displayName: authorName || undefined,
       caption: title,
       thumbnailUrl,
-      mediaKind,
-      isClips,
+      mediaKind: efgMeta.mediaKind,
+      isClips: efgMeta.isClips,
     };
   } catch {
     return null;
@@ -551,27 +543,36 @@ export async function fetchReelMetadata(
         return {};
       }
       const url = `https://www.instagram.com/${pathSegment}/${encodeURIComponent(shortcode)}/`;
-      const res = await fetch(url, {
-        signal: createCombinedSignal(8000, signal),
-        headers: {
-          'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-      });
-      lastStatus = res.status;
+      try {
+        const res = await fetch(url, {
+          signal: createCombinedSignal(8000, signal),
+          headers: {
+            'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+        });
+        lastStatus = res.status;
 
-      if (!res.ok) {
-        await res.body?.cancel().catch(() => {});
-        continue;
+        if (!res.ok) {
+          await res.body?.cancel().catch(() => {});
+          continue;
+        }
+
+        const candidateHtml = await res.text();
+        if (!OG_META_PATTERN.test(candidateHtml)) {
+          continue;
+        }
+
+        html = candidateHtml;
+        break;
+      } catch (err: any) {
+        if (signal?.aborted) {
+          return {};
+        }
+        console.warn(
+          `[MetadataResolver] Direct fetch attempt for ${shortcode} (/${pathSegment}/) failed: ${err?.message || err}`
+        );
       }
-
-      const candidateHtml = await res.text();
-      if (!OG_META_PATTERN.test(candidateHtml)) {
-        continue;
-      }
-
-      html = candidateHtml;
-      break;
     }
 
     if (!html) {

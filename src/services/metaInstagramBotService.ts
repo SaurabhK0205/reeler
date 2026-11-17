@@ -375,11 +375,16 @@ export class MetaInstagramBotService {
             const text = val.message?.text || '';
             let reelUrl: string | null = null;
             let attachmentType: string | null = null;
+            let attachmentTitle: string | null = null;
             if (val.message?.attachments) {
               for (const att of val.message.attachments) {
                 if (att.payload?.url) {
                   reelUrl = att.payload.url;
                   attachmentType = typeof att.type === 'string' ? att.type : null;
+                  attachmentTitle =
+                    typeof att.payload.title === 'string' && att.payload.title.trim()
+                      ? att.payload.title.trim()
+                      : null;
                   break;
                 }
               }
@@ -387,7 +392,7 @@ export class MetaInstagramBotService {
             const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
             if (combinedText) {
               try {
-                await this.processIncomingText(senderId, combinedText, attachmentType);
+                await this.processIncomingText(senderId, combinedText, attachmentType, attachmentTitle);
               } catch (error) {
                 console.error(`[MetaIG] Failed to process change event for sender ${senderId}:`, error);
               }

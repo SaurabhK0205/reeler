@@ -479,11 +479,31 @@ function hideVaultGateScreen() {
  * so the user can switch to a different account/bot vault without clearing browser storage manually.
  */
 function handleSwitchVault() {
+  if (fetchReelsAbortController) {
+    fetchReelsAbortController.abort();
+    fetchReelsAbortController = null;
+  }
+  if (creatorsFetchController) {
+    creatorsFetchController.abort();
+    creatorsFetchController = null;
+  }
+  if (statsFetchController) {
+    statsFetchController.abort();
+    statsFetchController = null;
+  }
   setVaultAccessKey(null);
   closeShortcutsPopover(false);
   if (typeof state !== 'undefined' && state) {
     state.reels = [];
     state.total = 0;
+    state.stats = null;
+    if (state.filters) {
+      state.filters.creatorId = '';
+      state.filters.page = 1;
+    }
+  }
+  if (typeof syncUrlState === 'function') {
+    syncUrlState();
   }
   if (statTotal) statTotal.textContent = '--';
   if (statMediaSplit) statMediaSplit.textContent = '';
@@ -604,6 +624,7 @@ const feedCloseBtn = document.getElementById('feed-close-btn');
 
 let fetchReelsAbortController = null;
 let creatorsFetchController = null;
+let statsFetchController = null;
 let searchTimeout = null;
 let creatorSearchTimeout = null;
 let isCreatorSearching = false;
@@ -1181,9 +1202,15 @@ async function checkHealth() {
  * Fetches summary statistics from the server and populates metric cards.
  */
 async function loadStats() {
+  if (statsFetchController) {
+    statsFetchController.abort();
+  }
+  statsFetchController = new AbortController();
+  const { signal } = statsFetchController;
   statsBar?.setAttribute('aria-busy', 'true');
   try {
-    const res = await vaultFetch('/api/stats');
+    const res = await vaultFetch('/api/stats', { signal });
+    if (signal.aborted) return;
     if (res.status === 401) {
       showVaultGateScreen();
       return;
@@ -1192,6 +1219,7 @@ async function loadStats() {
       throw new Error(`HTTP ${res.status}`);
     }
     const stats = await res.json();
+    if (signal.aborted) return;
     state.stats = stats;
     statsLoadErrorNotified = false;
 
@@ -1235,6 +1263,7 @@ async function loadStats() {
     }
     statsBar?.classList.remove('is-initial-loading');
   } catch (e) {
+    if (e?.name === 'AbortError' || signal.aborted) return;
     console.error('Failed to load stats:', e);
     statsBar?.classList.remove('is-initial-loading');
     if (!state.stats) {
@@ -1488,6 +1517,7 @@ async function fetchReels() {
 
   try {
     const res = await vaultFetch(`/api/reels?${params.toString()}`, { signal });
+    if (signal.aborted) return;
     if (res.status === 401) {
       showVaultGateScreen();
       return;
