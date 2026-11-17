@@ -2112,6 +2112,29 @@ test('Repository and MetaInstagramBotService protect unattributed active reminde
       (e: unknown) => e instanceof SenderReminderConflictError
     );
 
+    // Direct unattributed/admin write targeting a sender-owned instagram_media_id must fail closed without clobbering sender's row
+    await assert.rejects(
+      () =>
+        Repository.upsertSavedReel({
+          instagram_media_id: isolatedOutsideItem!.instagram_media_id,
+          shortcode: 'DAdminActive1',
+          reel_url: 'https://www.instagram.com/reel/DAdminActive1/',
+          media_type: 'reel',
+          creator_id: creator.id,
+          taken_at: new Date().toISOString(),
+          first_detected_at: new Date().toISOString(),
+          save_order_rank: 1,
+          watch_status: 'watched',
+          reminder_interval_hours: 10,
+        }),
+      (e: unknown) => e instanceof SenderReminderConflictError
+    );
+    assert.strictEqual(
+      (await Repository.getSavedItemByShortcode('DAdminActive1', 'outside_sender_1'))?.watch_status,
+      'watch_later',
+      'Sender-owned row must remain untouched after rejected unattributed write'
+    );
+
     // 2. Admin rescheduling (no incoming sender) still works on unattributed active reminder
     const rescheduledAdminAt = new Date(Date.now() + 2 * 3600 * 1000).toISOString();
     const adminUpdated = await Repository.upsertSavedReel({

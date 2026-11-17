@@ -174,7 +174,7 @@ export class ReminderWorker {
     // Case 1: Reel or Post was shared!
     if (msg.reel) {
       const { mediaId, shortcode, authorUsername, caption, thumbnailUrl, mediaType, reelUrl } = msg.reel;
-      const existingItem = shortcode ? await Repository.getSavedItemByShortcode(shortcode) : null;
+      const existingItem = shortcode ? await Repository.getSavedItemByShortcode(shortcode, null) : null;
       const isTextFallbackReel = !mediaId && mediaType === 'reel' && !/\/p\//i.test(reelUrl || '');
       const resolvedMediaType =
         isTextFallbackReel && existingItem

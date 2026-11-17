@@ -52,17 +52,21 @@ function quotePostgrestLiteral(value: string): string {
 }
 
 /**
- * Returns true when an incoming Instagram sender attempts to schedule/overwrite an active `watch_later`
- * reminder that is currently owned by a different Instagram sender or unattributed (admin/UI queue).
+ * Returns true when an incoming write would clobber another owner's saved reel:
+ * - An unattributed (admin/legacy) write targeting a sender-owned row always conflicts.
+ * - An incoming Instagram sender targeting an active `watch_later` reminder owned by a
+ *   different sender (or unattributed admin/UI queue) conflicts.
  */
 function isConflictingActiveSenderReminder(
   existing: Pick<SavedReel, 'watch_status' | 'instagram_sender_id'>,
   incomingSenderId?: string | null
 ): boolean {
   const incoming = String(incomingSenderId || '').trim();
-  if (!incoming) return false;
-  if (existing.watch_status !== 'watch_later') return false;
   const owner = String(existing.instagram_sender_id || '').trim();
+  if (!incoming) {
+    return Boolean(owner);
+  }
+  if (existing.watch_status !== 'watch_later') return false;
   return owner !== incoming;
 }
 
@@ -1000,6 +1004,9 @@ export class Repository {
         .eq('id', existing.id);
       if (senderOwnershipGuard) {
         updateQuery = updateQuery.or(senderOwnershipGuard);
+      } else {
+        // Prevent an unattributed/admin write from racing to overwrite a sender-owned row
+        updateQuery = updateQuery.is('instagram_sender_id', null);
       }
 
       const { data: updatedRow, error: updateErr } = await updateQuery
@@ -1011,18 +1018,16 @@ export class Repository {
       }
 
       if (!updatedRow) {
-        if (incomingSender) {
-          const { data: currentState, error: checkErr } = await supabase
-            .from('saved_reels')
-            .select('id, watch_status, instagram_sender_id')
-            .eq('id', existing.id)
-            .maybeSingle();
-          if (checkErr) {
-            throw new Error(`Supabase upsertSavedReel ownership check failed: ${checkErr.message}`);
-          }
-          if (currentState && isConflictingActiveSenderReminder(currentState as SavedReel, incomingSender)) {
-            throw new SenderReminderConflictError(data.shortcode);
-          }
+        const { data: currentState, error: checkErr } = await supabase
+          .from('saved_reels')
+          .select('id, watch_status, instagram_sender_id')
+          .eq('id', existing.id)
+          .maybeSingle();
+        if (checkErr) {
+          throw new Error(`Supabase upsertSavedReel ownership check failed: ${checkErr.message}`);
+        }
+        if (currentState && isConflictingActiveSenderReminder(currentState as SavedReel, incomingSender)) {
+          throw new SenderReminderConflictError(data.shortcode);
         }
         throw new Error('Supabase upsertSavedReel update failed: no record updated');
       }
@@ -1165,19 +1170,24 @@ export class Repository {
 
         const allShortcodes = Array.from(new Set(reels.map(r => r.shortcode)));
         const LOOKUP_CHUNK = 500;
+        const PAGE_SIZE = 1000;
 
         for (let i = 0; i < allShortcodes.length; i += LOOKUP_CHUNK) {
           const slice = allShortcodes.slice(i, i + LOOKUP_CHUNK);
-          const { data: matched, error } = await supabase
-            .from('saved_reels')
-            .select('id, instagram_media_id, shortcode, instagram_sender_id, saved_at, is_saved_on_instagram')
-            .in('shortcode', slice);
+          let pageOffset = 0;
+          while (true) {
+            const { data: matched, error } = await supabase
+              .from('saved_reels')
+              .select('id, instagram_media_id, shortcode, instagram_sender_id, saved_at, is_saved_on_instagram')
+              .in('shortcode', slice)
+              .order('id', { ascending: true })
+              .range(pageOffset, pageOffset + PAGE_SIZE - 1);
 
-          if (error) {
-            throw new Error(`Failed to query existing shortcodes: ${error.message}`);
-          }
-          if (matched) {
-            for (const row of matched) {
+            if (error) {
+              throw new Error(`Failed to query existing shortcodes: ${error.message}`);
+            }
+            const pageRows = matched || [];
+            for (const row of pageRows) {
               const entry: BatchExistingRow = {
                 id: String(row.id),
                 instagram_media_id: String(row.instagram_media_id),
@@ -1190,6 +1200,10 @@ export class Repository {
                 entry
               );
             }
+            if (pageRows.length < PAGE_SIZE) {
+              break;
+            }
+            pageOffset += PAGE_SIZE;
           }
         }
 

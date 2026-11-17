@@ -561,12 +561,19 @@ test('Vault UI exposes Switch Vault control with reduced-motion and logout state
 
   assert.ok(html.includes('id="switch-vault-btn"'), 'Header must include Switch Vault button');
   assert.ok(html.includes('aria-label="Sign out and switch vault"'), 'Switch Vault button must have accessible aria-label');
-  assert.ok(js.includes('function handleSwitchVault()'), 'app.js must define handleSwitchVault');
-  assert.ok(js.includes('setVaultAccessKey(null)'), 'handleSwitchVault must clear stored vault key');
-  assert.ok(js.includes('statsFetchController.abort()'), 'handleSwitchVault must cancel in-flight stats fetches');
-  assert.ok(js.includes("state.filters.creatorId = ''"), 'handleSwitchVault must clear creator filter');
-  assert.ok(js.includes('state.filters.page = 1'), 'handleSwitchVault must reset pagination to page 1');
-  assert.ok(js.includes('syncUrlState()'), 'handleSwitchVault must sync reset filters to URL');
+  const fnMatch = js.match(/function handleSwitchVault\(\)\s*\{[\s\S]*?\n\}/);
+  assert.ok(fnMatch, 'app.js must define handleSwitchVault');
+  const fnBody = fnMatch[0];
+  assert.ok(fnBody.includes('setVaultAccessKey(null)'), 'handleSwitchVault must clear stored vault key');
+  assert.ok(fnBody.includes('fetchReelsAbortController.abort()'), 'handleSwitchVault must cancel in-flight reels fetches');
+  assert.ok(fnBody.includes('creatorsFetchController.abort()'), 'handleSwitchVault must cancel in-flight creator fetches');
+  assert.ok(fnBody.includes('statsFetchController.abort()'), 'handleSwitchVault must cancel in-flight stats fetches');
+  assert.ok(fnBody.includes('state.creators = []'), 'handleSwitchVault must clear previous vault creators');
+  assert.ok(fnBody.includes('state.topCreators = []'), 'handleSwitchVault must clear previous vault topCreators');
+  assert.ok(fnBody.includes('state.selectedCreator = null'), 'handleSwitchVault must clear selectedCreator');
+  assert.ok(fnBody.includes("state.filters.creatorId = ''"), 'handleSwitchVault must clear creator filter');
+  assert.ok(fnBody.includes('state.filters.page = 1'), 'handleSwitchVault must reset pagination to page 1');
+  assert.ok(fnBody.includes('syncUrlState()'), 'handleSwitchVault must sync reset filters to URL');
   assert.ok(js.includes('syncSwitchVaultButtonVisibility()'), 'app.js must sync Switch Vault visibility with auth state');
   assert.ok(css.includes('.nav-btn:active:not(:disabled)'), 'style.css must provide tactile :active feedback for nav buttons');
   assert.ok(css.includes('.nav-btn:active'), 'style.css must respect prefers-reduced-motion for nav buttons');

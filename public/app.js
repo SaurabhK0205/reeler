@@ -497,11 +497,18 @@ function handleSwitchVault() {
     state.reels = [];
     state.total = 0;
     state.stats = null;
+    state.creators = [];
+    state.topCreators = [];
+    state.totalCreators = 0;
+    state.creatorMatchTotal = 0;
+    state.selectedCreator = null;
+    state.creatorQuery = '';
     if (state.filters) {
       state.filters.creatorId = '';
       state.filters.page = 1;
     }
   }
+  if (creatorFilterInput) creatorFilterInput.value = '';
   if (typeof syncUrlState === 'function') {
     syncUrlState();
   }
