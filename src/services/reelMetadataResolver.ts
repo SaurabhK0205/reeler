@@ -57,6 +57,8 @@ interface ResolveQueueWaiter {
 
 const feedMetaCache = new Map<string, { value: FeedMediaMetadata; expiresAt: number }>();
 const feedMetaInFlight = new Map<string, InFlightMetaEntry>();
+let feedMetaRefreshSeq = 0;
+const feedMetaRefreshCommitVersions = new Map<string, number>();
 let activeUpstreamResolves = 0;
 const upstreamResolveQueue: ResolveQueueWaiter[] = [];
 const upstreamResolveTimestamps: number[] = [];
@@ -68,6 +70,8 @@ let oEmbedBlockedUntil = 0;
  */
 export function resetFeedMetaResolverStateForTests(): void {
   feedMetaCache.clear();
+  feedMetaRefreshCommitVersions.clear();
+  feedMetaRefreshSeq = 0;
   upstreamResolveTimestamps.length = 0;
   oEmbedBlockedUntil = 0;
 }
@@ -999,6 +1003,9 @@ export async function resolveFeedMediaMetadata(
   }
   if (!entry) {
     const controller = new AbortController();
+    const startRefreshVersion = bypassCache
+      ? ++feedMetaRefreshSeq
+      : (feedMetaRefreshCommitVersions.get(shortcode) ?? 0);
     const promise = (async (): Promise<FeedMediaMetadata> => {
       const releaseSlot = await acquireResolveSlot(controller.signal);
       try {
@@ -1024,15 +1031,31 @@ export async function resolveFeedMediaMetadata(
         };
 
         if (!controller.signal.aborted) {
-          if (feedMetaCache.size >= META_CACHE_MAX_ENTRIES) {
-            const oldestKey = feedMetaCache.keys().next().value;
-            if (oldestKey) feedMetaCache.delete(oldestKey);
+          const latestRefreshVersion = feedMetaRefreshCommitVersions.get(shortcode) ?? 0;
+          const shouldWriteCache = bypassCache
+            ? startRefreshVersion > latestRefreshVersion
+            : startRefreshVersion === latestRefreshVersion;
+          if (shouldWriteCache) {
+            if (bypassCache) {
+              if (
+                feedMetaRefreshCommitVersions.size >= META_CACHE_MAX_ENTRIES &&
+                !feedMetaRefreshCommitVersions.has(shortcode)
+              ) {
+                const oldestVersionKey = feedMetaRefreshCommitVersions.keys().next().value;
+                if (oldestVersionKey) feedMetaRefreshCommitVersions.delete(oldestVersionKey);
+              }
+              feedMetaRefreshCommitVersions.set(shortcode, startRefreshVersion);
+            }
+            if (feedMetaCache.size >= META_CACHE_MAX_ENTRIES && !feedMetaCache.has(shortcode)) {
+              const oldestKey = feedMetaCache.keys().next().value;
+              if (oldestKey) feedMetaCache.delete(oldestKey);
+            }
+            const hasUsefulMeta = Boolean(thumbnailUrl || isClips !== null);
+            feedMetaCache.set(shortcode, {
+              value: result,
+              expiresAt: Date.now() + (hasUsefulMeta ? META_CACHE_TTL_MS : META_NEGATIVE_CACHE_TTL_MS),
+            });
           }
-          const hasUsefulMeta = Boolean(thumbnailUrl || isClips !== null);
-          feedMetaCache.set(shortcode, {
-            value: result,
-            expiresAt: Date.now() + (hasUsefulMeta ? META_CACHE_TTL_MS : META_NEGATIVE_CACHE_TTL_MS),
-          });
         }
 
         return result;

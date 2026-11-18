@@ -2271,6 +2271,7 @@ function renderReels() {
         card.classList.remove('has-thumbnail');
         card.classList.add('is-monogram');
         card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
+        if (!card.isConnected) return;
         // One-shot refresh when a previously cached or DB-stored Instagram CDN URL expires
         const sc = reel.shortcode ? String(reel.shortcode).trim() : '';
         if (
@@ -2582,6 +2583,8 @@ async function toggleWatchedStatus(reelId, currentStatus) {
 let feedIntersectionObserver = null;
 const metaInFlightMap = new Map();
 const MAX_CLIENT_META_CACHE = 500;
+let metaRefreshSeq = 0;
+const metaRefreshVersions = new Map();
 let lastMetaRateLimitUntil = 0;
 
 /**
@@ -2610,6 +2613,9 @@ async function fetchShortcodeMetaWithStatus(shortcode, signal, preferredType, op
 
   if (!entry) {
     const controller = new AbortController();
+    const startRefreshVersion = bypassCache
+      ? ++metaRefreshSeq
+      : (metaRefreshVersions.get(shortcode) || 0);
     const promise = (async () => {
       try {
         const params = new URLSearchParams();
@@ -2637,11 +2643,24 @@ async function fetchShortcodeMetaWithStatus(shortcode, signal, preferredType, op
         }
         const data = await res.json();
         if (data && (data.thumbnailUrl !== null || data.isClips !== null)) {
-          if (state.metaCache.size >= MAX_CLIENT_META_CACHE) {
-            const oldestKey = state.metaCache.keys().next().value;
-            if (oldestKey) state.metaCache.delete(oldestKey);
+          const currentVersion = metaRefreshVersions.get(shortcode) || 0;
+          const shouldCommitCache = bypassCache
+            ? startRefreshVersion > currentVersion
+            : startRefreshVersion === currentVersion;
+          if (shouldCommitCache) {
+            if (bypassCache) {
+              if (metaRefreshVersions.size >= MAX_CLIENT_META_CACHE && !metaRefreshVersions.has(shortcode)) {
+                const oldestVersionKey = metaRefreshVersions.keys().next().value;
+                if (oldestVersionKey) metaRefreshVersions.delete(oldestVersionKey);
+              }
+              metaRefreshVersions.set(shortcode, startRefreshVersion);
+            }
+            if (state.metaCache.size >= MAX_CLIENT_META_CACHE && !state.metaCache.has(shortcode)) {
+              const oldestKey = state.metaCache.keys().next().value;
+              if (oldestKey) state.metaCache.delete(oldestKey);
+            }
+            state.metaCache.set(shortcode, data);
           }
-          state.metaCache.set(shortcode, data);
         }
         return { status: 'ok', data, retryAfterMs: 0 };
       } catch (err) {
@@ -2844,16 +2863,24 @@ function registerGridCardForThumbnailHydration(card, reel, altText, isPost, opti
  * @param {number} generation
  */
 function applyHydratedGridThumbnail(entry, meta, generation) {
-  const { card, reel, shortcode, altText, isPost, failedStoredUrl } = entry;
-  if (generation !== gridThumbGeneration || !card.isConnected) return;
+  const { card, reel, shortcode, altText, isPost, failedStoredUrl, bypassCache } = entry;
+  if (generation !== gridThumbGeneration) return;
+  if (!card.isConnected) {
+    if (bypassCache) gridThumbPendingRefresh.delete(shortcode);
+    return;
+  }
   const cleanUrl = sanitizeMediaUrl(meta?.thumbnailUrl);
   if (!cleanUrl || isPlaceholderMediaUrl(cleanUrl)) {
+    if (bypassCache) gridThumbPendingRefresh.delete(shortcode);
     markGridThumbUnavailable(shortcode);
     return;
   }
 
   const mediaBox = card.querySelector('.poster-media-box');
-  if (!mediaBox) return;
+  if (!mediaBox) {
+    if (bypassCache) gridThumbPendingRefresh.delete(shortcode);
+    return;
+  }
 
   // Remove any previously hidden broken img before mounting the fresh cover
   mediaBox.querySelectorAll('.poster-actual-img').forEach((node) => node.remove());
@@ -2868,6 +2895,10 @@ function applyHydratedGridThumbnail(entry, meta, generation) {
   const revealLoadedCover = () => {
     if (revealed || generation !== gridThumbGeneration || !card.isConnected) return;
     revealed = true;
+    if (bypassCache) {
+      gridThumbPendingRefresh.delete(shortcode);
+      gridThumbRefreshedExpired.add(shortcode);
+    }
     reel.thumbnail_url = cleanUrl;
     if (failedStoredUrl) {
       recordReplacedGridThumbUrl(failedStoredUrl, cleanUrl);
@@ -2901,7 +2932,11 @@ function applyHydratedGridThumbnail(entry, meta, generation) {
   img.addEventListener('load', revealLoadedCover, { once: true });
   img.addEventListener('error', () => {
     img.remove();
-    if (generation !== gridThumbGeneration || !card.isConnected) return;
+    if (generation !== gridThumbGeneration) return;
+    if (bypassCache) {
+      gridThumbPendingRefresh.delete(shortcode);
+    }
+    if (!card.isConnected) return;
     card.classList.remove('has-thumbnail');
     card.classList.add('is-monogram');
     card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
@@ -2948,6 +2983,9 @@ function drainGridThumbnailQueue() {
   while (gridThumbActiveCount < MAX_GRID_THUMB_CONCURRENCY && gridThumbQueue.length > 0) {
     const entry = gridThumbQueue.shift();
     if (!entry || !entry.card.isConnected || entry.card.classList.contains('has-thumbnail')) {
+      if (entry?.bypassCache) {
+        gridThumbPendingRefresh.delete(entry.shortcode);
+      }
       continue;
     }
     if (isGridThumbUnavailable(entry.shortcode)) {
@@ -2962,15 +3000,20 @@ function drainGridThumbnailQueue() {
 
     fetchShortcodeMetaWithStatus(entry.shortcode, signal, preferredType, { bypassCache: entry.bypassCache })
       .then((outcome) => {
-        if (generation !== gridThumbGeneration || signal.aborted || outcome.status === 'aborted') return;
-        if (outcome.status === 'ok') {
+        if (generation !== gridThumbGeneration) return;
+        if (signal.aborted || outcome.status === 'aborted') {
           if (entry.bypassCache) {
             gridThumbPendingRefresh.delete(entry.shortcode);
-            gridThumbRefreshedExpired.add(entry.shortcode);
           }
+          return;
+        }
+        if (outcome.status === 'ok') {
           if (outcome.data && outcome.data.thumbnailUrl) {
             applyHydratedGridThumbnail(entry, outcome.data, generation);
           } else {
+            if (entry.bypassCache) {
+              gridThumbPendingRefresh.delete(entry.shortcode);
+            }
             markGridThumbUnavailable(entry.shortcode);
           }
           return;

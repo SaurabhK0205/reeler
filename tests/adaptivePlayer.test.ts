@@ -556,3 +556,71 @@ test('fetchReelMetadata and resolveFeedMediaMetadata prioritize /p/ when hinted 
     globalThis.fetch = originalFetch;
   }
 });
+
+test('resolveFeedMediaMetadata prevents a delayed ordinary lookup from overwriting refreshed cache', async () => {
+  const originalFetch = globalThis.fetch;
+  const origMetaProxy = process.env.METADATA_PROXY_URL;
+  delete process.env.METADATA_PROXY_URL;
+
+  let callCount = 0;
+  let releaseOrdinaryFetch!: () => void;
+  const ordinaryFetchStarted = new Promise<void>((resolve) => {
+    globalThis.fetch = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        resolve();
+        await new Promise<void>((r) => {
+          releaseOrdinaryFetch = r;
+        });
+        return new Response(
+          '<html><head>' +
+            '<meta property="og:url" content="https://www.instagram.com/p/RefreshRace1/" />' +
+            '<meta property="og:image" content="https://scontent.cdninstagram.com/v/stale-cover.jpg" />' +
+            '</head></html>',
+          { status: 200, headers: { 'content-type': 'text/html' } }
+        );
+      }
+      return new Response(
+        '<html><head>' +
+          '<meta property="og:url" content="https://www.instagram.com/p/RefreshRace1/" />' +
+          '<meta property="og:image" content="https://scontent.cdninstagram.com/v/fresh-cover.jpg" />' +
+          '</head></html>',
+        { status: 200, headers: { 'content-type': 'text/html' } }
+      );
+    }) as typeof fetch;
+  });
+
+  try {
+    resetFeedMetaResolverStateForTests();
+
+    const ordinaryPromise = resolveFeedMediaMetadata('RefreshRace1', undefined, 'p', false);
+    await ordinaryFetchStarted;
+
+    // Refresh starts and commits while the ordinary lookup is still in flight
+    const refreshed = await resolveFeedMediaMetadata('RefreshRace1', undefined, 'p', true);
+    assert.equal(refreshed.thumbnailUrl, 'https://scontent.cdninstagram.com/v/fresh-cover.jpg');
+
+    // Now let the delayed ordinary lookup finish
+    releaseOrdinaryFetch();
+    const ordinaryResult = await ordinaryPromise;
+    assert.equal(
+      ordinaryResult.thumbnailUrl,
+      'https://scontent.cdninstagram.com/v/stale-cover.jpg',
+      'Ordinary lookup still returns its resolved result to its existing caller'
+    );
+
+    // Subsequent cache hit must return the refreshed cover, not the delayed ordinary response
+    const cachedAfterRace = await resolveFeedMediaMetadata('RefreshRace1', undefined, 'p', false);
+    assert.equal(
+      cachedAfterRace.thumbnailUrl,
+      'https://scontent.cdninstagram.com/v/fresh-cover.jpg',
+      'Delayed ordinary lookup must not overwrite newer refreshed cache metadata'
+    );
+    assert.equal(callCount, 2, 'Subsequent lookup should be served from refreshed cache');
+  } finally {
+    resetFeedMetaResolverStateForTests();
+    globalThis.fetch = originalFetch;
+    if (origMetaProxy === undefined) delete process.env.METADATA_PROXY_URL;
+    else process.env.METADATA_PROXY_URL = origMetaProxy;
+  }
+});

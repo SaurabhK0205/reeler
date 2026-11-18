@@ -360,7 +360,12 @@ apiRouter.get('/reels/:shortcode/meta', metaRateLimiter.middleware, async (req: 
         : rawTypeHint === 'reel'
           ? 'reel'
           : undefined;
-    const bypassCache = req.query.refresh === '1';
+    const rawRefresh = req.query.refresh;
+    if (rawRefresh !== undefined && typeof rawRefresh !== 'string') {
+      res.status(400).json({ error: 'Invalid refresh query parameter' });
+      return;
+    }
+    const bypassCache = rawRefresh === '1';
 
     const meta = await resolveFeedMediaMetadata(shortcode, controller.signal, preferredPath, bypassCache);
     if (controller.signal.aborted || res.writableEnded) {

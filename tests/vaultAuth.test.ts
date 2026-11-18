@@ -666,15 +666,106 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
 
   // 5. Emil Kowalski + Benji Taylor motion craft invariants hold
   assert.ok(css.includes('--ease-out: cubic-bezier(0.23, 1, 0.32, 1);'), 'style.css must define custom --ease-out token');
+  const easeInTransitionRe = /transition\s*:[^;}]*(?:^|[\s,])ease-in(?=$|[\s,;}])/;
   assert.doesNotMatch(
     css,
-    /transition\s*:[^;}]*(?:^|[\s,])ease-in(?=$|[\s,;])/,
+    easeInTransitionRe,
     'style.css must not use sluggish ease-in on UI transitions (ease-in-out remains permitted)'
   );
-  assert.doesNotMatch(
-    css,
-    /\.reel-media-viewport\s*\{[^}]*transition\s*:[^;}]*\b(width|height)\b/,
-    '.reel-media-viewport must not animate layout width/height'
+  assert.match('.test { transition: opacity 120ms ease-in}', easeInTransitionRe);
+  assert.doesNotMatch('.test { transition: opacity 120ms ease-in-out}', easeInTransitionRe);
+
+  /**
+   * Extracts effective CSS transition property names across all rules targeting a given selector,
+   * expanding omitted shorthand properties to their CSS default `all`.
+   */
+  const extractEffectiveTransitionProperties = (stylesheet: string, targetSelector: string): string[] => {
+    const props: string[] = [];
+    const cleaned = stylesheet.replace(/\/\*[\s\S]*?\*\//g, '');
+    const ruleRe = /([^{}@]+)\{([^{}]+)\}/g;
+    let match: RegExpExecArray | null;
+    while ((match = ruleRe.exec(cleaned)) !== null) {
+      const selectors = match[1].split(',').map((s) => s.trim());
+      const selectorPattern = new RegExp(
+        `(?:^|[\\s>+~])${targetSelector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[\\s>+~.:#\\[])`
+      );
+      if (!selectors.some((sel) => selectorPattern.test(sel))) continue;
+      const decls = match[2].split(';');
+      for (const decl of decls) {
+        const colonIdx = decl.indexOf(':');
+        if (colonIdx === -1) continue;
+        const propName = decl.slice(0, colonIdx).trim().toLowerCase();
+        const rawValue = decl.slice(colonIdx + 1).replace(/!important\b/gi, '').trim();
+        if (!rawValue) continue;
+        if (propName === 'transition-property') {
+          for (const item of rawValue.split(',')) {
+            const token = item.trim().toLowerCase();
+            if (token) props.push(token);
+          }
+        } else if (propName === 'transition') {
+          const items: string[] = [];
+          let depth = 0;
+          let buf = '';
+          for (const ch of rawValue) {
+            if (ch === '(') depth++;
+            else if (ch === ')') depth = Math.max(0, depth - 1);
+            if (ch === ',' && depth === 0) {
+              items.push(buf.trim());
+              buf = '';
+            } else {
+              buf += ch;
+            }
+          }
+          if (buf.trim()) items.push(buf.trim());
+          for (const item of items) {
+            const stripped = item
+              .replace(/[a-z-]+\([^)]*\)/gi, ' ')
+              .replace(/\b\d*\.?\d+(?:m?s)\b/gi, ' ')
+              .trim();
+            const tokens = stripped
+              .split(/\s+/)
+              .map((t) => t.toLowerCase())
+              .filter(
+                (t) =>
+                  t &&
+                  ![
+                    'ease',
+                    'ease-in',
+                    'ease-out',
+                    'ease-in-out',
+                    'linear',
+                    'step-start',
+                    'step-end',
+                    'normal',
+                    'allow-discrete',
+                  ].includes(t)
+              );
+            props.push(tokens[0] || 'all');
+          }
+        }
+      }
+    }
+    return props;
+  };
+
+  const forbiddenViewportProps = new Set(['width', 'height', 'all']);
+  const viewportTransitionProps = extractEffectiveTransitionProperties(css, '.reel-media-viewport');
+  assert.ok(
+    viewportTransitionProps.every((p) => !forbiddenViewportProps.has(p)),
+    `.reel-media-viewport must not animate width/height/all (found: ${viewportTransitionProps.join(', ')})`
+  );
+  assert.deepEqual(
+    extractEffectiveTransitionProperties('.reel-media-viewport { transition: 120ms linear; }', '.reel-media-viewport'),
+    ['all'],
+    'Shorthand transition without explicit property must resolve to implicit all'
+  );
+  assert.deepEqual(
+    extractEffectiveTransitionProperties(
+      '.reel-media-viewport { transition: opacity 0.12s linear; }',
+      '.reel-media-viewport'
+    ),
+    ['opacity'],
+    'Opacity-only transition on .reel-media-viewport must remain permitted'
   );
   assert.match(
     css,

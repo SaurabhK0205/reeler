@@ -1813,6 +1813,7 @@ test('Archive Import - authenticated vault users import into isolated sender vau
         resetFeedMetaResolverStateForTests();
         // Exhaust metaRateLimiter (120 requests) across GET, HEAD, and percent-encoded shortcodes
         let sawMeta429 = false;
+        let meta429ErrorCode: string | null = null;
         const probeUrls = [
           { method: 'GET', url: `${baseUrl}/api/reels/MetaRateIso1/meta` },
           { method: 'HEAD', url: `${baseUrl}/api/reels/MetaRateIso1/meta` },
@@ -1823,24 +1824,42 @@ test('Archive Import - authenticated vault users import into isolated sender vau
           const r = await origFetchMeta(probe.url, { method: probe.method });
           if (r.status === 429) {
             sawMeta429 = true;
+            if (probe.method === 'GET') {
+              const body = (await r.json()) as { error?: string };
+              meta429ErrorCode = body.error ?? null;
+            }
             break;
           }
           assert.equal(r.status, 200);
         }
         assert.equal(sawMeta429, true, 'Dedicated metaRateLimiter must cap excessive /meta calls at 120/min');
+        assert.equal(
+          meta429ErrorCode,
+          'META_RATE_LIMITED',
+          'Metadata 429 must come specifically from dedicated metaRateLimiter'
+        );
 
-        // Core vault API endpoints must still succeed (not starved by GET/HEAD/encoded /meta hydration)
+        // Core vault API endpoints must still have full untouched quota (119 remaining after 1 call)
         const statsRes = await origFetchMeta(`${baseUrl}/api/stats`, {
           headers: { 'X-Vault-Key': userAKey },
         });
         assert.equal(statsRes.status, 200, 'Core /api/stats must not be rate-limited by /meta thumbnail hydration');
+        assert.equal(
+          statsRes.headers.get('ratelimit-remaining'),
+          '119',
+          'Supported GET/HEAD/encoded /meta probes must not consume any core apiRateLimiter quota'
+        );
 
         // Trailing-slash /meta/ must NOT bypass vaultAuthMiddleware or apiRateLimiter
         const trailingSlashRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta/`);
         assert.equal(trailingSlashRes.status, 401, 'Trailing-slash /meta/ must not bypass vaultAuthMiddleware');
 
-        // ?refresh=1 bypasses cached metadata and responds with Cache-Control: no-store
+        // Non-string refresh query parameter must be rejected with HTTP 400
         resetApiRateLimitersForTesting();
+        const invalidRefreshRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta?refresh[]=1`);
+        assert.equal(invalidRefreshRes.status, 400, 'Non-string refresh query parameter must return HTTP 400');
+
+        // ?refresh=1 bypasses cached metadata and responds with Cache-Control: no-store
         const refreshRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta?refresh=1`);
         assert.equal(refreshRes.status, 200);
         assert.equal(refreshRes.headers.get('cache-control'), 'no-store');
