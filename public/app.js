@@ -596,6 +596,9 @@ function hideVaultGateScreen() {
  * to another account or signing out cleanly.
  */
 function resetVaultSessionState() {
+  resetGridThumbnailHydration();
+  gridThumbUnavailableShortcodes.clear();
+  gridThumbRefreshedExpired.clear();
   if (fetchReelsAbortController) {
     fetchReelsAbortController.abort();
     fetchReelsAbortController = null;
@@ -1402,6 +1405,12 @@ function applyViewMode(mode, shouldSyncUrl = true, persistPreference = true) {
   reelsTableContainer.classList.toggle('is-hidden', isGrid);
   renderInitialSkeletons();
 
+  if (isGrid) {
+    observeGridCardsForThumbnails();
+  } else {
+    resetGridThumbnailHydration();
+  }
+
   if (shouldSyncUrl) {
     syncUrlState();
   }
@@ -2003,6 +2012,7 @@ function getStatusPillAriaLabel(status, targetLabel) {
  */
 function renderReels() {
   hasInitialReelsSettled = true;
+  resetGridThumbnailHydration();
   renderActiveFilterChips();
   reelsGrid.innerHTML = '';
   reelsTableBody.innerHTML = '';
@@ -2106,9 +2116,16 @@ function renderReels() {
     const rawCaption = cleanCaption || 'No caption provided';
     const safeCaption = escapeHtml(rawCaption);
     const rankNum = (rangeStart + idx).toLocaleString();
-    const cleanThumbnail = sanitizeMediaUrl(reel.thumbnail_url);
-    const hasRealThumbnail = Boolean(cleanThumbnail && !isPlaceholderMediaUrl(cleanThumbnail));
+    const cachedMetaThumb = reel.shortcode ? sanitizeMediaUrl(state.metaCache.get(reel.shortcode)?.thumbnailUrl) : null;
+    const rawCleanThumbnail = sanitizeMediaUrl(reel.thumbnail_url);
+    const cleanThumbnail = (rawCleanThumbnail && !isPlaceholderMediaUrl(rawCleanThumbnail))
+      ? rawCleanThumbnail
+      : ((cachedMetaThumb && !isPlaceholderMediaUrl(cachedMetaThumb)) ? cachedMetaThumb : null);
+    const hasRealThumbnail = Boolean(cleanThumbnail);
     const thumbMeta = ReelerGeometry.parseThumbMeta(cleanThumbnail);
+    const posterAltText = creatorInfo.isAttributedName
+      ? `${badgeLabel} poster by ${ariaTarget}`
+      : `${isBotSent ? 'Tracked' : 'Saved'} ${itemWord} poster`;
     const posterKindLabel = thumbMeta.mediaKind === 'CAROUSEL_ITEM'
       ? 'Carousel'
       : ((isPost || thumbMeta.isClips === false)
@@ -2155,7 +2172,7 @@ function renderReels() {
 
     const imageLayerHtml = hasRealThumbnail
       ? `
-        <img class="poster-actual-img" src="${escapeHtml(cleanThumbnail)}" referrerpolicy="no-referrer" alt="${creatorInfo.isAttributedName ? `${badgeLabel} poster by ${safeAriaTarget}` : `${isBotSent ? 'Tracked' : 'Saved'} ${itemWord} poster`}" loading="lazy" />
+        <img class="poster-actual-img" src="${escapeHtml(cleanThumbnail)}" referrerpolicy="no-referrer" alt="${escapeHtml(posterAltText)}" loading="lazy" />
         <div class="poster-top-scrim"></div>
         <div class="poster-bottom-scrim"></div>
       `
@@ -2250,6 +2267,16 @@ function renderReels() {
         card.classList.remove('has-thumbnail');
         card.classList.add('is-monogram');
         card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
+        // One-shot refresh when a previously cached or DB-stored Instagram CDN URL expires
+        const sc = reel.shortcode ? String(reel.shortcode).trim() : '';
+        if (sc && !gridThumbRefreshedExpired.has(sc) && !gridThumbUnavailableShortcodes.has(sc)) {
+          gridThumbRefreshedExpired.add(sc);
+          const cachedMeta = state.metaCache.get(sc);
+          if (cachedMeta && sanitizeMediaUrl(cachedMeta.thumbnailUrl) === cleanThumbnail) {
+            state.metaCache.delete(sc);
+          }
+          registerGridCardForThumbnailHydration(card, reel, posterAltText, isPost);
+        }
       }, { once: true });
 
       /**
@@ -2267,6 +2294,8 @@ function renderReels() {
       } else {
         cardImg.addEventListener('load', handleCardImgLoaded, { once: true });
       }
+    } else if (reel.shortcode) {
+      registerGridCardForThumbnailHydration(card, reel, posterAltText, isPost);
     }
 
     reelsGrid.appendChild(card);
@@ -2352,6 +2381,10 @@ function renderReels() {
     });
 
     reelsTableBody.appendChild(row);
+  }
+
+  if (state.viewMode === 'grid') {
+    observeGridCardsForThumbnails();
   }
 }
 
@@ -2533,10 +2566,13 @@ async function toggleWatchedStatus(reelId, currentStatus) {
 
 let feedIntersectionObserver = null;
 const metaInFlightMap = new Map();
+const MAX_CLIENT_META_CACHE = 500;
+let lastMetaRateLimitUntil = 0;
 
 /**
  * Fetches server-side media kind & natural cover aspect ratio for a shortcode when DB thumbnail/efg is missing.
- * Deduplicates concurrent requests and caches non-empty resolutions in state.metaCache.
+ * Deduplicates concurrent requests with ref-counted cancellation so aborting one caller never cancels another,
+ * and caches non-empty resolutions in state.metaCache.
  * @param {string} shortcode
  * @param {AbortSignal} [signal]
  * @param {'p' | 'reel'} [preferredType]
@@ -2544,32 +2580,370 @@ const metaInFlightMap = new Map();
  */
 async function fetchShortcodeMeta(shortcode, signal, preferredType) {
   if (!shortcode) return null;
+  if (signal?.aborted) return null;
   if (state.metaCache.has(shortcode)) {
     return state.metaCache.get(shortcode);
   }
-  if (metaInFlightMap.has(shortcode)) {
-    return metaInFlightMap.get(shortcode);
+
+  let entry = metaInFlightMap.get(shortcode);
+  if (entry?.controller.signal.aborted) {
+    metaInFlightMap.delete(shortcode);
+    entry = undefined;
   }
 
-  const reqPromise = (async () => {
-    try {
-      const qs = preferredType === 'p' || preferredType === 'reel' ? `?type=${encodeURIComponent(preferredType)}` : '';
-      const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}/meta${qs}`, { signal });
-      if (!res.ok) return null;
-      const data = await res.json();
-      if (data && (data.thumbnailUrl !== null || data.isClips !== null)) {
-        state.metaCache.set(shortcode, data);
+  if (!entry) {
+    const controller = new AbortController();
+    const promise = (async () => {
+      try {
+        const qs = preferredType === 'p' || preferredType === 'reel' ? `?type=${encodeURIComponent(preferredType)}` : '';
+        const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}/meta${qs}`, { signal: controller.signal });
+        if (res.status === 429) {
+          const retryAfterHeader = Number(res.headers.get('retry-after'));
+          const retryMs = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+            ? Math.min(15000, Math.max(2000, retryAfterHeader * 1000))
+            : 5000;
+          lastMetaRateLimitUntil = Math.max(lastMetaRateLimitUntil, Date.now() + retryMs);
+          return null;
+        }
+        if (!res.ok) return null;
+        const data = await res.json();
+        if (data && (data.thumbnailUrl !== null || data.isClips !== null)) {
+          if (state.metaCache.size >= MAX_CLIENT_META_CACHE) {
+            const oldestKey = state.metaCache.keys().next().value;
+            if (oldestKey) state.metaCache.delete(oldestKey);
+          }
+          state.metaCache.set(shortcode, data);
+        }
+        return data;
+      } catch (_) {
+        return null;
+      } finally {
+        if (metaInFlightMap.get(shortcode) === entry) {
+          metaInFlightMap.delete(shortcode);
+        }
       }
-      return data;
-    } catch (_) {
-      return null;
-    } finally {
-      metaInFlightMap.delete(shortcode);
-    }
-  })();
+    })();
 
-  metaInFlightMap.set(shortcode, reqPromise);
-  return reqPromise;
+    entry = { promise, controller, waiters: 0 };
+    metaInFlightMap.set(shortcode, entry);
+  }
+
+  entry.waiters++;
+  let released = false;
+  const releaseWaiter = () => {
+    if (released) return;
+    released = true;
+    entry.waiters = Math.max(0, entry.waiters - 1);
+    if (entry.waiters === 0) {
+      entry.controller.abort();
+    }
+  };
+
+  if (signal) {
+    signal.addEventListener('abort', releaseWaiter, { once: true });
+  }
+
+  try {
+    if (!signal) {
+      return await entry.promise;
+    }
+    return await new Promise((resolve) => {
+      const onAbort = () => resolve(null);
+      if (signal.aborted) {
+        resolve(null);
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+      entry.promise.then(
+        (data) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(signal.aborted ? null : data);
+        },
+        () => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(null);
+        }
+      );
+    });
+  } finally {
+    if (signal) {
+      signal.removeEventListener('abort', releaseWaiter);
+    }
+    if (!released) {
+      released = true;
+      entry.waiters = Math.max(0, entry.waiters - 1);
+    }
+  }
+}
+
+// ==============================================================================
+// LAZY VIEWPORT GRID THUMBNAIL HYDRATION (Archive-Imported & Expired Covers)
+// ==============================================================================
+
+const MAX_GRID_THUMB_CONCURRENCY = 3;
+const MAX_GRID_UNAVAILABLE_TRACKED = 500;
+let gridThumbnailObserver = null;
+let gridThumbAbortController = null;
+let gridThumbGeneration = 0;
+let gridThumbActiveCount = 0;
+let gridThumbResumeTimer = null;
+const gridThumbQueue = [];
+let gridThumbQueuedCards = new WeakSet();
+const gridCardHydrationMap = new WeakMap();
+const gridThumbUnavailableShortcodes = new Set();
+const gridThumbRefreshedExpired = new Set();
+
+/**
+ * Cancels all in-flight and queued grid thumbnail hydrations (e.g. on page change, filter, or vault switch).
+ */
+function resetGridThumbnailHydration() {
+  gridThumbGeneration++;
+  if (gridThumbResumeTimer) {
+    clearTimeout(gridThumbResumeTimer);
+    gridThumbResumeTimer = null;
+  }
+  if (gridThumbAbortController) {
+    gridThumbAbortController.abort();
+    gridThumbAbortController = null;
+  }
+  if (gridThumbnailObserver) {
+    gridThumbnailObserver.disconnect();
+    gridThumbnailObserver = null;
+  }
+  gridThumbQueue.length = 0;
+  gridThumbQueuedCards = new WeakSet();
+  gridThumbActiveCount = 0;
+}
+
+/**
+ * Tracks a shortcode whose cover metadata resolved empty or failed to load so we do not re-fetch it in this session.
+ * @param {string} shortcode
+ */
+function markGridThumbUnavailable(shortcode) {
+  if (!shortcode) return;
+  if (gridThumbUnavailableShortcodes.size >= MAX_GRID_UNAVAILABLE_TRACKED) {
+    const oldest = gridThumbUnavailableShortcodes.values().next().value;
+    if (oldest) gridThumbUnavailableShortcodes.delete(oldest);
+  }
+  gridThumbUnavailableShortcodes.add(shortcode);
+}
+
+/**
+ * Registers a monogram grid poster card for lazy viewport thumbnail hydration.
+ * @param {HTMLElement} card
+ * @param {object} reel
+ * @param {string} altText
+ * @param {boolean} isPost
+ */
+function registerGridCardForThumbnailHydration(card, reel, altText, isPost) {
+  const shortcode = reel?.shortcode ? String(reel.shortcode).trim() : '';
+  if (!card || !shortcode || gridThumbUnavailableShortcodes.has(shortcode)) return;
+  gridCardHydrationMap.set(card, { card, reel, shortcode, altText, isPost, retriedAfter429: false });
+  if (gridThumbnailObserver && state.viewMode === 'grid' && card.isConnected) {
+    gridThumbnailObserver.observe(card);
+  }
+}
+
+/**
+ * Applies a freshly resolved thumbnail URL to a grid poster card, keeping the monogram visible until the image paints.
+ * @param {{ card: HTMLElement, reel: object, shortcode: string, altText: string, isPost: boolean }} entry
+ * @param {{ thumbnailUrl?: string | null, isClips?: boolean | null }} meta
+ * @param {number} generation
+ */
+function applyHydratedGridThumbnail(entry, meta, generation) {
+  const { card, reel, shortcode, altText, isPost } = entry;
+  if (generation !== gridThumbGeneration || !card.isConnected) return;
+  const cleanUrl = sanitizeMediaUrl(meta?.thumbnailUrl);
+  if (!cleanUrl || isPlaceholderMediaUrl(cleanUrl)) {
+    markGridThumbUnavailable(shortcode);
+    return;
+  }
+
+  const mediaBox = card.querySelector('.poster-media-box');
+  if (!mediaBox) return;
+
+  // Remove any previously hidden broken img before mounting the fresh cover
+  mediaBox.querySelectorAll('.poster-actual-img').forEach((node) => node.remove());
+
+  const img = document.createElement('img');
+  img.className = 'poster-actual-img';
+  img.referrerPolicy = 'no-referrer';
+  img.alt = altText;
+  img.loading = 'eager';
+
+  let revealed = false;
+  const revealLoadedCover = () => {
+    if (revealed || generation !== gridThumbGeneration || !card.isConnected) return;
+    revealed = true;
+    reel.thumbnail_url = cleanUrl;
+    if (!mediaBox.querySelector('.poster-top-scrim')) {
+      const topScrim = document.createElement('div');
+      topScrim.className = 'poster-top-scrim';
+      img.insertAdjacentElement('afterend', topScrim);
+    }
+    if (!mediaBox.querySelector(':scope > .poster-bottom-scrim')) {
+      const bottomScrim = document.createElement('div');
+      bottomScrim.className = 'poster-bottom-scrim';
+      const topScrim = mediaBox.querySelector('.poster-top-scrim');
+      (topScrim || img).insertAdjacentElement('afterend', bottomScrim);
+    }
+    const cueThumb = card.querySelector('.poster-cue-thumb');
+    if (cueThumb) {
+      cueThumb.textContent = (isPost || meta?.isClips === false) ? 'Open' : 'Watch';
+    }
+    if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+      state.thumbRatioCache.set(shortcode, img.naturalWidth / img.naturalHeight);
+    }
+    card.classList.remove('is-monogram');
+    card.classList.add('has-thumbnail');
+    card.querySelector('.monochrome-poster-art')?.setAttribute('aria-hidden', 'true');
+    requestAnimationFrame(() => {
+      if (img.isConnected) img.classList.add('is-loaded');
+    });
+  };
+
+  img.addEventListener('load', revealLoadedCover, { once: true });
+  img.addEventListener('error', () => {
+    img.remove();
+    if (card.isConnected) {
+      card.classList.remove('has-thumbnail');
+      card.classList.add('is-monogram');
+      card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
+    }
+    markGridThumbUnavailable(shortcode);
+  }, { once: true });
+
+  const monogramArt = mediaBox.querySelector('.monochrome-poster-art');
+  if (monogramArt) {
+    monogramArt.insertAdjacentElement('afterend', img);
+  } else {
+    mediaBox.prepend(img);
+  }
+  img.src = cleanUrl;
+  if (img.complete && img.naturalWidth > 0) {
+    revealLoadedCover();
+  }
+}
+
+/**
+ * Drains queued visible grid cards up to MAX_GRID_THUMB_CONCURRENCY, respecting 429 Retry-After pauses.
+ */
+function drainGridThumbnailQueue() {
+  if (state.viewMode !== 'grid') return;
+  const generation = gridThumbGeneration;
+  const now = Date.now();
+  if (lastMetaRateLimitUntil > now) {
+    if (!gridThumbResumeTimer && gridThumbQueue.length > 0) {
+      const waitMs = Math.min(15000, Math.max(500, lastMetaRateLimitUntil - now));
+      gridThumbResumeTimer = setTimeout(() => {
+        gridThumbResumeTimer = null;
+        if (generation === gridThumbGeneration) {
+          drainGridThumbnailQueue();
+        }
+      }, waitMs);
+    }
+    return;
+  }
+
+  if (!gridThumbAbortController) {
+    gridThumbAbortController = new AbortController();
+  }
+  const signal = gridThumbAbortController.signal;
+
+  while (gridThumbActiveCount < MAX_GRID_THUMB_CONCURRENCY && gridThumbQueue.length > 0) {
+    const entry = gridThumbQueue.shift();
+    if (!entry || !entry.card.isConnected || entry.card.classList.contains('has-thumbnail')) {
+      continue;
+    }
+    if (gridThumbUnavailableShortcodes.has(entry.shortcode)) {
+      continue;
+    }
+
+    gridThumbActiveCount++;
+    const preferredType = entry.isPost ? 'p' : 'reel';
+    const beforeRateLimit = lastMetaRateLimitUntil;
+
+    fetchShortcodeMeta(entry.shortcode, signal, preferredType)
+      .then((meta) => {
+        if (generation !== gridThumbGeneration || signal.aborted) return;
+        if (meta && meta.thumbnailUrl) {
+          applyHydratedGridThumbnail(entry, meta, generation);
+          return;
+        }
+        if (lastMetaRateLimitUntil > beforeRateLimit && !entry.retriedAfter429) {
+          entry.retriedAfter429 = true;
+          gridThumbQueue.unshift(entry);
+          return;
+        }
+        if (meta !== null) {
+          markGridThumbUnavailable(entry.shortcode);
+        }
+      })
+      .finally(() => {
+        if (generation !== gridThumbGeneration) return;
+        gridThumbActiveCount = Math.max(0, gridThumbActiveCount - 1);
+        drainGridThumbnailQueue();
+      });
+  }
+}
+
+/**
+ * Attaches an IntersectionObserver to rendered monogram grid cards so only visible (and near-viewport) cards hydrate covers.
+ */
+function observeGridCardsForThumbnails() {
+  if (state.viewMode !== 'grid' || !reelsGrid) return;
+  const cards = Array.from(reelsGrid.querySelectorAll('.vault-poster-card.is-monogram'));
+  const pendingCards = cards.filter((card) => {
+    const entry = gridCardHydrationMap.get(card);
+    return Boolean(entry && !gridThumbUnavailableShortcodes.has(entry.shortcode));
+  });
+  if (pendingCards.length === 0) return;
+
+  if (!gridThumbAbortController) {
+    gridThumbAbortController = new AbortController();
+  }
+
+  if (typeof IntersectionObserver !== 'function') {
+    for (const card of pendingCards.slice(0, 8)) {
+      const entry = gridCardHydrationMap.get(card);
+      if (entry && !gridThumbQueuedCards.has(card)) {
+        gridThumbQueuedCards.add(card);
+        gridThumbQueue.push(entry);
+      }
+    }
+    drainGridThumbnailQueue();
+    return;
+  }
+
+  if (gridThumbnailObserver) {
+    gridThumbnailObserver.disconnect();
+  }
+  gridThumbnailObserver = new IntersectionObserver((entries) => {
+    let added = false;
+    for (const obsEntry of entries) {
+      if (!obsEntry.isIntersecting) continue;
+      const card = obsEntry.target;
+      gridThumbnailObserver?.unobserve(card);
+      const data = gridCardHydrationMap.get(card);
+      if (!data || gridThumbQueuedCards.has(card) || card.classList.contains('has-thumbnail')) {
+        continue;
+      }
+      gridThumbQueuedCards.add(card);
+      gridThumbQueue.push(data);
+      added = true;
+    }
+    if (added) {
+      drainGridThumbnailQueue();
+    }
+  }, {
+    root: null,
+    rootMargin: '200px 0px',
+    threshold: 0.01,
+  });
+
+  for (const card of pendingCards) {
+    gridThumbnailObserver.observe(card);
+  }
 }
 
 /**

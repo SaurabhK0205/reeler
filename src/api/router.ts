@@ -21,6 +21,7 @@ import type { ReelQueryFilters, WatchStatus, DateFilterPreset, SavedMediaType, S
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const SAFE_REEL_ID_RE = /^[\x21-\x7E]{1,128}$/;
+const REEL_META_ROUTE_RE = /^\/reels\/[A-Za-z0-9_-]{5,32}\/meta\/?$/;
 
 const apiRateLimiter = createRateLimiter({
   windowMs: 60 * 1000,
@@ -28,7 +29,18 @@ const apiRateLimiter = createRateLimiter({
   maxTrackedKeys: 5000,
   errorCode: 'API_RATE_LIMITED',
   message: 'Too many requests. Please slow down and try again shortly.',
-  skip: (req) => req.path === '/health' || req.path.startsWith('/instagram/webhook'),
+  skip: (req) =>
+    req.path === '/health' ||
+    req.path.startsWith('/instagram/webhook') ||
+    (req.method.toUpperCase() === 'GET' && REEL_META_ROUTE_RE.test(req.path)),
+});
+
+const metaRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 120,
+  maxTrackedKeys: 5000,
+  errorCode: 'META_RATE_LIMITED',
+  message: 'Too many thumbnail metadata requests. Please retry shortly.',
 });
 
 const mutationRateLimiter = createRateLimiter({
@@ -53,6 +65,7 @@ const mutationRateLimiter = createRateLimiter({
 
 export function resetApiRateLimitersForTesting(): void {
   apiRateLimiter.resetForTesting();
+  metaRateLimiter.resetForTesting();
   mutationRateLimiter.resetForTesting();
 }
 
@@ -309,7 +322,7 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
  * Resolves live media kind and cover aspect ratio for an Instagram shortcode with disconnect cancellation
  * and bounded upstream concurrency.
  */
-apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
+apiRouter.get('/reels/:shortcode/meta', metaRateLimiter.middleware, async (req: Request, res: Response) => {
   const controller = new AbortController();
   res.on('close', () => {
     if (!res.writableEnded) {

@@ -28,6 +28,7 @@ import {
   verifyOtp,
 } from '../src/services/vaultAuthService.ts';
 import { apiRouter, resetApiRateLimitersForTesting } from '../src/api/router.ts';
+import { resetFeedMetaResolverStateForTests } from '../src/services/reelMetadataResolver.ts';
 import { createApp } from '../src/server.ts';
 import { MetaInstagramBotService } from '../src/services/metaInstagramBotService.ts';
 import { Repository } from '../src/db/repository.ts';
@@ -1789,6 +1790,50 @@ test('Archive Import - authenticated vault users import into isolated sender vau
       const adminBody = await adminRes.json();
       assert.equal(adminBody.success, true);
       assert.equal(adminBody.reelsImported, 2);
+
+      // 8. GET /api/reels/:shortcode/meta uses its own rate-limit bucket so heavy grid thumbnail hydration never starves /api/stats
+      const origFetchMeta = globalThis.fetch;
+      const origMetaProxy = process.env.METADATA_PROXY_URL;
+      delete process.env.METADATA_PROXY_URL;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.startsWith(baseUrl)) {
+          return origFetchMeta(input, init);
+        }
+        return new Response(
+          '<html><head>' +
+            '<meta property="og:url" content="https://www.instagram.com/u/reel/MetaRateIso1/" />' +
+            '<meta property="og:image" content="https://scontent.cdninstagram.com/v/cover.jpg" />' +
+            '</head></html>',
+          { status: 200 }
+        );
+      }) as typeof fetch;
+      try {
+        resetApiRateLimitersForTesting();
+        resetFeedMetaResolverStateForTests();
+        // Exhaust metaRateLimiter (120 requests) on a cached shortcode
+        let sawMeta429 = false;
+        for (let i = 0; i < 121; i++) {
+          const r = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta`);
+          if (r.status === 429) {
+            sawMeta429 = true;
+            break;
+          }
+          assert.equal(r.status, 200);
+        }
+        assert.equal(sawMeta429, true, 'Dedicated metaRateLimiter must cap excessive /meta calls at 120/min');
+
+        // Core vault API endpoints must still succeed (not starved by /meta bucket)
+        const statsRes = await origFetchMeta(`${baseUrl}/api/stats`, {
+          headers: { 'X-Vault-Key': userAKey },
+        });
+        assert.equal(statsRes.status, 200, 'Core /api/stats must not be rate-limited by /meta thumbnail hydration');
+      } finally {
+        globalThis.fetch = origFetchMeta;
+        if (origMetaProxy === undefined) delete process.env.METADATA_PROXY_URL;
+        else process.env.METADATA_PROXY_URL = origMetaProxy;
+        resetFeedMetaResolverStateForTests();
+      }
     });
   } finally {
     Repository.resetMemoryStoreForTests();

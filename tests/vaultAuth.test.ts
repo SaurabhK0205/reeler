@@ -661,6 +661,30 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
   );
 
   // 4. HTML cache-busting query versions stay aligned
-  assert.ok(html.includes('style.css?v=4.7'), 'index.html must reference style.css?v=4.7');
-  assert.ok(html.includes('app.js?v=4.7'), 'index.html must reference app.js?v=4.7');
+  assert.ok(html.includes('style.css?v=4.8'), 'index.html must reference style.css?v=4.8');
+  assert.ok(html.includes('app.js?v=4.8'), 'index.html must reference app.js?v=4.8');
+
+  // 5. Emil Kowalski + Benji Taylor motion craft invariants hold
+  assert.ok(css.includes('--ease-out: cubic-bezier(0.23, 1, 0.32, 1);'), 'style.css must define custom --ease-out token');
+  assert.doesNotMatch(css, /transition\s*:[^;]*\bease-in\b/, 'style.css must not use sluggish ease-in on UI transitions');
+  assert.doesNotMatch(
+    css,
+    /\.reel-media-viewport\s*\{[^}]*transition\s*:[^}]*\b(width|height)\b/,
+    '.reel-media-viewport must not animate layout width/height'
+  );
+  assert.match(
+    css,
+    /\.shortcuts-popover\s*\{[^}]*transform-origin\s*:\s*top right\s*;/,
+    '.shortcuts-popover must scale from top right trigger origin'
+  );
+  assert.match(
+    reducedMotionBlock,
+    /\.shortcuts-popover[\s\S]*?animation\s*:\s*none\s*;/,
+    'Reduced-motion block must disable .shortcuts-popover animation'
+  );
+
+  // 6. Lazy grid thumbnail hydration is wired cleanly in app.js
+  assert.ok(js.includes('function observeGridCardsForThumbnails()'), 'app.js must wire lazy viewport grid thumbnail hydration');
+  assert.ok(js.includes('function resetGridThumbnailHydration()'), 'app.js must cancel stale grid thumbnail lookups on navigation/reset');
+  assert.ok(js.includes('MAX_GRID_THUMB_CONCURRENCY'), 'app.js must bound concurrent grid thumbnail lookups');
 });
