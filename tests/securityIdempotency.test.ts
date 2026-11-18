@@ -1298,6 +1298,20 @@ test('MetadataResolver - falls back to secondary crawler User-Agent when primary
     assert.match(seenRequests[1].ua, /^facebookexternalhit/);
     assert.equal(seenRequests[2].pathname, '/reel/DFallbackUA1/');
     assert.match(seenRequests[2].ua, /^WhatsApp\//);
+
+    // Mismatched og:url shortcode (e.g. DFallbackUA12 vs DFallbackUA1) must be rejected even with og:image
+    globalThis.fetch = (async () =>
+      new Response(
+        '<html><head>' +
+          '<meta property="og:url"\tcontent="https://www.instagram.com/wronguser/reel/DFallbackUA12/" />' +
+          '<meta property="og:image"\tcontent="https://scontent.cdninstagram.com/v/wrong.jpg" />' +
+          '</head></html>',
+        { status: 200 }
+      )) as typeof fetch;
+
+    const mismatched = await fetchReelMetadata('DFallbackUA1', undefined, 'reel');
+    assert.equal(mismatched.username, undefined, 'Mismatched shortcode og:url must be rejected');
+    assert.equal(mismatched.thumbnailUrl, undefined, 'Mismatched shortcode og:image must be rejected');
   } finally {
     globalThis.fetch = origFetch;
     if (origToken === undefined) delete process.env.META_PAGE_ACCESS_TOKEN;

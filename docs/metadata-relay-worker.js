@@ -9,12 +9,15 @@
  * across both the initial request and any redirect hops (CWE-918 mitigation).
  */
 
-const ALLOWED_PATH_RE = /^\/(?:reel|p)\/[A-Za-z0-9_-]{5,32}\/?$/;
+const ALLOWED_PATH_RE = /^\/(?:reel|p)\/([A-Za-z0-9_-]{5,32})\/?$/;
 const OG_META_RE = /<meta\s+(?:property|name)="(?:og:url|og:image|twitter:title|og:title)"/i;
+const OG_ITEM_SHORTCODE_RE = /instagram\.com\/(?:[^/?#]+\/)?(?:reel|reels|p|tv)\/([A-Za-z0-9_-]{5,32})(?:[/?#]|$)/i;
+const GENERIC_INSTAGRAM_TITLE_RE = /^(?:instagram|login\s*[•·-]\s*instagram)$/i;
 const MAX_REDIRECT_HOPS = 3;
 const MAX_HTML_BYTES = 1_500_000;
-// Bound each attempt so both crawler UAs fit well within the resolver's 8s timeout
-const PER_ATTEMPT_TIMEOUT_MS = 3500;
+// Shared relay deadline fits within the app resolver's 8s timeout while keeping primary eligible if slow
+const SHARED_RELAY_TIMEOUT_MS = 7200;
+const SECONDARY_HEDGE_DELAY_MS = 2500;
 const USER_AGENTS = [
   'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
   'WhatsApp/2.23.20.0',
@@ -37,6 +40,32 @@ function isAllowedInstagramUrl(parsed) {
     parsed.hostname === 'www.instagram.com' &&
     ALLOWED_PATH_RE.test(parsed.pathname)
   );
+}
+
+function hasValidItemOpenGraph(html, shortcode) {
+  if (!OG_META_RE.test(html)) {
+    return false;
+  }
+  const ogUrl = (html.match(/<meta\s+property="og:url"\s+content="([^"]+)"/i)?.[1] || '').trim();
+  if (ogUrl) {
+    const match = ogUrl.match(OG_ITEM_SHORTCODE_RE);
+    if (match && match[1] !== shortcode) {
+      return false;
+    }
+    if (match && match[1] === shortcode) {
+      return true;
+    }
+  }
+  const ogImage = (html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i)?.[1] || '').trim();
+  if (ogImage) {
+    return true;
+  }
+  const twitterTitle = (html.match(/<meta\s+name="twitter:title"\s+content="([^"]+)"/i)?.[1] || '').trim();
+  if (twitterTitle && !GENERIC_INSTAGRAM_TITLE_RE.test(twitterTitle)) {
+    return true;
+  }
+  const ogTitle = (html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i)?.[1] || '').trim();
+  return Boolean(ogTitle && !GENERIC_INSTAGRAM_TITLE_RE.test(ogTitle));
 }
 
 async function readBoundedText(response, maxBytes = MAX_HTML_BYTES) {
@@ -77,10 +106,10 @@ async function readBoundedText(response, maxBytes = MAX_HTML_BYTES) {
   }
 }
 
-async function fetchAllowedInstagramHtml(initialUrl, userAgent, signal) {
+async function fetchAllowedInstagramHtml(initialUrl, shortcode, userAgent, signal) {
   let currentUrl = initialUrl;
   for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
-    if (!isAllowedInstagramUrl(currentUrl)) {
+    if (!isAllowedInstagramUrl(currentUrl) || signal.aborted) {
       return null;
     }
     const upstream = await fetch(currentUrl.toString(), {
@@ -113,9 +142,81 @@ async function fetchAllowedInstagramHtml(initialUrl, userAgent, signal) {
     }
 
     const html = await readBoundedText(upstream, MAX_HTML_BYTES);
-    return OG_META_RE.test(html) ? html : null;
+    return hasValidItemOpenGraph(html, shortcode) ? html : null;
   }
   return null;
+}
+
+/**
+ * Runs primary crawler immediately and hedges the secondary crawler after a short delay (or immediately
+ * if primary fails/returns a login shell), sharing one bounded deadline and cancelling the remaining request on win.
+ */
+async function resolveWithHedgedCrawlers(targetUrl, shortcode) {
+  const primaryController = new AbortController();
+  const secondaryController = new AbortController();
+  let hedgeTimer = null;
+  let deadlineTimer = null;
+  let secondaryStarted = false;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let remaining = 2;
+
+    const finish = (html) => {
+      if (settled) return;
+      settled = true;
+      if (hedgeTimer) clearTimeout(hedgeTimer);
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      primaryController.abort();
+      secondaryController.abort();
+      resolve(html);
+    };
+
+    const startSecondary = () => {
+      if (secondaryStarted || settled) return;
+      secondaryStarted = true;
+      if (hedgeTimer) {
+        clearTimeout(hedgeTimer);
+        hedgeTimer = null;
+      }
+      fetchAllowedInstagramHtml(targetUrl, shortcode, USER_AGENTS[1], secondaryController.signal)
+        .then((html) => {
+          if (html) {
+            finish(html);
+          } else if (--remaining === 0) {
+            finish(null);
+          }
+        })
+        .catch(() => {
+          if (--remaining === 0) {
+            finish(null);
+          }
+        });
+    };
+
+    deadlineTimer = setTimeout(() => finish(null), SHARED_RELAY_TIMEOUT_MS);
+    hedgeTimer = setTimeout(startSecondary, SECONDARY_HEDGE_DELAY_MS);
+
+    fetchAllowedInstagramHtml(targetUrl, shortcode, USER_AGENTS[0], primaryController.signal)
+      .then((html) => {
+        if (html) {
+          finish(html);
+        } else {
+          remaining--;
+          startSecondary();
+          if (remaining === 0) {
+            finish(null);
+          }
+        }
+      })
+      .catch(() => {
+        remaining--;
+        startSecondary();
+        if (remaining === 0) {
+          finish(null);
+        }
+      });
+  });
 }
 
 export default {
@@ -148,25 +249,17 @@ export default {
       return new Response('Unsupported target URL', { status: 400 });
     }
 
-    for (const userAgent of USER_AGENTS) {
-      try {
-        const html = await fetchAllowedInstagramHtml(
-          targetUrl,
-          userAgent,
-          AbortSignal.timeout(PER_ATTEMPT_TIMEOUT_MS)
-        );
-        if (html) {
-          return new Response(html, {
-            status: 200,
-            headers: {
-              'Content-Type': 'text/html; charset=utf-8',
-              'Cache-Control': 'no-store',
-            },
-          });
-        }
-      } catch {
-        // Attempt failed or timed out; continue to secondary crawler UA
-      }
+    const shortcodeMatch = targetUrl.pathname.match(ALLOWED_PATH_RE);
+    const shortcode = shortcodeMatch ? shortcodeMatch[1] : '';
+    const html = await resolveWithHedgedCrawlers(targetUrl, shortcode);
+    if (html) {
+      return new Response(html, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+        },
+      });
     }
 
     return new Response('No OpenGraph metadata available', { status: 502 });

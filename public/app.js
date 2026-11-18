@@ -1438,14 +1438,18 @@ async function checkHealth() {
 
 /**
  * Fetches summary statistics from the server and populates metric cards.
+ * @param {{ silent?: boolean }} [options]
  */
-async function loadStats() {
+async function loadStats(options = {}) {
+  const silent = Boolean(options.silent);
   if (statsFetchController) {
     statsFetchController.abort();
   }
   statsFetchController = new AbortController();
   const { signal } = statsFetchController;
-  statsBar?.setAttribute('aria-busy', 'true');
+  if (!silent) {
+    statsBar?.setAttribute('aria-busy', 'true');
+  }
   try {
     const res = await vaultFetch('/api/stats', { signal });
     if (signal.aborted) return;
@@ -1532,7 +1536,7 @@ async function loadStats() {
         }
       }
     }
-    if (!statsLoadErrorNotified) {
+    if (!silent && !statsLoadErrorNotified) {
       statsLoadErrorNotified = true;
       showToast('Could not load library statistics.', 'error', {
         actionLabel: 'Retry',
@@ -1540,7 +1544,9 @@ async function loadStats() {
       });
     }
   } finally {
-    statsBar?.setAttribute('aria-busy', 'false');
+    if (!silent) {
+      statsBar?.setAttribute('aria-busy', 'false');
+    }
   }
 }
 
@@ -1548,8 +1554,10 @@ async function loadStats() {
  * Fetches bounded top creators (or matching server search results) and populates the quick-filter strip
  * without shipping the full directory over initial page load.
  * @param {string} [query=state.creatorQuery]
+ * @param {{ silent?: boolean }} [options]
  */
-async function loadCreators(query = state.creatorQuery) {
+async function loadCreators(query = state.creatorQuery, options = {}) {
+  const silent = Boolean(options.silent);
   const trimmedQ = String(query || '').trim();
   if (creatorsFetchController) {
     creatorsFetchController.abort();
@@ -1558,9 +1566,9 @@ async function loadCreators(query = state.creatorQuery) {
   const { signal } = creatorsFetchController;
   isCreatorSearching = Boolean(trimmedQ);
 
-  if (creatorStripMeta && !trimmedQ && state.creators.length === 0) {
+  if (!silent && creatorStripMeta && !trimmedQ && state.creators.length === 0) {
     creatorStripMeta.textContent = 'Loading top creators...';
-  } else if (creatorStripMeta && trimmedQ) {
+  } else if (!silent && creatorStripMeta && trimmedQ) {
     renderCreatorStrip();
   }
 
@@ -1615,11 +1623,14 @@ async function loadCreators(query = state.creatorQuery) {
     if (e?.name === 'AbortError') return;
     isCreatorSearching = false;
     console.error('Failed to load creators:', e);
+    if (silent && state.creators.length > 0) {
+      return;
+    }
     if (creatorStripMeta && (trimmedQ || state.creators.length === 0)) {
       creatorStripMeta.innerHTML = '<span>Creator filters unavailable</span> <button type="button" class="strip-inline-retry" data-action="retry-creators">Retry</button>';
       creatorStripMeta.querySelector('[data-action="retry-creators"]')?.addEventListener('click', () => loadCreators(state.creatorQuery));
     }
-    if (!creatorsLoadErrorNotified) {
+    if (!silent && !creatorsLoadErrorNotified) {
       creatorsLoadErrorNotified = true;
       showToast('Could not load creator filters.', 'error', {
         actionLabel: 'Retry',
@@ -1729,16 +1740,30 @@ function selectCreator(id) {
   fetchReels();
 }
 
+let isExplicitReelsFetchInFlight = false;
+
 /**
  * Queries reels matching active filters, pagination, and search terms with abort safety and inline error recovery.
+ * @param {{ silent?: boolean; pageOverride?: number }} [options]
  */
 async function fetchReels(options = {}) {
   const silent = Boolean(options.silent);
+  if (silent && isExplicitReelsFetchInFlight) {
+    return;
+  }
+  const pageToFetch = Number.isInteger(options.pageOverride) && options.pageOverride >= 1
+    ? options.pageOverride
+    : state.filters.page;
+
   if (fetchReelsAbortController) {
     fetchReelsAbortController.abort();
   }
-  fetchReelsAbortController = new AbortController();
-  const { signal } = fetchReelsAbortController;
+  const controller = new AbortController();
+  fetchReelsAbortController = controller;
+  const { signal } = controller;
+  if (!silent) {
+    isExplicitReelsFetchInFlight = true;
+  }
 
   renderActiveFilterChips();
   if (!silent) {
@@ -1754,7 +1779,7 @@ async function fetchReels(options = {}) {
   if (state.filters.watchStatus !== 'all') params.set('watchStatus', state.filters.watchStatus);
   if (state.filters.sortBy) params.set('sortBy', state.filters.sortBy);
   if (state.filters.search.trim()) params.set('search', state.filters.search.trim());
-  params.set('page', String(state.filters.page));
+  params.set('page', String(pageToFetch));
   params.set('limit', String(state.filters.limit));
 
   try {
@@ -1782,14 +1807,22 @@ async function fetchReels(options = {}) {
     if (signal.aborted) return;
     if (silent && feedModal?.classList.contains('active')) return;
 
-    state.reels = data.reels || [];
-    state.total = data.total || 0;
-    const maxPage = Math.max(1, Math.ceil(state.total / state.filters.limit) || 1);
-    if (state.reels.length === 0 && state.filters.page > maxPage) {
-      state.filters.page = maxPage;
-      syncUrlState();
-      return fetchReels({ silent });
+    const nextReels = data.reels || [];
+    const nextTotal = data.total || 0;
+    const maxPage = Math.max(1, Math.ceil(nextTotal / state.filters.limit) || 1);
+    if (nextReels.length === 0 && pageToFetch > maxPage) {
+      if (!silent && fetchReelsAbortController === controller) {
+        isExplicitReelsFetchInFlight = false;
+      }
+      return fetchReels({ silent, pageOverride: maxPage });
     }
+
+    if (pageToFetch !== state.filters.page) {
+      state.filters.page = pageToFetch;
+      syncUrlState();
+    }
+    state.reels = nextReels;
+    state.total = nextTotal;
     hasInitialReelsSettled = true;
 
     renderReels();
@@ -1802,6 +1835,10 @@ async function fetchReels(options = {}) {
     }
     hasInitialReelsSettled = true;
     renderFetchErrorState(e?.message || 'Unable to reach server');
+  } finally {
+    if (!silent && fetchReelsAbortController === controller) {
+      isExplicitReelsFetchInFlight = false;
+    }
   }
 }
 
@@ -4053,8 +4090,8 @@ function setupEventListeners() {
     const now = Date.now();
     if (now - lastAutoSyncAt < 5000) return;
     lastAutoSyncAt = now;
-    loadStats();
-    loadCreators(state.creatorQuery);
+    loadStats({ silent: true });
+    loadCreators(state.creatorQuery, { silent: true });
     fetchReels({ silent: true });
   });
 
