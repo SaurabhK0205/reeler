@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { generateUserVaultKey, getAdminVaultKey, createOtp, OtpCapacityError } from './vaultAuthService.ts';
+import { generateUserVaultKey, getAdminVaultKey, createOtp, isOtpActive, OtpCapacityError } from './vaultAuthService.ts';
 import { safeStringEqual } from '../middleware/security.ts';
 import { loadConfig } from '../config.ts';
 import { Repository, SenderReminderConflictError, SenderDeletionBarrierError } from '../db/repository.ts';
@@ -75,6 +75,10 @@ interface WebhookRetryState {
   pinnedDurationTargetReel?: SavedReel | null;
   /** Preserves the initially parsed target timestamp & duration across internal retries. */
   pinnedDuration?: ReturnType<typeof parseDuration>;
+  /** Preserves the exact Watch Later Reel IDs resolved on the initial watched/stop command across retries. */
+  pinnedWatchedTargetIds?: string[];
+  /** Monotonic sequence assigned on initial reception of a timezone-set command to block stale retries. */
+  timezoneCommandSeq?: number;
 }
 
 interface WebhookDeliveryContext {
@@ -82,12 +86,15 @@ interface WebhookDeliveryContext {
   anyDeliveryFailed: boolean;
   unsentMessages: string[];
   retryState: WebhookRetryState;
+  /** Tracks a newly issued OTP code so superseded OTP replies are discarded instead of replayed later. */
+  issuedOtpCode?: string;
 }
 
 interface PendingWebhookReply {
   recipientId: string;
   messages: string[];
   expiresAt: number;
+  otpCode?: string;
 }
 
 export class MetaInstagramBotService {
@@ -100,6 +107,8 @@ export class MetaInstagramBotService {
   private committedMutationMids = new Map<string, number>();
   private pendingRepliesByMid = new Map<string, PendingWebhookReply>();
   private scheduledRetries = new Map<string, ReturnType<typeof setTimeout>>();
+  private timezoneCommandSeq = 0;
+  private lastCommittedTimezoneSeqBySender = new Map<string, number>();
   public adminUserId: string | null = null;
 
   constructor(options?: { adminUserId?: string | null; retryDelaysMs?: number[] }) {
@@ -250,11 +259,31 @@ export class MetaInstagramBotService {
     return true;
   }
 
+  private recordCommittedTimezoneSeq(senderId: string, seq: number): void {
+    const existing = this.lastCommittedTimezoneSeqBySender.get(senderId) ?? 0;
+    if (seq < existing) return;
+    if (
+      !this.lastCommittedTimezoneSeqBySender.has(senderId) &&
+      this.lastCommittedTimezoneSeqBySender.size >= WEBHOOK_MID_MAX_ENTRIES
+    ) {
+      const oldest = this.lastCommittedTimezoneSeqBySender.keys().next().value;
+      if (oldest !== undefined) {
+        this.lastCommittedTimezoneSeqBySender.delete(oldest);
+      }
+    }
+    this.lastCommittedTimezoneSeqBySender.set(senderId, seq);
+  }
+
   /**
    * Stores unsent reply messages for a webhook mid whose side effects already committed,
    * so retries only redeliver the missing DM(s) without repeating mutations.
    */
-  private recordPendingWebhookReplies(mid: string, recipientId: string, messages: string[]): void {
+  private recordPendingWebhookReplies(
+    mid: string,
+    recipientId: string,
+    messages: string[],
+    otpCode?: string
+  ): void {
     const now = Date.now();
     if (this.pendingRepliesByMid.size >= WEBHOOK_PENDING_REPLY_MAX_ENTRIES) {
       for (const [key, entry] of this.pendingRepliesByMid.entries()) {
@@ -272,6 +301,7 @@ export class MetaInstagramBotService {
       recipientId,
       messages,
       expiresAt: now + WEBHOOK_PENDING_REPLY_TTL_MS,
+      ...(otpCode ? { otpCode } : {}),
     });
   }
 
@@ -569,6 +599,11 @@ export class MetaInstagramBotService {
       // retry only the remaining unsent DM(s) without repeating the mutation.
       const pending = this.pendingRepliesByMid.get(opId);
       if (pending && pending.expiresAt > Date.now()) {
+        if (pending.otpCode && !isOtpActive(pending.otpCode)) {
+          // A newer login code superseded (or already consumed/expired) this OTP; discard stale reply.
+          this.markWebhookMidCompleted(opId);
+          return;
+        }
         const remaining: string[] = [];
         let failed = false;
         for (const msg of pending.messages) {
@@ -585,7 +620,7 @@ export class MetaInstagramBotService {
         if (!failed) {
           this.markWebhookMidCompleted(opId);
         } else {
-          this.recordPendingWebhookReplies(opId, pending.recipientId, remaining);
+          this.recordPendingWebhookReplies(opId, pending.recipientId, remaining, pending.otpCode);
           shouldScheduleRetry = true;
         }
         return;
@@ -617,7 +652,7 @@ export class MetaInstagramBotService {
         this.markWebhookMidCompleted(opId);
       } else {
         if (delivery.stateMutated && delivery.unsentMessages.length > 0) {
-          this.recordPendingWebhookReplies(opId, senderId, delivery.unsentMessages);
+          this.recordPendingWebhookReplies(opId, senderId, delivery.unsentMessages, delivery.issuedOtpCode);
         }
         // The route already returned 200 EVENT_RECEIVED before dispatch, so Meta will not redeliver
         // this event; schedule a bounded internal retry preserving the opId and mutation checkpoint.
@@ -873,7 +908,20 @@ export class MetaInstagramBotService {
     // Handles single ("watched", "done", "stop") and bulk ("stop all", "watched all", "clear all", "unsub")
     const { isCommand, markAll } = parseWatchedStopCommand(text);
     if (isCommand) {
-      const { updatedReels, remainingCount } = await Repository.markWatchedForInstagramSender(senderId, { markAll });
+      let targetReelIds: string[] | undefined;
+      if (delivery) {
+        if (delivery.retryState.pinnedWatchedTargetIds === undefined) {
+          delivery.retryState.pinnedWatchedTargetIds = await Repository.selectWatchLaterTargetIdsForSender(
+            senderId,
+            { markAll }
+          );
+        }
+        targetReelIds = delivery.retryState.pinnedWatchedTargetIds;
+      }
+      const { updatedReels, remainingCount } = await Repository.markWatchedForInstagramSender(senderId, {
+        markAll,
+        ...(targetReelIds !== undefined ? { targetReelIds } : {}),
+      });
       if (delivery) delivery.stateMutated = true;
       const reply = formatWatchedConfirmationMessage(updatedReels, remainingCount, markAll);
       await this.deliverReply(senderId, reply, delivery);
@@ -935,7 +983,10 @@ export class MetaInstagramBotService {
         }
         throw error;
       }
-      if (delivery) delivery.stateMutated = true;
+      if (delivery) {
+        delivery.stateMutated = true;
+        delivery.issuedOtpCode = otpCode;
+      }
 
       const reply =
         `🔐 Your Reeler Login Code:\n${otpCode}\n\n` +
@@ -961,8 +1012,20 @@ export class MetaInstagramBotService {
     const tzSetMatch = text.match(/^(?:tz|timezone|set\s+tz|set\s+timezone)\s+(.+)$/i);
     if (tzSetMatch) {
       const rawInput = tzSetMatch[1].trim();
+      const cmdSeq =
+        delivery?.retryState.timezoneCommandSeq ?? ++this.timezoneCommandSeq;
+      if (delivery && delivery.retryState.timezoneCommandSeq === undefined) {
+        delivery.retryState.timezoneCommandSeq = cmdSeq;
+      }
+      const lastCommittedSeq = this.lastCommittedTimezoneSeqBySender.get(senderId) ?? 0;
+      if (cmdSeq < lastCommittedSeq) {
+        // A newer timezone command already committed for this sender; discard stale retry.
+        return;
+      }
+
       const updatedTz = await Repository.setSenderTimezone(senderId, rawInput);
       if (updatedTz) {
+        this.recordCommittedTimezoneSeq(senderId, cmdSeq);
         if (delivery) delivery.stateMutated = true;
         const tzSummary = getTimeZoneSummary(updatedTz);
         const reply =

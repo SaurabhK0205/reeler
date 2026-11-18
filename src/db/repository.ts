@@ -2178,16 +2178,88 @@ export class Repository {
   }
 
   /**
-   * Marks either the most recently reminded/updated active Watch Later reel (default)
-   * or all active Watch Later reels (`markAll: true`) as watched for an Instagram sender.
+   * Resolves the ordered Watch Later Reel IDs that a watched/stop command targets for an Instagram sender.
+   * Callers performing retries can pin these IDs before the first write so newer Reels saved later are never targeted.
+   */
+  static async selectWatchLaterTargetIdsForSender(
+    senderId: string,
+    options?: { markAll?: boolean; includeUnattributedFallback?: boolean }
+  ): Promise<string[]> {
+    const trimmedSender = String(senderId || '').trim();
+    const markAll = Boolean(options?.markAll);
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+
+    if (!trimmedSender && !allowUnattributedFallback) {
+      return [];
+    }
+
+    if (!isSupabaseConfigured()) {
+      const activeWatchLater = Array.from(memoryStore.reels.values()).filter(
+        (r) => r.watch_status === 'watch_later'
+      );
+      let candidates = trimmedSender
+        ? activeWatchLater.filter((r) => r.instagram_sender_id === trimmedSender)
+        : [];
+      if (allowUnattributedFallback && candidates.length === 0) {
+        candidates = activeWatchLater.filter((r) => !String(r.instagram_sender_id || '').trim());
+      }
+      if (candidates.length === 0) {
+        return [];
+      }
+      const ordered = sortWatchLaterReelsMostRecentFirst(
+        candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) }))
+      );
+      return (markAll ? ordered : [ordered[0]]).map((r) => r.id);
+    }
+
+    const supabase = getSupabase();
+    const fetchActiveCandidates = async (senderFilter: 'exact' | 'unattributed'): Promise<SavedReel[]> => {
+      let query = supabase
+        .from('saved_reels')
+        .select('id, updated_at, last_reminded_at, created_at, watch_status, instagram_sender_id')
+        .eq('watch_status', 'watch_later')
+        .order('updated_at', { ascending: false })
+        .order('last_reminded_at', { ascending: false, nullsFirst: false })
+        .order('created_at', { ascending: false });
+
+      if (senderFilter === 'exact') {
+        query = query.eq('instagram_sender_id', trimmedSender);
+      } else {
+        query = query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+
+      const { data, error } = await query;
+      if (error) {
+        throw new Error(`Failed to fetch active watch-later reels: ${error.message}`);
+      }
+      return (data || []) as SavedReel[];
+    };
+
+    let candidates = trimmedSender ? await fetchActiveCandidates('exact') : [];
+    if (allowUnattributedFallback && candidates.length === 0) {
+      candidates = await fetchActiveCandidates('unattributed');
+    }
+    if (candidates.length === 0) {
+      return [];
+    }
+
+    const ordered = sortWatchLaterReelsMostRecentFirst(candidates);
+    return (markAll ? ordered : [ordered[0]]).map((r) => r.id);
+  }
+
+  /**
+   * Marks either the most recently reminded/updated active Watch Later reel (default),
+   * all active Watch Later reels (`markAll: true`), or an explicit pinned set (`targetReelIds`)
+   * as watched for an Instagram sender.
    */
   static async markWatchedForInstagramSender(
     senderId: string,
-    options?: { markAll?: boolean; includeUnattributedFallback?: boolean }
+    options?: { markAll?: boolean; includeUnattributedFallback?: boolean; targetReelIds?: string[] }
   ): Promise<MarkWatchedResult> {
     const trimmedSender = String(senderId || '').trim();
     const markAll = Boolean(options?.markAll);
     const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    const pinnedIdSet = options?.targetReelIds !== undefined ? new Set(options.targetReelIds) : null;
     const now = new Date().toISOString();
 
     if (!trimmedSender && !allowUnattributedFallback) {
@@ -2216,7 +2288,11 @@ export class Repository {
       const ordered = sortWatchLaterReelsMostRecentFirst(
         candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) }))
       );
-      const targets = markAll ? ordered : [ordered[0]];
+      const targets = pinnedIdSet
+        ? ordered.filter((r) => pinnedIdSet.has(r.id))
+        : markAll
+          ? ordered
+          : [ordered[0]];
       const updatedReels: SavedReel[] = [];
 
       for (const target of targets) {
@@ -2276,7 +2352,14 @@ export class Repository {
     }
 
     const ordered = sortWatchLaterReelsMostRecentFirst(candidates);
-    const targets = markAll ? ordered : [ordered[0]];
+    const targets = pinnedIdSet
+      ? ordered.filter((r) => pinnedIdSet.has(r.id))
+      : markAll
+        ? ordered
+        : [ordered[0]];
+    if (targets.length === 0) {
+      return { updatedReels: [], remainingCount: ordered.length };
+    }
     const targetIds = targets.map((r) => r.id);
     const orderIndex = new Map(targetIds.map((id, idx) => [id, idx]));
 

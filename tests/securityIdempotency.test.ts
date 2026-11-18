@@ -1047,3 +1047,205 @@ test('Security - OTP store enforces 1 active code per principal and refuses cros
     clearOtpsForTesting();
   }
 });
+
+test('Security - OTP trailing-slash allowlist, failed resend rollback, and superseded OTP reply discard', async () => {
+  clearOtpsForTesting();
+  const origEnv = process.env.NODE_ENV;
+  const origVaultSecret = process.env.VAULT_SECRET;
+  const origAdminUsername = process.env.ADMIN_USERNAME;
+  process.env.NODE_ENV = 'production';
+  process.env.VAULT_SECRET = 'test-prod-otp-secret';
+  process.env.ADMIN_USERNAME = 'otp_admin';
+
+  const bot = new MetaInstagramBotService({ retryDelaysMs: [20] });
+  try {
+    // 1. Trailing-slash OTP routes bypass vaultAuthMiddleware; extra segments stay 401
+    for (const allowedPath of ['/auth/otp/verify', '/auth/otp/verify/', '/auth/otp/request', '/auth/otp/request/']) {
+      let nextCalled = false;
+      vaultAuthMiddleware(
+        { path: allowedPath, headers: {}, query: {} } as any,
+        { status: () => ({ json: () => {} }) } as any,
+        () => {
+          nextCalled = true;
+        }
+      );
+      assert.equal(nextCalled, true, `${allowedPath} must bypass vault auth`);
+    }
+    for (const blockedPath of ['/auth/otp/verify/extra', '/auth/otp/request/extra', '/auth/otp/verify//']) {
+      let status = 200;
+      let nextCalled = false;
+      vaultAuthMiddleware(
+        { path: blockedPath, headers: {}, query: {} } as any,
+        {
+          status: (code: number) => {
+            status = code;
+            return { json: () => {} };
+          },
+        } as any,
+        () => {
+          nextCalled = true;
+        }
+      );
+      assert.equal(nextCalled, false, `${blockedPath} must NOT bypass vault auth`);
+      assert.equal(status, 401);
+    }
+
+    // 2. requestOtpForUsername preserves previous unexpired admin OTP when replacement delivery fails
+    const existingAdminCode = createOtp({ role: 'admin' });
+    const failedResend = await requestOtpForUsername('otp_admin', async () => false, 'admin_sender_1');
+    assert.equal(failedResend.success, false);
+    assert.equal(failedResend.code, 'DELIVERY_FAILED');
+
+    let sentReplacementCode = '';
+    const okResend = await requestOtpForUsername(
+      'otp_admin',
+      async (_id, msg) => {
+        const match = msg.match(/\b(\d{6})\b/);
+        sentReplacementCode = match ? match[1] : '';
+        return true;
+      },
+      'admin_sender_1'
+    );
+    assert.equal(okResend.success, true);
+    assert.match(sentReplacementCode, /^\d{6}$/);
+    assert.equal(verifyOtp(existingAdminCode).valid, false, 'Successful replacement must supersede prior OTP');
+    assert.equal(verifyOtp(sentReplacementCode).valid, true, 'Delivered replacement OTP must be valid');
+
+    // Verify rollback itself keeps existing code valid if we check before any successful replacement
+    const preservedCode = createOtp({ role: 'admin' });
+    await requestOtpForUsername('otp_admin', async () => false, 'admin_sender_1');
+    assert.equal(verifyOtp(preservedCode).valid, true, 'Failed replacement delivery must leave previous unexpired OTP usable');
+
+    // 3. Superseded OTP reply is discarded on retry so invalid C1 is never delivered after valid C2
+    const deliveredCodes: string[] = [];
+    let attemptNum = 0;
+    bot.sendDirectMessage = async (_recipientId, text) => {
+      attemptNum++;
+      const match = text.match(/\b(\d{6})\b/);
+      if (attemptNum === 1) {
+        // C1 first attempt fails -> queued for retry in 20ms
+        return false;
+      }
+      if (match) deliveredCodes.push(match[1]);
+      return true;
+    };
+
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: 'sender_otp_sup' }, message: { mid: 'mid.otp_c1', text: 'code' } }] }],
+    });
+    // Before C1 retry runs, user requests a fresh code C2 which succeeds and supersedes C1
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: 'sender_otp_sup' }, message: { mid: 'mid.otp_c2', text: 'code' } }] }],
+    });
+    // Wait for C1's retry timer to fire -> must be discarded!
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(deliveredCodes.length, 1, 'Superseded C1 reply must be discarded instead of delivered after C2');
+    assert.equal(verifyOtp(deliveredCodes[0]).valid, true, 'The single delivered code must be the active C2');
+  } finally {
+    bot.clearPendingRetriesForTesting();
+    clearOtpsForTesting();
+    if (origEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = origEnv;
+    if (origVaultSecret === undefined) delete process.env.VAULT_SECRET;
+    else process.env.VAULT_SECRET = origVaultSecret;
+    if (origAdminUsername === undefined) delete process.env.ADMIN_USERNAME;
+    else process.env.ADMIN_USERNAME = origAdminUsername;
+  }
+});
+
+test('MetaInstagramBotService - pins watched targets and guards timezone preference ordering across retries', async () => {
+  const bot = new MetaInstagramBotService({ retryDelaysMs: [20] });
+  const origMarkWatched = Repository.markWatchedForInstagramSender;
+  const origSetTz = Repository.setSenderTimezone;
+
+  try {
+    // 1. Watched command retry stays pinned to original Reel A even if Reel B is saved before retry
+    const sender = 'sender_watched_pin';
+    const creator = await Repository.upsertCreator({
+      instagram_user_id: 'ig_watched_pin_creator',
+      username: 'watched_pin_creator',
+    });
+    const reelA = await Repository.upsertSavedReel({
+      instagram_media_id: 'media_watched_a',
+      shortcode: 'WatchedPinA',
+      reel_url: 'https://www.instagram.com/reel/WatchedPinA/',
+      media_type: 'reel',
+      creator_id: creator.id,
+      taken_at: new Date(Date.now() - 10_000).toISOString(),
+      first_detected_at: new Date(Date.now() - 10_000).toISOString(),
+      save_order_rank: 1,
+      watch_status: 'watch_later',
+      instagram_sender_id: sender,
+    });
+    assert.ok(reelA);
+
+    const realMarkWatched = Repository.markWatchedForInstagramSender.bind(Repository);
+    let failFirstWatched = true;
+    Repository.markWatchedForInstagramSender = (async (sid, opts) => {
+      if (sid === sender && failFirstWatched) {
+        failFirstWatched = false;
+        // Simulate Reel B arriving before the internal retry runs
+        await Repository.upsertSavedReel({
+          instagram_media_id: 'media_watched_b',
+          shortcode: 'WatchedPinB',
+          reel_url: 'https://www.instagram.com/reel/WatchedPinB/',
+          media_type: 'reel',
+          creator_id: creator.id,
+          taken_at: new Date().toISOString(),
+          first_detected_at: new Date().toISOString(),
+          save_order_rank: 2,
+          watch_status: 'watch_later',
+          instagram_sender_id: sender,
+        });
+        throw new Error('Transient DB blip on watched update');
+      }
+      return realMarkWatched(sid, opts);
+    }) as typeof Repository.markWatchedForInstagramSender;
+
+    bot.sendDirectMessage = async () => true;
+
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: sender }, message: { mid: 'mid.watched_pin', text: 'watched' } }] }],
+    });
+    await new Promise((r) => setTimeout(r, 70));
+
+    const remainingActive = await Repository.getLastReelForInstagramSender(sender);
+    assert.equal(
+      remainingActive?.shortcode,
+      'WatchedPinB',
+      'Retried watched command must mark original Reel A watched and leave newly saved Reel B untouched'
+    );
+
+    // 2. Older failed timezone retry ("tz London") must NOT overwrite newer committed preference ("tz Tokyo")
+    const tzSender = 'sender_tz_order';
+    const realSetTz = Repository.setSenderTimezone.bind(Repository);
+    let failLondonOnce = true;
+    Repository.setSenderTimezone = (async (sid, tzInput) => {
+      if (sid === tzSender && /london/i.test(tzInput) && failLondonOnce) {
+        failLondonOnce = false;
+        throw new Error('Transient DB blip on tz London');
+      }
+      return realSetTz(sid, tzInput);
+    }) as typeof Repository.setSenderTimezone;
+
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: tzSender }, message: { mid: 'mid.tz_london', text: 'tz London' } }] }],
+    });
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: tzSender }, message: { mid: 'mid.tz_tokyo', text: 'tz Tokyo' } }] }],
+    });
+    await new Promise((r) => setTimeout(r, 70));
+
+    const finalTz = await Repository.getSenderTimezone(tzSender);
+    assert.equal(finalTz, 'Asia/Tokyo', 'Stale tz London retry must NOT overwrite newer committed tz Tokyo');
+  } finally {
+    bot.clearPendingRetriesForTesting();
+    Repository.markWatchedForInstagramSender = origMarkWatched;
+    Repository.setSenderTimezone = origSetTz;
+  }
+});

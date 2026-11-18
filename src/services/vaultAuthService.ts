@@ -156,6 +156,15 @@ export function verifyOtp(code: string): { valid: boolean; session?: VaultUserSe
 }
 
 /**
+ * Checks whether the given 6-digit OTP is currently active and unexpired without consuming it.
+ */
+export function isOtpActive(code: string): boolean {
+  cleanupExpiredOtps();
+  const record = pendingOtps.get(code);
+  return Boolean(record && record.expiresAt > Date.now());
+}
+
+/**
  * Clears in-memory OTPs (for testing only).
  */
 export function clearOtpsForTesting(): void {
@@ -284,6 +293,12 @@ export async function requestOtpForUsername(
   const targetSenderId = adminSenderId || config.instagram.userId;
 
   if (username && username === adminUser && targetSenderId) {
+    cleanupExpiredOtps();
+    const previousCode = principalToOtp.get('admin');
+    const previousRecord = previousCode ? pendingOtps.get(previousCode) : undefined;
+    const preservedPrevious =
+      previousRecord && previousRecord.expiresAt > Date.now() ? { ...previousRecord } : null;
+
     let code: string;
     try {
       code = createOtp({ role: 'admin' });
@@ -297,11 +312,31 @@ export async function requestOtpForUsername(
       }
       throw error;
     }
+
+    const rollbackUndeliveredOtp = () => {
+      if (principalToOtp.get('admin') !== code) {
+        return;
+      }
+      pendingOtps.delete(code);
+      principalToOtp.delete('admin');
+      if (preservedPrevious && preservedPrevious.expiresAt > Date.now()) {
+        pendingOtps.set(preservedPrevious.code, preservedPrevious);
+        principalToOtp.set('admin', preservedPrevious.code);
+      }
+    };
+
     const message =
       `🔐 Your Reeler Login Code:\n${code}\n\n` +
       `Enter this 6-digit code on your PC or laptop browser to unlock your private vault (valid for 10 minutes).`;
-    const delivered = await sendDm(targetSenderId, message);
+    let delivered: boolean;
+    try {
+      delivered = await sendDm(targetSenderId, message);
+    } catch (error) {
+      rollbackUndeliveredOtp();
+      throw error;
+    }
     if (!delivered) {
+      rollbackUndeliveredOtp();
       return {
         success: false,
         code: 'DELIVERY_FAILED',
@@ -452,13 +487,14 @@ export function verifyVaultKey(key: string): { valid: boolean; session?: VaultUs
 export function vaultAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
   // Public bypass paths: Meta webhook, health check, reel metadata probe, and OTP endpoints
   const reqPath = req.path || '';
+  const normalizedOtpPath = reqPath.length > 1 && reqPath.endsWith('/') ? reqPath.slice(0, -1) : reqPath;
   if (
     reqPath === '/health' ||
     reqPath === '/instagram/webhook' ||
     reqPath.startsWith('/instagram/webhook/') ||
     REEL_META_PATH_RE.test(reqPath) ||
-    reqPath === '/auth/otp/verify' ||
-    reqPath === '/auth/otp/request'
+    normalizedOtpPath === '/auth/otp/verify' ||
+    normalizedOtpPath === '/auth/otp/request'
   ) {
     return next();
   }
