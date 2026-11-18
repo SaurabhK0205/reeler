@@ -194,7 +194,7 @@ class InMemoryStore {
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
     awaiting_reminder_choice_until?: string | null;
-  }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean }): Promise<SavedReel | null> {
+  }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean; onInsertResult?: (inserted: boolean) => void }): Promise<SavedReel | null> {
     let existing: SavedReel | undefined;
     for (const r of this.reels.values()) {
       if (r.instagram_media_id === data.instagram_media_id) {
@@ -217,6 +217,7 @@ class InMemoryStore {
 
     if (existing) {
       if (options?.ignoreDuplicates) {
+        options.onInsertResult?.(false);
         return options.skipReturn ? null : existing;
       }
       if (isConflictingActiveSenderReminder(existing, data.instagram_sender_id)) {
@@ -256,6 +257,7 @@ class InMemoryStore {
       existing.effective_saved_at = resolveEffectiveSavedAt(existing);
       if (data.instagram_sender_id !== undefined) existing.instagram_sender_id = data.instagram_sender_id;
       existing.updated_at = now;
+      options?.onInsertResult?.(false);
       return options?.skipReturn ? null : { ...existing, creator: this.creators.get(existing.creator_id) };
     }
 
@@ -296,6 +298,7 @@ class InMemoryStore {
     };
 
     this.reels.set(newReel.id, newReel);
+    options?.onInsertResult?.(true);
     return options?.skipReturn ? null : newReel;
   }
 
@@ -437,9 +440,15 @@ class InMemoryStore {
           }
         }
 
-        const countBefore = this.reels.size;
-        await this.upsertSavedReel(r, { ignoreDuplicates: options?.ignoreDuplicates, skipReturn: true });
-        if (this.reels.size > countBefore || !options?.ignoreDuplicates) {
+        let itemInserted = false;
+        await this.upsertSavedReel(r, {
+          ignoreDuplicates: options?.ignoreDuplicates,
+          skipReturn: true,
+          onInsertResult: (inserted) => {
+            itemInserted = inserted;
+          },
+        });
+        if (itemInserted || !options?.ignoreDuplicates) {
           newlyImported++;
         } else {
           failedCount++;
@@ -1555,6 +1564,9 @@ export class Repository {
             .from('saved_reels')
             .update(payload)
             .eq('id', currentRow.id);
+          if (shouldPromote) {
+            conditionalUpdate = conditionalUpdate.eq('is_saved_on_instagram', false);
+          }
           conditionalUpdate =
             currentRow.saved_at === null
               ? conditionalUpdate.is('saved_at', null)
@@ -1841,7 +1853,11 @@ export class Repository {
               );
               assertImportNotAborted(signal);
               if (skipLookupErr) {
-                throw new Error(`Failed to batch-lookup skipped archive reels: ${skipLookupErr.message}`);
+                console.warn(
+                  `[Repository] Skipped archive-reel batch lookup (${subIds.length} ids) failed, falling back to per-item reconciliation:`,
+                  skipLookupErr.message
+                );
+                continue;
               }
               for (const row of existingSkipped || []) {
                 matchedByMediaId.set(String(row.instagram_media_id), {
