@@ -28,6 +28,7 @@ import {
   verifyOtp,
 } from '../src/services/vaultAuthService.ts';
 import { apiRouter, resetApiRateLimitersForTesting } from '../src/api/router.ts';
+import { resetFeedMetaResolverStateForTests } from '../src/services/reelMetadataResolver.ts';
 import { createApp } from '../src/server.ts';
 import { MetaInstagramBotService } from '../src/services/metaInstagramBotService.ts';
 import { Repository } from '../src/db/repository.ts';
@@ -1789,6 +1790,83 @@ test('Archive Import - authenticated vault users import into isolated sender vau
       const adminBody = await adminRes.json();
       assert.equal(adminBody.success, true);
       assert.equal(adminBody.reelsImported, 2);
+
+      // 8. GET /api/reels/:shortcode/meta uses its own rate-limit bucket so heavy grid thumbnail hydration never starves /api/stats
+      const origFetchMeta = globalThis.fetch;
+      const origMetaProxy = process.env.METADATA_PROXY_URL;
+      delete process.env.METADATA_PROXY_URL;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.startsWith(baseUrl)) {
+          return origFetchMeta(input, init);
+        }
+        return new Response(
+          '<html><head>' +
+            '<meta property="og:url" content="https://www.instagram.com/u/reel/MetaRateIso1/" />' +
+            '<meta property="og:image" content="https://scontent.cdninstagram.com/v/cover.jpg" />' +
+            '</head></html>',
+          { status: 200 }
+        );
+      }) as typeof fetch;
+      try {
+        resetApiRateLimitersForTesting();
+        resetFeedMetaResolverStateForTests();
+        // Exhaust metaRateLimiter (all 120 requests must succeed across GET, HEAD, and percent-encoded shortcodes)
+        const probeUrls = [
+          { method: 'GET', url: `${baseUrl}/api/reels/MetaRateIso1/meta` },
+          { method: 'HEAD', url: `${baseUrl}/api/reels/MetaRateIso1/meta` },
+          { method: 'GET', url: `${baseUrl}/api/reels/Meta%5FRate1/meta` },
+        ];
+        for (let i = 0; i < 120; i++) {
+          const probe = probeUrls[i % probeUrls.length];
+          const r = await origFetchMeta(probe.url, { method: probe.method });
+          assert.equal(
+            r.status,
+            200,
+            `Dedicated metaRateLimiter must allow probe ${i + 1}/120 (${probe.method} ${probe.url})`
+          );
+        }
+
+        // Probe 121 (distinct GET) must hit dedicated metaRateLimiter with META_RATE_LIMITED
+        const overLimitRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta`, { method: 'GET' });
+        assert.equal(overLimitRes.status, 429, 'Dedicated metaRateLimiter must cap probe 121 at 429');
+        const overLimitBody = (await overLimitRes.json()) as { error?: string };
+        assert.equal(
+          overLimitBody.error,
+          'META_RATE_LIMITED',
+          'Metadata 429 must come specifically from dedicated metaRateLimiter'
+        );
+
+        // Core vault API endpoints must still have full untouched quota (119 remaining after 1 call)
+        const statsRes = await origFetchMeta(`${baseUrl}/api/stats`, {
+          headers: { 'X-Vault-Key': userAKey },
+        });
+        assert.equal(statsRes.status, 200, 'Core /api/stats must not be rate-limited by /meta thumbnail hydration');
+        assert.equal(
+          statsRes.headers.get('ratelimit-remaining'),
+          '119',
+          'Supported GET/HEAD/encoded /meta probes must not consume any core apiRateLimiter quota'
+        );
+
+        // Trailing-slash /meta/ must NOT bypass vaultAuthMiddleware or apiRateLimiter
+        const trailingSlashRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta/`);
+        assert.equal(trailingSlashRes.status, 401, 'Trailing-slash /meta/ must not bypass vaultAuthMiddleware');
+
+        // Non-string refresh query parameter must be rejected with HTTP 400
+        resetApiRateLimitersForTesting();
+        const invalidRefreshRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta?refresh[]=1`);
+        assert.equal(invalidRefreshRes.status, 400, 'Non-string refresh query parameter must return HTTP 400');
+
+        // ?refresh=1 bypasses cached metadata and responds with Cache-Control: no-store
+        const refreshRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta?refresh=1`);
+        assert.equal(refreshRes.status, 200);
+        assert.equal(refreshRes.headers.get('cache-control'), 'no-store');
+      } finally {
+        globalThis.fetch = origFetchMeta;
+        if (origMetaProxy === undefined) delete process.env.METADATA_PROXY_URL;
+        else process.env.METADATA_PROXY_URL = origMetaProxy;
+        resetFeedMetaResolverStateForTests();
+      }
     });
   } finally {
     Repository.resetMemoryStoreForTests();

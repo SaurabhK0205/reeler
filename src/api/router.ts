@@ -21,6 +21,23 @@ import type { ReelQueryFilters, WatchStatus, DateFilterPreset, SavedMediaType, S
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const SAFE_REEL_ID_RE = /^[\x21-\x7E]{1,128}$/;
+const REEL_META_SEGMENT_RE = /^\/reels\/([^/]+)\/meta$/;
+
+/**
+ * Identifies canonical GET/HEAD metadata probe requests (matching Express's decoded shortcode routing
+ * and vaultAuthMiddleware's exact non-trailing-slash exemption) so they use only metaRateLimiter.
+ */
+function isSupportedReelMetaRequest(req: Request): boolean {
+  const method = req.method.toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD') return false;
+  const match = REEL_META_SEGMENT_RE.exec(req.path || '');
+  if (!match) return false;
+  try {
+    return isValidShortcode(decodeURIComponent(match[1]));
+  } catch {
+    return false;
+  }
+}
 
 const apiRateLimiter = createRateLimiter({
   windowMs: 60 * 1000,
@@ -28,7 +45,18 @@ const apiRateLimiter = createRateLimiter({
   maxTrackedKeys: 5000,
   errorCode: 'API_RATE_LIMITED',
   message: 'Too many requests. Please slow down and try again shortly.',
-  skip: (req) => req.path === '/health' || req.path.startsWith('/instagram/webhook'),
+  skip: (req) =>
+    req.path === '/health' ||
+    req.path.startsWith('/instagram/webhook') ||
+    isSupportedReelMetaRequest(req),
+});
+
+const metaRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 120,
+  maxTrackedKeys: 5000,
+  errorCode: 'META_RATE_LIMITED',
+  message: 'Too many thumbnail metadata requests. Please retry shortly.',
 });
 
 const mutationRateLimiter = createRateLimiter({
@@ -53,6 +81,7 @@ const mutationRateLimiter = createRateLimiter({
 
 export function resetApiRateLimitersForTesting(): void {
   apiRateLimiter.resetForTesting();
+  metaRateLimiter.resetForTesting();
   mutationRateLimiter.resetForTesting();
 }
 
@@ -309,7 +338,7 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
  * Resolves live media kind and cover aspect ratio for an Instagram shortcode with disconnect cancellation
  * and bounded upstream concurrency.
  */
-apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
+apiRouter.get('/reels/:shortcode/meta', metaRateLimiter.middleware, async (req: Request, res: Response) => {
   const controller = new AbortController();
   res.on('close', () => {
     if (!res.writableEnded) {
@@ -331,12 +360,18 @@ apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
         : rawTypeHint === 'reel'
           ? 'reel'
           : undefined;
+    const rawRefresh = req.query.refresh;
+    if (rawRefresh !== undefined && typeof rawRefresh !== 'string') {
+      res.status(400).json({ error: 'Invalid refresh query parameter' });
+      return;
+    }
+    const bypassCache = rawRefresh === '1';
 
-    const meta = await resolveFeedMediaMetadata(shortcode, controller.signal, preferredPath);
+    const meta = await resolveFeedMediaMetadata(shortcode, controller.signal, preferredPath, bypassCache);
     if (controller.signal.aborted || res.writableEnded) {
       return;
     }
-    res.setHeader('Cache-Control', feedMetaCacheControl(meta));
+    res.setHeader('Cache-Control', bypassCache ? 'no-store' : feedMetaCacheControl(meta));
     res.json(meta);
   } catch (error: any) {
     if (controller.signal.aborted || res.writableEnded) {
@@ -348,7 +383,11 @@ apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
       return;
     }
     if (error?.code === 'RATE_LIMITED') {
-      res.setHeader('Retry-After', '5');
+      const retryAfterSec =
+        typeof error?.retryAfterMs === 'number' && Number.isFinite(error.retryAfterMs)
+          ? Math.max(1, Math.ceil(error.retryAfterMs / 1000))
+          : 5;
+      res.setHeader('Retry-After', String(retryAfterSec));
       res.status(429).json({ error: 'Too many metadata requests, please retry shortly' });
       return;
     }

@@ -57,6 +57,8 @@ interface ResolveQueueWaiter {
 
 const feedMetaCache = new Map<string, { value: FeedMediaMetadata; expiresAt: number }>();
 const feedMetaInFlight = new Map<string, InFlightMetaEntry>();
+let feedMetaRefreshSeq = 0;
+const feedMetaRefreshCommitVersions = new Map<string, number>();
 let activeUpstreamResolves = 0;
 const upstreamResolveQueue: ResolveQueueWaiter[] = [];
 const upstreamResolveTimestamps: number[] = [];
@@ -68,6 +70,8 @@ let oEmbedBlockedUntil = 0;
  */
 export function resetFeedMetaResolverStateForTests(): void {
   feedMetaCache.clear();
+  feedMetaRefreshCommitVersions.clear();
+  feedMetaRefreshSeq = 0;
   upstreamResolveTimestamps.length = 0;
   oEmbedBlockedUntil = 0;
 }
@@ -82,8 +86,12 @@ function consumeUpstreamResolveBudget(): void {
     upstreamResolveTimestamps.shift();
   }
   if (upstreamResolveTimestamps.length >= MAX_UPSTREAM_RESOLVES_PER_MINUTE) {
-    const budgetErr = new Error('Metadata resolver upstream rate budget reached') as Error & { code?: string };
+    const budgetErr = new Error('Metadata resolver upstream rate budget reached') as Error & {
+      code?: string;
+      retryAfterMs?: number;
+    };
     budgetErr.code = 'RATE_LIMITED';
+    budgetErr.retryAfterMs = Math.max(1000, upstreamResolveTimestamps[0] + UPSTREAM_BUDGET_WINDOW_MS - Date.now());
     throw budgetErr;
   }
   upstreamResolveTimestamps.push(Date.now());
@@ -966,7 +974,8 @@ export function feedMetaCacheControl(meta: FeedMediaMetadata): string {
 export async function resolveFeedMediaMetadata(
   shortcode: string,
   signal?: AbortSignal,
-  preferredPath?: 'reel' | 'p'
+  preferredPath?: 'reel' | 'p',
+  bypassCache = false
 ): Promise<FeedMediaMetadata> {
   if (!isValidShortcode(shortcode)) {
     throw new Error('Invalid shortcode format');
@@ -976,21 +985,27 @@ export async function resolveFeedMediaMetadata(
   }
 
   const now = Date.now();
-  const cached = feedMetaCache.get(shortcode);
-  if (cached && cached.expiresAt > now) {
-    return cached.value;
-  }
-  if (cached) {
-    feedMetaCache.delete(shortcode);
+  if (!bypassCache) {
+    const cached = feedMetaCache.get(shortcode);
+    if (cached && cached.expiresAt > now) {
+      return cached.value;
+    }
+    if (cached) {
+      feedMetaCache.delete(shortcode);
+    }
   }
 
-  let entry = feedMetaInFlight.get(shortcode);
+  const inFlightKey = bypassCache ? `refresh:${shortcode}` : shortcode;
+  let entry = feedMetaInFlight.get(inFlightKey);
   if (entry?.controller.signal.aborted) {
-    feedMetaInFlight.delete(shortcode);
+    feedMetaInFlight.delete(inFlightKey);
     entry = undefined;
   }
   if (!entry) {
     const controller = new AbortController();
+    const startRefreshVersion = bypassCache
+      ? ++feedMetaRefreshSeq
+      : (feedMetaRefreshCommitVersions.get(shortcode) ?? 0);
     const promise = (async (): Promise<FeedMediaMetadata> => {
       const releaseSlot = await acquireResolveSlot(controller.signal);
       try {
@@ -1016,15 +1031,40 @@ export async function resolveFeedMediaMetadata(
         };
 
         if (!controller.signal.aborted) {
-          if (feedMetaCache.size >= META_CACHE_MAX_ENTRIES) {
-            const oldestKey = feedMetaCache.keys().next().value;
-            if (oldestKey) feedMetaCache.delete(oldestKey);
-          }
           const hasUsefulMeta = Boolean(thumbnailUrl || isClips !== null);
-          feedMetaCache.set(shortcode, {
-            value: result,
-            expiresAt: Date.now() + (hasUsefulMeta ? META_CACHE_TTL_MS : META_NEGATIVE_CACHE_TTL_MS),
-          });
+          const existingCached = feedMetaCache.get(shortcode);
+          const hasUnexpiredUsefulCached = Boolean(
+            existingCached &&
+            existingCached.expiresAt > Date.now() &&
+            (existingCached.value.thumbnailUrl || existingCached.value.isClips !== null)
+          );
+          if (bypassCache && !hasUsefulMeta && hasUnexpiredUsefulCached) {
+            return result;
+          }
+          const latestRefreshVersion = feedMetaRefreshCommitVersions.get(shortcode) ?? 0;
+          const shouldWriteCache = bypassCache
+            ? startRefreshVersion > latestRefreshVersion
+            : startRefreshVersion === latestRefreshVersion;
+          if (shouldWriteCache) {
+            if (bypassCache) {
+              if (
+                feedMetaRefreshCommitVersions.size >= META_CACHE_MAX_ENTRIES &&
+                !feedMetaRefreshCommitVersions.has(shortcode)
+              ) {
+                const oldestVersionKey = feedMetaRefreshCommitVersions.keys().next().value;
+                if (oldestVersionKey) feedMetaRefreshCommitVersions.delete(oldestVersionKey);
+              }
+              feedMetaRefreshCommitVersions.set(shortcode, startRefreshVersion);
+            }
+            if (feedMetaCache.size >= META_CACHE_MAX_ENTRIES && !feedMetaCache.has(shortcode)) {
+              const oldestKey = feedMetaCache.keys().next().value;
+              if (oldestKey) feedMetaCache.delete(oldestKey);
+            }
+            feedMetaCache.set(shortcode, {
+              value: result,
+              expiresAt: Date.now() + (hasUsefulMeta ? META_CACHE_TTL_MS : META_NEGATIVE_CACHE_TTL_MS),
+            });
+          }
         }
 
         return result;
@@ -1034,10 +1074,10 @@ export async function resolveFeedMediaMetadata(
     })();
 
     entry = { promise, controller, waiters: 0 };
-    feedMetaInFlight.set(shortcode, entry);
+    feedMetaInFlight.set(inFlightKey, entry);
     promise.finally(() => {
-      if (feedMetaInFlight.get(shortcode) === entry) {
-        feedMetaInFlight.delete(shortcode);
+      if (feedMetaInFlight.get(inFlightKey) === entry) {
+        feedMetaInFlight.delete(inFlightKey);
       }
     }).catch(() => {});
   }
