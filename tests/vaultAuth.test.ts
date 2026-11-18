@@ -666,43 +666,55 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
 
   // 5. Emil Kowalski + Benji Taylor motion craft invariants hold
   assert.ok(css.includes('--ease-out: cubic-bezier(0.23, 1, 0.32, 1);'), 'style.css must define custom --ease-out token');
-  const easeInTransitionRe = /transition\s*:[^;}]*(?:^|[\s,])ease-in(?=$|[\s,;}])/;
+  const easeInTransitionRe = /transition(?:-timing-function)?\s*:[^;}]*(?:^|[\s:,])ease-in(?=$|[\s,;}])/;
   assert.doesNotMatch(
     css,
     easeInTransitionRe,
     'style.css must not use sluggish ease-in on UI transitions (ease-in-out remains permitted)'
   );
   assert.match('.test { transition: opacity 120ms ease-in}', easeInTransitionRe);
+  assert.match('.test { transition-timing-function: ease-in; }', easeInTransitionRe);
   assert.doesNotMatch('.test { transition: opacity 120ms ease-in-out}', easeInTransitionRe);
+  assert.doesNotMatch('.test { transition-timing-function: ease-in-out; }', easeInTransitionRe);
 
   /**
    * Extracts effective CSS transition property names across all rules targeting a given selector,
-   * expanding omitted shorthand properties to their CSS default `all`.
+   * applying declaration precedence within each rule and expanding omitted shorthand properties to `all`.
    */
   const extractEffectiveTransitionProperties = (stylesheet: string, targetSelector: string): string[] => {
     const props: string[] = [];
     const cleaned = stylesheet.replace(/\/\*[\s\S]*?\*\//g, '');
     const ruleRe = /([^{}@]+)\{([^{}]+)\}/g;
+    const selectorPattern = new RegExp(
+      `(?:^|[\\s>+~])${targetSelector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[\\s>+~.:#\\[])`
+    );
     let match: RegExpExecArray | null;
     while ((match = ruleRe.exec(cleaned)) !== null) {
       const selectors = match[1].split(',').map((s) => s.trim());
-      const selectorPattern = new RegExp(
-        `(?:^|[\\s>+~])${targetSelector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[\\s>+~.:#\\[])`
-      );
       if (!selectors.some((sel) => selectorPattern.test(sel))) continue;
       const decls = match[2].split(';');
+      let ruleProps: string[] | null = null;
+      let rulePropsImportant = false;
       for (const decl of decls) {
         const colonIdx = decl.indexOf(':');
         if (colonIdx === -1) continue;
         const propName = decl.slice(0, colonIdx).trim().toLowerCase();
-        const rawValue = decl.slice(colonIdx + 1).replace(/!important\b/gi, '').trim();
+        if (propName !== 'transition' && propName !== 'transition-property') continue;
+        const rawDeclVal = decl.slice(colonIdx + 1);
+        const isImportant = /!important\b/i.test(rawDeclVal);
+        if (rulePropsImportant && !isImportant) continue;
+        const rawValue = rawDeclVal.replace(/!important\b/gi, '').trim();
         if (!rawValue) continue;
         if (propName === 'transition-property') {
-          for (const item of rawValue.split(',')) {
-            const token = item.trim().toLowerCase();
-            if (token) props.push(token);
+          const parsed = rawValue
+            .split(',')
+            .map((item) => item.trim().toLowerCase())
+            .filter(Boolean);
+          if (parsed.length > 0) {
+            ruleProps = parsed;
+            rulePropsImportant = isImportant;
           }
-        } else if (propName === 'transition') {
+        } else {
           const items: string[] = [];
           let depth = 0;
           let buf = '';
@@ -717,6 +729,7 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
             }
           }
           if (buf.trim()) items.push(buf.trim());
+          const parsed: string[] = [];
           for (const item of items) {
             const stripped = item
               .replace(/[a-z-]+\([^)]*\)/gi, ' ')
@@ -740,9 +753,16 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
                     'allow-discrete',
                   ].includes(t)
               );
-            props.push(tokens[0] || 'all');
+            parsed.push(tokens[0] || 'all');
+          }
+          if (parsed.length > 0) {
+            ruleProps = parsed;
+            rulePropsImportant = isImportant;
           }
         }
+      }
+      if (ruleProps) {
+        props.push(...ruleProps);
       }
     }
     return props;
@@ -758,6 +778,14 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
     extractEffectiveTransitionProperties('.reel-media-viewport { transition: 120ms linear; }', '.reel-media-viewport'),
     ['all'],
     'Shorthand transition without explicit property must resolve to implicit all'
+  );
+  assert.deepEqual(
+    extractEffectiveTransitionProperties(
+      '.reel-media-viewport { transition: 120ms linear; transition-property: opacity; }',
+      '.reel-media-viewport'
+    ),
+    ['opacity'],
+    'Explicit transition-property declaration must override preceding shorthand transition property in the same rule'
   );
   assert.deepEqual(
     extractEffectiveTransitionProperties(

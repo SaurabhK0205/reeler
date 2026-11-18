@@ -2276,7 +2276,7 @@ function renderReels() {
         const sc = reel.shortcode ? String(reel.shortcode).trim() : '';
         if (
           sc &&
-          !gridThumbRefreshedExpired.has(sc) &&
+          !hasRefreshedGridThumb(sc, cleanThumbnail) &&
           !gridThumbPendingRefresh.has(sc) &&
           !isGridThumbUnavailable(sc)
         ) {
@@ -2290,6 +2290,7 @@ function renderReels() {
           }
           registerGridCardForThumbnailHydration(card, reel, posterAltText, isPost, {
             bypassCache: true,
+            failedUrl: cleanThumbnail,
             failedStoredUrl: rawCleanThumbnail || cleanThumbnail,
           });
         }
@@ -2827,12 +2828,48 @@ function recordReplacedGridThumbUrl(failedStoredUrl, replacementUrl) {
 }
 
 /**
+ * Builds a composite key scoping completed cover refreshes to both shortcode and the failed URL.
+ * @param {string} shortcode
+ * @param {string | null | undefined} failedUrl
+ * @returns {string}
+ */
+function makeGridThumbRefreshKey(shortcode, failedUrl) {
+  return `${shortcode}\0${failedUrl || ''}`;
+}
+
+/**
+ * Returns true if the specific failed cover URL for a shortcode has already been refreshed.
+ * @param {string} shortcode
+ * @param {string | null | undefined} failedUrl
+ * @returns {boolean}
+ */
+function hasRefreshedGridThumb(shortcode, failedUrl) {
+  if (!shortcode) return false;
+  return gridThumbRefreshedExpired.has(makeGridThumbRefreshKey(shortcode, failedUrl));
+}
+
+/**
+ * Records a bounded completed cover refresh keyed by shortcode and failed cover URL.
+ * @param {string} shortcode
+ * @param {string | null | undefined} failedUrl
+ */
+function markRefreshedGridThumb(shortcode, failedUrl) {
+  if (!shortcode) return;
+  const key = makeGridThumbRefreshKey(shortcode, failedUrl);
+  if (gridThumbRefreshedExpired.size >= MAX_GRID_REPLACED_TRACKED && !gridThumbRefreshedExpired.has(key)) {
+    const oldest = gridThumbRefreshedExpired.values().next().value;
+    if (oldest !== undefined) gridThumbRefreshedExpired.delete(oldest);
+  }
+  gridThumbRefreshedExpired.add(key);
+}
+
+/**
  * Registers a monogram grid poster card for lazy viewport thumbnail hydration.
  * @param {HTMLElement} card
  * @param {object} reel
  * @param {string} altText
  * @param {boolean} isPost
- * @param {{ bypassCache?: boolean, failedStoredUrl?: string | null }} [options]
+ * @param {{ bypassCache?: boolean, failedUrl?: string | null, failedStoredUrl?: string | null }} [options]
  */
 function registerGridCardForThumbnailHydration(card, reel, altText, isPost, options = {}) {
   const shortcode = reel?.shortcode ? String(reel.shortcode).trim() : '';
@@ -2844,6 +2881,7 @@ function registerGridCardForThumbnailHydration(card, reel, altText, isPost, opti
     altText,
     isPost,
     bypassCache: Boolean(options?.bypassCache),
+    failedUrl: options?.failedUrl || null,
     failedStoredUrl: options?.failedStoredUrl || null,
     retriedAfter429: false,
     retriedAfterError: false,
@@ -2863,7 +2901,7 @@ function registerGridCardForThumbnailHydration(card, reel, altText, isPost, opti
  * @param {number} generation
  */
 function applyHydratedGridThumbnail(entry, meta, generation) {
-  const { card, reel, shortcode, altText, isPost, failedStoredUrl, bypassCache } = entry;
+  const { card, reel, shortcode, altText, isPost, failedUrl, failedStoredUrl, bypassCache } = entry;
   if (generation !== gridThumbGeneration) return;
   if (!card.isConnected) {
     if (bypassCache) gridThumbPendingRefresh.delete(shortcode);
@@ -2897,7 +2935,7 @@ function applyHydratedGridThumbnail(entry, meta, generation) {
     revealed = true;
     if (bypassCache) {
       gridThumbPendingRefresh.delete(shortcode);
-      gridThumbRefreshedExpired.add(shortcode);
+      markRefreshedGridThumb(shortcode, failedUrl || failedStoredUrl);
     }
     reel.thumbnail_url = cleanUrl;
     if (failedStoredUrl) {
@@ -2940,6 +2978,25 @@ function applyHydratedGridThumbnail(entry, meta, generation) {
     card.classList.remove('has-thumbnail');
     card.classList.add('is-monogram');
     card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
+    if (
+      !bypassCache &&
+      !hasRefreshedGridThumb(shortcode, cleanUrl) &&
+      !gridThumbPendingRefresh.has(shortcode) &&
+      !isGridThumbUnavailable(shortcode)
+    ) {
+      const cachedMeta = state.metaCache.get(shortcode);
+      if (cachedMeta && sanitizeMediaUrl(cachedMeta.thumbnailUrl) === cleanUrl) {
+        state.metaCache.delete(shortcode);
+      }
+      gridThumbPendingRefresh.add(shortcode);
+      gridThumbQueuedCards.delete(card);
+      registerGridCardForThumbnailHydration(card, reel, altText, isPost, {
+        bypassCache: true,
+        failedUrl: cleanUrl,
+        failedStoredUrl: failedStoredUrl || null,
+      });
+      return;
+    }
     markGridThumbUnavailable(shortcode);
   }, { once: true });
 

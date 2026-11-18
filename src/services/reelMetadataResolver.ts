@@ -1031,6 +1031,16 @@ export async function resolveFeedMediaMetadata(
         };
 
         if (!controller.signal.aborted) {
+          const hasUsefulMeta = Boolean(thumbnailUrl || isClips !== null);
+          const existingCached = feedMetaCache.get(shortcode);
+          const hasUnexpiredUsefulCached = Boolean(
+            existingCached &&
+            existingCached.expiresAt > Date.now() &&
+            (existingCached.value.thumbnailUrl || existingCached.value.isClips !== null)
+          );
+          if (bypassCache && !hasUsefulMeta && hasUnexpiredUsefulCached) {
+            return result;
+          }
           const latestRefreshVersion = feedMetaRefreshCommitVersions.get(shortcode) ?? 0;
           const shouldWriteCache = bypassCache
             ? startRefreshVersion > latestRefreshVersion
@@ -1050,7 +1060,6 @@ export async function resolveFeedMediaMetadata(
               const oldestKey = feedMetaCache.keys().next().value;
               if (oldestKey) feedMetaCache.delete(oldestKey);
             }
-            const hasUsefulMeta = Boolean(thumbnailUrl || isClips !== null);
             feedMetaCache.set(shortcode, {
               value: result,
               expiresAt: Date.now() + (hasUsefulMeta ? META_CACHE_TTL_MS : META_NEGATIVE_CACHE_TTL_MS),

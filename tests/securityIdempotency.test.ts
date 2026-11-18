@@ -1811,30 +1811,28 @@ test('Archive Import - authenticated vault users import into isolated sender vau
       try {
         resetApiRateLimitersForTesting();
         resetFeedMetaResolverStateForTests();
-        // Exhaust metaRateLimiter (120 requests) across GET, HEAD, and percent-encoded shortcodes
-        let sawMeta429 = false;
-        let meta429ErrorCode: string | null = null;
+        // Exhaust metaRateLimiter (all 120 requests must succeed across GET, HEAD, and percent-encoded shortcodes)
         const probeUrls = [
           { method: 'GET', url: `${baseUrl}/api/reels/MetaRateIso1/meta` },
           { method: 'HEAD', url: `${baseUrl}/api/reels/MetaRateIso1/meta` },
           { method: 'GET', url: `${baseUrl}/api/reels/Meta%5FRate1/meta` },
         ];
-        for (let i = 0; i < 121; i++) {
+        for (let i = 0; i < 120; i++) {
           const probe = probeUrls[i % probeUrls.length];
           const r = await origFetchMeta(probe.url, { method: probe.method });
-          if (r.status === 429) {
-            sawMeta429 = true;
-            if (probe.method === 'GET') {
-              const body = (await r.json()) as { error?: string };
-              meta429ErrorCode = body.error ?? null;
-            }
-            break;
-          }
-          assert.equal(r.status, 200);
+          assert.equal(
+            r.status,
+            200,
+            `Dedicated metaRateLimiter must allow probe ${i + 1}/120 (${probe.method} ${probe.url})`
+          );
         }
-        assert.equal(sawMeta429, true, 'Dedicated metaRateLimiter must cap excessive /meta calls at 120/min');
+
+        // Probe 121 (distinct GET) must hit dedicated metaRateLimiter with META_RATE_LIMITED
+        const overLimitRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta`, { method: 'GET' });
+        assert.equal(overLimitRes.status, 429, 'Dedicated metaRateLimiter must cap probe 121 at 429');
+        const overLimitBody = (await overLimitRes.json()) as { error?: string };
         assert.equal(
-          meta429ErrorCode,
+          overLimitBody.error,
           'META_RATE_LIMITED',
           'Metadata 429 must come specifically from dedicated metaRateLimiter'
         );
