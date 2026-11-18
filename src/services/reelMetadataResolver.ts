@@ -443,19 +443,31 @@ interface ParsedOpenGraphFields {
  */
 function extractMetaTagAttributes(html: string): Array<Record<string, string>> {
   const tags: Array<Record<string, string>> = [];
-  const lower = html.toLowerCase();
   let pos = 0;
 
   while (pos < html.length) {
-    const start = lower.indexOf('<meta', pos);
-    if (start === -1) break;
-    const afterName = html[start + 5];
-    if (afterName && !/[\s/>]/.test(afterName)) {
-      pos = start + 5;
+    const lt = html.indexOf('<', pos);
+    if (lt === -1) break;
+
+    // Skip HTML comments so commented-out <meta> tags are never treated as elements
+    if (html.startsWith('<!--', lt)) {
+      const commentEnd = html.indexOf('-->', lt + 4);
+      if (commentEnd === -1) break;
+      pos = commentEnd + 3;
       continue;
     }
 
-    let i = start + 5;
+    // Match ASCII <meta directly on the original string (avoiding Unicode toLowerCase length shifts like İ)
+    const afterName = html[lt + 5];
+    if (
+      html.slice(lt + 1, lt + 5).toLowerCase() !== 'meta' ||
+      (afterName && !/[\s/>]/.test(afterName))
+    ) {
+      pos = lt + 1;
+      continue;
+    }
+
+    let i = lt + 5;
     const attrs: Record<string, string> = Object.create(null);
 
     while (i < html.length) {
@@ -501,7 +513,7 @@ function extractMetaTagAttributes(html: string): Array<Record<string, string>> {
 
 /**
  * Extracts OpenGraph, Twitter meta, and embedded JSON owner values once by tokenizing `<meta>` tags
- * safely across quoted `>` characters, arbitrary attribute ordering, and unquoted attribute values.
+ * safely across comments, Unicode titles, quoted `>` characters, arbitrary attribute ordering, and entity-encoded selectors.
  */
 function parseOpenGraphFields(html: string): ParsedOpenGraphFields {
   let ogUrl = '';
@@ -513,8 +525,8 @@ function parseOpenGraphFields(html: string): ParsedOpenGraphFields {
   for (const attrs of extractMetaTagAttributes(html)) {
     const contentAttr = attrs.content;
     if (contentAttr === undefined) continue;
-    const propertyAttr = (attrs.property || '').toLowerCase();
-    const nameAttr = (attrs.name || '').toLowerCase();
+    const propertyAttr = decodeHtml(attrs.property || '').trim().toLowerCase();
+    const nameAttr = decodeHtml(attrs.name || '').trim().toLowerCase();
 
     if (propertyAttr === 'og:url' && !ogUrl) {
       ogUrl = decodeHtml(contentAttr).trim();

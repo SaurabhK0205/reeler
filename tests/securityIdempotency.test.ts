@@ -1313,10 +1313,10 @@ test('MetadataResolver - falls back to secondary crawler User-Agent when primary
     assert.equal(mismatched.username, undefined, 'Mismatched shortcode og:url (reversed attrs) must be rejected');
     assert.equal(mismatched.thumbnailUrl, undefined, 'Mismatched shortcode og:image must be rejected');
 
-    // Matching og:url with reversed attribute order and quoted '>' inside description must parse cleanly
+    // Matching og:url preceded by Unicode İ (which expands under toLowerCase) must preserve tag offsets
     globalThis.fetch = (async () =>
       new Response(
-        '<html><head>' +
+        '<html><head><title>İ</title>' +
           '<meta content="https://www.instagram.com/rightuser/reel/DFallbackUA1/" property="og:url" />' +
           '<meta property="og:description" content="5 likes: &quot;A > B comparison clip&quot;" />' +
           '<meta content="https://scontent.cdninstagram.com/v/right.jpg" property="og:image" />' +
@@ -1329,19 +1329,20 @@ test('MetadataResolver - falls back to secondary crawler User-Agent when primary
     assert.equal(reversedMatch.thumbnailUrl, 'https://scontent.cdninstagram.com/v/right.jpg');
     assert.match(reversedMatch.caption || '', /A > B/);
 
-    // Quoted '>' before a mismatched og:url AND unquoted og:url mismatch must both be rejected
+    // Commented-out matching og:url + entity-encoded property=og&#58;url mismatch must be rejected
     globalThis.fetch = (async () =>
       new Response(
         '<html><head>' +
-          '<meta data-note="A > B" property=og:url content=https://www.instagram.com/wronguser/reel/DFallbackUA12/ />' +
+          '<!-- <meta content="https://www.instagram.com/fake/reel/DFallbackUA1/" property="og:url" /> -->' +
+          '<meta data-note="A > B" property=og&#58;url content=https://www.instagram.com/wronguser/reel/DFallbackUA12/ />' +
           '<meta property="og:image" content="https://scontent.cdninstagram.com/v/wrong2.jpg" />' +
           '</head></html>',
         { status: 200 }
       )) as typeof fetch;
 
     const quotedGtMismatch = await fetchReelMetadata('DFallbackUA1', undefined, 'reel');
-    assert.equal(quotedGtMismatch.username, undefined, 'Unquoted / quoted-> mismatched og:url must be rejected');
-    assert.equal(quotedGtMismatch.thumbnailUrl, undefined, 'Mismatched og:image must not leak on quoted->/unquoted og:url');
+    assert.equal(quotedGtMismatch.username, undefined, 'Commented og:url and encoded/unquoted mismatch must be rejected');
+    assert.equal(quotedGtMismatch.thumbnailUrl, undefined, 'Mismatched og:image must not leak on commented/encoded og:url');
   } finally {
     globalThis.fetch = origFetch;
     if (origToken === undefined) delete process.env.META_PAGE_ACCESS_TOKEN;

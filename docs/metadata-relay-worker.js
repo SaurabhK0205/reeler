@@ -62,19 +62,29 @@ function isAllowedInstagramUrl(parsed, expectedShortcode) {
  */
 function extractMetaTagAttributes(html) {
   const tags = [];
-  const lower = html.toLowerCase();
   let pos = 0;
 
   while (pos < html.length) {
-    const start = lower.indexOf('<meta', pos);
-    if (start === -1) break;
-    const afterName = html[start + 5];
-    if (afterName && !/[\s/>]/.test(afterName)) {
-      pos = start + 5;
+    const lt = html.indexOf('<', pos);
+    if (lt === -1) break;
+
+    if (html.startsWith('<!--', lt)) {
+      const commentEnd = html.indexOf('-->', lt + 4);
+      if (commentEnd === -1) break;
+      pos = commentEnd + 3;
       continue;
     }
 
-    let i = start + 5;
+    const afterName = html[lt + 5];
+    if (
+      html.slice(lt + 1, lt + 5).toLowerCase() !== 'meta' ||
+      (afterName && !/[\s/>]/.test(afterName))
+    ) {
+      pos = lt + 1;
+      continue;
+    }
+
+    let i = lt + 5;
     const attrs = Object.create(null);
 
     while (i < html.length) {
@@ -119,7 +129,7 @@ function extractMetaTagAttributes(html) {
 }
 
 /**
- * Classifies HTML OpenGraph metadata safely across attribute order, quoting styles, and quoted `>`:
+ * Classifies HTML OpenGraph metadata safely across comments, Unicode titles, attribute order, quoting styles, and quoted `>`:
  * - 'rich': has og:image or non-generic title and no mismatched og:url shortcode
  * - 'url_only': only has a matching og:url shortcode (held as fallback while other crawler runs)
  * - 'invalid': login wall, missing tags, or mismatched shortcode
@@ -133,8 +143,8 @@ function classifyItemOpenGraph(html, shortcode) {
   for (const attrs of extractMetaTagAttributes(html)) {
     const contentAttr = attrs.content;
     if (contentAttr === undefined) continue;
-    const propertyAttr = (attrs.property || '').toLowerCase();
-    const nameAttr = (attrs.name || '').toLowerCase();
+    const propertyAttr = decodeHtmlAttribute(attrs.property || '').trim().toLowerCase();
+    const nameAttr = decodeHtmlAttribute(attrs.name || '').trim().toLowerCase();
 
     if (propertyAttr === 'og:url' && !ogUrl) ogUrl = decodeHtmlAttribute(contentAttr).trim();
     else if (propertyAttr === 'og:image' && !ogImage) ogImage = decodeHtmlAttribute(contentAttr).trim();
