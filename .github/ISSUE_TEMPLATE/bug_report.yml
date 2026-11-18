@@ -1,0 +1,92 @@
+name: Bug Report
+description: Report broken behavior in the Instagram DM bot, web vault, reminders, or self-hosted setup.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue. Please do not include vault keys (`?key=...`), 6-digit login codes, `.env` files, or API tokens in public issues.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Area
+      description: Which part of Reeler is affected?
+      options:
+        - Instagram DM Bot
+        - Web Vault UI
+        - Reminders & Timezones
+        - Archive Import (saved_posts.json)
+        - Vault Access / 6-Digit Login Code
+        - Self-Hosting / Deployment
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      description: Where did you encounter this bug?
+      options:
+        - Hosted Reeler instance
+        - Self-hosted (Render / Docker / local)
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior clearly.
+      placeholder: 'Example: I replied "watched" to the bot in DMs, but the Watched counter in the web vault stayed at 0.'
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps to trigger the issue.
+      placeholder: |
+        1. Send a Reel to the bot in Instagram DMs
+        2. Reply with ...
+        3. Open the web vault and click ...
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Browser, OS, or Node.js version (if self-hosted).
+      placeholder: "Example: Chrome 131 on macOS, or Instagram iOS app"
+    validations:
+      required: false
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshots or sanitized logs
+      description: Attach screenshots or error output. Remove any vault keys, cookies, or access tokens before posting.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission check
+      options:
+        - label: I searched existing issues to make sure this is not a duplicate.
+          required: true
+        - label: I confirmed no vault keys, access tokens, or personal credentials are included.
+          required: true
