@@ -1388,6 +1388,7 @@ export class Repository {
           promoteToSaved: boolean;
           saved_at?: string;
           save_order_rank?: number;
+          matchedCount: number;
         }
       >();
 
@@ -1465,7 +1466,6 @@ export class Repository {
             existingByOwnerMediaId.get(makeOwnerCompositeKey(r.instagram_sender_id, r.instagram_media_id)) ||
             existingBySenderShortcode.get(makeOwnerCompositeKey(r.instagram_sender_id, r.shortcode));
           if (existing) {
-            alreadyPresent++;
             const shouldPromote = r.is_saved_on_instagram !== false && existing.is_saved_on_instagram === false;
             const shouldBackfill = Boolean(
               options.backfillMissingSavedAt && r.saved_at && shouldBackfillSavedAt(existing, r.saved_at)
@@ -1480,7 +1480,9 @@ export class Repository {
                 },
                 shortcode: r.shortcode,
                 promoteToSaved: false,
+                matchedCount: 0,
               };
+              prev.matchedCount++;
               if (shouldPromote) {
                 prev.promoteToSaved = true;
               }
@@ -1489,6 +1491,8 @@ export class Repository {
                 prev.save_order_rank = r.save_order_rank;
               }
               updatesById.set(existing.id, prev);
+            } else {
+              alreadyPresent++;
             }
           } else {
             freshReels.push(r);
@@ -1658,6 +1662,7 @@ export class Repository {
               failedCount++;
               failedShortcodes.push(item.shortcode);
             } else {
+              alreadyPresent += item.matchedCount;
               if (outcome.promoted) promotedToSaved++;
               if (outcome.backfilled) savedAtBackfilled++;
             }

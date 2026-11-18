@@ -2004,6 +2004,51 @@ test('Archive Import - rejects non-JSON media types with 415, enforces bounded e
       const serialized = JSON.stringify(errBody);
       assert.equal(serialized.includes('saved_reels'), false, 'Response must not leak internal table names');
       assert.equal(serialized.includes('internal_secret_col'), false, 'Response must not leak internal column names');
+
+      // 4. Partial import result must NOT be cached by Idempotency-Key so retries can recover failed items
+      let partialAttempts = 0;
+      Repository.upsertSavedReelsBatch = (async (reels, opts) => {
+        partialAttempts++;
+        if (partialAttempts === 1) {
+          return {
+            newlyImported: 1,
+            alreadyPresent: 0,
+            savedAtBackfilled: 0,
+            promotedToSaved: 0,
+            failedCount: 1,
+            failedShortcodes: ['HardenReel01'],
+          };
+        }
+        return origUpsertBatch.call(Repository, reels, opts);
+      }) as typeof Repository.upsertSavedReelsBatch;
+
+      const partialIdemKey = 'idem-partial-retry-001';
+      const firstPartialRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Vault-Key': user3Key,
+          'Idempotency-Key': partialIdemKey,
+        },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(firstPartialRes.status, 200);
+      const firstPartialBody = (await firstPartialRes.json()) as { status?: string };
+      assert.equal(firstPartialBody.status, 'partial');
+
+      const retryPartialRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Vault-Key': user3Key,
+          'Idempotency-Key': partialIdemKey,
+        },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(retryPartialRes.status, 200);
+      const retryPartialBody = (await retryPartialRes.json()) as { status?: string };
+      assert.equal(retryPartialBody.status, 'success', 'Retry after partial import must execute instead of replaying partial');
+      assert.equal(partialAttempts, 2, 'Partial result must not be cached by idempotencyMiddleware');
     });
   } finally {
     Repository.upsertSavedReelsBatch = origUpsertBatch;
