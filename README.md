@@ -58,14 +58,13 @@ npm install
 cp .env.example .env
 ```
 
-If you leave `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` empty, the server falls back to an in-memory store so you can test the UI immediately:
+If you leave `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` empty, the server starts with an empty in-memory store so you can open the UI immediately and test archive import (`saved_posts.json`) without setting up a database:
 
 ```bash
-npm run seed
 npm start
 ```
 
-Open `http://localhost:3000`.
+Open `http://localhost:3000`. Once Supabase is configured in `.env`, you can optionally run `npm run seed` before `npm start` to populate sample items into your database.
 
 ### 3. Available scripts
 - `npm start` — Run the server (`src/server.ts`)
@@ -73,7 +72,7 @@ Open `http://localhost:3000`.
 - `npm test` — Run all 6 regression test suites (archive import, Meta bot & metadata resolver, adaptive player, vault auth, compliance pages, duration/timezone)
 - `npm run import` — Import an Instagram `saved_posts.json` export from the CLI
 - `npm run recover-posts` — Repair legacy `/reel/` URLs that are actually `/p/` posts
-- `npm run seed` — Populate sample data for local development
+- `npm run seed` — Populate sample data into a configured Supabase database
 
 ---
 
