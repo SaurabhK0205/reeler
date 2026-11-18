@@ -1072,9 +1072,10 @@ export class MetaInstagramBotService {
           nextDate,
           customDuration.seconds,
           {
+            // Compare schedule & watch-status fields only so metadata-only updates (e.g. archive
+            // promotion updating is_saved_on_instagram/updated_at) do not falsely discard durations.
             expectedNextReminderAt: targetReel.next_reminder_at ?? null,
             expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
-            expectedUpdatedAt: targetReel.updated_at ?? null,
             ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
           }
         );
