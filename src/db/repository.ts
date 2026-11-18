@@ -1593,14 +1593,15 @@ export class Repository {
           return false;
         }
 
-        alreadyPresent++;
         let currentRow: ReconcileRow = existingRow;
+        let reconciliationComplete = false;
         for (let attempt = 0; attempt < 2; attempt++) {
           const shouldPromote = item.is_saved_on_instagram !== false && currentRow.is_saved_on_instagram === false;
           const shouldBackfill = Boolean(
             options?.backfillMissingSavedAt && item.saved_at && shouldBackfillSavedAt(currentRow, item.saved_at)
           );
           if (!shouldPromote && !shouldBackfill) {
+            reconciliationComplete = true;
             break;
           }
 
@@ -1633,6 +1634,7 @@ export class Repository {
             if ((updatedRows?.length ?? 0) > 0) {
               promotedToSaved++;
             }
+            reconciliationComplete = true;
             break;
           }
 
@@ -1657,6 +1659,7 @@ export class Repository {
           if ((updatedRows?.length ?? 0) > 0) {
             if (shouldPromote) promotedToSaved++;
             if (shouldBackfill) savedAtBackfilled++;
+            reconciliationComplete = true;
             break;
           }
 
@@ -1674,7 +1677,7 @@ export class Repository {
             throw new Error(`Failed to re-read conflicting archive reel: ${refreshErr.message}`);
           }
           if (!refreshed) {
-            break;
+            return false;
           }
           currentRow = {
             id: String(refreshed.id),
@@ -1683,6 +1686,19 @@ export class Repository {
             is_saved_on_instagram: refreshed.is_saved_on_instagram !== false,
           };
         }
+
+        if (!reconciliationComplete) {
+          const stillNeedsPromote =
+            item.is_saved_on_instagram !== false && currentRow.is_saved_on_instagram === false;
+          const stillNeedsBackfill = Boolean(
+            options?.backfillMissingSavedAt && item.saved_at && shouldBackfillSavedAt(currentRow, item.saved_at)
+          );
+          if (stillNeedsPromote || stillNeedsBackfill) {
+            throw new Error('Concurrent modification prevented archive reconciliation backfill');
+          }
+        }
+
+        alreadyPresent++;
         return true;
       };
 

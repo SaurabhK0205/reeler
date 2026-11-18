@@ -2689,7 +2689,7 @@ async function fetchShortcodeMetaWithStatus(shortcode, signal, preferredType, op
             }
             const existingClientCache = state.metaCache.get(shortcode);
             const preserveExistingCover = Boolean(
-              bypassCache && !data.thumbnailUrl && existingClientCache?.thumbnailUrl
+              !data.thumbnailUrl && existingClientCache?.thumbnailUrl
             );
             if (!preserveExistingCover) {
               state.metaCache.set(shortcode, data);
