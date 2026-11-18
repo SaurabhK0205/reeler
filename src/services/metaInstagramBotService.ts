@@ -62,12 +62,27 @@ export function isMetaMessagingWindowError(errorData: unknown): boolean {
 
 const WEBHOOK_MID_DEDUP_TTL_MS = 10 * 60 * 1000;
 const WEBHOOK_MID_MAX_ENTRIES = 2000;
+const WEBHOOK_PENDING_REPLY_MAX_ENTRIES = 500;
+
+interface WebhookDeliveryContext {
+  stateMutated: boolean;
+  anyDeliveryFailed: boolean;
+  unsentMessages: string[];
+}
+
+interface PendingWebhookReply {
+  recipientId: string;
+  messages: string[];
+  expiresAt: number;
+}
 
 export class MetaInstagramBotService {
   private accessToken: string;
   private verifyToken: string;
   private appSecret: string;
-  private processedMessageIds = new Map<string, number>();
+  private inFlightMessageIds = new Set<string>();
+  private completedMessageIds = new Map<string, number>();
+  private pendingRepliesByMid = new Map<string, PendingWebhookReply>();
   public adminUserId: string | null = null;
 
   constructor(options?: { adminUserId?: string | null }) {
@@ -133,35 +148,96 @@ export class MetaInstagramBotService {
   }
 
   /**
-   * Tracks processed Meta message IDs (mid) with bounded TTL/LRU eviction so webhook retries
-   * and duplicate messaging/changes dispatches remain idempotent.
+   * Normalizes a Meta webhook message ID (`mid`) when present.
    */
-  private isDuplicateWebhookMid(mid: unknown): boolean {
-    if (typeof mid !== 'string') return false;
+  private normalizeWebhookMid(mid: unknown): string | null {
+    if (typeof mid !== 'string') return null;
     const trimmed = mid.trim();
-    if (!trimmed) return false;
+    return trimmed || null;
+  }
 
-    const now = Date.now();
-    const existingExpiry = this.processedMessageIds.get(trimmed);
-    if (existingExpiry !== undefined && existingExpiry > now) {
-      return true;
+  /**
+   * Attempts to claim a webhook message ID for processing.
+   * Separates in-flight claims from completed markers so failed deliveries remain retryable.
+   */
+  private claimWebhookMid(mid: string | null): boolean {
+    if (!mid) return true;
+    if (this.inFlightMessageIds.has(mid)) {
+      return false;
     }
+    const now = Date.now();
+    const completedExpiry = this.completedMessageIds.get(mid);
+    if (completedExpiry !== undefined) {
+      if (completedExpiry > now) {
+        return false;
+      }
+      this.completedMessageIds.delete(mid);
+    }
+    this.inFlightMessageIds.add(mid);
+    return true;
+  }
 
-    if (this.processedMessageIds.size >= WEBHOOK_MID_MAX_ENTRIES) {
-      for (const [key, exp] of this.processedMessageIds.entries()) {
+  /**
+   * Marks a webhook message ID as successfully completed with bounded TTL/LRU eviction.
+   */
+  private markWebhookMidCompleted(mid: string | null): void {
+    if (!mid) return;
+    const now = Date.now();
+    if (this.completedMessageIds.size >= WEBHOOK_MID_MAX_ENTRIES) {
+      for (const [key, exp] of this.completedMessageIds.entries()) {
         if (exp <= now) {
-          this.processedMessageIds.delete(key);
+          this.completedMessageIds.delete(key);
         }
       }
-      while (this.processedMessageIds.size >= WEBHOOK_MID_MAX_ENTRIES) {
-        const oldest = this.processedMessageIds.keys().next().value;
+      while (this.completedMessageIds.size >= WEBHOOK_MID_MAX_ENTRIES) {
+        const oldest = this.completedMessageIds.keys().next().value;
         if (oldest === undefined) break;
-        this.processedMessageIds.delete(oldest);
+        this.completedMessageIds.delete(oldest);
       }
     }
+    this.completedMessageIds.set(mid, now + WEBHOOK_MID_DEDUP_TTL_MS);
+    this.pendingRepliesByMid.delete(mid);
+  }
 
-    this.processedMessageIds.set(trimmed, now + WEBHOOK_MID_DEDUP_TTL_MS);
-    return false;
+  /**
+   * Stores unsent reply messages for a webhook mid whose side effects already committed,
+   * so retries only redeliver the missing DM(s) without repeating mutations.
+   */
+  private recordPendingWebhookReplies(mid: string, recipientId: string, messages: string[]): void {
+    const now = Date.now();
+    if (this.pendingRepliesByMid.size >= WEBHOOK_PENDING_REPLY_MAX_ENTRIES) {
+      for (const [key, entry] of this.pendingRepliesByMid.entries()) {
+        if (entry.expiresAt <= now) {
+          this.pendingRepliesByMid.delete(key);
+        }
+      }
+      while (this.pendingRepliesByMid.size >= WEBHOOK_PENDING_REPLY_MAX_ENTRIES) {
+        const oldest = this.pendingRepliesByMid.keys().next().value;
+        if (oldest === undefined) break;
+        this.pendingRepliesByMid.delete(oldest);
+      }
+    }
+    this.pendingRepliesByMid.set(mid, {
+      recipientId,
+      messages,
+      expiresAt: now + WEBHOOK_MID_DEDUP_TTL_MS,
+    });
+  }
+
+  /**
+   * Sends a reply DM while tracking delivery failures in the active webhook delivery context.
+   */
+  private async deliverReply(
+    recipientId: string,
+    text: string,
+    delivery?: WebhookDeliveryContext
+  ): Promise<boolean> {
+    const ok = await this.sendDirectMessage(recipientId, text);
+    if (!ok && delivery) {
+      delivery.anyDeliveryFailed = true;
+      delivery.unsentMessages.push(text);
+    }
+    return ok;
   }
 
   /**
@@ -360,6 +436,98 @@ export class MetaInstagramBotService {
   }
 
   /**
+   * Dispatches a single normalized webhook message with in-flight claim tracking, failure-safe
+   * retryability, and partial-reply replay without repeating committed mutations.
+   */
+  private async dispatchWebhookMessage(
+    senderId: string,
+    rawMid: unknown,
+    text: string,
+    attachments: any[] | undefined,
+    sourceLabel: 'messaging' | 'change'
+  ): Promise<void> {
+    let reelUrl: string | null = null;
+    let attachmentType: string | null = null;
+    let attachmentTitle: string | null = null;
+    if (Array.isArray(attachments)) {
+      for (const att of attachments) {
+        if (att?.payload?.url) {
+          reelUrl = att.payload.url;
+          attachmentType = typeof att.type === 'string' ? att.type : null;
+          attachmentTitle =
+            typeof att.payload.title === 'string' && att.payload.title.trim()
+              ? att.payload.title.trim()
+              : null;
+          break;
+        }
+      }
+    }
+
+    const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
+    if (!combinedText) return;
+
+    const mid = this.normalizeWebhookMid(rawMid);
+    if (!this.claimWebhookMid(mid)) {
+      return;
+    }
+
+    try {
+      // If a prior attempt already committed state and only failed sending reply DM(s),
+      // retry only the remaining unsent DM(s) without repeating the mutation.
+      if (mid) {
+        const pending = this.pendingRepliesByMid.get(mid);
+        if (pending && pending.expiresAt > Date.now()) {
+          const remaining: string[] = [];
+          let failed = false;
+          for (const msg of pending.messages) {
+            if (failed) {
+              remaining.push(msg);
+              continue;
+            }
+            const ok = await this.sendDirectMessage(pending.recipientId, msg);
+            if (!ok) {
+              failed = true;
+              remaining.push(msg);
+            }
+          }
+          if (!failed) {
+            this.markWebhookMidCompleted(mid);
+          } else {
+            this.recordPendingWebhookReplies(mid, pending.recipientId, remaining);
+          }
+          return;
+        }
+        if (pending) {
+          this.pendingRepliesByMid.delete(mid);
+        }
+      }
+
+      const delivery: WebhookDeliveryContext = {
+        stateMutated: false,
+        anyDeliveryFailed: false,
+        unsentMessages: [],
+      };
+
+      await this.processIncomingText(senderId, combinedText, attachmentType, attachmentTitle, delivery);
+
+      if (!delivery.anyDeliveryFailed) {
+        this.markWebhookMidCompleted(mid);
+      } else if (mid && delivery.stateMutated && delivery.unsentMessages.length > 0) {
+        this.recordPendingWebhookReplies(mid, senderId, delivery.unsentMessages);
+      }
+      // If !stateMutated and delivery failed, claim is released in finally without marking completed
+      // so Meta's webhook retry can cleanly reprocess the message.
+    } catch (error) {
+      console.error(`[MetaIG] Failed to process ${sourceLabel} event for sender ${senderId}:`, error);
+      // Do not mark completed on thrown errors; in-flight claim is released in finally so retries proceed.
+    } finally {
+      if (mid) {
+        this.inFlightMessageIds.delete(mid);
+      }
+    }
+  }
+
+  /**
    * Handles incoming webhook event payload from Meta Graph API
    */
   async handleWebhookPayload(body: any): Promise<void> {
@@ -372,42 +540,14 @@ export class MetaInstagramBotService {
         const messaging = entry.messaging || [];
         for (const event of messaging) {
           const senderId = event.sender?.id;
-          if (!senderId) continue;
-
-          // Ignore echoes / own sent messages
-          if (event.message?.is_echo) continue;
-
-          // Deduplicate repeated Meta webhook deliveries by message ID
-          if (this.isDuplicateWebhookMid(event.message?.mid)) continue;
-
-          const text = event.message?.text || '';
-          
-          // Check for attachments (e.g. shared Reel clip, ig_reel, share, photo/carousel post)
-          let reelUrl: string | null = null;
-          let attachmentType: string | null = null;
-          let attachmentTitle: string | null = null;
-          if (event.message?.attachments) {
-            for (const att of event.message.attachments) {
-              if (att.payload?.url) {
-                reelUrl = att.payload.url;
-                attachmentType = typeof att.type === 'string' ? att.type : null;
-                attachmentTitle =
-                  typeof att.payload.title === 'string' && att.payload.title.trim()
-                    ? att.payload.title.trim()
-                    : null;
-                break;
-              }
-            }
-          }
-
-          const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
-          if (combinedText) {
-            try {
-              await this.processIncomingText(senderId, combinedText, attachmentType, attachmentTitle);
-            } catch (error) {
-              console.error(`[MetaIG] Failed to process messaging event for sender ${senderId}:`, error);
-            }
-          }
+          if (!senderId || event.message?.is_echo) continue;
+          await this.dispatchWebhookMessage(
+            senderId,
+            event.message?.mid,
+            event.message?.text || '',
+            event.message?.attachments,
+            'messaging'
+          );
         }
 
         // B. Changes events (some webhook subscriptions dispatch via changes)
@@ -417,32 +557,13 @@ export class MetaInstagramBotService {
             const val = change.value;
             const senderId = val.sender?.id;
             if (!senderId || val.message?.is_echo) continue;
-            if (this.isDuplicateWebhookMid(val.message?.mid)) continue;
-            const text = val.message?.text || '';
-            let reelUrl: string | null = null;
-            let attachmentType: string | null = null;
-            let attachmentTitle: string | null = null;
-            if (val.message?.attachments) {
-              for (const att of val.message.attachments) {
-                if (att.payload?.url) {
-                  reelUrl = att.payload.url;
-                  attachmentType = typeof att.type === 'string' ? att.type : null;
-                  attachmentTitle =
-                    typeof att.payload.title === 'string' && att.payload.title.trim()
-                      ? att.payload.title.trim()
-                      : null;
-                  break;
-                }
-              }
-            }
-            const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
-            if (combinedText) {
-              try {
-                await this.processIncomingText(senderId, combinedText, attachmentType, attachmentTitle);
-              } catch (error) {
-                console.error(`[MetaIG] Failed to process change event for sender ${senderId}:`, error);
-              }
-            }
+            await this.dispatchWebhookMessage(
+              senderId,
+              val.message?.mid,
+              val.message?.text || '',
+              val.message?.attachments,
+              'change'
+            );
           }
         }
       }
@@ -456,7 +577,8 @@ export class MetaInstagramBotService {
     senderId: string,
     text: string,
     attachmentType?: string | null,
-    attachmentTitle?: string | null
+    attachmentTitle?: string | null,
+    delivery?: WebhookDeliveryContext
   ): Promise<void> {
     console.log(`[MetaIG] Incoming DM from Instagram user ${senderId}: "${text}"`);
     const senderTz = await Repository.getSenderTimezone(senderId);
@@ -500,7 +622,7 @@ export class MetaInstagramBotService {
         console.warn(
           `[MetaIG] Rejected Watch Later update for ${shortcode} from sender ${senderId}: active reminder already exists (${activeOwner ? 'another sender' : 'unattributed admin/UI'}).`
         );
-        await this.sendDirectMessage(senderId, formatSenderConflictRejectionMessage(mediaType));
+        await this.deliverReply(senderId, formatSenderConflictRejectionMessage(mediaType), delivery);
         return;
       }
 
@@ -581,21 +703,23 @@ export class MetaInstagramBotService {
           is_saved_on_instagram: isSavedOnInstagram,
           instagram_sender_id: senderId,
         });
+        if (delivery) delivery.stateMutated = true;
       } catch (error) {
         if (error instanceof SenderReminderConflictError) {
           console.warn(
             `[MetaIG] Concurrent Watch Later conflict for ${shortcode} from sender ${senderId}; existing reminder preserved.`
           );
-          await this.sendDirectMessage(senderId, formatSenderConflictRejectionMessage(mediaType));
+          await this.deliverReply(senderId, formatSenderConflictRejectionMessage(mediaType), delivery);
           return;
         }
         if (error instanceof SenderDeletionBarrierError) {
           console.warn(
             `[MetaIG] Reel save rejected for sender ${senderId}: deletion barrier active.`
           );
-          await this.sendDirectMessage(
+          await this.deliverReply(
             senderId,
-            `⏳ Your account data was recently deleted. Please wait 60 seconds before sharing new reels.`
+            `⏳ Your account data was recently deleted. Please wait 60 seconds before sharing new reels.`,
+            delivery
           );
           return;
         }
@@ -608,7 +732,7 @@ export class MetaInstagramBotService {
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
-        await this.sendDirectMessage(senderId, reply);
+        await this.deliverReply(senderId, reply, delivery);
       } else {
         // No time provided — wait up to 10 minutes for user choice before defaulting to 10 hours
         const defaultTriggerDate = new Date(Date.now() + (10 * 60 + 10 * 3600) * 1000);
@@ -621,7 +745,7 @@ export class MetaInstagramBotService {
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz London" or "tz IST") to set your local timezone.`;
         }
-        await this.sendDirectMessage(senderId, reply);
+        await this.deliverReply(senderId, reply, delivery);
       }
       return;
     }
@@ -631,8 +755,9 @@ export class MetaInstagramBotService {
     const { isCommand, markAll } = parseWatchedStopCommand(text);
     if (isCommand) {
       const { updatedReels, remainingCount } = await Repository.markWatchedForInstagramSender(senderId, { markAll });
+      if (delivery) delivery.stateMutated = true;
       const reply = formatWatchedConfirmationMessage(updatedReels, remainingCount, markAll);
-      await this.sendDirectMessage(senderId, reply);
+      await this.deliverReply(senderId, reply, delivery);
       return;
     }
 
@@ -641,15 +766,17 @@ export class MetaInstagramBotService {
     if (['delete my data', 'delete account', 'purge data', 'purge my data', 'erase my data', 'delete all my data'].includes(normalizedText)) {
       try {
         const deletedCount = await Repository.deleteUserDataForSender(senderId);
+        if (delivery) delivery.stateMutated = true;
         const reply =
           `🗑️ Your data deletion request has been processed.\n\n` +
           `Permanently removed ${deletedCount} saved item(s) and cleared your user records from our systems.`;
-        await this.sendDirectMessage(senderId, reply);
+        await this.deliverReply(senderId, reply, delivery);
       } catch (error) {
         console.error(`[MetaIG] Data deletion failed for sender ${senderId}:`, error);
-        await this.sendDirectMessage(
+        await this.deliverReply(
           senderId,
-          `⚠️ We encountered an issue processing your data deletion request. Please try again or email saurabhk0205@gmail.com for manual assistance.`
+          `⚠️ We encountered an issue processing your data deletion request. Please try again or email saurabhk0205@gmail.com for manual assistance.`,
+          delivery
         );
       }
       return;
@@ -667,7 +794,7 @@ export class MetaInstagramBotService {
         `Tap to view your saved items in your browser. No login or password required!\n\n` +
         `Tip: If opening on a PC or laptop, you can also message "code" to get a 6-digit login code.\n\n` +
         `Note: The web library is an optional companion—you can manage reminders and searches entirely here in DMs.`;
-      await this.sendDirectMessage(senderId, reply);
+      await this.deliverReply(senderId, reply, delivery);
       return;
     }
 
@@ -676,11 +803,12 @@ export class MetaInstagramBotService {
       const isSenderAdmin = Boolean(this.adminUserId && senderId === this.adminUserId);
       const session = isSenderAdmin ? { role: 'admin' as const } : { role: 'user' as const, senderId };
       const otpCode = createOtp(session);
+      if (delivery) delivery.stateMutated = true;
 
       const reply =
         `🔐 Your Reeler Login Code:\n${otpCode}\n\n` +
         `Enter this 6-digit code on your PC or laptop browser to unlock your private vault (valid for 10 minutes).`;
-      await this.sendDirectMessage(senderId, reply);
+      await this.deliverReply(senderId, reply, delivery);
       return;
     }
 
@@ -693,7 +821,7 @@ export class MetaInstagramBotService {
         (isDefault
           ? `You are currently using default UTC.\nTo set your local timezone, reply with your city or timezone code:\n• "tz New York" or "tz EST"\n• "tz London" or "tz GMT"\n• "tz IST" or "tz Mumbai"\n• "tz Tokyo" or "tz Sydney"\n• "tz +5:30" or "tz -5"`
           : `To update your timezone anytime, reply e.g.:\n• "tz New York"\n• "tz London"\n• "tz IST"\n• "tz +5:30"`);
-      await this.sendDirectMessage(senderId, reply);
+      await this.deliverReply(senderId, reply, delivery);
       return;
     }
 
@@ -703,16 +831,17 @@ export class MetaInstagramBotService {
       const rawInput = tzSetMatch[1].trim();
       const updatedTz = await Repository.setSenderTimezone(senderId, rawInput);
       if (updatedTz) {
+        if (delivery) delivery.stateMutated = true;
         const tzSummary = getTimeZoneSummary(updatedTz);
         const reply =
           `✅ Timezone updated to ${tzSummary}!\n\n` +
           `All your reminders and scheduling choices will now be formatted and calculated in your local time.`;
-        await this.sendDirectMessage(senderId, reply);
+        await this.deliverReply(senderId, reply, delivery);
       } else {
         const reply =
           `❌ Could not recognize timezone "${rawInput}".\n\n` +
           `Try replying with a major city or standard abbreviation, e.g.:\n• "tz New York"\n• "tz London"\n• "tz IST"\n• "tz Tokyo"\n• "tz +5:30"`;
-        await this.sendDirectMessage(senderId, reply);
+        await this.deliverReply(senderId, reply, delivery);
       }
       return;
     }
@@ -727,17 +856,18 @@ export class MetaInstagramBotService {
       if (targetReel) {
         const nextDate = customDuration.targetDate.toISOString();
         await Repository.updateReminderSchedule(targetReel.id, nextDate, customDuration.seconds);
+        if (delivery) delivery.stateMutated = true;
         let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget);
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are currently shown in UTC. Reply e.g. "tz New York" or "tz IST" to set your local time!`;
         }
-        await this.sendDirectMessage(senderId, reply);
+        await this.deliverReply(senderId, reply, delivery);
       } else {
         let reply = `⏰ Got it! Duration set to ${customDuration.label} (${customDuration.formattedTarget}). Share any Reel or Post to track it!`;
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <your city>" to use your local time.`;
         }
-        await this.sendDirectMessage(senderId, reply);
+        await this.deliverReply(senderId, reply, delivery);
       }
       return;
     }
@@ -786,58 +916,51 @@ export class MetaInstagramBotService {
       });
 
       if (!creator || (reelsToSend.length === 0 && postsToSend.length === 0)) {
-        await this.sendDirectMessage(senderId, searchCopy.notFound);
+        await this.deliverReply(senderId, searchCopy.notFound, delivery);
         return;
       }
 
-      // 1. Send header message with clean @mention and clickable profile link
-      const headerSent = await this.sendDirectMessage(senderId, searchCopy.header);
-      if (!headerSent) {
-        console.warn(`[MetaIG] Failed to send creator query header to ${senderId}`);
-        return;
+      // Build ordered sequence so if a partial batch fails mid-way, only unsent trailing messages are queued
+      const plannedMessages: string[] = [searchCopy.header];
+      if (reelsToSend.length > 0) {
+        if (searchCopy.reelsSectionHeader) plannedMessages.push(searchCopy.reelsSectionHeader);
+        for (const r of reelsToSend) {
+          plannedMessages.push(formatCanonicalInstagramUrl(r.shortcode, r.media_type, r.reel_url));
+        }
       }
-
-      const sendItemsBatch = async (
-        items: typeof reels,
-        sectionHeader: string | null
-      ): Promise<boolean> => {
-        if (items.length === 0) return true;
-        if (sectionHeader) {
-          await new Promise((resolve) => setTimeout(resolve, 350));
-          const sectionSent = await this.sendDirectMessage(senderId, sectionHeader);
-          if (!sectionSent) {
-            console.warn(`[MetaIG] Failed to send section header to ${senderId}`);
-            return false;
-          }
+      if (postsToSend.length > 0) {
+        if (searchCopy.postsSectionHeader) plannedMessages.push(searchCopy.postsSectionHeader);
+        for (const r of postsToSend) {
+          plannedMessages.push(formatCanonicalInstagramUrl(r.shortcode, r.media_type, r.reel_url));
         }
-        for (const r of items) {
-          await new Promise((resolve) => setTimeout(resolve, 350));
-          const canonicalItemUrl = formatCanonicalInstagramUrl(r.shortcode, r.media_type, r.reel_url);
-          const itemSent = await this.sendDirectMessage(senderId, canonicalItemUrl);
-          if (!itemSent) {
-            console.warn(`[MetaIG] Failed to send item ${r.shortcode} message to ${senderId}`);
-            return false;
-          }
-        }
-        return true;
-      };
-
-      const reelsOk = await sendItemsBatch(reelsToSend, searchCopy.reelsSectionHeader);
-      if (!reelsOk) return;
-
-      const postsOk = await sendItemsBatch(postsToSend, searchCopy.postsSectionHeader);
-      if (!postsOk) return;
-
-      // 3. Send footer message if additional items exist in the user's library
+      }
       if (searchCopy.footer) {
-        await new Promise((resolve) => setTimeout(resolve, 350));
-        await this.sendDirectMessage(senderId, searchCopy.footer);
+        plannedMessages.push(searchCopy.footer);
+      }
+
+      for (let i = 0; i < plannedMessages.length; i++) {
+        if (i > 0) {
+          await new Promise((resolve) => setTimeout(resolve, 350));
+        }
+        const sent = await this.sendDirectMessage(senderId, plannedMessages[i]);
+        if (!sent) {
+          console.warn(`[MetaIG] Failed to send creator query message #${i + 1} to ${senderId}`);
+          if (delivery) {
+            delivery.anyDeliveryFailed = true;
+            if (i > 0) {
+              // Header/earlier items already reached the user; queue only unsent remainder on retry
+              delivery.stateMutated = true;
+              delivery.unsentMessages.push(...plannedMessages.slice(i));
+            }
+          }
+          return;
+        }
       }
       return;
     }
 
     // Default welcome / help reply
     const helpMsg = `👋 Hi! Whenever you see a Reel or Post you want to track or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username (or "reels by @name" / "posts by @name") to view your tracked items!\nType "tz" to check or set your local timezone!\nType "vault" to browse your saved items on the web, or "code" to get a 6-digit login code for your laptop.`;
-    await this.sendDirectMessage(senderId, helpMsg);
+    await this.deliverReply(senderId, helpMsg, delivery);
   }
 }

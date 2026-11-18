@@ -10,6 +10,7 @@ import {
 import {
   clearIdempotencyStoreForTesting,
   computePayloadFingerprint,
+  createIdempotencyMiddleware,
   idempotencyMiddleware,
 } from '../src/middleware/idempotency.ts';
 import {
@@ -544,5 +545,162 @@ test('Security - Meta oEmbed metadata lookup passes token in Authorization Beare
     if (origProxy === undefined) delete process.env.METADATA_PROXY_URL;
     else process.env.METADATA_PROXY_URL = origProxy;
     resetFeedMetaResolverStateForTests();
+  }
+});
+
+test('Idempotency - keeps active entries locked on client disconnect and rejects overflow with 503 instead of evicting active locks', async () => {
+  const managed = createIdempotencyMiddleware({ maxActiveEntries: 1, maxCompletedEntries: 2 });
+  let executions = 0;
+  let releaseHandler: (() => void) | null = null;
+
+  const app = express();
+  app.use(express.json());
+  app.use(managed.middleware);
+  app.post('/mutate', async (req, res) => {
+    executions++;
+    await new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
+    res.status(200).json({ ok: true, execution: executions, payload: req.body });
+  });
+
+  await withServer(app, async (baseUrl) => {
+    // 1. Start a mutation and abort the client socket mid-flight
+    const ac = new AbortController();
+    const firstReq = fetch(`${baseUrl}/mutate`, {
+      method: 'POST',
+      signal: ac.signal,
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'active-lock-1' },
+      body: JSON.stringify({ step: 1 }),
+    }).catch(() => null);
+
+    while (!releaseHandler) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    // Disconnect client while handler is still running
+    ac.abort();
+    await firstReq;
+    await new Promise((r) => setTimeout(r, 25));
+
+    // 2. Retry with the SAME key must still receive 409 (lock NOT prematurely dropped on disconnect)
+    const dupRes = await fetch(`${baseUrl}/mutate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'active-lock-1' },
+      body: JSON.stringify({ step: 1 }),
+    });
+    assert.equal(dupRes.status, 409);
+    assert.equal(executions, 1);
+
+    // 3. New distinct key while maxActiveEntries=1 is full must return 503 instead of evicting active-lock-1
+    const overflowRes = await fetch(`${baseUrl}/mutate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'active-lock-2' },
+      body: JSON.stringify({ step: 2 }),
+    });
+    assert.equal(overflowRes.status, 503);
+    assert.equal(((await overflowRes.json()) as any).error, 'IDEMPOTENCY_CAPACITY_EXCEEDED');
+
+    // 4. Let the original mutation finish -> retry now replays the cached 200 without re-executing!
+    releaseHandler!();
+    await new Promise((r) => setTimeout(r, 25));
+
+    const replayRes = await fetch(`${baseUrl}/mutate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'active-lock-1' },
+      body: JSON.stringify({ step: 1 }),
+    });
+    assert.equal(replayRes.status, 200);
+    assert.equal(replayRes.headers.get('idempotency-replayed'), 'true');
+    assert.equal(((await replayRes.json()) as any).execution, 1);
+    assert.equal(executions, 1, 'Mutation must have executed strictly once');
+  });
+});
+
+test('MetaInstagramBotService - failed webhook processing remains retryable and preserves committed mutations on reply retry', async () => {
+  const bot = new MetaInstagramBotService();
+  const origGetTz = Repository.getSenderTimezone;
+  const origMarkWatched = Repository.markWatchedForInstagramSender;
+
+  try {
+    // 1. Transient DB exception before side effects -> releases mid claim so retry succeeds
+    let tzAttempts = 0;
+    Repository.getSenderTimezone = (async () => {
+      tzAttempts++;
+      if (tzAttempts === 1) throw new Error('Transient DB blip');
+      return 'UTC';
+    }) as typeof Repository.getSenderTimezone;
+
+    let helpDeliveries = 0;
+    bot.sendDirectMessage = async () => {
+      helpDeliveries++;
+      return true;
+    };
+
+    const helpPayload = {
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_retry_db' },
+              message: { mid: 'mid.retry_db_err', text: 'help' },
+            },
+          ],
+        },
+      ],
+    };
+
+    await bot.handleWebhookPayload(helpPayload);
+    assert.equal(helpDeliveries, 0);
+    await bot.handleWebhookPayload(helpPayload);
+    assert.equal(helpDeliveries, 1, 'Retry after transient DB error must succeed');
+    await bot.handleWebhookPayload(helpPayload);
+    assert.equal(helpDeliveries, 1, 'Subsequent duplicate after completion must be deduplicated');
+
+    // 2. DM delivery returning false AFTER a state mutation -> retry redelivers DM WITHOUT repeating mutation!
+    Repository.getSenderTimezone = async () => 'UTC';
+    let markWatchedCalls = 0;
+    Repository.markWatchedForInstagramSender = (async () => {
+      markWatchedCalls++;
+      return { updatedReels: [], remainingCount: 0 };
+    }) as typeof Repository.markWatchedForInstagramSender;
+
+    let dmAttempts = 0;
+    bot.sendDirectMessage = async () => {
+      dmAttempts++;
+      return dmAttempts >= 2; // 1st delivery fails, 2nd succeeds
+    };
+
+    const watchedPayload = {
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_retry_dm' },
+              message: { mid: 'mid.retry_dm_fail', text: 'watched' },
+            },
+          ],
+        },
+      ],
+    };
+
+    await bot.handleWebhookPayload(watchedPayload);
+    assert.equal(markWatchedCalls, 1);
+    assert.equal(dmAttempts, 1);
+
+    // Retry same mid: must NOT call markWatchedForInstagramSender a second time, only redeliver DM
+    await bot.handleWebhookPayload(watchedPayload);
+    assert.equal(markWatchedCalls, 1, 'Retry after reply failure must NOT repeat committed state mutation');
+    assert.equal(dmAttempts, 2, 'Retry must redeliver the failed confirmation DM');
+
+    // 3rd duplicate after delivery succeeded -> completely deduplicated
+    await bot.handleWebhookPayload(watchedPayload);
+    assert.equal(markWatchedCalls, 1);
+    assert.equal(dmAttempts, 2);
+  } finally {
+    Repository.getSenderTimezone = origGetTz;
+    Repository.markWatchedForInstagramSender = origMarkWatched;
   }
 });

@@ -571,6 +571,10 @@ test('Vault UI exposes reversible Switch Vault, explicit Sign Out, and Idempoten
   const cancelFnMatch = js.match(/function cancelSwitchVault\(\)\s*\{[\s\S]*?\n\}/);
   assert.ok(cancelFnMatch, 'app.js must define cancelSwitchVault');
   assert.ok(cancelFnMatch[0].includes('hideVaultGateScreen()'), 'cancelSwitchVault must return directly to the active vault');
+  assert.ok(cancelFnMatch[0].includes('invalidatePendingVaultAuth()'), 'cancelSwitchVault must invalidate any pending auth request');
+
+  assert.ok(js.includes('if (!isSwitchingVault) {\n      hideVaultGateScreen();'), 'Background fetchReels must not close an active Switch Vault gate');
+  assert.ok(js.includes('getOtpAttemptIdempotencyKey(entered)'), 'OTP verification must reuse the attempt Idempotency-Key across network retries');
 
   const resetFnMatch = js.match(/function resetVaultSessionState\(\)\s*\{[\s\S]*?\n\}/);
   assert.ok(resetFnMatch, 'app.js must define resetVaultSessionState');

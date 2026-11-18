@@ -433,6 +433,58 @@ const SWITCH_VAULT_GATE_TITLE = 'Switch Vault';
 const SWITCH_VAULT_GATE_DESC = 'Sign in to another Instagram account with a fresh single-use 6-digit code or direct key. Your current vault stays active if you cancel.';
 
 let isSwitchingVault = false;
+let vaultAuthGeneration = 0;
+let vaultAuthAbortController = null;
+let pendingOtpAttempt = { code: '', key: '' };
+
+/**
+ * Returns the Idempotency-Key bound to the current 6-digit OTP submission attempt so network-error
+ * retries for the same code reuse the original key and replay a consumed OTP's response safely.
+ * @param {string} code
+ * @returns {string}
+ */
+function getOtpAttemptIdempotencyKey(code) {
+  if (pendingOtpAttempt.code === code && pendingOtpAttempt.key) {
+    return pendingOtpAttempt.key;
+  }
+  const key = generateIdempotencyKey();
+  pendingOtpAttempt = { code, key };
+  return key;
+}
+
+/**
+ * Clears any cached OTP attempt key when the code changes, completes, or the flow resets.
+ */
+function clearPendingOtpAttempt() {
+  pendingOtpAttempt = { code: '', key: '' };
+}
+
+/**
+ * Invalidates and aborts any in-flight vault authentication request so late completions from
+ * canceled or signed-out attempts can never overwrite the active vault key or workspace.
+ */
+function invalidatePendingVaultAuth() {
+  vaultAuthGeneration++;
+  if (vaultAuthAbortController) {
+    vaultAuthAbortController.abort();
+    vaultAuthAbortController = null;
+  }
+  if (vaultOtpSubmitBtn) {
+    vaultOtpSubmitBtn.disabled = false;
+    vaultOtpSubmitBtn.textContent = 'Unlock Vault';
+  }
+  if (vaultKeySubmitBtn) {
+    vaultKeySubmitBtn.disabled = false;
+    vaultKeySubmitBtn.textContent = 'Unlock Vault';
+  }
+}
+
+vaultOtpInput?.addEventListener('input', () => {
+  const normalized = (vaultOtpInput.value || '').trim().replace(/\s+/g, '');
+  if (pendingOtpAttempt.code && normalized !== pendingOtpAttempt.code) {
+    clearPendingOtpAttempt();
+  }
+});
 
 /**
  * Keeps the header Switch Vault button visible only while an active vault session is unlocked.
@@ -589,6 +641,8 @@ function resetVaultSessionState() {
  * or cancel right back to their active session without getting locked out.
  */
 function handleSwitchVault() {
+  invalidatePendingVaultAuth();
+  clearPendingOtpAttempt();
   closeShortcutsPopover(false);
   if (vaultOtpInput) vaultOtpInput.value = '';
   if (vaultKeyInput) vaultKeyInput.value = '';
@@ -613,6 +667,8 @@ function handleSwitchVault() {
  */
 function cancelSwitchVault() {
   if (!isSwitchingVault || !getVaultAccessKey()) return;
+  invalidatePendingVaultAuth();
+  clearPendingOtpAttempt();
   hideVaultGateScreen();
   switchVaultBtn?.focus();
   if (typeof announceStatus === 'function') {
@@ -624,6 +680,8 @@ function cancelSwitchVault() {
  * Explicitly signs out of the current device, clears the stored vault key, and resets vault state.
  */
 function confirmSignOutVault() {
+  invalidatePendingVaultAuth();
+  clearPendingOtpAttempt();
   isSwitchingVault = false;
   setVaultAccessKey(null);
   closeShortcutsPopover(false);
@@ -650,6 +708,13 @@ if (vaultOtpForm) {
       showVaultGateScreen('Please enter the 6-digit code received from your Instagram DM.');
       return;
     }
+
+    invalidatePendingVaultAuth();
+    const opGen = vaultAuthGeneration;
+    const controller = new AbortController();
+    vaultAuthAbortController = controller;
+    const idempotencyKey = getOtpAttemptIdempotencyKey(entered);
+
     if (vaultOtpSubmitBtn) {
       vaultOtpSubmitBtn.disabled = true;
       vaultOtpSubmitBtn.textContent = 'Verifying...';
@@ -657,14 +722,19 @@ if (vaultOtpForm) {
     try {
       const res = await fetch('/api/auth/otp/verify', {
         method: 'POST',
+        signal: controller.signal,
         headers: {
           'Content-Type': 'application/json',
-          'Idempotency-Key': generateIdempotencyKey(),
+          'Idempotency-Key': idempotencyKey,
         },
         body: JSON.stringify({ code: entered }),
       });
+      if (opGen !== vaultAuthGeneration) return;
       const data = await res.json().catch(() => null);
+      if (opGen !== vaultAuthGeneration) return;
+
       if (res.ok && data?.vaultKey) {
+        clearPendingOtpAttempt();
         const wasSwitching = isSwitchingVault;
         if (wasSwitching) {
           resetVaultSessionState();
@@ -673,19 +743,33 @@ if (vaultOtpForm) {
         hideVaultGateScreen();
         syncBrowserTimezone();
         await loadStats();
+        if (opGen !== vaultAuthGeneration) return;
         await loadCreators();
+        if (opGen !== vaultAuthGeneration) return;
         await fetchReels();
       } else {
+        // Keep the attempt key on transient 5xx/409/429 responses so retries replay cleanly;
+        // clear it on terminal 400/422 rejections so the next submission starts fresh.
+        if (res.status === 400 || res.status === 422) {
+          clearPendingOtpAttempt();
+        }
         showVaultGateScreen(
           data?.message || 'This 6-digit code is invalid, expired, or already used (codes are single-use). Send "code" to @er_reel_er for a fresh code.'
         );
       }
-    } catch {
+    } catch (err) {
+      if (opGen !== vaultAuthGeneration || err?.name === 'AbortError') return;
+      // Preserve pendingOtpAttempt on network errors so resubmitting the same OTP reuses the original key
       showVaultGateScreen('Unable to verify code. Please check your connection and try again.');
     } finally {
-      if (vaultOtpSubmitBtn) {
-        vaultOtpSubmitBtn.disabled = false;
-        vaultOtpSubmitBtn.textContent = 'Unlock Vault';
+      if (opGen === vaultAuthGeneration) {
+        if (vaultAuthAbortController === controller) {
+          vaultAuthAbortController = null;
+        }
+        if (vaultOtpSubmitBtn) {
+          vaultOtpSubmitBtn.disabled = false;
+          vaultOtpSubmitBtn.textContent = 'Unlock Vault';
+        }
       }
     }
   });
@@ -699,14 +783,23 @@ if (vaultKeyForm) {
       showVaultGateScreen('Please enter your vault access key.');
       return;
     }
+
+    invalidatePendingVaultAuth();
+    const opGen = vaultAuthGeneration;
+    const controller = new AbortController();
+    vaultAuthAbortController = controller;
+
     if (vaultKeySubmitBtn) {
       vaultKeySubmitBtn.disabled = true;
       vaultKeySubmitBtn.textContent = 'Verifying...';
     }
     try {
       const res = await fetch('/api/session', {
+        signal: controller.signal,
         headers: { 'X-Vault-Key': entered },
       });
+      if (opGen !== vaultAuthGeneration) return;
+
       if (res.ok) {
         const wasSwitching = isSwitchingVault;
         if (wasSwitching) {
@@ -716,17 +809,25 @@ if (vaultKeyForm) {
         hideVaultGateScreen();
         syncBrowserTimezone();
         await loadStats();
+        if (opGen !== vaultAuthGeneration) return;
         await loadCreators();
+        if (opGen !== vaultAuthGeneration) return;
         await fetchReels();
       } else {
         showVaultGateScreen('Invalid access key. Please check the link from your Instagram DM.');
       }
-    } catch {
+    } catch (err) {
+      if (opGen !== vaultAuthGeneration || err?.name === 'AbortError') return;
       showVaultGateScreen('Unable to verify key. Please try again.');
     } finally {
-      if (vaultKeySubmitBtn) {
-        vaultKeySubmitBtn.disabled = false;
-        vaultKeySubmitBtn.textContent = 'Unlock Vault';
+      if (opGen === vaultAuthGeneration) {
+        if (vaultAuthAbortController === controller) {
+          vaultAuthAbortController = null;
+        }
+        if (vaultKeySubmitBtn) {
+          vaultKeySubmitBtn.disabled = false;
+          vaultKeySubmitBtn.textContent = 'Unlock Vault';
+        }
       }
     }
   });
@@ -1652,7 +1753,9 @@ async function fetchReels() {
       showVaultGateScreen();
       return;
     }
-    hideVaultGateScreen();
+    if (!isSwitchingVault) {
+      hideVaultGateScreen();
+    }
     if (!res.ok) {
       let errMsg = `HTTP ${res.status}`;
       try {
