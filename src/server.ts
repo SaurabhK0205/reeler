@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.ts';
 import { apiRouter } from './api/router.ts';
 import { ReminderWorker } from './services/reminderWorker.ts';
-import { requireAdminVaultMiddleware, resolveConfiguredVaultSecret } from './services/vaultAuthService.ts';
+import { vaultAuthMiddleware, resolveConfiguredVaultSecret } from './services/vaultAuthService.ts';
 import { createRateLimiter, getClientIp, securityHeadersMiddleware } from './middleware/security.ts';
 
 // Server runtime defaults to UTC standard; user-specific timezones are dynamically resolved per session
@@ -60,49 +60,53 @@ const webhookRateLimiter = createRateLimiter({
 // Concurrency & rate-limiting guard for large payload import endpoint
 let activeImports = 0;
 const MAX_CONCURRENT_IMPORTS = 1;
-const MAX_TRACKED_IPS = 1000;
+const MAX_TRACKED_IMPORT_KEYS = 1000;
 const importRateLimitWindowMs = 60 * 1000;
-const importIpRequests = new Map<string, { count: number; resetAt: number }>();
+const importPrincipalRequests = new Map<string, { count: number; resetAt: number }>();
 
-function pruneExpiredImportIps(now: number): void {
-  for (const [k, v] of importIpRequests.entries()) {
-    if (v.resetAt <= now) importIpRequests.delete(k);
+function pruneExpiredImportKeys(now: number): void {
+  for (const [k, v] of importPrincipalRequests.entries()) {
+    if (v.resetAt <= now) importPrincipalRequests.delete(k);
   }
 }
 
 // Periodic unref'd sweep to clean up expired rate-limit records without per-request overhead
-const ipCleanupInterval = setInterval(() => {
-  pruneExpiredImportIps(Date.now());
+const importCleanupInterval = setInterval(() => {
+  pruneExpiredImportKeys(Date.now());
 }, importRateLimitWindowMs);
-ipCleanupInterval.unref();
+importCleanupInterval.unref();
 
 function archiveImportGuard(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const ip = getClientIp(req);
+  const rateLimitKey = req.vaultUser?.role === 'admin'
+    ? 'admin'
+    : req.vaultUser?.senderId
+      ? `user:${req.vaultUser.senderId}`
+      : `ip:${getClientIp(req)}`;
   const now = Date.now();
 
-  const ipRecord = importIpRequests.get(ip);
-  if (ipRecord && ipRecord.resetAt > now) {
-    if (ipRecord.count >= 5) {
-      const retryAfterSec = Math.max(1, Math.ceil((ipRecord.resetAt - now) / 1000));
+  const keyRecord = importPrincipalRequests.get(rateLimitKey);
+  if (keyRecord && keyRecord.resetAt > now) {
+    if (keyRecord.count >= 5) {
+      const retryAfterSec = Math.max(1, Math.ceil((keyRecord.resetAt - now) / 1000));
       res.setHeader('Retry-After', String(retryAfterSec));
       res.status(429).json({ success: false, error: 'Too many import requests. Please wait a minute before retrying.' });
       return;
     }
-    ipRecord.count++;
+    keyRecord.count++;
   } else {
-    if (ipRecord) {
-      importIpRequests.delete(ip);
+    if (keyRecord) {
+      importPrincipalRequests.delete(rateLimitKey);
     }
-    if (importIpRequests.size >= MAX_TRACKED_IPS) {
-      pruneExpiredImportIps(now);
+    if (importPrincipalRequests.size >= MAX_TRACKED_IMPORT_KEYS) {
+      pruneExpiredImportKeys(now);
     }
-    if (importIpRequests.size >= MAX_TRACKED_IPS) {
-      const oldestIp = importIpRequests.keys().next().value;
-      if (oldestIp !== undefined) {
-        importIpRequests.delete(oldestIp);
+    if (importPrincipalRequests.size >= MAX_TRACKED_IMPORT_KEYS) {
+      const oldestKey = importPrincipalRequests.keys().next().value;
+      if (oldestKey !== undefined) {
+        importPrincipalRequests.delete(oldestKey);
       }
     }
-    importIpRequests.set(ip, { count: 1, resetAt: now + importRateLimitWindowMs });
+    importPrincipalRequests.set(rateLimitKey, { count: 1, resetAt: now + importRateLimitWindowMs });
   }
 
   if (activeImports >= MAX_CONCURRENT_IMPORTS) {
@@ -141,8 +145,8 @@ function archiveImportGuard(req: express.Request, res: express.Response, next: e
   next();
 }
 
-// Authenticate admin BEFORE allocating 50MB parser or claiming concurrency slot
-app.use('/api/archive/import', requireAdminVaultMiddleware, archiveImportGuard, express.json({ limit: '50mb' }));
+// Authenticate vault user BEFORE allocating 50MB parser or claiming concurrency slot
+app.use('/api/archive/import', vaultAuthMiddleware, archiveImportGuard, express.json({ limit: '50mb' }));
 
 // Route-specific parser for Meta webhooks with flood guard and raw body retention for HMAC verification (1MB)
 app.use(['/api/instagram/webhook', '/webhook'], webhookRateLimiter.middleware, express.json({

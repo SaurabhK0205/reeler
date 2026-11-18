@@ -1130,6 +1130,16 @@ export class Repository {
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
   }>, options?: { ignoreDuplicates?: boolean; backfillMissingSavedAt?: boolean }): Promise<BatchReelsResult> {
+    const distinctSenders = new Set<string | null>();
+    for (const r of reels) {
+      const normalized = r.instagram_sender_id ? String(r.instagram_sender_id).trim() || null : null;
+      distinctSenders.add(normalized);
+      if (normalized && Repository.isSenderInRecentDeletion(normalized)) {
+        console.warn(`[Repository] Rejecting batch reel upsert for sender ${normalized} due to active deletion window`);
+        throw new SenderDeletionBarrierError(normalized);
+      }
+    }
+
     Repository.invalidateCreatorsCache();
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertSavedReelsBatch(reels, options);
@@ -1156,6 +1166,16 @@ export class Repository {
         }
       >();
 
+      const singleOwner = distinctSenders.size === 1 ? distinctSenders.values().next().value : undefined;
+      const assertNoActiveDeletion = () => {
+        for (const sender of distinctSenders) {
+          if (sender && Repository.isSenderInRecentDeletion(sender)) {
+            console.warn(`[Repository] Aborting batch reel upsert for sender ${sender} due to active deletion window`);
+            throw new SenderDeletionBarrierError(sender);
+          }
+        }
+      };
+
       if (options?.ignoreDuplicates) {
         type BatchExistingRow = {
           id: string;
@@ -1176,10 +1196,16 @@ export class Repository {
           const slice = allShortcodes.slice(i, i + LOOKUP_CHUNK);
           let pageOffset = 0;
           while (true) {
-            const { data: matched, error } = await supabase
+            let lookupQuery = supabase
               .from('saved_reels')
               .select('id, instagram_media_id, shortcode, instagram_sender_id, saved_at, is_saved_on_instagram')
-              .in('shortcode', slice)
+              .in('shortcode', slice);
+            if (singleOwner !== undefined) {
+              lookupQuery = singleOwner === null
+                ? lookupQuery.is('instagram_sender_id', null)
+                : lookupQuery.eq('instagram_sender_id', singleOwner);
+            }
+            const { data: matched, error } = await lookupQuery
               .order('id', { ascending: true })
               .range(pageOffset, pageOffset + PAGE_SIZE - 1);
 
@@ -1245,6 +1271,7 @@ export class Repository {
         const upgradeNow = new Date().toISOString();
         const BACKFILL_CONCURRENCY = 20;
         for (let i = 0; i < upgradeItems.length; i += BACKFILL_CONCURRENCY) {
+          assertNoActiveDeletion();
           const slice = upgradeItems.slice(i, i + BACKFILL_CONCURRENCY);
           const results = await Promise.all(
             slice.map(async (item) => {
@@ -1290,6 +1317,7 @@ export class Repository {
 
       const CHUNK_SIZE = 300;
       for (let i = 0; i < reelsToInsert.length; i += CHUNK_SIZE) {
+        assertNoActiveDeletion();
         const chunk = reelsToInsert.slice(i, i + CHUNK_SIZE).map(r => {
           const intervalSeconds = r.reminder_interval_seconds ?? (r.reminder_interval_hours ? r.reminder_interval_hours * 3600 : 36000);
           return {
@@ -1327,6 +1355,9 @@ export class Repository {
               await this.upsertSavedReel(item, { ignoreDuplicates: options?.ignoreDuplicates, skipReturn: true });
               newlyImported++;
             } catch (itemErr: any) {
+              if (itemErr instanceof SenderDeletionBarrierError) {
+                throw itemErr;
+              }
               console.error(`[Repository] Failed to upsert reel ${item.shortcode}:`, itemErr.message);
               failedCount++;
               failedShortcodes.push(item.shortcode);

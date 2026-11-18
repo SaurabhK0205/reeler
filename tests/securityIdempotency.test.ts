@@ -1352,3 +1352,168 @@ test('MetadataResolver - falls back to secondary crawler User-Agent when primary
     resetFeedMetaResolverStateForTests();
   }
 });
+
+test('Archive Import - authenticated vault users import into isolated sender vaults while blocking anonymous and deleting senders', async () => {
+  const origEnv = process.env.NODE_ENV;
+  const origVaultSecret = process.env.VAULT_SECRET;
+  const origSupabaseUrl = process.env.SUPABASE_URL;
+  const origSupabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  process.env.NODE_ENV = 'production';
+  process.env.VAULT_SECRET = 'test-archive-import-secret';
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  Repository.resetMemoryStoreForTests();
+  resetApiRateLimitersForTesting();
+  clearIdempotencyStoreForTesting();
+
+  try {
+    let parserCalled = false;
+    const app = express();
+    app.use(
+      '/api/archive/import',
+      vaultAuthMiddleware,
+      (_req, _res, next) => {
+        parserCalled = true;
+        next();
+      },
+      express.json({ limit: '50mb' })
+    );
+    app.use(express.json({ limit: '1mb' }));
+    app.use('/api', apiRouter);
+
+    const payload = {
+      saved_saved_media: [
+        {
+          title: 'creator_one',
+          string_map_data: {
+            'Saved on': {
+              href: 'https://www.instagram.com/reel/SharedUserImp1/',
+              timestamp: 1700000100,
+            },
+          },
+        },
+        {
+          title: 'creator_two',
+          string_map_data: {
+            'Saved on': {
+              href: 'https://www.instagram.com/p/SharedPostImp2/',
+              timestamp: 1700000200,
+            },
+          },
+        },
+      ],
+    };
+
+    // Seed a bot-sent DM reel for user A so archive import should promote it to Saved on IG
+    const seedCreator = await Repository.upsertCreator({
+      instagram_user_id: 'creator_creator_one',
+      username: 'creator_one',
+      display_name: 'creator_one',
+    });
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'dm_user_import_a_SharedUserImp1',
+      shortcode: 'SharedUserImp1',
+      reel_url: 'https://www.instagram.com/reel/SharedUserImp1/',
+      media_type: 'reel',
+      creator_id: seedCreator.id,
+      taken_at: '2026-01-01T00:00:00.000Z',
+      saved_at: null,
+      first_detected_at: '2026-01-01T00:00:00.000Z',
+      save_order_rank: 1,
+      watch_status: 'unwatched',
+      is_saved_on_instagram: false,
+      instagram_sender_id: 'user_import_a',
+    });
+
+    await withServer(app, async (baseUrl) => {
+      // 1. Anonymous request rejected with 401 BEFORE 50MB JSON body parser runs
+      const anonRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(anonRes.status, 401);
+      assert.equal(parserCalled, false, 'Anonymous archive import must be rejected before body parser');
+
+      const userAKey = generateUserVaultKey('user_import_a');
+      const userBKey = generateUserVaultKey('user_import_b');
+      const deletingKey = generateUserVaultKey('user_import_deleting');
+
+      // 2. User A imports archive: promotes their DM reel + imports second item into User A's vault only
+      const userARes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': userAKey },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(userARes.status, 200);
+      assert.equal(parserCalled, true);
+      const userABody = await userARes.json();
+      assert.equal(userABody.success, true);
+      assert.equal(userABody.reelsImported, 1);
+      assert.equal(userABody.alreadyPresent, 1);
+      assert.equal(userABody.promotedToSaved, 1);
+      assert.equal(userABody.savedAtBackfilled, 1);
+
+      // User B sees 0 items before importing
+      const userBReelsBefore = await (await fetch(`${baseUrl}/api/reels`, {
+        headers: { 'X-Vault-Key': userBKey },
+      })).json();
+      assert.equal(userBReelsBefore.total, 0, 'User A archive import must not leak into User B vault');
+
+      // 3. User B imports the SAME shortcodes independently without colliding with User A
+      const userBRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': userBKey },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(userBRes.status, 200);
+      const userBBody = await userBRes.json();
+      assert.equal(userBBody.success, true);
+      assert.equal(userBBody.reelsImported, 2);
+      assert.equal(userBBody.alreadyPresent, 0);
+
+      const userBReelsAfter = await (await fetch(`${baseUrl}/api/reels`, {
+        headers: { 'X-Vault-Key': userBKey },
+      })).json();
+      assert.equal(userBReelsAfter.total, 2);
+      assert.ok(userBReelsAfter.reels.every((r: any) => r.instagram_sender_id === 'user_import_b'));
+
+      // 4. Sender under active deletion barrier receives 409 and no rows are inserted
+      Repository.recordSenderDeletion('user_import_deleting');
+      const deletingRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': deletingKey },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(deletingRes.status, 409);
+
+      const deletingReels = await (await fetch(`${baseUrl}/api/reels`, {
+        headers: { 'X-Vault-Key': deletingKey },
+      })).json();
+      assert.equal(deletingReels.total, 0);
+
+      // 5. Admin import continues to work cleanly into the unattributed admin vault
+      const adminRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': getAdminVaultKey() },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(adminRes.status, 200);
+      const adminBody = await adminRes.json();
+      assert.equal(adminBody.success, true);
+      assert.equal(adminBody.reelsImported, 2);
+    });
+  } finally {
+    Repository.resetMemoryStoreForTests();
+    resetApiRateLimitersForTesting();
+    clearIdempotencyStoreForTesting();
+    if (origEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = origEnv;
+    if (origVaultSecret === undefined) delete process.env.VAULT_SECRET;
+    else process.env.VAULT_SECRET = origVaultSecret;
+    if (origSupabaseUrl === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = origSupabaseUrl;
+    if (origSupabaseKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = origSupabaseKey;
+  }
+});

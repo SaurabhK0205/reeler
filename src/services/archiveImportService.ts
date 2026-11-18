@@ -1,4 +1,4 @@
-import { Repository } from '../db/repository.ts';
+import { Repository, SenderDeletionBarrierError } from '../db/repository.ts';
 import type { Creator, SavedMediaType } from '../types.ts';
 import { formatCanonicalInstagramUrl, parseCanonicalInstagramMediaUrl } from '../utils/mediaType.ts';
 
@@ -63,6 +63,7 @@ export class ArchiveImportService {
    * @param senderId Optional Instagram sender ID to associate imported reels with
    */
   static async importArchive(input: unknown, senderId?: string): Promise<ArchiveImportResult> {
+    const scopedSenderId = typeof senderId === 'string' && senderId.trim() ? senderId.trim() : undefined;
     let data = input;
     if (typeof input === 'string') {
       try {
@@ -377,7 +378,7 @@ export class ArchiveImportService {
         }> = [];
 
         for (const c of parsedCandidates) {
-          const scopedMediaId = senderId ? `export_${senderId}_${c.shortcode}` : c.mediaId;
+          const scopedMediaId = scopedSenderId ? `export_${scopedSenderId}_${c.shortcode}` : c.mediaId;
           if (c.creatorHandle !== UNKNOWN_CREATOR_HANDLE) {
             const creator = creatorMap.get(c.creatorHandle);
             if (!creator?.id) {
@@ -399,7 +400,7 @@ export class ArchiveImportService {
               save_order_rank: c.rank,
               watch_status: 'unwatched',
               is_saved_on_instagram: true,
-              instagram_sender_id: senderId || null,
+              instagram_sender_id: scopedSenderId || null,
             });
           } else {
             const fallback = creatorMap.get(UNKNOWN_CREATOR_HANDLE) || fallbackCreator;
@@ -418,7 +419,7 @@ export class ArchiveImportService {
                 save_order_rank: c.rank,
                 watch_status: 'unwatched',
                 is_saved_on_instagram: true,
-                instagram_sender_id: senderId || null,
+                instagram_sender_id: scopedSenderId || null,
               });
             } else {
               errors.push(`Failed to resolve fallback unattributed creator for reel ${c.shortcode}`);
@@ -443,6 +444,9 @@ export class ArchiveImportService {
           }
         }
       } catch (batchErr: any) {
+        if (batchErr instanceof SenderDeletionBarrierError) {
+          throw batchErr;
+        }
         console.error('[ArchiveImport] Batch import error, attempting recovery:', batchErr.message);
         errors.push(`Batch import error: ${batchErr.message || 'unknown error'}`);
       }

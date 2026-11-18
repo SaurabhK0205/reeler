@@ -390,13 +390,24 @@ apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
 });
 
 /**
- * Imports an official Instagram `saved_posts.json` archive export into the repository.
+ * Imports an official Instagram `saved_posts.json` archive export into the authenticated user's vault
+ * (or the unattributed admin vault for administrator sessions).
  */
 apiRouter.post('/archive/import', async (req: Request, res: Response) => {
   setResponseHeader(res, 'Cache-Control', 'no-store');
-  if (req.vaultUser?.role !== 'admin') {
+  const vaultUser = req.vaultUser;
+  if (!vaultUser || (vaultUser.role !== 'admin' && !vaultUser.senderId)) {
     (req as any).releaseImportSlot?.();
-    res.status(403).json({ success: false, error: 'Only the vault administrator can import archive files.' });
+    res.status(403).json({ success: false, error: 'An authenticated vault session is required to import archive files.' });
+    return;
+  }
+  const targetSenderId = vaultUser.role === 'admin' ? undefined : vaultUser.senderId;
+  if (targetSenderId && Repository.isSenderInRecentDeletion(targetSenderId)) {
+    (req as any).releaseImportSlot?.();
+    res.status(409).json({
+      success: false,
+      error: 'Account data deletion is currently in progress. Please try importing again shortly.',
+    });
     return;
   }
   (req as any).markHandlerStarted?.();
@@ -407,7 +418,7 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await ArchiveImportService.importArchive(rawData);
+    const result = await ArchiveImportService.importArchive(rawData, targetSenderId);
     if (result.status === 'too_large') {
       res.status(413).json({ success: false, ...result });
       return;
@@ -423,6 +434,13 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
 
     res.status(200).json({ success: true, ...result });
   } catch (error: any) {
+    if (error instanceof SenderDeletionBarrierError) {
+      res.status(409).json({
+        success: false,
+        error: 'Account data deletion is currently in progress. Please try importing again shortly.',
+      });
+      return;
+    }
     console.error('[ArchiveImport] Unexpected error in /archive/import endpoint:', error);
     res.status(500).json({ success: false, error: 'An unexpected internal error occurred during archive import.' });
   } finally {
