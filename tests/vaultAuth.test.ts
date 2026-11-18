@@ -589,6 +589,8 @@ test('Vault UI exposes reversible Switch Vault, explicit Sign Out, and Idempoten
   assert.ok(resetBody.includes("state.filters.creatorId = ''"), 'resetVaultSessionState must clear creator filter');
   assert.ok(resetBody.includes('state.filters.page = 1'), 'resetVaultSessionState must reset pagination to page 1');
   assert.ok(resetBody.includes('syncUrlState()'), 'resetVaultSessionState must sync reset filters to URL');
+  assert.ok(resetBody.includes("reelsGrid.innerHTML = ''"), 'resetVaultSessionState must clear previous catalog grid DOM on commit/sign-out');
+  assert.ok(resetBody.includes("reelsTableBody.innerHTML = ''"), 'resetVaultSessionState must clear previous catalog table DOM on commit/sign-out');
 
   const signOutFnMatch = js.match(/function confirmSignOutVault\(\)\s*\{[\s\S]*?\n\}/);
   assert.ok(signOutFnMatch, 'app.js must define confirmSignOutVault');

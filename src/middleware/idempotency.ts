@@ -25,6 +25,7 @@ interface CompletedEntry {
   fingerprint: string;
   statusCode: number;
   contentType: string;
+  cacheControl: string;
   body: string;
   createdAt: number;
   expiresAt: number;
@@ -224,6 +225,7 @@ export function createIdempotencyMiddleware(
         setResponseHeader(res, 'Idempotency-Key', idempotencyKey);
         setResponseHeader(res, 'Idempotency-Replayed', 'true');
         setResponseHeader(res, 'Content-Type', completed.contentType);
+        setResponseHeader(res, 'Cache-Control', completed.cacheControl);
         res.status(completed.statusCode).send(completed.body);
         return;
       }
@@ -299,11 +301,18 @@ export function createIdempotencyMiddleware(
         completedResponses.delete(oldestKey);
       }
 
+      const rawCacheControl = res.getHeader('cache-control');
+      const cacheControl =
+        typeof rawCacheControl === 'string' && rawCacheControl.trim()
+          ? rawCacheControl.trim()
+          : 'no-store';
+
       completedResponses.set(cacheKey, {
         state: 'completed',
         fingerprint,
         statusCode,
         contentType,
+        cacheControl,
         body: serialized,
         createdAt: completedAt,
         expiresAt: completedAt + ttlMs,

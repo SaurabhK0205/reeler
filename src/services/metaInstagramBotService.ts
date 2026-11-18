@@ -60,9 +60,13 @@ export function isMetaMessagingWindowError(errorData: unknown): boolean {
   return false;
 }
 
-const WEBHOOK_MID_DEDUP_TTL_MS = 10 * 60 * 1000;
-const WEBHOOK_MID_MAX_ENTRIES = 2000;
+// Retain completed & committed-mutation mids for Meta's 24-hour webhook redelivery window.
+const WEBHOOK_MID_DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
+const WEBHOOK_MID_MAX_ENTRIES = 5000;
+const WEBHOOK_PENDING_REPLY_TTL_MS = 15 * 60 * 1000;
 const WEBHOOK_PENDING_REPLY_MAX_ENTRIES = 500;
+const WEBHOOK_MAX_SCHEDULED_RETRIES = 200;
+const DEFAULT_WEBHOOK_RETRY_DELAYS_MS = [2000, 8000];
 
 interface WebhookDeliveryContext {
   stateMutated: boolean;
@@ -80,15 +84,19 @@ export class MetaInstagramBotService {
   private accessToken: string;
   private verifyToken: string;
   private appSecret: string;
+  private retryDelaysMs: number[];
   private inFlightMessageIds = new Set<string>();
   private completedMessageIds = new Map<string, number>();
+  private committedMutationMids = new Map<string, number>();
   private pendingRepliesByMid = new Map<string, PendingWebhookReply>();
+  private scheduledRetries = new Map<string, ReturnType<typeof setTimeout>>();
   public adminUserId: string | null = null;
 
-  constructor(options?: { adminUserId?: string | null }) {
+  constructor(options?: { adminUserId?: string | null; retryDelaysMs?: number[] }) {
     this.accessToken = process.env.META_PAGE_ACCESS_TOKEN || '';
     this.verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN || 'rea_instagram_saved_token';
     this.appSecret = process.env.META_APP_SECRET || '';
+    this.retryDelaysMs = options?.retryDelaysMs ?? DEFAULT_WEBHOOK_RETRY_DELAYS_MS;
     this.adminUserId =
       options?.adminUserId ||
       process.env.ADMIN_SENDER_ID ||
@@ -200,6 +208,39 @@ export class MetaInstagramBotService {
   }
 
   /**
+   * Records that a webhook mid has committed a state mutation so it cannot be re-executed during
+   * Meta's 24-hour redelivery window even if pending reply text expires earlier.
+   */
+  private markWebhookMutationCommitted(mid: string | null): void {
+    if (!mid) return;
+    const now = Date.now();
+    if (this.committedMutationMids.size >= WEBHOOK_MID_MAX_ENTRIES) {
+      for (const [key, exp] of this.committedMutationMids.entries()) {
+        if (exp <= now) {
+          this.committedMutationMids.delete(key);
+        }
+      }
+      while (this.committedMutationMids.size >= WEBHOOK_MID_MAX_ENTRIES) {
+        const oldest = this.committedMutationMids.keys().next().value;
+        if (oldest === undefined) break;
+        this.committedMutationMids.delete(oldest);
+      }
+    }
+    this.committedMutationMids.set(mid, now + WEBHOOK_MID_DEDUP_TTL_MS);
+  }
+
+  private hasCommittedWebhookMutation(mid: string | null): boolean {
+    if (!mid) return false;
+    const exp = this.committedMutationMids.get(mid);
+    if (exp === undefined) return false;
+    if (exp <= Date.now()) {
+      this.committedMutationMids.delete(mid);
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * Stores unsent reply messages for a webhook mid whose side effects already committed,
    * so retries only redeliver the missing DM(s) without repeating mutations.
    */
@@ -220,8 +261,42 @@ export class MetaInstagramBotService {
     this.pendingRepliesByMid.set(mid, {
       recipientId,
       messages,
-      expiresAt: now + WEBHOOK_MID_DEDUP_TTL_MS,
+      expiresAt: now + WEBHOOK_PENDING_REPLY_TTL_MS,
     });
+  }
+
+  /**
+   * Schedules a bounded internal retry for transient post-200 webhook processing or DM failures.
+   * Uses unref'd timers so pending retries never block graceful shutdown.
+   */
+  private scheduleWebhookRetry(
+    retryKey: string,
+    attempt: number,
+    task: () => Promise<void>
+  ): void {
+    if (attempt >= this.retryDelaysMs.length) return;
+    if (this.scheduledRetries.has(retryKey)) return;
+    if (this.scheduledRetries.size >= WEBHOOK_MAX_SCHEDULED_RETRIES) return;
+
+    const delayMs = Math.max(0, this.retryDelaysMs[attempt]);
+    const timer = setTimeout(() => {
+      this.scheduledRetries.delete(retryKey);
+      task().catch((err) => {
+        console.error(`[MetaIG] Scheduled webhook retry failed for ${retryKey}:`, err);
+      });
+    }, delayMs);
+    timer.unref();
+    this.scheduledRetries.set(retryKey, timer);
+  }
+
+  /**
+   * Cancels any pending internal webhook retry timers (useful for graceful shutdown or tests).
+   */
+  public clearPendingRetriesForTesting(): void {
+    for (const timer of this.scheduledRetries.values()) {
+      clearTimeout(timer);
+    }
+    this.scheduledRetries.clear();
   }
 
   /**
@@ -436,15 +511,16 @@ export class MetaInstagramBotService {
   }
 
   /**
-   * Dispatches a single normalized webhook message with in-flight claim tracking, failure-safe
-   * retryability, and partial-reply replay without repeating committed mutations.
+   * Dispatches a single normalized webhook message with in-flight claim tracking, 24h committed-mutation
+   * deduplication, internal post-200 retry scheduling, and partial-reply replay.
    */
   private async dispatchWebhookMessage(
     senderId: string,
     rawMid: unknown,
     text: string,
     attachments: any[] | undefined,
-    sourceLabel: 'messaging' | 'change'
+    sourceLabel: 'messaging' | 'change',
+    attempt: number = 0
   ): Promise<void> {
     let reelUrl: string | null = null;
     let attachmentType: string | null = null;
@@ -471,6 +547,9 @@ export class MetaInstagramBotService {
       return;
     }
 
+    let shouldScheduleRetry = false;
+    const retryKey = mid || `${sourceLabel}:${senderId}:${combinedText.slice(0, 64)}`;
+
     try {
       // If a prior attempt already committed state and only failed sending reply DM(s),
       // retry only the remaining unsent DM(s) without repeating the mutation.
@@ -494,11 +573,18 @@ export class MetaInstagramBotService {
             this.markWebhookMidCompleted(mid);
           } else {
             this.recordPendingWebhookReplies(mid, pending.recipientId, remaining);
+            shouldScheduleRetry = true;
           }
           return;
         }
         if (pending) {
           this.pendingRepliesByMid.delete(mid);
+        }
+        // If the mutation already committed within Meta's 24h redelivery window (even after pending
+        // reply text expired), never re-execute the command and risk repeating a stateful mutation.
+        if (this.hasCommittedWebhookMutation(mid)) {
+          this.markWebhookMidCompleted(mid);
+          return;
         }
       }
 
@@ -510,19 +596,32 @@ export class MetaInstagramBotService {
 
       await this.processIncomingText(senderId, combinedText, attachmentType, attachmentTitle, delivery);
 
+      if (delivery.stateMutated) {
+        this.markWebhookMutationCommitted(mid);
+      }
+
       if (!delivery.anyDeliveryFailed) {
         this.markWebhookMidCompleted(mid);
-      } else if (mid && delivery.stateMutated && delivery.unsentMessages.length > 0) {
-        this.recordPendingWebhookReplies(mid, senderId, delivery.unsentMessages);
+      } else {
+        if (mid && delivery.stateMutated && delivery.unsentMessages.length > 0) {
+          this.recordPendingWebhookReplies(mid, senderId, delivery.unsentMessages);
+        }
+        // The route already returned 200 EVENT_RECEIVED before dispatch, so Meta will not redeliver
+        // this event; schedule a bounded internal retry preserving the mid and mutation checkpoint.
+        shouldScheduleRetry = true;
       }
-      // If !stateMutated and delivery failed, claim is released in finally without marking completed
-      // so Meta's webhook retry can cleanly reprocess the message.
     } catch (error) {
       console.error(`[MetaIG] Failed to process ${sourceLabel} event for sender ${senderId}:`, error);
-      // Do not mark completed on thrown errors; in-flight claim is released in finally so retries proceed.
+      // The route already sent 200 before dispatch; schedule a bounded internal retry after releasing claim.
+      shouldScheduleRetry = true;
     } finally {
       if (mid) {
         this.inFlightMessageIds.delete(mid);
+      }
+      if (shouldScheduleRetry) {
+        this.scheduleWebhookRetry(retryKey, attempt, () =>
+          this.dispatchWebhookMessage(senderId, rawMid, text, attachments, sourceLabel, attempt + 1)
+        );
       }
     }
   }

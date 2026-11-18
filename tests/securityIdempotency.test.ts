@@ -410,6 +410,7 @@ test('API Router - end-to-end idempotency on PATCH /reels/:id/status, POST /auth
     });
     assert.equal(otpRetrySameKey.status, 200);
     assert.equal(otpRetrySameKey.headers.get('idempotency-replayed'), 'true');
+    assert.equal(otpRetrySameKey.headers.get('cache-control'), 'no-store', 'Replayed OTP response must preserve Cache-Control: no-store');
     assert.equal(((await otpRetrySameKey.json()) as any).vaultKey, userKey);
 
     // Reusing the consumed OTP WITHOUT the same Idempotency-Key is still rejected as single-use!
@@ -520,11 +521,11 @@ test('Security - Supabase migration 015 locks down over-permissive RLS policies 
   }
 });
 
-test('Security - ArchiveImportService rejects oversized item arrays (> 50,000 items) before DB processing', async () => {
+test('Security - ArchiveImportService rejects oversized item arrays (> 50,000 items) with too_large status before DB processing', async () => {
   const { ArchiveImportService } = await import('../src/services/archiveImportService.ts');
   const hugePayload = Array.from({ length: 50_001 }, () => ({}));
   const result = await ArchiveImportService.importArchive(hugePayload);
-  assert.equal(result.status, 'failed');
+  assert.equal(result.status, 'too_large');
   assert.equal(result.reelsImported, 0);
   assert.match(result.errors[0] || '', /50,000/);
 });
@@ -642,13 +643,13 @@ test('Idempotency - keeps active entries locked on client disconnect and rejects
   });
 });
 
-test('MetaInstagramBotService - failed webhook processing remains retryable and preserves committed mutations on reply retry', async () => {
-  const bot = new MetaInstagramBotService();
+test('MetaInstagramBotService - automatically retries post-200 transient failures internally without repeating committed mutations', async () => {
+  const bot = new MetaInstagramBotService({ retryDelaysMs: [15] });
   const origGetTz = Repository.getSenderTimezone;
   const origMarkWatched = Repository.markWatchedForInstagramSender;
 
   try {
-    // 1. Transient DB exception before side effects -> releases mid claim so retry succeeds
+    // 1. Transient DB exception before side effects -> internal retry executes cleanly without a second webhook call
     let tzAttempts = 0;
     Repository.getSenderTimezone = (async () => {
       tzAttempts++;
@@ -678,12 +679,13 @@ test('MetaInstagramBotService - failed webhook processing remains retryable and 
 
     await bot.handleWebhookPayload(helpPayload);
     assert.equal(helpDeliveries, 0);
-    await bot.handleWebhookPayload(helpPayload);
-    assert.equal(helpDeliveries, 1, 'Retry after transient DB error must succeed');
+    // Wait for scheduled internal retry (15ms)
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(helpDeliveries, 1, 'Internal retry after transient DB error must succeed without external redelivery');
     await bot.handleWebhookPayload(helpPayload);
     assert.equal(helpDeliveries, 1, 'Subsequent duplicate after completion must be deduplicated');
 
-    // 2. DM delivery returning false AFTER a state mutation -> retry redelivers DM WITHOUT repeating mutation!
+    // 2. DM delivery returning false AFTER a state mutation -> internal retry redelivers DM WITHOUT repeating mutation!
     Repository.getSenderTimezone = async () => 'UTC';
     let markWatchedCalls = 0;
     Repository.markWatchedForInstagramSender = (async () => {
@@ -694,7 +696,7 @@ test('MetaInstagramBotService - failed webhook processing remains retryable and 
     let dmAttempts = 0;
     bot.sendDirectMessage = async () => {
       dmAttempts++;
-      return dmAttempts >= 2; // 1st delivery fails, 2nd succeeds
+      return dmAttempts >= 2; // 1st delivery fails, internal retry succeeds
     };
 
     const watchedPayload = {
@@ -715,16 +717,17 @@ test('MetaInstagramBotService - failed webhook processing remains retryable and 
     assert.equal(markWatchedCalls, 1);
     assert.equal(dmAttempts, 1);
 
-    // Retry same mid: must NOT call markWatchedForInstagramSender a second time, only redeliver DM
-    await bot.handleWebhookPayload(watchedPayload);
-    assert.equal(markWatchedCalls, 1, 'Retry after reply failure must NOT repeat committed state mutation');
-    assert.equal(dmAttempts, 2, 'Retry must redeliver the failed confirmation DM');
+    // Wait for scheduled internal retry (15ms) -> must NOT call markWatchedForInstagramSender again, only redeliver DM
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(markWatchedCalls, 1, 'Internal retry after reply failure must NOT repeat committed state mutation');
+    assert.equal(dmAttempts, 2, 'Internal retry must redeliver the failed confirmation DM');
 
-    // 3rd duplicate after delivery succeeded -> completely deduplicated
+    // Duplicate delivery after completion -> completely deduplicated
     await bot.handleWebhookPayload(watchedPayload);
     assert.equal(markWatchedCalls, 1);
     assert.equal(dmAttempts, 2);
   } finally {
+    bot.clearPendingRetriesForTesting();
     Repository.getSenderTimezone = origGetTz;
     Repository.markWatchedForInstagramSender = origMarkWatched;
   }

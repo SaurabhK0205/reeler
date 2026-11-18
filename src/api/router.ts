@@ -402,6 +402,10 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
     }
 
     const result = await ArchiveImportService.importArchive(rawData);
+    if (result.status === 'too_large') {
+      res.status(413).json({ success: false, ...result });
+      return;
+    }
     if (result.status === 'empty') {
       res.status(400).json({ success: false, ...result });
       return;

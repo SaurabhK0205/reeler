@@ -635,6 +635,14 @@ function resetVaultSessionState() {
   if (sourceCountInstagram) sourceCountInstagram.textContent = '--';
   if (sourceCountBot) sourceCountBot.textContent = '--';
   if (creatorPillsList) creatorPillsList.innerHTML = '';
+  if (reelsGrid) reelsGrid.innerHTML = '';
+  if (reelsTableBody) reelsTableBody.innerHTML = '';
+  if (reelsTableState) {
+    reelsTableState.hidden = true;
+    reelsTableState.innerHTML = '';
+  }
+  if (paginationBar) paginationBar.classList.add('is-hidden');
+  if (resultsCount) resultsCount.textContent = 'Loading tracked items...';
 }
 
 /**

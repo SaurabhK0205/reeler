@@ -10,7 +10,7 @@ export interface RawSavedExportItem {
   caption?: string;
 }
 
-export type ArchiveImportStatus = 'success' | 'empty' | 'failed' | 'partial';
+export type ArchiveImportStatus = 'success' | 'empty' | 'failed' | 'partial' | 'too_large';
 
 export interface ArchiveImportResult {
   totalProcessed: number;
@@ -141,7 +141,7 @@ export class ArchiveImportService {
         creatorsAdded: 0,
         skipped: 0,
         errors: [`Archive exceeds the maximum supported limit of ${MAX_ARCHIVE_IMPORT_ITEMS.toLocaleString()} items per import.`],
-        status: 'failed',
+        status: 'too_large',
       };
     }
 
