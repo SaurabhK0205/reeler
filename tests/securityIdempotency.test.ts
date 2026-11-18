@@ -1313,11 +1313,12 @@ test('MetadataResolver - falls back to secondary crawler User-Agent when primary
     assert.equal(mismatched.username, undefined, 'Mismatched shortcode og:url (reversed attrs) must be rejected');
     assert.equal(mismatched.thumbnailUrl, undefined, 'Mismatched shortcode og:image must be rejected');
 
-    // Matching og:url with reversed attribute order must parse cleanly
+    // Matching og:url with reversed attribute order and quoted '>' inside description must parse cleanly
     globalThis.fetch = (async () =>
       new Response(
         '<html><head>' +
           '<meta content="https://www.instagram.com/rightuser/reel/DFallbackUA1/" property="og:url" />' +
+          '<meta property="og:description" content="5 likes: &quot;A > B comparison clip&quot;" />' +
           '<meta content="https://scontent.cdninstagram.com/v/right.jpg" property="og:image" />' +
           '</head></html>',
         { status: 200 }
@@ -1326,6 +1327,21 @@ test('MetadataResolver - falls back to secondary crawler User-Agent when primary
     const reversedMatch = await fetchReelMetadata('DFallbackUA1', undefined, 'reel');
     assert.equal(reversedMatch.username, 'rightuser');
     assert.equal(reversedMatch.thumbnailUrl, 'https://scontent.cdninstagram.com/v/right.jpg');
+    assert.match(reversedMatch.caption || '', /A > B/);
+
+    // Quoted '>' before a mismatched og:url AND unquoted og:url mismatch must both be rejected
+    globalThis.fetch = (async () =>
+      new Response(
+        '<html><head>' +
+          '<meta data-note="A > B" property=og:url content=https://www.instagram.com/wronguser/reel/DFallbackUA12/ />' +
+          '<meta property="og:image" content="https://scontent.cdninstagram.com/v/wrong2.jpg" />' +
+          '</head></html>',
+        { status: 200 }
+      )) as typeof fetch;
+
+    const quotedGtMismatch = await fetchReelMetadata('DFallbackUA1', undefined, 'reel');
+    assert.equal(quotedGtMismatch.username, undefined, 'Unquoted / quoted-> mismatched og:url must be rejected');
+    assert.equal(quotedGtMismatch.thumbnailUrl, undefined, 'Mismatched og:image must not leak on quoted->/unquoted og:url');
   } finally {
     globalThis.fetch = origFetch;
     if (origToken === undefined) delete process.env.META_PAGE_ACCESS_TOKEN;

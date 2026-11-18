@@ -1436,26 +1436,23 @@ async function checkHealth() {
   }
 }
 
-let isExplicitStatsFetchInFlight = false;
-let isExplicitCreatorsFetchInFlight = false;
-
 /**
  * Fetches summary statistics from the server and populates metric cards.
  * @param {{ silent?: boolean }} [options]
  */
 async function loadStats(options = {}) {
   const silent = Boolean(options.silent);
-  if (silent && isExplicitStatsFetchInFlight) {
+  if (silent && statsFetchController?.isExplicit) {
     return;
   }
   if (statsFetchController) {
     statsFetchController.abort();
   }
   const controller = new AbortController();
+  controller.isExplicit = !silent;
   statsFetchController = controller;
   const { signal } = controller;
   if (!silent) {
-    isExplicitStatsFetchInFlight = true;
     statsBar?.setAttribute('aria-busy', 'true');
   }
   try {
@@ -1552,9 +1549,11 @@ async function loadStats(options = {}) {
       });
     }
   } finally {
-    if (!silent && statsFetchController === controller) {
-      isExplicitStatsFetchInFlight = false;
-      statsBar?.setAttribute('aria-busy', 'false');
+    if (statsFetchController === controller) {
+      statsFetchController = null;
+      if (!silent) {
+        statsBar?.setAttribute('aria-busy', 'false');
+      }
     }
   }
 }
@@ -1567,7 +1566,7 @@ async function loadStats(options = {}) {
  */
 async function loadCreators(query = state.creatorQuery, options = {}) {
   const silent = Boolean(options.silent);
-  if (silent && isExplicitCreatorsFetchInFlight) {
+  if (silent && creatorsFetchController?.isExplicit) {
     return;
   }
   const trimmedQ = String(query || '').trim();
@@ -1575,11 +1574,9 @@ async function loadCreators(query = state.creatorQuery, options = {}) {
     creatorsFetchController.abort();
   }
   const controller = new AbortController();
+  controller.isExplicit = !silent;
   creatorsFetchController = controller;
   const { signal } = controller;
-  if (!silent) {
-    isExplicitCreatorsFetchInFlight = true;
-  }
   isCreatorSearching = Boolean(trimmedQ);
 
   if (!silent && creatorStripMeta && !trimmedQ && state.creators.length === 0) {
@@ -1654,8 +1651,8 @@ async function loadCreators(query = state.creatorQuery, options = {}) {
       });
     }
   } finally {
-    if (!silent && creatorsFetchController === controller) {
-      isExplicitCreatorsFetchInFlight = false;
+    if (creatorsFetchController === controller) {
+      creatorsFetchController = null;
     }
   }
 }
@@ -1760,15 +1757,13 @@ function selectCreator(id) {
   fetchReels();
 }
 
-let isExplicitReelsFetchInFlight = false;
-
 /**
  * Queries reels matching active filters, pagination, and search terms with abort safety and inline error recovery.
  * @param {{ silent?: boolean; pageOverride?: number }} [options]
  */
 async function fetchReels(options = {}) {
   const silent = Boolean(options.silent);
-  if (silent && isExplicitReelsFetchInFlight) {
+  if (silent && fetchReelsAbortController?.isExplicit) {
     return;
   }
   const pageToFetch = Number.isInteger(options.pageOverride) && options.pageOverride >= 1
@@ -1779,11 +1774,9 @@ async function fetchReels(options = {}) {
     fetchReelsAbortController.abort();
   }
   const controller = new AbortController();
+  controller.isExplicit = !silent;
   fetchReelsAbortController = controller;
   const { signal } = controller;
-  if (!silent) {
-    isExplicitReelsFetchInFlight = true;
-  }
 
   renderActiveFilterChips();
   if (!silent) {
@@ -1831,8 +1824,8 @@ async function fetchReels(options = {}) {
     const nextTotal = data.total || 0;
     const maxPage = Math.max(1, Math.ceil(nextTotal / state.filters.limit) || 1);
     if (nextReels.length === 0 && pageToFetch > maxPage) {
-      if (!silent && fetchReelsAbortController === controller) {
-        isExplicitReelsFetchInFlight = false;
+      if (fetchReelsAbortController === controller) {
+        fetchReelsAbortController = null;
       }
       return fetchReels({ silent, pageOverride: maxPage });
     }
@@ -1856,8 +1849,8 @@ async function fetchReels(options = {}) {
     hasInitialReelsSettled = true;
     renderFetchErrorState(e?.message || 'Unable to reach server');
   } finally {
-    if (!silent && fetchReelsAbortController === controller) {
-      isExplicitReelsFetchInFlight = false;
+    if (fetchReelsAbortController === controller) {
+      fetchReelsAbortController = null;
     }
   }
 }

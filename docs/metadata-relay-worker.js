@@ -6,14 +6,12 @@
  *   METADATA_PROXY_TOKEN=<same secret configured in Worker env.RELAY_TOKEN>
  *
  * Strictly allows only public Instagram /reel/<shortcode>/ and /p/<shortcode>/ URLs
- * across both the initial request and any redirect hops (CWE-918 mitigation).
+ * matching the requested shortcode across both the initial request and redirect hops (CWE-918 mitigation).
  */
 
 const ALLOWED_PATH_RE = /^\/(?:reel|p)\/([A-Za-z0-9_-]{5,32})\/?$/;
 const OG_ITEM_SHORTCODE_RE = /instagram\.com\/(?:[^/?#]+\/)?(?:reel|reels|p|tv)\/([A-Za-z0-9_-]{5,32})(?:[/?#]|$)/i;
 const GENERIC_INSTAGRAM_TITLE_RE = /^(?:instagram|login\s*[•·-]\s*instagram)$/i;
-const META_TAG_RE = /<meta\b[^>]*>/gi;
-const META_ATTR_RE = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
 const MAX_REDIRECT_HOPS = 3;
 const MAX_HTML_BYTES = 1_500_000;
 // Shared relay deadline fits within the app resolver's 8s timeout while keeping primary eligible if slow
@@ -47,16 +45,81 @@ function decodeHtmlAttribute(value) {
     .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
 
-function isAllowedInstagramUrl(parsed) {
-  return (
-    parsed.protocol === 'https:' &&
-    parsed.hostname === 'www.instagram.com' &&
-    ALLOWED_PATH_RE.test(parsed.pathname)
-  );
+function isAllowedInstagramUrl(parsed, expectedShortcode) {
+  if (parsed.protocol !== 'https:' || parsed.hostname !== 'www.instagram.com') {
+    return false;
+  }
+  const match = parsed.pathname.match(ALLOWED_PATH_RE);
+  if (!match) {
+    return false;
+  }
+  return !expectedShortcode || match[1] === expectedShortcode;
 }
 
 /**
- * Classifies HTML OpenGraph metadata independently of attribute order:
+ * Quote-aware `<meta>` tokenizer supporting `>` inside quoted values, arbitrary attribute order,
+ * and double-quoted, single-quoted, or unquoted attribute values.
+ */
+function extractMetaTagAttributes(html) {
+  const tags = [];
+  const lower = html.toLowerCase();
+  let pos = 0;
+
+  while (pos < html.length) {
+    const start = lower.indexOf('<meta', pos);
+    if (start === -1) break;
+    const afterName = html[start + 5];
+    if (afterName && !/[\s/>]/.test(afterName)) {
+      pos = start + 5;
+      continue;
+    }
+
+    let i = start + 5;
+    const attrs = Object.create(null);
+
+    while (i < html.length) {
+      while (i < html.length && /[\s/]/.test(html[i])) i++;
+      if (i >= html.length || html[i] === '>') {
+        i++;
+        break;
+      }
+
+      const nameStart = i;
+      while (i < html.length && !/[\s=/>]/.test(html[i])) i++;
+      const attrName = html.slice(nameStart, i).toLowerCase();
+      while (i < html.length && /\s/.test(html[i])) i++;
+
+      let attrVal = '';
+      if (i < html.length && html[i] === '=') {
+        i++;
+        while (i < html.length && /\s/.test(html[i])) i++;
+        if (i < html.length && (html[i] === '"' || html[i] === "'")) {
+          const quote = html[i++];
+          const valStart = i;
+          while (i < html.length && html[i] !== quote) i++;
+          attrVal = html.slice(valStart, i);
+          if (i < html.length && html[i] === quote) i++;
+        } else {
+          const valStart = i;
+          while (i < html.length && !/[\s>]/.test(html[i])) i++;
+          attrVal = html.slice(valStart, i);
+        }
+      }
+
+      if (attrName && !(attrName in attrs)) {
+        attrs[attrName] = attrVal;
+      }
+    }
+
+    tags.push(attrs);
+    pos = i;
+  }
+
+  return tags;
+}
+
+/**
+ * Classifies HTML OpenGraph metadata safely across attribute order, quoting styles, and quoted `>`:
  * - 'rich': has og:image or non-generic title and no mismatched og:url shortcode
  * - 'url_only': only has a matching og:url shortcode (held as fallback while other crawler runs)
  * - 'invalid': login wall, missing tags, or mismatched shortcode
@@ -67,24 +130,11 @@ function classifyItemOpenGraph(html, shortcode) {
   let twitterTitle = '';
   let ogTitle = '';
 
-  META_TAG_RE.lastIndex = 0;
-  let tagMatch;
-  while ((tagMatch = META_TAG_RE.exec(html)) !== null) {
-    const tag = tagMatch[0];
-    let propertyAttr = '';
-    let nameAttr = '';
-    let contentAttr;
-
-    META_ATTR_RE.lastIndex = 0;
-    let attrMatch;
-    while ((attrMatch = META_ATTR_RE.exec(tag)) !== null) {
-      const attrName = attrMatch[1].toLowerCase();
-      const attrVal = attrMatch[2] ?? attrMatch[3] ?? '';
-      if (attrName === 'property') propertyAttr = attrVal.toLowerCase();
-      else if (attrName === 'name') nameAttr = attrVal.toLowerCase();
-      else if (attrName === 'content') contentAttr = attrVal;
-    }
+  for (const attrs of extractMetaTagAttributes(html)) {
+    const contentAttr = attrs.content;
     if (contentAttr === undefined) continue;
+    const propertyAttr = (attrs.property || '').toLowerCase();
+    const nameAttr = (attrs.name || '').toLowerCase();
 
     if (propertyAttr === 'og:url' && !ogUrl) ogUrl = decodeHtmlAttribute(contentAttr).trim();
     else if (propertyAttr === 'og:image' && !ogImage) ogImage = decodeHtmlAttribute(contentAttr).trim();
@@ -153,7 +203,7 @@ async function readBoundedText(response, maxBytes = MAX_HTML_BYTES) {
 async function fetchAllowedInstagramHtml(initialUrl, shortcode, userAgent, signal) {
   let currentUrl = initialUrl;
   for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
-    if (!isAllowedInstagramUrl(currentUrl) || signal.aborted) {
+    if (!isAllowedInstagramUrl(currentUrl, shortcode) || signal.aborted) {
       return null;
     }
     const upstream = await fetch(currentUrl.toString(), {

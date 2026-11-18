@@ -421,8 +421,6 @@ async function fetchImageDimensions(
  */
 const GENERIC_INSTAGRAM_TITLE_RE = /^(?:instagram|login\s*[•·-]\s*instagram)$/i;
 const OG_ITEM_SHORTCODE_RE = /instagram\.com\/(?:[^/?#]+\/)?(?:reel|reels|p|tv)\/([A-Za-z0-9_-]{5,32})(?:[/?#]|$)/i;
-const META_TAG_RE = /<meta\b[^>]*>/gi;
-const META_ATTR_RE = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
 const DIRECT_PRIMARY_TIMEOUT_MS = 8000;
 const DIRECT_SECONDARY_TIMEOUT_MS = 3000;
 const DIRECT_METADATA_USER_AGENTS = [
@@ -440,8 +438,70 @@ interface ParsedOpenGraphFields {
 }
 
 /**
- * Extracts OpenGraph, Twitter meta, and embedded JSON owner values once by reading `<meta>` attributes
- * by name (independent of attribute order or whitespace).
+ * Quote-aware HTML `<meta>` tag tokenizer that safely handles `>` inside quoted attribute values,
+ * arbitrary attribute ordering, and double-quoted, single-quoted, or unquoted attribute values.
+ */
+function extractMetaTagAttributes(html: string): Array<Record<string, string>> {
+  const tags: Array<Record<string, string>> = [];
+  const lower = html.toLowerCase();
+  let pos = 0;
+
+  while (pos < html.length) {
+    const start = lower.indexOf('<meta', pos);
+    if (start === -1) break;
+    const afterName = html[start + 5];
+    if (afterName && !/[\s/>]/.test(afterName)) {
+      pos = start + 5;
+      continue;
+    }
+
+    let i = start + 5;
+    const attrs: Record<string, string> = Object.create(null);
+
+    while (i < html.length) {
+      while (i < html.length && /[\s/]/.test(html[i])) i++;
+      if (i >= html.length || html[i] === '>') {
+        i++;
+        break;
+      }
+
+      const nameStart = i;
+      while (i < html.length && !/[\s=/>]/.test(html[i])) i++;
+      const attrName = html.slice(nameStart, i).toLowerCase();
+      while (i < html.length && /\s/.test(html[i])) i++;
+
+      let attrVal = '';
+      if (i < html.length && html[i] === '=') {
+        i++;
+        while (i < html.length && /\s/.test(html[i])) i++;
+        if (i < html.length && (html[i] === '"' || html[i] === "'")) {
+          const quote = html[i++];
+          const valStart = i;
+          while (i < html.length && html[i] !== quote) i++;
+          attrVal = html.slice(valStart, i);
+          if (i < html.length && html[i] === quote) i++;
+        } else {
+          const valStart = i;
+          while (i < html.length && !/[\s>]/.test(html[i])) i++;
+          attrVal = html.slice(valStart, i);
+        }
+      }
+
+      if (attrName && !(attrName in attrs)) {
+        attrs[attrName] = attrVal;
+      }
+    }
+
+    tags.push(attrs);
+    pos = i;
+  }
+
+  return tags;
+}
+
+/**
+ * Extracts OpenGraph, Twitter meta, and embedded JSON owner values once by tokenizing `<meta>` tags
+ * safely across quoted `>` characters, arbitrary attribute ordering, and unquoted attribute values.
  */
 function parseOpenGraphFields(html: string): ParsedOpenGraphFields {
   let ogUrl = '';
@@ -450,24 +510,11 @@ function parseOpenGraphFields(html: string): ParsedOpenGraphFields {
   let ogDesc = '';
   let ogImage: string | undefined;
 
-  META_TAG_RE.lastIndex = 0;
-  let tagMatch: RegExpExecArray | null;
-  while ((tagMatch = META_TAG_RE.exec(html)) !== null) {
-    const tag = tagMatch[0];
-    let propertyAttr = '';
-    let nameAttr = '';
-    let contentAttr: string | undefined;
-
-    META_ATTR_RE.lastIndex = 0;
-    let attrMatch: RegExpExecArray | null;
-    while ((attrMatch = META_ATTR_RE.exec(tag)) !== null) {
-      const attrName = attrMatch[1].toLowerCase();
-      const attrVal = attrMatch[2] ?? attrMatch[3] ?? '';
-      if (attrName === 'property') propertyAttr = attrVal.toLowerCase();
-      else if (attrName === 'name') nameAttr = attrVal.toLowerCase();
-      else if (attrName === 'content') contentAttr = attrVal;
-    }
+  for (const attrs of extractMetaTagAttributes(html)) {
+    const contentAttr = attrs.content;
     if (contentAttr === undefined) continue;
+    const propertyAttr = (attrs.property || '').toLowerCase();
+    const nameAttr = (attrs.name || '').toLowerCase();
 
     if (propertyAttr === 'og:url' && !ogUrl) {
       ogUrl = decodeHtml(contentAttr).trim();
