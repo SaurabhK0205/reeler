@@ -561,12 +561,20 @@ async function fetchHtmlViaProxy(
       headers,
     });
     if (!res.ok) {
+      console.warn(`[MetadataResolver] Proxy relay returned HTTP ${res.status} (${parsedProxy.hostname}).`);
       await res.body?.cancel().catch(() => {});
       return null;
     }
     const candidateHtml = await readBoundedText(res);
-    return OG_META_PATTERN.test(candidateHtml) ? candidateHtml : null;
-  } catch {
+    if (!OG_META_PATTERN.test(candidateHtml)) {
+      console.warn(`[MetadataResolver] Proxy relay returned HTTP 200 without OpenGraph tags (${parsedProxy.hostname}).`);
+      return null;
+    }
+    return candidateHtml;
+  } catch (err: any) {
+    if (!signal?.aborted) {
+      console.warn(`[MetadataResolver] Proxy relay request failed (${parsedProxy.hostname}): ${err?.message || err}`);
+    }
     return null;
   }
 }
@@ -670,7 +678,7 @@ export async function fetchReelMetadata(
 
       if (!html) {
         console.warn(
-          `[MetadataResolver] No OpenGraph metadata returned for ${shortcode} (lastStatus=${lastStatus}).`
+          `[MetadataResolver] No OpenGraph metadata returned for ${shortcode} (lastStatus=${lastStatus}, proxyConfigured=${Boolean(process.env.METADATA_PROXY_URL?.trim())}).`
         );
         return {};
       }
