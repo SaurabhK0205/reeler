@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { generateUserVaultKey, getAdminVaultKey, createOtp } from './vaultAuthService.ts';
+import { generateUserVaultKey, getAdminVaultKey, createOtp, OtpCapacityError } from './vaultAuthService.ts';
 import { safeStringEqual } from '../middleware/security.ts';
 import { loadConfig } from '../config.ts';
 import { Repository, SenderReminderConflictError, SenderDeletionBarrierError } from '../db/repository.ts';
@@ -71,8 +71,10 @@ const WEBHOOK_MAX_SCHEDULED_RETRIES = 200;
 const DEFAULT_WEBHOOK_RETRY_DELAYS_MS = [2000, 8000];
 
 interface WebhookRetryState {
-  /** Preserves the exact Reel resolved on the initial duration command across internal retries. */
+  /** Preserves the exact Reel snapshot resolved on the initial duration command across internal retries. */
   pinnedDurationTargetReel?: SavedReel | null;
+  /** Preserves the initially parsed target timestamp & duration across internal retries. */
+  pinnedDuration?: ReturnType<typeof parseDuration>;
 }
 
 interface WebhookDeliveryContext {
@@ -919,7 +921,20 @@ export class MetaInstagramBotService {
     if (['code', 'otp', 'login', 'login code', 'get code', 'passcode'].includes(normalizedText)) {
       const isSenderAdmin = Boolean(this.adminUserId && senderId === this.adminUserId);
       const session = isSenderAdmin ? { role: 'admin' as const } : { role: 'user' as const, senderId };
-      const otpCode = createOtp(session);
+      let otpCode: string;
+      try {
+        otpCode = createOtp(session);
+      } catch (error) {
+        if (error instanceof OtpCapacityError) {
+          await this.deliverReply(
+            senderId,
+            `⏳ Too many login codes are active right now. Please try again in a minute.`,
+            delivery
+          );
+          return;
+        }
+        throw error;
+      }
       if (delivery) delivery.stateMutated = true;
 
       const reply =
@@ -964,17 +979,24 @@ export class MetaInstagramBotService {
     }
 
     // 3. Custom duration command (e.g. "5s", "remind me in 5 days", "tomorrow at 5pm", "12 nov", etc.)
-    const customDuration = parseDuration(text, new Date(), senderTz);
+    const customDuration =
+      delivery && delivery.retryState.pinnedDuration !== undefined
+        ? delivery.retryState.pinnedDuration
+        : parseDuration(text, new Date(), senderTz);
+    if (delivery && delivery.retryState.pinnedDuration === undefined) {
+      delivery.retryState.pinnedDuration = customDuration;
+    }
     if (customDuration) {
       let targetReel: SavedReel | null;
       if (delivery && delivery.retryState.pinnedDurationTargetReel !== undefined) {
-        // Reuse the exact Reel resolved on the initial attempt so an internal retry never
+        // Reuse the exact Reel snapshot resolved on the initial attempt so an internal retry never
         // retargets a newer Reel saved after the first attempt failed.
         targetReel = delivery.retryState.pinnedDurationTargetReel;
       } else {
-        targetReel =
+        const resolved =
           (await Repository.getActiveAwaitingReelForSender(senderId)) ||
           (await Repository.getLastReelForInstagramSender(senderId));
+        targetReel = resolved ? { ...resolved } : null;
         if (delivery) {
           delivery.retryState.pinnedDurationTargetReel = targetReel;
         }
@@ -982,7 +1004,21 @@ export class MetaInstagramBotService {
 
       if (targetReel) {
         const nextDate = customDuration.targetDate.toISOString();
-        await Repository.updateReminderSchedule(targetReel.id, nextDate, customDuration.seconds);
+        const applied = await Repository.updateReminderSchedule(
+          targetReel.id,
+          nextDate,
+          customDuration.seconds,
+          {
+            expectedNextReminderAt: targetReel.next_reminder_at ?? null,
+            expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
+            expectedUpdatedAt: targetReel.updated_at ?? null,
+            ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
+          }
+        );
+        if (!applied) {
+          // A newer reminder schedule or watch-status change already updated this Reel before this retry ran.
+          return;
+        }
         if (delivery) delivery.stateMutated = true;
         let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget);
         if (senderTz === 'UTC') {

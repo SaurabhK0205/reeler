@@ -10,15 +10,36 @@ export interface VaultUserSession {
 
 interface PendingOtp {
   code: string;
+  principalKey: string;
   role: 'admin' | 'user';
   senderId?: string;
   createdAt: number;
   expiresAt: number;
 }
 
+export class OtpCapacityError extends Error {
+  public readonly code = 'OTP_CAPACITY_REACHED';
+  constructor() {
+    super('Too many active login codes across users. Please wait a moment and try again.');
+    this.name = 'OtpCapacityError';
+  }
+}
+
 const pendingOtps = new Map<string, PendingOtp>();
+const principalToOtp = new Map<string, string>();
 const MAX_PENDING_OTPS = 500;
 const REEL_META_PATH_RE = /^\/reels\/[^/]+\/meta$/;
+
+function resolveOtpPrincipalKey(session: VaultUserSession): string {
+  if (session.role === 'admin') {
+    return 'admin';
+  }
+  const sender = String(session.senderId || '').trim();
+  if (!sender) {
+    throw new Error('Cannot generate user OTP without senderId');
+  }
+  return `user:${sender}`;
+}
 
 /**
  * Default OTP Time-To-Live: 10 minutes.
@@ -33,21 +54,30 @@ function cleanupExpiredOtps(): void {
   for (const [code, item] of pendingOtps.entries()) {
     if (item.expiresAt <= now) {
       pendingOtps.delete(code);
+      if (principalToOtp.get(item.principalKey) === code) {
+        principalToOtp.delete(item.principalKey);
+      }
     }
   }
 }
 
 /**
  * Generates a cryptographically random 6-digit numeric login OTP bound to the given user session.
- * Re-rolls candidates if a collision with an existing active OTP occurs to prevent overwriting active sessions.
+ * Enforces one active OTP per principal (replacing the caller's own prior code) and never evicts
+ * another principal's unexpired login code (CWE-400 mitigation).
  */
 export function createOtp(session: VaultUserSession, ttlMs: number = OTP_DEFAULT_TTL_MS): string {
   cleanupExpiredOtps();
 
-  while (pendingOtps.size >= MAX_PENDING_OTPS) {
-    const oldestCode = pendingOtps.keys().next().value;
-    if (oldestCode === undefined) break;
-    pendingOtps.delete(oldestCode);
+  const principalKey = resolveOtpPrincipalKey(session);
+  const existingCode = principalToOtp.get(principalKey);
+  if (existingCode) {
+    pendingOtps.delete(existingCode);
+    principalToOtp.delete(principalKey);
+  }
+
+  if (pendingOtps.size >= MAX_PENDING_OTPS) {
+    throw new OtpCapacityError();
   }
 
   let code: string;
@@ -63,11 +93,13 @@ export function createOtp(session: VaultUserSession, ttlMs: number = OTP_DEFAULT
   const now = Date.now();
   pendingOtps.set(code, {
     code,
+    principalKey,
     role: session.role,
     senderId: session.senderId,
     createdAt: now,
     expiresAt: now + ttlMs,
   });
+  principalToOtp.set(principalKey, code);
 
   return code;
 }
@@ -95,11 +127,17 @@ export function verifyOtp(code: string): { valid: boolean; session?: VaultUserSe
 
   if (record.expiresAt <= Date.now()) {
     pendingOtps.delete(normalizedCode);
+    if (principalToOtp.get(record.principalKey) === normalizedCode) {
+      principalToOtp.delete(record.principalKey);
+    }
     return { valid: false };
   }
 
   // Immediately delete upon consumption (one-time use)
   pendingOtps.delete(normalizedCode);
+  if (principalToOtp.get(record.principalKey) === normalizedCode) {
+    principalToOtp.delete(record.principalKey);
+  }
 
   const session: VaultUserSession = {
     role: record.role,
@@ -122,6 +160,7 @@ export function verifyOtp(code: string): { valid: boolean; session?: VaultUserSe
  */
 export function clearOtpsForTesting(): void {
   pendingOtps.clear();
+  principalToOtp.clear();
 }
 
 const MAX_OTP_VERIFY_ATTEMPTS = 5;
@@ -245,7 +284,19 @@ export async function requestOtpForUsername(
   const targetSenderId = adminSenderId || config.instagram.userId;
 
   if (username && username === adminUser && targetSenderId) {
-    const code = createOtp({ role: 'admin' });
+    let code: string;
+    try {
+      code = createOtp({ role: 'admin' });
+    } catch (error) {
+      if (error instanceof OtpCapacityError) {
+        return {
+          success: false,
+          code: error.code,
+          message: error.message,
+        };
+      }
+      throw error;
+    }
     const message =
       `🔐 Your Reeler Login Code:\n${code}\n\n` +
       `Enter this 6-digit code on your PC or laptop browser to unlock your private vault (valid for 10 minutes).`;

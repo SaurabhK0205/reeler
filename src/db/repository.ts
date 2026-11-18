@@ -1366,21 +1366,56 @@ export class Repository {
     return (data || []) as SavedReel[];
   }
 
-  static async updateReminderSchedule(id: string, nextReminderAt: string, intervalSeconds?: number): Promise<void> {
+  static async updateReminderSchedule(
+    id: string,
+    nextReminderAt: string,
+    intervalSeconds?: number,
+    options?: {
+      expectedNextReminderAt?: string | null;
+      expectedIntervalSeconds?: number | null;
+      expectedUpdatedAt?: string | null;
+      expectedWatchStatus?: WatchStatus;
+    }
+  ): Promise<boolean> {
     const now = new Date().toISOString();
     if (!isSupabaseConfigured()) {
       const reel = memoryStore.reels.get(id);
-      if (reel) {
-        reel.next_reminder_at = nextReminderAt;
-        reel.watch_status = 'watch_later';
-        reel.awaiting_reminder_choice_until = null;
-        reel.updated_at = now;
-        if (intervalSeconds) {
-          reel.reminder_interval_seconds = intervalSeconds;
-          reel.reminder_interval_hours = Math.round(intervalSeconds / 3600);
+      if (!reel) return false;
+      if (options) {
+        if (
+          options.expectedNextReminderAt !== undefined &&
+          (reel.next_reminder_at ?? null) !== (options.expectedNextReminderAt ?? null)
+        ) {
+          return false;
+        }
+        if (
+          options.expectedIntervalSeconds !== undefined &&
+          (reel.reminder_interval_seconds ?? null) !== (options.expectedIntervalSeconds ?? null)
+        ) {
+          return false;
+        }
+        if (
+          options.expectedUpdatedAt !== undefined &&
+          (reel.updated_at ?? null) !== (options.expectedUpdatedAt ?? null)
+        ) {
+          return false;
+        }
+        if (
+          options.expectedWatchStatus !== undefined &&
+          reel.watch_status !== options.expectedWatchStatus
+        ) {
+          return false;
         }
       }
-      return;
+      reel.next_reminder_at = nextReminderAt;
+      reel.watch_status = 'watch_later';
+      reel.awaiting_reminder_choice_until = null;
+      reel.updated_at = now;
+      if (intervalSeconds) {
+        reel.reminder_interval_seconds = intervalSeconds;
+        reel.reminder_interval_hours = Math.round(intervalSeconds / 3600);
+      }
+      return true;
     }
 
     const supabase = getSupabase();
@@ -1395,7 +1430,33 @@ export class Repository {
       updatePayload.reminder_interval_hours = Math.round(intervalSeconds / 3600);
     }
 
-    await supabase.from('saved_reels').update(updatePayload).eq('id', id);
+    let query = supabase.from('saved_reels').update(updatePayload).eq('id', id);
+    if (options) {
+      if (options.expectedNextReminderAt !== undefined) {
+        query = options.expectedNextReminderAt === null
+          ? query.is('next_reminder_at', null)
+          : query.eq('next_reminder_at', options.expectedNextReminderAt);
+      }
+      if (options.expectedIntervalSeconds !== undefined) {
+        query = options.expectedIntervalSeconds === null
+          ? query.is('reminder_interval_seconds', null)
+          : query.eq('reminder_interval_seconds', options.expectedIntervalSeconds);
+      }
+      if (options.expectedUpdatedAt !== undefined) {
+        query = options.expectedUpdatedAt === null
+          ? query.is('updated_at', null)
+          : query.eq('updated_at', options.expectedUpdatedAt);
+      }
+      if (options.expectedWatchStatus !== undefined) {
+        query = query.eq('watch_status', options.expectedWatchStatus);
+      }
+    }
+
+    const { data, error } = await query.select('id');
+    if (error) {
+      throw new Error(`Supabase updateReminderSchedule failed: ${error.message}`);
+    }
+    return Array.isArray(data) && data.length > 0;
   }
 
   static async getActiveAwaitingReelForSender(senderId: string): Promise<SavedReel | null> {

@@ -187,7 +187,13 @@ apiRouter.post('/auth/otp/request', otpRequestRateLimiter, async (req: Request, 
     metaBotService.adminUserId
   );
 
-  const httpStatus = result.success ? 200 : result.code === 'DELIVERY_FAILED' ? 502 : 200;
+  const httpStatus = result.success
+    ? 200
+    : result.code === 'DELIVERY_FAILED'
+      ? 502
+      : result.code === 'OTP_CAPACITY_REACHED'
+        ? 503
+        : 200;
   res.status(httpStatus).json(result);
 });
 

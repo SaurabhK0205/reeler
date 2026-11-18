@@ -19,8 +19,11 @@ import {
   createOtp,
   generateUserVaultKey,
   getAdminVaultKey,
+  OtpCapacityError,
+  requestOtpForUsername,
   requireAdminVaultMiddleware,
   vaultAuthMiddleware,
+  verifyOtp,
 } from '../src/services/vaultAuthService.ts';
 import { apiRouter, resetApiRateLimitersForTesting } from '../src/api/router.ts';
 import { MetaInstagramBotService } from '../src/services/metaInstagramBotService.ts';
@@ -755,7 +758,7 @@ test('MetaInstagramBotService - automatically retries post-200 transient failure
     assert.equal(midlessWatchedCalls, 1, 'Mid-less internal retry must NOT repeat committed mutation');
     assert.equal(midlessDmAttempts, 2, 'Mid-less internal retry must redeliver failed DM');
 
-    // 4. Duration command internal retry stays pinned to the ORIGINAL Reel even if a newer Reel arrives
+    // 4. Duration command internal retry stays pinned to the ORIGINAL Reel and ORIGINAL target timestamp
     const origGetAwaiting = Repository.getActiveAwaitingReelForSender;
     const origGetLast = Repository.getLastReelForInstagramSender;
     const origUpdateSchedule = Repository.updateReminderSchedule;
@@ -766,19 +769,26 @@ test('MetaInstagramBotService - automatically retries post-200 transient failure
         shortcode: 'OrigReel1',
         reel_url: 'https://www.instagram.com/reel/OrigReel1/',
         media_type: 'reel',
+        watch_status: 'watch_later',
+        next_reminder_at: null,
+        reminder_interval_seconds: null,
+        updated_at: '2026-01-01T00:00:00.000Z',
       })) as any;
       Repository.getLastReelForInstagramSender = async () => null;
 
       const updatedTargets: string[] = [];
+      const updatedTimestamps: string[] = [];
       let scheduleAttempts = 0;
-      Repository.updateReminderSchedule = (async (reelId: string) => {
+      Repository.updateReminderSchedule = (async (reelId: string, nextReminderAt: string) => {
         scheduleAttempts++;
         updatedTargets.push(reelId);
+        updatedTimestamps.push(nextReminderAt);
         if (scheduleAttempts === 1) {
           // Simulate a brand-new Reel arriving before internal retry runs
           currentLatestReelId = 'reel_newer_2';
           throw new Error('Transient DB write timeout');
         }
+        return true;
       }) as typeof Repository.updateReminderSchedule;
       bot.sendDirectMessage = async () => true;
 
@@ -798,14 +808,177 @@ test('MetaInstagramBotService - automatically retries post-200 transient failure
         ['reel_original_1', 'reel_original_1'],
         'Duration retry must stay pinned to original Reel instead of retargeting newer Reel'
       );
+      assert.equal(
+        updatedTimestamps[0],
+        updatedTimestamps[1],
+        'Duration retry must preserve the originally parsed target timestamp instead of reparsing from retry time'
+      );
     } finally {
       Repository.getActiveAwaitingReelForSender = origGetAwaiting;
       Repository.getLastReelForInstagramSender = origGetLast;
+      Repository.updateReminderSchedule = origUpdateSchedule;
+    }
+
+    // 5. Stale duration retry MUST NOT overwrite a newer schedule committed on the same Reel (CAS guard)
+    const realUpdateSchedule = Repository.updateReminderSchedule.bind(Repository);
+    const casSender = 'sender_duration_cas';
+    const casCreator = await Repository.upsertCreator({
+      instagram_user_id: 'ig_cas_creator_1',
+      username: 'cas_creator',
+    });
+    const casReel = await Repository.upsertSavedReel({
+      instagram_media_id: 'media_cas_1',
+      shortcode: 'CasReel01',
+      reel_url: 'https://www.instagram.com/reel/CasReel01/',
+      media_type: 'reel',
+      creator_id: casCreator.id,
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 1,
+      watch_status: 'watch_later',
+      awaiting_reminder_choice_until: new Date(Date.now() + 60_000).toISOString(),
+      instagram_sender_id: casSender,
+    });
+    assert.ok(casReel, 'CAS test reel must be created');
+
+    const sentReplies: string[] = [];
+    bot.sendDirectMessage = async (_recipientId: string, text: string) => {
+      sentReplies.push(text);
+      return true;
+    };
+
+    let failFirst30m = true;
+    Repository.updateReminderSchedule = (async (id, nextReminderAt, intervalSeconds, options) => {
+      if (intervalSeconds === 1800 && failFirst30m) {
+        failFirst30m = false;
+        throw new Error('Transient DB blip on first 30m attempt');
+      }
+      return realUpdateSchedule(id, nextReminderAt, intervalSeconds, options);
+    }) as typeof Repository.updateReminderSchedule;
+
+    try {
+      // First command "30m" fails transiently and schedules an internal retry in 15ms
+      await bot.handleWebhookPayload({
+        object: 'instagram',
+        entry: [
+          {
+            messaging: [
+              { sender: { id: casSender }, message: { mid: 'mid.cas_30m', text: '30m' } },
+            ],
+          },
+        ],
+      });
+
+      // Before the retry fires, user sends a newer command "2h" which commits immediately!
+      await bot.handleWebhookPayload({
+        object: 'instagram',
+        entry: [
+          {
+            messaging: [
+              { sender: { id: casSender }, message: { mid: 'mid.cas_2h', text: '2h' } },
+            ],
+          },
+        ],
+      });
+
+      // Wait for the stale "30m" retry to run and be rejected by the CAS guard
+      await new Promise((r) => setTimeout(r, 60));
+
+      const finalReel = await Repository.getLastReelForInstagramSender(casSender);
+      assert.equal(
+        finalReel?.reminder_interval_seconds,
+        7200,
+        'Newer 2h reminder schedule must NOT be overwritten by stale 30m retry'
+      );
+      assert.equal(
+        sentReplies.length,
+        1,
+        'Stale 30m retry must NOT send a misleading confirmation DM after losing CAS'
+      );
+      assert.match(sentReplies[0] || '', /2 hours/i);
+    } finally {
       Repository.updateReminderSchedule = origUpdateSchedule;
     }
   } finally {
     bot.clearPendingRetriesForTesting();
     Repository.getSenderTimezone = origGetTz;
     Repository.markWatchedForInstagramSender = origMarkWatched;
+  }
+});
+
+test('Security - OTP store enforces 1 active code per principal and refuses cross-user eviction at capacity (CWE-400)', async () => {
+  clearOtpsForTesting();
+  try {
+    // 1. Admin and Victim user receive valid OTPs
+    const adminCode = createOtp({ role: 'admin' });
+    const victimCode = createOtp({ role: 'user', senderId: 'victim_sender_1' });
+
+    // 2. Attacker repeatedly requests 600 codes -> replaces only attacker's own OTP, never evicts victim or admin
+    let attackerFirstCode = '';
+    let attackerLastCode = '';
+    for (let i = 0; i < 600; i++) {
+      const nextCode = createOtp({ role: 'user', senderId: 'attacker_sender_flood' });
+      if (i === 0) attackerFirstCode = nextCode;
+      attackerLastCode = nextCode;
+    }
+
+    assert.equal(verifyOtp(attackerFirstCode).valid, false, 'Attacker prior OTP must be superseded by their latest OTP');
+    assert.equal(verifyOtp(victimCode).valid, true, 'Victim OTP must remain valid despite attacker flooding');
+    assert.equal(verifyOtp(adminCode).valid, true, 'Admin OTP must remain valid despite attacker flooding');
+    assert.equal(verifyOtp(attackerLastCode).valid, true, 'Attacker latest OTP must be valid');
+
+    // 3. Fill capacity with 500 distinct principals -> 501st principal must get OtpCapacityError instead of evicting others
+    clearOtpsForTesting();
+    const firstPrincipalCode = createOtp({ role: 'user', senderId: 'distinct_user_0' });
+    for (let i = 1; i < 500; i++) {
+      createOtp({ role: 'user', senderId: `distinct_user_${i}` });
+    }
+
+    assert.throws(
+      () => createOtp({ role: 'user', senderId: 'distinct_user_500' }),
+      (err: unknown) => err instanceof OtpCapacityError && err.code === 'OTP_CAPACITY_REACHED',
+      '501st distinct principal must fail closed with OtpCapacityError rather than evicting another user'
+    );
+
+    // Existing principal can still rotate their own OTP even at global capacity
+    const rotatedCode = createOtp({ role: 'user', senderId: 'distinct_user_1' });
+    assert.match(rotatedCode, /^\d{6}$/);
+
+    // Bot webhook handles OtpCapacityError gracefully with a user-facing DM instead of throwing/retrying
+    const bot = new MetaInstagramBotService({ retryDelaysMs: [15] });
+    const botReplies: string[] = [];
+    bot.sendDirectMessage = async (_recipientId, text) => {
+      botReplies.push(text);
+      return true;
+    };
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: 'overflow_dm_user' }, message: { mid: 'mid.otp_cap', text: 'code' } },
+          ],
+        },
+      ],
+    });
+    assert.equal(botReplies.length, 1);
+    assert.match(botReplies[0], /too many login codes/i);
+
+    // requestOtpForUsername returns structured OTP_CAPACITY_REACHED without throwing
+    const origAdminUsername = process.env.ADMIN_USERNAME;
+    process.env.ADMIN_USERNAME = 'cap_admin';
+    try {
+      const capResult = await requestOtpForUsername('cap_admin', async () => true, 'admin_sender_cap');
+      assert.equal(capResult.success, false);
+      assert.equal(capResult.code, 'OTP_CAPACITY_REACHED');
+    } finally {
+      if (origAdminUsername === undefined) delete process.env.ADMIN_USERNAME;
+      else process.env.ADMIN_USERNAME = origAdminUsername;
+    }
+
+    // First principal's original live OTP was NEVER evicted throughout capacity pressure
+    assert.equal(verifyOtp(firstPrincipalCode).valid, true, 'Original live OTP must never be evicted at capacity');
+  } finally {
+    clearOtpsForTesting();
   }
 });
