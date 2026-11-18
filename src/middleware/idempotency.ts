@@ -267,8 +267,8 @@ export function createIdempotencyMiddleware(
       activeRequests.delete(cacheKey);
 
       const statusCode = res.statusCode;
-      // Never cache transient server errors or rate-limit rejections so clients can safely retry
-      if (statusCode >= 500 || statusCode === 429) {
+      // Never cache transient server errors, rate-limit rejections, or explicitly non-cacheable conflicts
+      if (statusCode >= 500 || statusCode === 429 || res.locals?.skipIdempotencyCache === true) {
         return;
       }
 
