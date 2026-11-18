@@ -434,6 +434,7 @@ const SWITCH_VAULT_GATE_DESC = 'Sign in to another Instagram account with a fres
 
 let isSwitchingVault = false;
 let vaultAuthGeneration = 0;
+let vaultSessionGeneration = 0;
 let vaultAuthAbortController = null;
 let pendingOtpAttempt = { code: '', key: '' };
 
@@ -682,6 +683,7 @@ function cancelSwitchVault() {
 function confirmSignOutVault() {
   invalidatePendingVaultAuth();
   clearPendingOtpAttempt();
+  vaultSessionGeneration++;
   isSwitchingVault = false;
   setVaultAccessKey(null);
   closeShortcutsPopover(false);
@@ -693,6 +695,24 @@ function confirmSignOutVault() {
   if (typeof announceStatus === 'function') {
     announceStatus('Signed out of this device. Enter a fresh 6-digit code or vault key to sign back in.');
   }
+}
+
+/**
+ * Commits a newly authenticated vault key and starts all catalog loads immediately under a
+ * session generation independent of later Switch Vault open/cancel actions.
+ * @param {string} newVaultKey
+ */
+async function commitAuthenticatedVaultKey(newVaultKey) {
+  clearPendingOtpAttempt();
+  const sessionGen = ++vaultSessionGeneration;
+  if (isSwitchingVault) {
+    resetVaultSessionState();
+  }
+  setVaultAccessKey(newVaultKey);
+  hideVaultGateScreen();
+  syncBrowserTimezone();
+  await Promise.all([loadStats(), loadCreators(), fetchReels()]);
+  if (sessionGen !== vaultSessionGeneration) return;
 }
 
 switchVaultBtn?.addEventListener('click', handleSwitchVault);
@@ -734,19 +754,7 @@ if (vaultOtpForm) {
       if (opGen !== vaultAuthGeneration) return;
 
       if (res.ok && data?.vaultKey) {
-        clearPendingOtpAttempt();
-        const wasSwitching = isSwitchingVault;
-        if (wasSwitching) {
-          resetVaultSessionState();
-        }
-        setVaultAccessKey(data.vaultKey);
-        hideVaultGateScreen();
-        syncBrowserTimezone();
-        await loadStats();
-        if (opGen !== vaultAuthGeneration) return;
-        await loadCreators();
-        if (opGen !== vaultAuthGeneration) return;
-        await fetchReels();
+        await commitAuthenticatedVaultKey(data.vaultKey);
       } else {
         // Keep the attempt key on transient 5xx/409/429 responses so retries replay cleanly;
         // clear it on terminal 400/422 rejections so the next submission starts fresh.
@@ -801,18 +809,7 @@ if (vaultKeyForm) {
       if (opGen !== vaultAuthGeneration) return;
 
       if (res.ok) {
-        const wasSwitching = isSwitchingVault;
-        if (wasSwitching) {
-          resetVaultSessionState();
-        }
-        setVaultAccessKey(entered);
-        hideVaultGateScreen();
-        syncBrowserTimezone();
-        await loadStats();
-        if (opGen !== vaultAuthGeneration) return;
-        await loadCreators();
-        if (opGen !== vaultAuthGeneration) return;
-        await fetchReels();
+        await commitAuthenticatedVaultKey(entered);
       } else {
         showVaultGateScreen('Invalid access key. Please check the link from your Instagram DM.');
       }
