@@ -1,4 +1,4 @@
-import { Repository, SenderDeletionBarrierError } from '../db/repository.ts';
+import { ArchiveImportTimeoutError, Repository, SenderDeletionBarrierError } from '../db/repository.ts';
 import type { Creator, SavedMediaType } from '../types.ts';
 import { formatCanonicalInstagramUrl, parseCanonicalInstagramMediaUrl } from '../utils/mediaType.ts';
 
@@ -66,8 +66,12 @@ export class ArchiveImportService {
   static async importArchive(
     input: unknown,
     senderId?: string,
-    expectedDeletionGeneration?: number
+    expectedDeletionGeneration?: number,
+    signal?: AbortSignal
   ): Promise<ArchiveImportResult> {
+    if (signal?.aborted) {
+      throw signal.reason instanceof ArchiveImportTimeoutError ? signal.reason : new ArchiveImportTimeoutError();
+    }
     const scopedSenderId = typeof senderId === 'string' && senderId.trim() ? senderId.trim() : undefined;
     if (
       scopedSenderId &&
@@ -369,15 +373,19 @@ export class ArchiveImportService {
         // Batch upsert creators (preserve existing shared creator metadata for non-admin user imports)
         const creatorMap = await Repository.upsertCreatorsBatch(Array.from(creatorsToUpsert.values()), {
           preserveExisting: Boolean(scopedSenderId),
+          signal,
         });
 
         const fallbackCreator = creatorMap.get(UNKNOWN_CREATOR_HANDLE);
         if (!fallbackCreator) {
-          const createdFallback = await Repository.upsertCreator({
-            instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
-            username: UNKNOWN_CREATOR_HANDLE,
-            display_name: null,
-          });
+          const createdFallback = await Repository.upsertCreator(
+            {
+              instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
+              username: UNKNOWN_CREATOR_HANDLE,
+              display_name: null,
+            },
+            { signal }
+          );
           creatorMap.set(UNKNOWN_CREATOR_HANDLE, createdFallback);
         }
 
@@ -455,6 +463,7 @@ export class ArchiveImportService {
           ignoreDuplicates: true,
           backfillMissingSavedAt: true,
           expectedDeletionGeneration: admissionDeletionGeneration,
+          signal,
         });
         reelsImported = batchResult.newlyImported;
         alreadyPresent = batchResult.alreadyPresent;
@@ -467,11 +476,11 @@ export class ArchiveImportService {
           }
         }
       } catch (batchErr: any) {
-        if (batchErr instanceof SenderDeletionBarrierError) {
+        if (batchErr instanceof SenderDeletionBarrierError || batchErr instanceof ArchiveImportTimeoutError) {
           throw batchErr;
         }
-        console.error('[ArchiveImport] Batch import error, attempting recovery:', batchErr.message);
-        errors.push(`Batch import error: ${batchErr.message || 'unknown error'}`);
+        console.error('[ArchiveImport] Batch import error, attempting recovery:', batchErr?.message || batchErr);
+        errors.push('Failed to import archive batch due to a temporary storage error. Please try again.');
       }
     }
 

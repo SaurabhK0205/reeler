@@ -600,6 +600,7 @@ function resetVaultSessionState() {
   gridThumbUnavailableShortcodes.clear();
   gridThumbRefreshedExpired.clear();
   gridThumbReplacedUrls.clear();
+  metaNoThumbExpiry.clear();
   if (fetchReelsAbortController) {
     fetchReelsAbortController.abort();
     fetchReelsAbortController = null;
@@ -2274,25 +2275,34 @@ function renderReels() {
         if (!card.isConnected) return;
         // One-shot refresh when a previously cached or DB-stored Instagram CDN URL expires
         const sc = reel.shortcode ? String(reel.shortcode).trim() : '';
-        if (
-          sc &&
-          !hasRefreshedGridThumb(sc, cleanThumbnail) &&
-          !gridThumbPendingRefresh.has(sc) &&
-          !isGridThumbUnavailable(sc)
-        ) {
-          gridThumbPendingRefresh.add(sc);
-          const cachedMeta = state.metaCache.get(sc);
-          if (cachedMeta && sanitizeMediaUrl(cachedMeta.thumbnailUrl) === cleanThumbnail) {
-            state.metaCache.delete(sc);
+        if (sc && !hasRefreshedGridThumb(sc, cleanThumbnail) && !isGridThumbUnavailable(sc)) {
+          if (gridThumbPendingRefresh.has(sc)) {
+            addGridThumbRefreshWaiter(sc, {
+              card,
+              reel,
+              shortcode: sc,
+              altText: posterAltText,
+              isPost,
+              bypassCache: false,
+              suppressRefreshRetry: true,
+              failedUrl: cleanThumbnail,
+              failedStoredUrl: rawCleanThumbnail || cleanThumbnail,
+            });
+          } else {
+            gridThumbPendingRefresh.add(sc);
+            const cachedMeta = state.metaCache.get(sc);
+            if (cachedMeta && sanitizeMediaUrl(cachedMeta.thumbnailUrl) === cleanThumbnail) {
+              state.metaCache.delete(sc);
+            }
+            if (rawCleanThumbnail && gridThumbReplacedUrls.get(rawCleanThumbnail) === cleanThumbnail) {
+              gridThumbReplacedUrls.delete(rawCleanThumbnail);
+            }
+            registerGridCardForThumbnailHydration(card, reel, posterAltText, isPost, {
+              bypassCache: true,
+              failedUrl: cleanThumbnail,
+              failedStoredUrl: rawCleanThumbnail || cleanThumbnail,
+            });
           }
-          if (rawCleanThumbnail && gridThumbReplacedUrls.get(rawCleanThumbnail) === cleanThumbnail) {
-            gridThumbReplacedUrls.delete(rawCleanThumbnail);
-          }
-          registerGridCardForThumbnailHydration(card, reel, posterAltText, isPost, {
-            bypassCache: true,
-            failedUrl: cleanThumbnail,
-            failedStoredUrl: rawCleanThumbnail || cleanThumbnail,
-          });
         }
       }, { once: true });
 
@@ -2586,6 +2596,7 @@ const metaInFlightMap = new Map();
 const MAX_CLIENT_META_CACHE = 500;
 let metaRefreshSeq = 0;
 const metaRefreshVersions = new Map();
+const metaNoThumbExpiry = new Map();
 let lastMetaRateLimitUntil = 0;
 
 /**
@@ -2594,18 +2605,31 @@ let lastMetaRateLimitUntil = 0;
  * @param {string} shortcode
  * @param {AbortSignal} [signal]
  * @param {'p' | 'reel'} [preferredType]
- * @param {{ bypassCache?: boolean }} [options]
+ * @param {{ bypassCache?: boolean, requireThumbnail?: boolean }} [options]
  * @returns {Promise<{ status: 'ok' | 'rate_limited' | 'transient_error' | 'aborted', data: { isClips: boolean | null, mediaKind: string, thumbAspectRatio: number | null, thumbnailUrl: string | null } | null, retryAfterMs: number }>}
  */
 async function fetchShortcodeMetaWithStatus(shortcode, signal, preferredType, options = {}) {
   const bypassCache = Boolean(options?.bypassCache);
+  const requireThumbnail = Boolean(options?.requireThumbnail);
   if (!shortcode) return { status: 'transient_error', data: null, retryAfterMs: 0 };
   if (signal?.aborted) return { status: 'aborted', data: null, retryAfterMs: 0 };
   if (!bypassCache && state.metaCache.has(shortcode)) {
-    return { status: 'ok', data: state.metaCache.get(shortcode), retryAfterMs: 0 };
+    const cached = state.metaCache.get(shortcode);
+    if (!requireThumbnail || cached?.thumbnailUrl) {
+      return { status: 'ok', data: cached, retryAfterMs: 0 };
+    }
+    const noThumbUntil = metaNoThumbExpiry.get(shortcode) || 0;
+    if (noThumbUntil > Date.now()) {
+      return { status: 'ok', data: cached, retryAfterMs: 0 };
+    }
+    metaNoThumbExpiry.delete(shortcode);
   }
 
-  const inFlightKey = bypassCache ? `refresh:${shortcode}` : shortcode;
+  const inFlightKey = bypassCache
+    ? `refresh:${shortcode}`
+    : requireThumbnail
+      ? `thumb:${shortcode}`
+      : shortcode;
   let entry = metaInFlightMap.get(inFlightKey);
   if (entry?.controller.signal.aborted) {
     metaInFlightMap.delete(inFlightKey);
@@ -2626,8 +2650,11 @@ async function fetchShortcodeMetaWithStatus(shortcode, signal, preferredType, op
         if (bypassCache) {
           params.set('refresh', '1');
         }
+        if (requireThumbnail) {
+          params.set('thumb', '1');
+        }
         const qs = params.toString() ? `?${params.toString()}` : '';
-        const fetchOpts = bypassCache
+        const fetchOpts = (bypassCache || requireThumbnail)
           ? { signal: controller.signal, cache: 'no-store' }
           : { signal: controller.signal };
         const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}/meta${qs}`, fetchOpts);
@@ -2649,7 +2676,7 @@ async function fetchShortcodeMetaWithStatus(shortcode, signal, preferredType, op
             ? startRefreshVersion > currentVersion
             : startRefreshVersion === currentVersion;
           if (shouldCommitCache) {
-            if (bypassCache) {
+            if (bypassCache && data.thumbnailUrl) {
               if (metaRefreshVersions.size >= MAX_CLIENT_META_CACHE && !metaRefreshVersions.has(shortcode)) {
                 const oldestVersionKey = metaRefreshVersions.keys().next().value;
                 if (oldestVersionKey) metaRefreshVersions.delete(oldestVersionKey);
@@ -2660,7 +2687,22 @@ async function fetchShortcodeMetaWithStatus(shortcode, signal, preferredType, op
               const oldestKey = state.metaCache.keys().next().value;
               if (oldestKey) state.metaCache.delete(oldestKey);
             }
-            state.metaCache.set(shortcode, data);
+            const existingClientCache = state.metaCache.get(shortcode);
+            const preserveExistingCover = Boolean(
+              !data.thumbnailUrl && existingClientCache?.thumbnailUrl
+            );
+            if (!preserveExistingCover) {
+              state.metaCache.set(shortcode, data);
+              if (data.thumbnailUrl) {
+                metaNoThumbExpiry.delete(shortcode);
+              } else {
+                if (metaNoThumbExpiry.size >= MAX_CLIENT_META_CACHE && !metaNoThumbExpiry.has(shortcode)) {
+                  const oldestNoThumb = metaNoThumbExpiry.keys().next().value;
+                  if (oldestNoThumb) metaNoThumbExpiry.delete(oldestNoThumb);
+                }
+                metaNoThumbExpiry.set(shortcode, Date.now() + GRID_THUMB_UNAVAILABLE_TTL_MS);
+              }
+            }
           }
         }
         return { status: 'ok', data, retryAfterMs: 0 };
@@ -2758,6 +2800,7 @@ let gridThumbQueuedCards = new WeakSet();
 const gridCardHydrationMap = new WeakMap();
 const gridThumbUnavailableShortcodes = new Map();
 const gridThumbPendingRefresh = new Set();
+const gridThumbWaitingCards = new Map();
 const gridThumbRefreshedExpired = new Set();
 const gridThumbReplacedUrls = new Map();
 
@@ -2781,7 +2824,63 @@ function resetGridThumbnailHydration() {
   gridThumbQueue.length = 0;
   gridThumbQueuedCards = new WeakSet();
   gridThumbPendingRefresh.clear();
+  gridThumbWaitingCards.clear();
   gridThumbActiveCount = 0;
+}
+
+/**
+ * Adds a duplicate grid card to wait for an already-pending cover refresh of the same shortcode.
+ * @param {string} shortcode
+ * @param {object} waiterEntry
+ */
+function addGridThumbRefreshWaiter(shortcode, waiterEntry) {
+  if (!shortcode || !waiterEntry?.card) return;
+  let waiters = gridThumbWaitingCards.get(shortcode);
+  if (!waiters) {
+    waiters = new Set();
+    gridThumbWaitingCards.set(shortcode, waiters);
+  }
+  waiters.add(waiterEntry);
+}
+
+/**
+ * Releases a pending refresh marker and either hydrates waiting duplicate cards, promotes a connected waiter,
+ * or clears waiters when the refresh failed.
+ * @param {string} shortcode
+ * @param {number} generation
+ * @param {{ loadedMeta?: object, promoteWaiter?: boolean }} [options]
+ */
+function releasePendingGridThumbRefresh(shortcode, generation, options = {}) {
+  gridThumbPendingRefresh.delete(shortcode);
+  const waiters = gridThumbWaitingCards.get(shortcode);
+  gridThumbWaitingCards.delete(shortcode);
+  if (!waiters || waiters.size === 0 || generation !== gridThumbGeneration) return;
+  if (options.loadedMeta) {
+    for (const waiter of waiters) {
+      if (waiter.card.isConnected && !waiter.card.classList.contains('has-thumbnail')) {
+        applyHydratedGridThumbnail(waiter, options.loadedMeta, generation);
+      }
+    }
+    return;
+  }
+  if (options.promoteWaiter && !isGridThumbUnavailable(shortcode)) {
+    const connected = Array.from(waiters).filter(
+      (w) => w.card.isConnected && !w.card.classList.contains('has-thumbnail')
+    );
+    if (connected.length > 0) {
+      const [leader, ...rest] = connected;
+      gridThumbPendingRefresh.add(shortcode);
+      if (rest.length > 0) {
+        gridThumbWaitingCards.set(shortcode, new Set(rest));
+      }
+      gridThumbQueuedCards.delete(leader.card);
+      registerGridCardForThumbnailHydration(leader.card, leader.reel, leader.altText, leader.isPost, {
+        bypassCache: true,
+        failedUrl: leader.failedUrl,
+        failedStoredUrl: leader.failedStoredUrl,
+      });
+    }
+  }
 }
 
 /**
@@ -2873,7 +2972,7 @@ function markRefreshedGridThumb(shortcode, failedUrl) {
  */
 function registerGridCardForThumbnailHydration(card, reel, altText, isPost, options = {}) {
   const shortcode = reel?.shortcode ? String(reel.shortcode).trim() : '';
-  if (!card || !shortcode || isGridThumbUnavailable(shortcode)) return;
+  if (!card || !shortcode) return;
   gridCardHydrationMap.set(card, {
     card,
     reel,
@@ -2881,12 +2980,13 @@ function registerGridCardForThumbnailHydration(card, reel, altText, isPost, opti
     altText,
     isPost,
     bypassCache: Boolean(options?.bypassCache),
+    suppressRefreshRetry: Boolean(options?.suppressRefreshRetry),
     failedUrl: options?.failedUrl || null,
     failedStoredUrl: options?.failedStoredUrl || null,
     retriedAfter429: false,
     retriedAfterError: false,
   });
-  if (state.viewMode !== 'grid' || !card.isConnected) return;
+  if (state.viewMode !== 'grid' || !card.isConnected || isGridThumbUnavailable(shortcode)) return;
   if (gridThumbnailObserver) {
     gridThumbnailObserver.observe(card);
   } else {
@@ -2896,27 +2996,27 @@ function registerGridCardForThumbnailHydration(card, reel, altText, isPost, opti
 
 /**
  * Applies a freshly resolved thumbnail URL to a grid poster card, keeping the monogram visible until the image paints.
- * @param {{ card: HTMLElement, reel: object, shortcode: string, altText: string, isPost: boolean, failedStoredUrl?: string | null }} entry
+ * @param {{ card: HTMLElement, reel: object, shortcode: string, altText: string, isPost: boolean, failedUrl?: string | null, failedStoredUrl?: string | null, bypassCache?: boolean, suppressRefreshRetry?: boolean }} entry
  * @param {{ thumbnailUrl?: string | null, isClips?: boolean | null }} meta
  * @param {number} generation
  */
 function applyHydratedGridThumbnail(entry, meta, generation) {
-  const { card, reel, shortcode, altText, isPost, failedUrl, failedStoredUrl, bypassCache } = entry;
+  const { card, reel, shortcode, altText, isPost, failedUrl, failedStoredUrl, bypassCache, suppressRefreshRetry } = entry;
   if (generation !== gridThumbGeneration) return;
   if (!card.isConnected) {
-    if (bypassCache) gridThumbPendingRefresh.delete(shortcode);
+    if (bypassCache) releasePendingGridThumbRefresh(shortcode, generation, { promoteWaiter: true });
     return;
   }
   const cleanUrl = sanitizeMediaUrl(meta?.thumbnailUrl);
   if (!cleanUrl || isPlaceholderMediaUrl(cleanUrl)) {
-    if (bypassCache) gridThumbPendingRefresh.delete(shortcode);
+    if (bypassCache) releasePendingGridThumbRefresh(shortcode, generation);
     markGridThumbUnavailable(shortcode);
     return;
   }
 
   const mediaBox = card.querySelector('.poster-media-box');
   if (!mediaBox) {
-    if (bypassCache) gridThumbPendingRefresh.delete(shortcode);
+    if (bypassCache) releasePendingGridThumbRefresh(shortcode, generation, { promoteWaiter: true });
     return;
   }
 
@@ -2934,8 +3034,8 @@ function applyHydratedGridThumbnail(entry, meta, generation) {
     if (revealed || generation !== gridThumbGeneration || !card.isConnected) return;
     revealed = true;
     if (bypassCache) {
-      gridThumbPendingRefresh.delete(shortcode);
       markRefreshedGridThumb(shortcode, failedUrl || failedStoredUrl);
+      releasePendingGridThumbRefresh(shortcode, generation, { loadedMeta: meta });
     }
     reel.thumbnail_url = cleanUrl;
     if (failedStoredUrl) {
@@ -2972,7 +3072,7 @@ function applyHydratedGridThumbnail(entry, meta, generation) {
     img.remove();
     if (generation !== gridThumbGeneration) return;
     if (bypassCache) {
-      gridThumbPendingRefresh.delete(shortcode);
+      releasePendingGridThumbRefresh(shortcode, generation);
     }
     if (!card.isConnected) return;
     card.classList.remove('has-thumbnail');
@@ -2980,10 +3080,24 @@ function applyHydratedGridThumbnail(entry, meta, generation) {
     card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
     if (
       !bypassCache &&
+      !suppressRefreshRetry &&
       !hasRefreshedGridThumb(shortcode, cleanUrl) &&
-      !gridThumbPendingRefresh.has(shortcode) &&
       !isGridThumbUnavailable(shortcode)
     ) {
+      if (gridThumbPendingRefresh.has(shortcode)) {
+        addGridThumbRefreshWaiter(shortcode, {
+          card,
+          reel,
+          shortcode,
+          altText,
+          isPost,
+          bypassCache: false,
+          suppressRefreshRetry: true,
+          failedUrl: cleanUrl,
+          failedStoredUrl: failedStoredUrl || null,
+        });
+        return;
+      }
       const cachedMeta = state.metaCache.get(shortcode);
       if (cachedMeta && sanitizeMediaUrl(cachedMeta.thumbnailUrl) === cleanUrl) {
         state.metaCache.delete(shortcode);
@@ -3041,13 +3155,13 @@ function drainGridThumbnailQueue() {
     const entry = gridThumbQueue.shift();
     if (!entry || !entry.card.isConnected || entry.card.classList.contains('has-thumbnail')) {
       if (entry?.bypassCache) {
-        gridThumbPendingRefresh.delete(entry.shortcode);
+        releasePendingGridThumbRefresh(entry.shortcode, generation, { promoteWaiter: true });
       }
       continue;
     }
     if (isGridThumbUnavailable(entry.shortcode)) {
       if (entry.bypassCache) {
-        gridThumbPendingRefresh.delete(entry.shortcode);
+        releasePendingGridThumbRefresh(entry.shortcode, generation);
       }
       continue;
     }
@@ -3055,12 +3169,15 @@ function drainGridThumbnailQueue() {
     gridThumbActiveCount++;
     const preferredType = entry.isPost ? 'p' : 'reel';
 
-    fetchShortcodeMetaWithStatus(entry.shortcode, signal, preferredType, { bypassCache: entry.bypassCache })
+    fetchShortcodeMetaWithStatus(entry.shortcode, signal, preferredType, {
+      bypassCache: entry.bypassCache,
+      requireThumbnail: true,
+    })
       .then((outcome) => {
         if (generation !== gridThumbGeneration) return;
         if (signal.aborted || outcome.status === 'aborted') {
           if (entry.bypassCache) {
-            gridThumbPendingRefresh.delete(entry.shortcode);
+            releasePendingGridThumbRefresh(entry.shortcode, generation);
           }
           return;
         }
@@ -3069,7 +3186,7 @@ function drainGridThumbnailQueue() {
             applyHydratedGridThumbnail(entry, outcome.data, generation);
           } else {
             if (entry.bypassCache) {
-              gridThumbPendingRefresh.delete(entry.shortcode);
+              releasePendingGridThumbRefresh(entry.shortcode, generation);
             }
             markGridThumbUnavailable(entry.shortcode);
           }
@@ -3080,7 +3197,7 @@ function drainGridThumbnailQueue() {
             entry.retriedAfter429 = true;
             gridThumbQueue.unshift(entry);
           } else if (entry.bypassCache) {
-            gridThumbPendingRefresh.delete(entry.shortcode);
+            releasePendingGridThumbRefresh(entry.shortcode, generation);
           }
           return;
         }
@@ -3091,7 +3208,7 @@ function drainGridThumbnailQueue() {
         } else {
           gridThumbQueuedCards.delete(entry.card);
           if (entry.bypassCache) {
-            gridThumbPendingRefresh.delete(entry.shortcode);
+            releasePendingGridThumbRefresh(entry.shortcode, generation);
           }
         }
       })

@@ -55,7 +55,7 @@ interface ResolveQueueWaiter {
   cleanup: () => void;
 }
 
-const feedMetaCache = new Map<string, { value: FeedMediaMetadata; expiresAt: number }>();
+const feedMetaCache = new Map<string, { value: FeedMediaMetadata; expiresAt: number; cachedAt: number }>();
 const feedMetaInFlight = new Map<string, InFlightMetaEntry>();
 let feedMetaRefreshSeq = 0;
 const feedMetaRefreshCommitVersions = new Map<string, number>();
@@ -975,7 +975,8 @@ export async function resolveFeedMediaMetadata(
   shortcode: string,
   signal?: AbortSignal,
   preferredPath?: 'reel' | 'p',
-  bypassCache = false
+  bypassCache = false,
+  requireThumbnail = false
 ): Promise<FeedMediaMetadata> {
   if (!isValidShortcode(shortcode)) {
     throw new Error('Invalid shortcode format');
@@ -988,9 +989,14 @@ export async function resolveFeedMediaMetadata(
   if (!bypassCache) {
     const cached = feedMetaCache.get(shortcode);
     if (cached && cached.expiresAt > now) {
-      return cached.value;
-    }
-    if (cached) {
+      if (!requireThumbnail || cached.value.thumbnailUrl) {
+        return cached.value;
+      }
+      // For thumbnail-requiring grid lookups, honor only the short negative TTL on coverless classification entries
+      if (cached.cachedAt + META_NEGATIVE_CACHE_TTL_MS > now) {
+        return cached.value;
+      }
+    } else if (cached) {
       feedMetaCache.delete(shortcode);
     }
   }
@@ -1032,13 +1038,17 @@ export async function resolveFeedMediaMetadata(
 
         if (!controller.signal.aborted) {
           const hasUsefulMeta = Boolean(thumbnailUrl || isClips !== null);
+          const hasCover = Boolean(thumbnailUrl);
           const existingCached = feedMetaCache.get(shortcode);
+          const hasUnexpiredCached = Boolean(existingCached && existingCached.expiresAt > Date.now());
           const hasUnexpiredUsefulCached = Boolean(
-            existingCached &&
-            existingCached.expiresAt > Date.now() &&
-            (existingCached.value.thumbnailUrl || existingCached.value.isClips !== null)
+            hasUnexpiredCached &&
+            (existingCached!.value.thumbnailUrl || existingCached!.value.isClips !== null)
           );
-          if (bypassCache && !hasUsefulMeta && hasUnexpiredUsefulCached) {
+          const hasUnexpiredCoverCached = Boolean(hasUnexpiredCached && existingCached!.value.thumbnailUrl);
+          // Preserve an unexpired cover when a refresh finds no cover (empty or classification-only),
+          // and preserve unexpired useful metadata when a refresh returns completely empty.
+          if (bypassCache && ((!hasCover && hasUnexpiredCoverCached) || (!hasUsefulMeta && hasUnexpiredUsefulCached))) {
             return result;
           }
           const latestRefreshVersion = feedMetaRefreshCommitVersions.get(shortcode) ?? 0;
@@ -1046,7 +1056,9 @@ export async function resolveFeedMediaMetadata(
             ? startRefreshVersion > latestRefreshVersion
             : startRefreshVersion === latestRefreshVersion;
           if (shouldWriteCache) {
-            if (bypassCache) {
+            // Only advance refresh commit version when a refresh finds an actual cover so an empty
+            // or coverless refresh cannot prevent an overlapping ordinary lookup from caching a cover.
+            if (bypassCache && hasCover) {
               if (
                 feedMetaRefreshCommitVersions.size >= META_CACHE_MAX_ENTRIES &&
                 !feedMetaRefreshCommitVersions.has(shortcode)
@@ -1060,9 +1072,11 @@ export async function resolveFeedMediaMetadata(
               const oldestKey = feedMetaCache.keys().next().value;
               if (oldestKey) feedMetaCache.delete(oldestKey);
             }
+            const writeNow = Date.now();
             feedMetaCache.set(shortcode, {
               value: result,
-              expiresAt: Date.now() + (hasUsefulMeta ? META_CACHE_TTL_MS : META_NEGATIVE_CACHE_TTL_MS),
+              cachedAt: writeNow,
+              expiresAt: writeNow + (hasUsefulMeta ? META_CACHE_TTL_MS : META_NEGATIVE_CACHE_TTL_MS),
             });
           }
         }

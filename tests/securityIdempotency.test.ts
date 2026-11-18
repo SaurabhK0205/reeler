@@ -1883,3 +1883,136 @@ test('Archive Import - authenticated vault users import into isolated sender vau
     else process.env.SUPABASE_SERVICE_ROLE_KEY = origSupabaseKey;
   }
 });
+
+test('Archive Import - rejects non-JSON media types with 415, enforces bounded execution deadline, and sanitizes batch DB errors', async () => {
+  const origEnv = process.env.NODE_ENV;
+  const origVaultSecret = process.env.VAULT_SECRET;
+  const origSupabaseUrl = process.env.SUPABASE_URL;
+  const origSupabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  process.env.NODE_ENV = 'test';
+  process.env.VAULT_SECRET = 'archive-hardening-secret-key';
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  Repository.resetMemoryStoreForTests();
+  Repository.resetDeletionTimestampsForTesting();
+  resetApiRateLimitersForTesting();
+  clearIdempotencyStoreForTesting();
+
+  let preParseHits = 0;
+  const app = createApp({
+    archiveImportExecutionTimeoutMs: 120,
+    onArchiveImportPreParse: () => {
+      preParseHits++;
+    },
+  });
+
+  const payload = {
+    saved_saved_media: [
+      {
+        title: 'hardening_creator',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/reel/HardenReel01/',
+            timestamp: 1710000000,
+          },
+        },
+      },
+    ],
+  };
+
+  const user1Key = generateUserVaultKey('user_harden_1');
+  const user2Key = generateUserVaultKey('user_harden_2');
+  const user3Key = generateUserVaultKey('user_harden_3');
+  const origUpsertBatch = Repository.upsertSavedReelsBatch;
+
+  try {
+    await withServer(app, async (baseUrl) => {
+      // 1. Non-JSON Content-Type (and suffix types not parsed by express.json) rejected with sanitized 415 BEFORE admission
+      const textPlainRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain', 'X-Vault-Key': user1Key },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(textPlainRes.status, 415, 'text/plain archive import must return HTTP 415');
+      const vndJsonRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/vnd.archive+json', 'X-Vault-Key': user1Key },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(vndJsonRes.status, 415, 'application/vnd.archive+json must return HTTP 415 to match express.json');
+      assert.equal(preParseHits, 0, 'Unsupported media type must be rejected before admission/scheduler');
+
+      // 2. Stalled DB work hits execution deadline -> 504, cancels work, releases slot only after abort settles
+      let stalledAborted = false;
+      let stallOnce = true;
+      Repository.upsertSavedReelsBatch = (async (reels, opts) => {
+        if (stallOnce) {
+          stallOnce = false;
+          await new Promise<void>((resolve) => {
+            if (opts?.signal?.aborted) {
+              stalledAborted = true;
+              resolve();
+              return;
+            }
+            opts?.signal?.addEventListener(
+              'abort',
+              () => {
+                stalledAborted = true;
+                resolve();
+              },
+              { once: true }
+            );
+          });
+        }
+        return origUpsertBatch.call(Repository, reels, opts);
+      }) as typeof Repository.upsertSavedReelsBatch;
+
+      const timedOutRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': user1Key },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(timedOutRes.status, 504, 'Stalled archive import must time out with HTTP 504');
+      assert.equal(stalledAborted, true, 'Execution deadline must signal abort to active DB work before releasing slot');
+
+      // Next vault must immediately succeed once the timed-out import settles and releases its slot
+      const followUpRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': user2Key },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(followUpRes.status, 200, 'Follow-up vault import must succeed after timed-out import releases slot');
+
+      // 3. Batch DB error must be sanitized and never leak internal Postgres table/column details
+      Repository.upsertSavedReelsBatch = (async () => {
+        throw new Error('Failed to query existing shortcodes: relation "saved_reels" column "internal_secret_col" does not exist');
+      }) as typeof Repository.upsertSavedReelsBatch;
+
+      const errRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': user3Key },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(errRes.status, 500);
+      const errBody = await errRes.json();
+      const serialized = JSON.stringify(errBody);
+      assert.equal(serialized.includes('saved_reels'), false, 'Response must not leak internal table names');
+      assert.equal(serialized.includes('internal_secret_col'), false, 'Response must not leak internal column names');
+    });
+  } finally {
+    Repository.upsertSavedReelsBatch = origUpsertBatch;
+    Repository.resetMemoryStoreForTests();
+    Repository.resetDeletionTimestampsForTesting();
+    resetApiRateLimitersForTesting();
+    clearIdempotencyStoreForTesting();
+    if (origEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = origEnv;
+    if (origVaultSecret === undefined) delete process.env.VAULT_SECRET;
+    else process.env.VAULT_SECRET = origVaultSecret;
+    if (origSupabaseUrl === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = origSupabaseUrl;
+    if (origSupabaseKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = origSupabaseKey;
+  }
+});
