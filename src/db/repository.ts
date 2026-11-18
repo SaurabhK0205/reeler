@@ -849,7 +849,8 @@ export class Repository {
     username: string;
     display_name?: string | null;
     profile_picture_url?: string | null;
-  }): Promise<Creator> {
+  }, options?: { signal?: AbortSignal }): Promise<Creator> {
+    assertImportNotAborted(options?.signal);
     Repository.invalidateCreatorsCache();
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertCreator(data);
@@ -857,20 +858,24 @@ export class Repository {
 
     const supabase = getSupabase();
     try {
-      const { data: creator, error } = await supabase
-        .from('creators')
-        .upsert(
-          {
-            instagram_user_id: data.instagram_user_id,
-            username: data.username,
-            display_name: data.display_name,
-            profile_picture_url: data.profile_picture_url,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: 'instagram_user_id' }
-        )
-        .select()
-        .single();
+      const { data: creator, error } = await applyAbortSignal(
+        supabase
+          .from('creators')
+          .upsert(
+            {
+              instagram_user_id: data.instagram_user_id,
+              username: data.username,
+              display_name: data.display_name,
+              profile_picture_url: data.profile_picture_url,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'instagram_user_id' }
+          )
+          .select()
+          .single(),
+        options?.signal
+      );
+      assertImportNotAborted(options?.signal);
 
       if (error || !creator) {
         throw new Error(`Supabase upsertCreator failed: ${error?.message || 'unknown error'}`);
@@ -1233,7 +1238,7 @@ export class Repository {
           for (const c of chunk) {
             assertImportNotAborted(signal);
             try {
-              const single = await this.upsertCreator(c);
+              const single = await this.upsertCreator(c, { signal });
               result.set(single.username, single);
             } catch (err: any) {
               if (err instanceof ArchiveImportTimeoutError) throw err;
@@ -1525,16 +1530,19 @@ export class Repository {
         assertImportNotAborted(signal);
         const incomingSender = item.instagram_sender_id ? String(item.instagram_sender_id).trim() || null : null;
 
-        let existingRow: {
+        type ReconcileRow = {
           id: string;
+          instagram_media_id: string;
           saved_at: string | null;
           is_saved_on_instagram: boolean;
-        } | null = null;
+        };
+
+        let existingRow: ReconcileRow | null = null;
 
         const { data: byMedia, error: byMediaErr } = await applyAbortSignal(
           supabase
             .from('saved_reels')
-            .select('id, saved_at, is_saved_on_instagram')
+            .select('id, instagram_media_id, instagram_sender_id, saved_at, is_saved_on_instagram')
             .eq('instagram_media_id', item.instagram_media_id)
             .maybeSingle(),
           signal
@@ -1544,15 +1552,21 @@ export class Repository {
           throw new Error(`Failed to resolve conflicting reel by media id: ${byMediaErr.message}`);
         }
         if (byMedia) {
+          const rowSender = byMedia.instagram_sender_id ? String(byMedia.instagram_sender_id).trim() || null : null;
+          if (rowSender !== incomingSender) {
+            // Incompatible owner collision on instagram_media_id: never update or miscount a foreign row
+            return false;
+          }
           existingRow = {
             id: String(byMedia.id),
+            instagram_media_id: String(byMedia.instagram_media_id),
             saved_at: byMedia.saved_at ? String(byMedia.saved_at) : null,
             is_saved_on_instagram: byMedia.is_saved_on_instagram !== false,
           };
         } else {
           let bySenderQuery = supabase
             .from('saved_reels')
-            .select('id, saved_at, is_saved_on_instagram')
+            .select('id, instagram_media_id, saved_at, is_saved_on_instagram')
             .eq('shortcode', item.shortcode);
           bySenderQuery = incomingSender
             ? bySenderQuery.eq('instagram_sender_id', incomingSender)
@@ -1568,6 +1582,7 @@ export class Repository {
           if (bySender) {
             existingRow = {
               id: String(bySender.id),
+              instagram_media_id: String(bySender.instagram_media_id),
               saved_at: bySender.saved_at ? String(bySender.saved_at) : null,
               is_saved_on_instagram: bySender.is_saved_on_instagram !== false,
             };
@@ -1579,11 +1594,16 @@ export class Repository {
         }
 
         alreadyPresent++;
-        const shouldPromote = item.is_saved_on_instagram !== false && existingRow.is_saved_on_instagram === false;
-        const shouldBackfill = Boolean(
-          options?.backfillMissingSavedAt && item.saved_at && shouldBackfillSavedAt(existingRow, item.saved_at)
-        );
-        if (shouldPromote || shouldBackfill) {
+        let currentRow: ReconcileRow = existingRow;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const shouldPromote = item.is_saved_on_instagram !== false && currentRow.is_saved_on_instagram === false;
+          const shouldBackfill = Boolean(
+            options?.backfillMissingSavedAt && item.saved_at && shouldBackfillSavedAt(currentRow, item.saved_at)
+          );
+          if (!shouldPromote && !shouldBackfill) {
+            break;
+          }
+
           const payload: Record<string, any> = {
             updated_at: new Date().toISOString(),
           };
@@ -1594,13 +1614,14 @@ export class Repository {
             payload.saved_at = item.saved_at;
             payload.save_order_rank = item.save_order_rank;
           }
+
           const isPromoteOnly = shouldPromote && !shouldBackfill;
           if (isPromoteOnly) {
             const { data: updatedRows, error: updateErr } = await applyAbortSignal(
               supabase
                 .from('saved_reels')
                 .update(payload)
-                .eq('id', existingRow.id)
+                .eq('id', currentRow.id)
                 .eq('is_saved_on_instagram', false)
                 .select('id'),
               signal
@@ -1612,21 +1633,55 @@ export class Repository {
             if ((updatedRows?.length ?? 0) > 0) {
               promotedToSaved++;
             }
-          } else {
-            const { error: updateErr } = await applyAbortSignal(
-              supabase
-                .from('saved_reels')
-                .update(payload)
-                .eq('id', existingRow.id),
-              signal
-            );
-            assertImportNotAborted(signal);
-            if (updateErr) {
-              throw new Error(`Failed to backfill conflicting archive reel: ${updateErr.message}`);
-            }
+            break;
+          }
+
+          // Guard saved_at backfill against concurrent changes since lookup (CAS on observed saved_at)
+          let conditionalUpdate = supabase
+            .from('saved_reels')
+            .update(payload)
+            .eq('id', currentRow.id);
+          conditionalUpdate =
+            currentRow.saved_at === null
+              ? conditionalUpdate.is('saved_at', null)
+              : conditionalUpdate.eq('saved_at', currentRow.saved_at);
+
+          const { data: updatedRows, error: updateErr } = await applyAbortSignal(
+            conditionalUpdate.select('id'),
+            signal
+          );
+          assertImportNotAborted(signal);
+          if (updateErr) {
+            throw new Error(`Failed to backfill conflicting archive reel: ${updateErr.message}`);
+          }
+          if ((updatedRows?.length ?? 0) > 0) {
             if (shouldPromote) promotedToSaved++;
             if (shouldBackfill) savedAtBackfilled++;
+            break;
           }
+
+          // Observed saved_at changed concurrently: re-read current row and re-evaluate backfill/promotion
+          const { data: refreshed, error: refreshErr } = await applyAbortSignal(
+            supabase
+              .from('saved_reels')
+              .select('id, instagram_media_id, saved_at, is_saved_on_instagram')
+              .eq('id', currentRow.id)
+              .maybeSingle(),
+            signal
+          );
+          assertImportNotAborted(signal);
+          if (refreshErr) {
+            throw new Error(`Failed to re-read conflicting archive reel: ${refreshErr.message}`);
+          }
+          if (!refreshed) {
+            break;
+          }
+          currentRow = {
+            id: String(refreshed.id),
+            instagram_media_id: String(refreshed.instagram_media_id),
+            saved_at: refreshed.saved_at ? String(refreshed.saved_at) : null,
+            is_saved_on_instagram: refreshed.is_saved_on_instagram !== false,
+          };
         }
         return true;
       };

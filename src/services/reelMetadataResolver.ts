@@ -55,7 +55,7 @@ interface ResolveQueueWaiter {
   cleanup: () => void;
 }
 
-const feedMetaCache = new Map<string, { value: FeedMediaMetadata; expiresAt: number }>();
+const feedMetaCache = new Map<string, { value: FeedMediaMetadata; expiresAt: number; cachedAt: number }>();
 const feedMetaInFlight = new Map<string, InFlightMetaEntry>();
 let feedMetaRefreshSeq = 0;
 const feedMetaRefreshCommitVersions = new Map<string, number>();
@@ -975,7 +975,8 @@ export async function resolveFeedMediaMetadata(
   shortcode: string,
   signal?: AbortSignal,
   preferredPath?: 'reel' | 'p',
-  bypassCache = false
+  bypassCache = false,
+  requireThumbnail = false
 ): Promise<FeedMediaMetadata> {
   if (!isValidShortcode(shortcode)) {
     throw new Error('Invalid shortcode format');
@@ -988,9 +989,14 @@ export async function resolveFeedMediaMetadata(
   if (!bypassCache) {
     const cached = feedMetaCache.get(shortcode);
     if (cached && cached.expiresAt > now) {
-      return cached.value;
-    }
-    if (cached) {
+      if (!requireThumbnail || cached.value.thumbnailUrl) {
+        return cached.value;
+      }
+      // For thumbnail-requiring grid lookups, honor only the short negative TTL on coverless classification entries
+      if (cached.cachedAt + META_NEGATIVE_CACHE_TTL_MS > now) {
+        return cached.value;
+      }
+    } else if (cached) {
       feedMetaCache.delete(shortcode);
     }
   }
@@ -1066,9 +1072,11 @@ export async function resolveFeedMediaMetadata(
               const oldestKey = feedMetaCache.keys().next().value;
               if (oldestKey) feedMetaCache.delete(oldestKey);
             }
+            const writeNow = Date.now();
             feedMetaCache.set(shortcode, {
               value: result,
-              expiresAt: Date.now() + (hasUsefulMeta ? META_CACHE_TTL_MS : META_NEGATIVE_CACHE_TTL_MS),
+              cachedAt: writeNow,
+              expiresAt: writeNow + (hasUsefulMeta ? META_CACHE_TTL_MS : META_NEGATIVE_CACHE_TTL_MS),
             });
           }
         }

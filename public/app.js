@@ -2625,7 +2625,11 @@ async function fetchShortcodeMetaWithStatus(shortcode, signal, preferredType, op
     metaNoThumbExpiry.delete(shortcode);
   }
 
-  const inFlightKey = bypassCache ? `refresh:${shortcode}` : shortcode;
+  const inFlightKey = bypassCache
+    ? `refresh:${shortcode}`
+    : requireThumbnail
+      ? `thumb:${shortcode}`
+      : shortcode;
   let entry = metaInFlightMap.get(inFlightKey);
   if (entry?.controller.signal.aborted) {
     metaInFlightMap.delete(inFlightKey);
@@ -2646,8 +2650,11 @@ async function fetchShortcodeMetaWithStatus(shortcode, signal, preferredType, op
         if (bypassCache) {
           params.set('refresh', '1');
         }
+        if (requireThumbnail) {
+          params.set('thumb', '1');
+        }
         const qs = params.toString() ? `?${params.toString()}` : '';
-        const fetchOpts = bypassCache
+        const fetchOpts = (bypassCache || requireThumbnail)
           ? { signal: controller.signal, cache: 'no-store' }
           : { signal: controller.signal };
         const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}/meta${qs}`, fetchOpts);

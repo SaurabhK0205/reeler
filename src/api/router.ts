@@ -365,13 +365,29 @@ apiRouter.get('/reels/:shortcode/meta', metaRateLimiter.middleware, async (req: 
       res.status(400).json({ error: 'Invalid refresh query parameter' });
       return;
     }
+    const rawThumb = req.query.thumb;
+    if (rawThumb !== undefined && typeof rawThumb !== 'string') {
+      res.status(400).json({ error: 'Invalid thumb query parameter' });
+      return;
+    }
     const bypassCache = rawRefresh === '1';
+    const requireThumbnail = rawThumb === '1';
 
-    const meta = await resolveFeedMediaMetadata(shortcode, controller.signal, preferredPath, bypassCache);
+    const meta = await resolveFeedMediaMetadata(
+      shortcode,
+      controller.signal,
+      preferredPath,
+      bypassCache,
+      requireThumbnail
+    );
     if (controller.signal.aborted || res.writableEnded) {
       return;
     }
-    res.setHeader('Cache-Control', bypassCache ? 'no-store' : feedMetaCacheControl(meta));
+    const cacheControl =
+      bypassCache || (requireThumbnail && !meta.thumbnailUrl)
+        ? 'no-store'
+        : feedMetaCacheControl(meta);
+    res.setHeader('Cache-Control', cacheControl);
     res.json(meta);
   } catch (error: any) {
     if (controller.signal.aborted || res.writableEnded) {

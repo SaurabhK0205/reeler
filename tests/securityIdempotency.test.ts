@@ -1928,13 +1928,19 @@ test('Archive Import - rejects non-JSON media types with 415, enforces bounded e
 
   try {
     await withServer(app, async (baseUrl) => {
-      // 1. Non-JSON Content-Type rejected with sanitized 415 BEFORE admission/parser/scheduler
+      // 1. Non-JSON Content-Type (and suffix types not parsed by express.json) rejected with sanitized 415 BEFORE admission
       const textPlainRes = await fetch(`${baseUrl}/api/archive/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain', 'X-Vault-Key': user1Key },
         body: JSON.stringify(payload),
       });
       assert.equal(textPlainRes.status, 415, 'text/plain archive import must return HTTP 415');
+      const vndJsonRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/vnd.archive+json', 'X-Vault-Key': user1Key },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(vndJsonRes.status, 415, 'application/vnd.archive+json must return HTTP 415 to match express.json');
       assert.equal(preParseHits, 0, 'Unsupported media type must be rejected before admission/scheduler');
 
       // 2. Stalled DB work hits execution deadline -> 504, cancels work, releases slot only after abort settles

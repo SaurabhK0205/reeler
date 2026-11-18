@@ -378,11 +378,14 @@ export class ArchiveImportService {
 
         const fallbackCreator = creatorMap.get(UNKNOWN_CREATOR_HANDLE);
         if (!fallbackCreator) {
-          const createdFallback = await Repository.upsertCreator({
-            instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
-            username: UNKNOWN_CREATOR_HANDLE,
-            display_name: null,
-          });
+          const createdFallback = await Repository.upsertCreator(
+            {
+              instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
+              username: UNKNOWN_CREATOR_HANDLE,
+              display_name: null,
+            },
+            { signal }
+          );
           creatorMap.set(UNKNOWN_CREATOR_HANDLE, createdFallback);
         }
 

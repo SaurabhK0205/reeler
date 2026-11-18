@@ -277,7 +277,7 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     next: express.NextFunction
   ) {
     const contentType = req.headers['content-type'];
-    if (!contentType || !req.is(['application/json', 'application/*+json'])) {
+    if (!contentType || !req.is('application/json')) {
       res.status(415).json({
         success: false,
         error: 'Unsupported Media Type. Archive imports require Content-Type: application/json.',
