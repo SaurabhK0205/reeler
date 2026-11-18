@@ -28,6 +28,7 @@ import {
   verifyOtp,
 } from '../src/services/vaultAuthService.ts';
 import { apiRouter, resetApiRateLimitersForTesting } from '../src/api/router.ts';
+import { createApp } from '../src/server.ts';
 import { MetaInstagramBotService } from '../src/services/metaInstagramBotService.ts';
 import { Repository } from '../src/db/repository.ts';
 
@@ -1353,7 +1354,7 @@ test('MetadataResolver - falls back to secondary crawler User-Agent when primary
   }
 });
 
-test('Archive Import - authenticated vault users import into isolated sender vaults while blocking anonymous and deleting senders', async () => {
+test('Archive Import - authenticated vault users import into isolated sender vaults while blocking anonymous, subpath bypasses, shared creator overwrites, and deleting senders', async () => {
   const origEnv = process.env.NODE_ENV;
   const origVaultSecret = process.env.VAULT_SECRET;
   const origSupabaseUrl = process.env.SUPABASE_URL;
@@ -1363,23 +1364,17 @@ test('Archive Import - authenticated vault users import into isolated sender vau
   delete process.env.SUPABASE_URL;
   delete process.env.SUPABASE_SERVICE_ROLE_KEY;
   Repository.resetMemoryStoreForTests();
+  Repository.resetDeletionTimestampsForTesting();
   resetApiRateLimitersForTesting();
   clearIdempotencyStoreForTesting();
 
   try {
-    let parserCalled = false;
-    const app = express();
-    app.use(
-      '/api/archive/import',
-      vaultAuthMiddleware,
-      (_req, _res, next) => {
-        parserCalled = true;
-        next();
+    let preParseCalls = 0;
+    const app = createApp({
+      onArchiveImportPreParse: () => {
+        preParseCalls++;
       },
-      express.json({ limit: '50mb' })
-    );
-    app.use(express.json({ limit: '1mb' }));
-    app.use('/api', apiRouter);
+    });
 
     const payload = {
       saved_saved_media: [
@@ -1393,22 +1388,30 @@ test('Archive Import - authenticated vault users import into isolated sender vau
           },
         },
         {
-          title: 'creator_two',
-          string_map_data: {
-            'Saved on': {
-              href: 'https://www.instagram.com/p/SharedPostImp2/',
-              timestamp: 1700000200,
+          label_values: [
+            { label: 'URL', href: 'https://www.instagram.com/p/SharedPostImp2/' },
+            {
+              title: 'Owner',
+              dict: [
+                {
+                  dict: [
+                    { label: 'Username', value: 'creator_one' },
+                    { label: 'Name', value: 'Spoofed Display Name' },
+                  ],
+                },
+              ],
             },
-          },
+          ],
+          timestamp: 1700000200,
         },
       ],
     };
 
-    // Seed a bot-sent DM reel for user A so archive import should promote it to Saved on IG
+    // Seed shared creator with an authoritative display name + a bot-sent DM reel for user A
     const seedCreator = await Repository.upsertCreator({
       instagram_user_id: 'creator_creator_one',
       username: 'creator_one',
-      display_name: 'creator_one',
+      display_name: 'Official Creator Name',
     });
     await Repository.upsertSavedReel({
       instagram_media_id: 'dm_user_import_a_SharedUserImp1',
@@ -1426,33 +1429,51 @@ test('Archive Import - authenticated vault users import into isolated sender vau
     });
 
     await withServer(app, async (baseUrl) => {
-      // 1. Anonymous request rejected with 401 BEFORE 50MB JSON body parser runs
+      // 1a. Anonymous POST /api/archive/import rejected with 401 BEFORE guard/50MB parser runs
       const anonRes = await fetch(`${baseUrl}/api/archive/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
       assert.equal(anonRes.status, 401);
-      assert.equal(parserCalled, false, 'Anonymous archive import must be rejected before body parser');
+      assert.equal(preParseCalls, 0, 'Anonymous archive import must be rejected before guard/body parser');
+
+      // 1b. Anonymous subpath probe /api/archive/import/health must NOT bypass auth or hit import guard
+      const subpathBypassRes = await fetch(`${baseUrl}/api/archive/import/health`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(subpathBypassRes.status, 401);
+      assert.equal(preParseCalls, 0, 'Subpath /api/archive/import/health must not reach archive import guard/parser');
 
       const userAKey = generateUserVaultKey('user_import_a');
       const userBKey = generateUserVaultKey('user_import_b');
+      const user123Key = generateUserVaultKey('123');
       const deletingKey = generateUserVaultKey('user_import_deleting');
 
-      // 2. User A imports archive: promotes their DM reel + imports second item into User A's vault only
+      // 2. User A imports archive: promotes their DM reel + imports second item without overwriting shared creator name
       const userARes = await fetch(`${baseUrl}/api/archive/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Vault-Key': userAKey },
         body: JSON.stringify(payload),
       });
       assert.equal(userARes.status, 200);
-      assert.equal(parserCalled, true);
+      assert.equal(preParseCalls, 1);
       const userABody = await userARes.json();
       assert.equal(userABody.success, true);
       assert.equal(userABody.reelsImported, 1);
       assert.equal(userABody.alreadyPresent, 1);
       assert.equal(userABody.promotedToSaved, 1);
       assert.equal(userABody.savedAtBackfilled, 1);
+
+      const creatorsAfterUserA = await Repository.getCreators();
+      const creatorOne = creatorsAfterUserA.find((c) => c.username === 'creator_one');
+      assert.equal(
+        creatorOne?.display_name,
+        'Official Creator Name',
+        'Regular user archive import must not overwrite existing shared creator display_name'
+      );
 
       // User B sees 0 items before importing
       const userBReelsBefore = await (await fetch(`${baseUrl}/api/reels`, {
@@ -1478,7 +1499,48 @@ test('Archive Import - authenticated vault users import into isolated sender vau
       assert.equal(userBReelsAfter.total, 2);
       assert.ok(userBReelsAfter.reels.every((r: any) => r.instagram_sender_id === 'user_import_b'));
 
-      // 4. Sender under active deletion barrier receives 409 and no rows are inserted
+      // 4. Disjoint media ID namespace: unattributed shortcode "123_Clip" vs sender "123" shortcode "Clip"
+      const adminUnderscoreRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': getAdminVaultKey() },
+        body: JSON.stringify({
+          saved_saved_media: [
+            {
+              title: 'creator_one',
+              string_map_data: {
+                'Saved on': { href: 'https://www.instagram.com/reel/123_Clip/', timestamp: 1700000300 },
+              },
+            },
+          ],
+        }),
+      });
+      assert.equal(adminUnderscoreRes.status, 200);
+
+      const user123Res = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': user123Key },
+        body: JSON.stringify({
+          saved_saved_media: [
+            {
+              title: 'creator_one',
+              string_map_data: {
+                'Saved on': { href: 'https://www.instagram.com/reel/Clip/', timestamp: 1700000400 },
+              },
+            },
+          ],
+        }),
+      });
+      assert.equal(user123Res.status, 200);
+      const user123Body = await user123Res.json();
+      assert.equal(user123Body.reelsImported, 1, 'Sender 123 importing Clip must not collide with unattributed 123_Clip');
+
+      const user123Reels = await (await fetch(`${baseUrl}/api/reels`, {
+        headers: { 'X-Vault-Key': user123Key },
+      })).json();
+      assert.equal(user123Reels.total, 1);
+      assert.equal(user123Reels.reels[0].instagram_media_id, 'user_export:123:Clip');
+
+      // 5. Sender under active deletion barrier receives 409 and no rows are inserted
       Repository.recordSenderDeletion('user_import_deleting');
       const deletingRes = await fetch(`${baseUrl}/api/archive/import`, {
         method: 'POST',
@@ -1492,7 +1554,58 @@ test('Archive Import - authenticated vault users import into isolated sender vau
       })).json();
       assert.equal(deletingReels.total, 0);
 
-      // 5. Admin import continues to work cleanly into the unattributed admin vault
+      // 6. Concurrent deletion waits for in-flight archive batch writes so zero rows survive
+      const raceSender = 'user_import_race_del';
+      const origWait = Repository.waitForInFlightReelWrites;
+      let sawInFlightWrite = false;
+      Repository.waitForInFlightReelWrites = async (senderId: string) => {
+        if (senderId === raceSender) sawInFlightWrite = true;
+        return origWait.call(Repository, senderId);
+      };
+      try {
+        const batchWritePromise = Repository.upsertSavedReelsBatch(
+          [
+            {
+              instagram_media_id: `user_export:${raceSender}:RaceClip1`,
+              shortcode: 'RaceClip1',
+              reel_url: 'https://www.instagram.com/reel/RaceClip1/',
+              media_type: 'reel',
+              creator_id: seedCreator.id,
+              taken_at: '2026-01-01T00:00:00.000Z',
+              saved_at: '2026-01-01T00:00:00.000Z',
+              first_detected_at: '2026-01-01T00:00:00.000Z',
+              save_order_rank: 1,
+              watch_status: 'unwatched',
+              is_saved_on_instagram: true,
+              instagram_sender_id: raceSender,
+            },
+            {
+              instagram_media_id: `user_export:${raceSender}:RaceClip2`,
+              shortcode: 'RaceClip2',
+              reel_url: 'https://www.instagram.com/reel/RaceClip2/',
+              media_type: 'reel',
+              creator_id: seedCreator.id,
+              taken_at: '2026-01-01T00:00:00.000Z',
+              saved_at: '2026-01-01T00:00:00.000Z',
+              first_detected_at: '2026-01-01T00:00:00.000Z',
+              save_order_rank: 2,
+              watch_status: 'unwatched',
+              is_saved_on_instagram: true,
+              instagram_sender_id: raceSender,
+            },
+          ],
+          { ignoreDuplicates: true }
+        );
+        const deletePromise = Repository.deleteUserDataForSender(raceSender);
+        await Promise.allSettled([batchWritePromise, deletePromise]);
+        assert.equal(sawInFlightWrite, true, 'deleteUserDataForSender must coordinate with waitForInFlightReelWrites');
+        const surviving = await Repository.getReels({ instagramSenderId: raceSender, page: 1, limit: 20 });
+        assert.equal(surviving.total, 0, 'Zero sender rows may survive concurrent archive import + deletion');
+      } finally {
+        Repository.waitForInFlightReelWrites = origWait;
+      }
+
+      // 7. Admin import continues to work cleanly into the unattributed admin vault
       const adminRes = await fetch(`${baseUrl}/api/archive/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Vault-Key': getAdminVaultKey() },
@@ -1505,6 +1618,7 @@ test('Archive Import - authenticated vault users import into isolated sender vau
     });
   } finally {
     Repository.resetMemoryStoreForTests();
+    Repository.resetDeletionTimestampsForTesting();
     resetApiRateLimitersForTesting();
     clearIdempotencyStoreForTesting();
     if (origEnv === undefined) delete process.env.NODE_ENV;

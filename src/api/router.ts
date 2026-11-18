@@ -402,14 +402,6 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
     return;
   }
   const targetSenderId = vaultUser.role === 'admin' ? undefined : vaultUser.senderId;
-  if (targetSenderId && Repository.isSenderInRecentDeletion(targetSenderId)) {
-    (req as any).releaseImportSlot?.();
-    res.status(409).json({
-      success: false,
-      error: 'Account data deletion is currently in progress. Please try importing again shortly.',
-    });
-    return;
-  }
   (req as any).markHandlerStarted?.();
   try {
     const rawData = req.body;

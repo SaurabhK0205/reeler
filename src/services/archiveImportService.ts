@@ -64,6 +64,9 @@ export class ArchiveImportService {
    */
   static async importArchive(input: unknown, senderId?: string): Promise<ArchiveImportResult> {
     const scopedSenderId = typeof senderId === 'string' && senderId.trim() ? senderId.trim() : undefined;
+    if (scopedSenderId && Repository.isSenderInRecentDeletion(scopedSenderId)) {
+      throw new SenderDeletionBarrierError(scopedSenderId);
+    }
     let data = input;
     if (typeof input === 'string') {
       try {
@@ -346,8 +349,10 @@ export class ArchiveImportService {
 
     if (parsedCandidates.length > 0) {
       try {
-        // Batch upsert creators
-        const creatorMap = await Repository.upsertCreatorsBatch(Array.from(creatorsToUpsert.values()));
+        // Batch upsert creators (preserve existing shared creator metadata for non-admin user imports)
+        const creatorMap = await Repository.upsertCreatorsBatch(Array.from(creatorsToUpsert.values()), {
+          preserveExisting: Boolean(scopedSenderId),
+        });
 
         const fallbackCreator = creatorMap.get(UNKNOWN_CREATOR_HANDLE);
         if (!fallbackCreator) {
@@ -378,7 +383,7 @@ export class ArchiveImportService {
         }> = [];
 
         for (const c of parsedCandidates) {
-          const scopedMediaId = scopedSenderId ? `export_${scopedSenderId}_${c.shortcode}` : c.mediaId;
+          const scopedMediaId = scopedSenderId ? `user_export:${scopedSenderId}:${c.shortcode}` : c.mediaId;
           if (c.creatorHandle !== UNKNOWN_CREATOR_HANDLE) {
             const creator = creatorMap.get(c.creatorHandle);
             if (!creator?.id) {

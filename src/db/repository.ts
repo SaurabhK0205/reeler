@@ -278,9 +278,22 @@ class InMemoryStore {
     username: string;
     display_name?: string | null;
     profile_picture_url?: string | null;
-  }>): Promise<Map<string, Creator>> {
+  }>, options?: { preserveExisting?: boolean }): Promise<Map<string, Creator>> {
     const result = new Map<string, Creator>();
     for (const c of creators) {
+      if (options?.preserveExisting) {
+        let existing: Creator | undefined;
+        for (const existingCreator of this.creators.values()) {
+          if (existingCreator.instagram_user_id === c.instagram_user_id) {
+            existing = existingCreator;
+            break;
+          }
+        }
+        if (existing) {
+          result.set(existing.username, existing);
+          continue;
+        }
+      }
       const creator = await this.upsertCreator(c);
       result.set(creator.username, creator);
     }
@@ -323,8 +336,14 @@ class InMemoryStore {
       try {
         let existing: SavedReel | undefined;
         const incomingSender = r.instagram_sender_id ? String(r.instagram_sender_id).trim() || null : null;
+        if (incomingSender && Repository.isSenderInRecentDeletion(incomingSender)) {
+          throw new SenderDeletionBarrierError(incomingSender);
+        }
         for (const existingReel of this.reels.values()) {
-          if (existingReel.instagram_media_id === r.instagram_media_id) {
+          const rowSender = existingReel.instagram_sender_id
+            ? String(existingReel.instagram_sender_id).trim() || null
+            : null;
+          if (existingReel.instagram_media_id === r.instagram_media_id && rowSender === incomingSender) {
             existing = existingReel;
             break;
           }
@@ -366,6 +385,9 @@ class InMemoryStore {
         await this.upsertSavedReel(r, { ignoreDuplicates: options?.ignoreDuplicates, skipReturn: true });
         newlyImported++;
       } catch (err: any) {
+        if (err instanceof SenderDeletionBarrierError) {
+          throw err;
+        }
         failedCount++;
         failedShortcodes.push(r.shortcode);
       }
@@ -1059,15 +1081,16 @@ export class Repository {
     username: string;
     display_name?: string | null;
     profile_picture_url?: string | null;
-  }>): Promise<Map<string, Creator>> {
+  }>, options?: { preserveExisting?: boolean }): Promise<Map<string, Creator>> {
     Repository.invalidateCreatorsCache();
     if (!isSupabaseConfigured()) {
-      return memoryStore.upsertCreatorsBatch(creators);
+      return memoryStore.upsertCreatorsBatch(creators, options);
     }
 
     const supabase = getSupabase();
     const result = new Map<string, Creator>();
     const CHUNK_SIZE = 400;
+    const preserveExisting = Boolean(options?.preserveExisting);
 
     try {
       for (let i = 0; i < creators.length; i += CHUNK_SIZE) {
@@ -1078,6 +1101,43 @@ export class Repository {
           profile_picture_url: c.profile_picture_url,
           updated_at: new Date().toISOString(),
         }));
+
+        if (preserveExisting) {
+          const { error: insertErr } = await supabase
+            .from('creators')
+            .upsert(chunk, { onConflict: 'instagram_user_id', ignoreDuplicates: true });
+
+          const chunkIds = chunk.map(c => c.instagram_user_id);
+          const { data: fetchedRows, error: fetchErr } = await supabase
+            .from('creators')
+            .select('*')
+            .in('instagram_user_id', chunkIds);
+
+          if (insertErr || fetchErr) {
+            for (const c of chunk) {
+              try {
+                const { data: existingRow } = await supabase
+                  .from('creators')
+                  .select('*')
+                  .eq('instagram_user_id', c.instagram_user_id)
+                  .maybeSingle();
+                if (existingRow) {
+                  result.set(existingRow.username, existingRow as Creator);
+                } else {
+                  const single = await this.upsertCreator(c);
+                  result.set(single.username, single);
+                }
+              } catch (err: any) {
+                console.error(`[Repository] Failed to resolve creator ${c.username}:`, err.message);
+              }
+            }
+          } else if (fetchedRows) {
+            for (const c of fetchedRows) {
+              result.set(c.username, c as Creator);
+            }
+          }
+          continue;
+        }
 
         const { data, error } = await supabase
           .from('creators')
@@ -1131,29 +1191,50 @@ export class Repository {
     instagram_sender_id?: string | null;
   }>, options?: { ignoreDuplicates?: boolean; backfillMissingSavedAt?: boolean }): Promise<BatchReelsResult> {
     const distinctSenders = new Set<string | null>();
+    const nonNullSenders: string[] = [];
     for (const r of reels) {
       const normalized = r.instagram_sender_id ? String(r.instagram_sender_id).trim() || null : null;
-      distinctSenders.add(normalized);
-      if (normalized && Repository.isSenderInRecentDeletion(normalized)) {
-        console.warn(`[Repository] Rejecting batch reel upsert for sender ${normalized} due to active deletion window`);
-        throw new SenderDeletionBarrierError(normalized);
+      if (!distinctSenders.has(normalized)) {
+        distinctSenders.add(normalized);
+        if (normalized) {
+          nonNullSenders.push(normalized);
+        }
       }
     }
 
-    Repository.invalidateCreatorsCache();
-    if (!isSupabaseConfigured()) {
-      return memoryStore.upsertSavedReelsBatch(reels, options);
+    const assertNoActiveDeletion = () => {
+      for (const sender of nonNullSenders) {
+        if (Repository.isSenderInRecentDeletion(sender)) {
+          console.warn(`[Repository] Rejecting batch reel upsert for sender ${sender} due to active deletion window`);
+          throw new SenderDeletionBarrierError(sender);
+        }
+      }
+    };
+
+    // Register in-flight reel write BEFORE checking the deletion barrier so concurrent deletion waits for
+    // any write that cleared the barrier (zero TOCTOU window between check and commit).
+    let resolveInFlight!: () => void;
+    const inFlightPromise = new Promise<void>((res) => { resolveInFlight = res; });
+    for (const sender of nonNullSenders) {
+      Repository.trackInFlightReelWrite(sender, inFlightPromise);
     }
 
-    const supabase = getSupabase();
-    let newlyImported = 0;
-    let alreadyPresent = 0;
-    let savedAtBackfilled = 0;
-    let promotedToSaved = 0;
-    let failedCount = 0;
-    const failedShortcodes: string[] = [];
-
     try {
+      assertNoActiveDeletion();
+
+      Repository.invalidateCreatorsCache();
+      if (!isSupabaseConfigured()) {
+        return await memoryStore.upsertSavedReelsBatch(reels, options);
+      }
+
+      const supabase = getSupabase();
+      let newlyImported = 0;
+      let alreadyPresent = 0;
+      let savedAtBackfilled = 0;
+      let promotedToSaved = 0;
+      let failedCount = 0;
+      const failedShortcodes: string[] = [];
+
       let reelsToInsert = reels;
       const updatesById = new Map<
         string,
@@ -1167,14 +1248,6 @@ export class Repository {
       >();
 
       const singleOwner = distinctSenders.size === 1 ? distinctSenders.values().next().value : undefined;
-      const assertNoActiveDeletion = () => {
-        for (const sender of distinctSenders) {
-          if (sender && Repository.isSenderInRecentDeletion(sender)) {
-            console.warn(`[Repository] Aborting batch reel upsert for sender ${sender} due to active deletion window`);
-            throw new SenderDeletionBarrierError(sender);
-          }
-        }
-      };
 
       if (options?.ignoreDuplicates) {
         type BatchExistingRow = {
@@ -1183,10 +1256,10 @@ export class Repository {
           saved_at: string | null;
           is_saved_on_instagram: boolean;
         };
-        const existingByMediaId = new Map<string, BatchExistingRow>();
+        const existingByOwnerMediaId = new Map<string, BatchExistingRow>();
         const existingBySenderShortcode = new Map<string, BatchExistingRow>();
-        const makeSenderShortcodeKey = (sender: string | null | undefined, shortcode: string) =>
-          `${sender ? String(sender).trim() : ''}\u0000${shortcode}`;
+        const makeOwnerCompositeKey = (sender: string | null | undefined, value: string) =>
+          `${sender ? String(sender).trim() : ''}\u0000${value}`;
 
         const allShortcodes = Array.from(new Set(reels.map(r => r.shortcode)));
         const LOOKUP_CHUNK = 500;
@@ -1202,7 +1275,7 @@ export class Repository {
               .in('shortcode', slice);
             if (singleOwner !== undefined) {
               lookupQuery = singleOwner === null
-                ? lookupQuery.is('instagram_sender_id', null)
+                ? lookupQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.')
                 : lookupQuery.eq('instagram_sender_id', singleOwner);
             }
             const { data: matched, error } = await lookupQuery
@@ -1220,9 +1293,12 @@ export class Repository {
                 saved_at: row.saved_at ? String(row.saved_at) : null,
                 is_saved_on_instagram: row.is_saved_on_instagram !== false,
               };
-              existingByMediaId.set(entry.instagram_media_id, entry);
+              existingByOwnerMediaId.set(
+                makeOwnerCompositeKey(row.instagram_sender_id, entry.instagram_media_id),
+                entry
+              );
               existingBySenderShortcode.set(
-                makeSenderShortcodeKey(row.instagram_sender_id, String(row.shortcode)),
+                makeOwnerCompositeKey(row.instagram_sender_id, String(row.shortcode)),
                 entry
               );
             }
@@ -1236,8 +1312,8 @@ export class Repository {
         const freshReels: typeof reels = [];
         for (const r of reels) {
           const existing =
-            existingByMediaId.get(r.instagram_media_id) ||
-            existingBySenderShortcode.get(makeSenderShortcodeKey(r.instagram_sender_id, r.shortcode));
+            existingByOwnerMediaId.get(makeOwnerCompositeKey(r.instagram_sender_id, r.instagram_media_id)) ||
+            existingBySenderShortcode.get(makeOwnerCompositeKey(r.instagram_sender_id, r.shortcode));
           if (existing) {
             alreadyPresent++;
             const shouldPromote = r.is_saved_on_instagram !== false && existing.is_saved_on_instagram === false;
@@ -1370,6 +1446,10 @@ export class Repository {
 
       return { newlyImported, alreadyPresent, savedAtBackfilled, promotedToSaved, failedCount, failedShortcodes };
     } finally {
+      for (const sender of nonNullSenders) {
+        Repository.untrackInFlightReelWrite(sender, inFlightPromise);
+      }
+      resolveInFlight();
       Repository.invalidateCreatorsCache();
     }
   }
@@ -2669,6 +2749,7 @@ export class Repository {
   private static senderTimezones = new Map<string, string>();
   private static senderTimezoneGenerations = new Map<string, number>();
   private static inFlightPreferenceWrites = new Map<string, Set<Promise<any>>>();
+  private static inFlightReelWrites = new Map<string, Set<Promise<any>>>();
 
   /**
    * Clears in-memory caches for testing.
@@ -2677,6 +2758,7 @@ export class Repository {
     Repository.senderTimezones.clear();
     Repository.senderTimezoneGenerations.clear();
     Repository.inFlightPreferenceWrites.clear();
+    Repository.inFlightReelWrites.clear();
     Repository.activeSenderDeletions.clear();
   }
 
@@ -2701,6 +2783,32 @@ export class Repository {
 
   static async waitForInFlightPreferenceWrites(senderId: string): Promise<void> {
     const set = Repository.inFlightPreferenceWrites.get(senderId);
+    if (set && set.size > 0) {
+      await Promise.allSettled(Array.from(set));
+    }
+  }
+
+  private static trackInFlightReelWrite(senderId: string, promise: Promise<any>): void {
+    let set = Repository.inFlightReelWrites.get(senderId);
+    if (!set) {
+      set = new Set();
+      Repository.inFlightReelWrites.set(senderId, set);
+    }
+    set.add(promise);
+  }
+
+  private static untrackInFlightReelWrite(senderId: string, promise: Promise<any>): void {
+    const set = Repository.inFlightReelWrites.get(senderId);
+    if (set) {
+      set.delete(promise);
+      if (set.size === 0) {
+        Repository.inFlightReelWrites.delete(senderId);
+      }
+    }
+  }
+
+  static async waitForInFlightReelWrites(senderId: string): Promise<void> {
+    const set = Repository.inFlightReelWrites.get(senderId);
     if (set && set.size > 0) {
       await Promise.allSettled(Array.from(set));
     }
@@ -2847,7 +2955,10 @@ export class Repository {
     Repository.recordSenderDeletion(trimmed);
 
     try {
-      await Repository.waitForInFlightPreferenceWrites(trimmed);
+      await Promise.all([
+        Repository.waitForInFlightPreferenceWrites(trimmed),
+        Repository.waitForInFlightReelWrites(trimmed),
+      ]);
 
       const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
       Repository.senderTimezoneGenerations.set(trimmed, nextGen);
