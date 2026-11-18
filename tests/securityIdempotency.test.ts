@@ -167,10 +167,15 @@ test('Security - vaultAuthMiddleware rejects spoofed /meta paths and requireAdmi
 test('Idempotency - replays deterministic POST/PUT/PATCH responses, rejects conflicts (422), concurrent duplicates (409), malformed keys (400), and isolates principals', async () => {
   clearIdempotencyStoreForTesting();
 
-  // Verify canonical payload fingerprinting ignores key order
+  // Verify canonical payload fingerprinting ignores key order and preserves own __proto__ keys
   assert.equal(
     computePayloadFingerprint({ a: 1, b: { x: 2, y: 3 } }),
     computePayloadFingerprint({ b: { y: 3, x: 2 }, a: 1 })
+  );
+  assert.notEqual(
+    computePayloadFingerprint(JSON.parse('{"__proto__":[]}')),
+    computePayloadFingerprint({}),
+    'Own __proto__ keys must not be dropped during canonicalization'
   );
 
   let executions = 0;
@@ -726,6 +731,78 @@ test('MetaInstagramBotService - automatically retries post-200 transient failure
     await bot.handleWebhookPayload(watchedPayload);
     assert.equal(markWatchedCalls, 1);
     assert.equal(dmAttempts, 2);
+
+    // 3. Mid-less event still gets an isolated per-event opId so internal retry preserves mutation checkpoint
+    let midlessWatchedCalls = 0;
+    Repository.markWatchedForInstagramSender = (async () => {
+      midlessWatchedCalls++;
+      return { updatedReels: [], remainingCount: 0 };
+    }) as typeof Repository.markWatchedForInstagramSender;
+
+    let midlessDmAttempts = 0;
+    bot.sendDirectMessage = async () => {
+      midlessDmAttempts++;
+      return midlessDmAttempts >= 2;
+    };
+
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: 'sender_midless' }, message: { text: 'watched' } }] }],
+    });
+    assert.equal(midlessWatchedCalls, 1);
+    assert.equal(midlessDmAttempts, 1);
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(midlessWatchedCalls, 1, 'Mid-less internal retry must NOT repeat committed mutation');
+    assert.equal(midlessDmAttempts, 2, 'Mid-less internal retry must redeliver failed DM');
+
+    // 4. Duration command internal retry stays pinned to the ORIGINAL Reel even if a newer Reel arrives
+    const origGetAwaiting = Repository.getActiveAwaitingReelForSender;
+    const origGetLast = Repository.getLastReelForInstagramSender;
+    const origUpdateSchedule = Repository.updateReminderSchedule;
+    try {
+      let currentLatestReelId = 'reel_original_1';
+      Repository.getActiveAwaitingReelForSender = (async () => ({
+        id: currentLatestReelId,
+        shortcode: 'OrigReel1',
+        reel_url: 'https://www.instagram.com/reel/OrigReel1/',
+        media_type: 'reel',
+      })) as any;
+      Repository.getLastReelForInstagramSender = async () => null;
+
+      const updatedTargets: string[] = [];
+      let scheduleAttempts = 0;
+      Repository.updateReminderSchedule = (async (reelId: string) => {
+        scheduleAttempts++;
+        updatedTargets.push(reelId);
+        if (scheduleAttempts === 1) {
+          // Simulate a brand-new Reel arriving before internal retry runs
+          currentLatestReelId = 'reel_newer_2';
+          throw new Error('Transient DB write timeout');
+        }
+      }) as typeof Repository.updateReminderSchedule;
+      bot.sendDirectMessage = async () => true;
+
+      await bot.handleWebhookPayload({
+        object: 'instagram',
+        entry: [
+          {
+            messaging: [
+              { sender: { id: 'sender_duration_pin' }, message: { mid: 'mid.duration_pin', text: '30m' } },
+            ],
+          },
+        ],
+      });
+      await new Promise((r) => setTimeout(r, 60));
+      assert.deepEqual(
+        updatedTargets,
+        ['reel_original_1', 'reel_original_1'],
+        'Duration retry must stay pinned to original Reel instead of retargeting newer Reel'
+      );
+    } finally {
+      Repository.getActiveAwaitingReelForSender = origGetAwaiting;
+      Repository.getLastReelForInstagramSender = origGetLast;
+      Repository.updateReminderSchedule = origUpdateSchedule;
+    }
   } finally {
     bot.clearPendingRetriesForTesting();
     Repository.getSenderTimezone = origGetTz;

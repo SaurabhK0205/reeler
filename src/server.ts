@@ -184,8 +184,11 @@ app.get('*', (_req, res) => {
 });
 
 // Sanitized JSON error handler for malformed payloads, oversize bodies, and unexpected errors
-app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  if (res.headersSent) return;
+app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
   if (err?.type === 'entity.too.large' || err?.status === 413) {
     res.status(413).json({ error: 'PAYLOAD_TOO_LARGE', message: 'Request payload exceeds the maximum allowed size.' });
     return;

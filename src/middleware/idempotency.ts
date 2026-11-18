@@ -57,7 +57,7 @@ function canonicalizeValue(value: unknown, depth: number): unknown {
     return value.map((item) => canonicalizeValue(item, depth + 1));
   }
   const obj = value as Record<string, unknown>;
-  const sorted: Record<string, unknown> = {};
+  const sorted: Record<string, unknown> = Object.create(null);
   for (const key of Object.keys(obj).sort()) {
     sorted[key] = canonicalizeValue(obj[key], depth + 1);
   }

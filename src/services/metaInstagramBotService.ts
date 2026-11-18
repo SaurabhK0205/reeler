@@ -60,6 +60,8 @@ export function isMetaMessagingWindowError(errorData: unknown): boolean {
   return false;
 }
 
+import type { SavedReel } from '../types.ts';
+
 // Retain completed & committed-mutation mids for Meta's 24-hour webhook redelivery window.
 const WEBHOOK_MID_DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
 const WEBHOOK_MID_MAX_ENTRIES = 5000;
@@ -68,10 +70,16 @@ const WEBHOOK_PENDING_REPLY_MAX_ENTRIES = 500;
 const WEBHOOK_MAX_SCHEDULED_RETRIES = 200;
 const DEFAULT_WEBHOOK_RETRY_DELAYS_MS = [2000, 8000];
 
+interface WebhookRetryState {
+  /** Preserves the exact Reel resolved on the initial duration command across internal retries. */
+  pinnedDurationTargetReel?: SavedReel | null;
+}
+
 interface WebhookDeliveryContext {
   stateMutated: boolean;
   anyDeliveryFailed: boolean;
   unsentMessages: string[];
+  retryState: WebhookRetryState;
 }
 
 interface PendingWebhookReply {
@@ -512,7 +520,8 @@ export class MetaInstagramBotService {
 
   /**
    * Dispatches a single normalized webhook message with in-flight claim tracking, 24h committed-mutation
-   * deduplication, internal post-200 retry scheduling, and partial-reply replay.
+   * deduplication, per-event operation IDs for mid-less events, internal post-200 retry scheduling,
+   * pinned target context, and partial-reply replay.
    */
   private async dispatchWebhookMessage(
     senderId: string,
@@ -520,7 +529,9 @@ export class MetaInstagramBotService {
     text: string,
     attachments: any[] | undefined,
     sourceLabel: 'messaging' | 'change',
-    attempt: number = 0
+    attempt: number = 0,
+    existingOpId?: string,
+    retryState: WebhookRetryState = {}
   ): Promise<void> {
     let reelUrl: string | null = null;
     let attachmentType: string | null = null;
@@ -542,72 +553,72 @@ export class MetaInstagramBotService {
     const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
     if (!combinedText) return;
 
-    const mid = this.normalizeWebhookMid(rawMid);
-    if (!this.claimWebhookMid(mid)) {
+    // Use Meta's mid when supplied; for mid-less events, assign a unique per-received-event opId
+    // so internal retries still retain an isolated mutation and pending-reply checkpoint.
+    const opId = existingOpId || this.normalizeWebhookMid(rawMid) || `event_${crypto.randomUUID()}`;
+    if (!this.claimWebhookMid(opId)) {
       return;
     }
 
     let shouldScheduleRetry = false;
-    const retryKey = mid || `${sourceLabel}:${senderId}:${combinedText.slice(0, 64)}`;
 
     try {
       // If a prior attempt already committed state and only failed sending reply DM(s),
       // retry only the remaining unsent DM(s) without repeating the mutation.
-      if (mid) {
-        const pending = this.pendingRepliesByMid.get(mid);
-        if (pending && pending.expiresAt > Date.now()) {
-          const remaining: string[] = [];
-          let failed = false;
-          for (const msg of pending.messages) {
-            if (failed) {
-              remaining.push(msg);
-              continue;
-            }
-            const ok = await this.sendDirectMessage(pending.recipientId, msg);
-            if (!ok) {
-              failed = true;
-              remaining.push(msg);
-            }
+      const pending = this.pendingRepliesByMid.get(opId);
+      if (pending && pending.expiresAt > Date.now()) {
+        const remaining: string[] = [];
+        let failed = false;
+        for (const msg of pending.messages) {
+          if (failed) {
+            remaining.push(msg);
+            continue;
           }
-          if (!failed) {
-            this.markWebhookMidCompleted(mid);
-          } else {
-            this.recordPendingWebhookReplies(mid, pending.recipientId, remaining);
-            shouldScheduleRetry = true;
+          const ok = await this.sendDirectMessage(pending.recipientId, msg);
+          if (!ok) {
+            failed = true;
+            remaining.push(msg);
           }
-          return;
         }
-        if (pending) {
-          this.pendingRepliesByMid.delete(mid);
+        if (!failed) {
+          this.markWebhookMidCompleted(opId);
+        } else {
+          this.recordPendingWebhookReplies(opId, pending.recipientId, remaining);
+          shouldScheduleRetry = true;
         }
-        // If the mutation already committed within Meta's 24h redelivery window (even after pending
-        // reply text expired), never re-execute the command and risk repeating a stateful mutation.
-        if (this.hasCommittedWebhookMutation(mid)) {
-          this.markWebhookMidCompleted(mid);
-          return;
-        }
+        return;
+      }
+      if (pending) {
+        this.pendingRepliesByMid.delete(opId);
+      }
+      // If the mutation already committed within Meta's 24h redelivery window (even after pending
+      // reply text expired), never re-execute the command and risk repeating a stateful mutation.
+      if (this.hasCommittedWebhookMutation(opId)) {
+        this.markWebhookMidCompleted(opId);
+        return;
       }
 
       const delivery: WebhookDeliveryContext = {
         stateMutated: false,
         anyDeliveryFailed: false,
         unsentMessages: [],
+        retryState,
       };
 
       await this.processIncomingText(senderId, combinedText, attachmentType, attachmentTitle, delivery);
 
       if (delivery.stateMutated) {
-        this.markWebhookMutationCommitted(mid);
+        this.markWebhookMutationCommitted(opId);
       }
 
       if (!delivery.anyDeliveryFailed) {
-        this.markWebhookMidCompleted(mid);
+        this.markWebhookMidCompleted(opId);
       } else {
-        if (mid && delivery.stateMutated && delivery.unsentMessages.length > 0) {
-          this.recordPendingWebhookReplies(mid, senderId, delivery.unsentMessages);
+        if (delivery.stateMutated && delivery.unsentMessages.length > 0) {
+          this.recordPendingWebhookReplies(opId, senderId, delivery.unsentMessages);
         }
         // The route already returned 200 EVENT_RECEIVED before dispatch, so Meta will not redeliver
-        // this event; schedule a bounded internal retry preserving the mid and mutation checkpoint.
+        // this event; schedule a bounded internal retry preserving the opId and mutation checkpoint.
         shouldScheduleRetry = true;
       }
     } catch (error) {
@@ -615,12 +626,19 @@ export class MetaInstagramBotService {
       // The route already sent 200 before dispatch; schedule a bounded internal retry after releasing claim.
       shouldScheduleRetry = true;
     } finally {
-      if (mid) {
-        this.inFlightMessageIds.delete(mid);
-      }
+      this.inFlightMessageIds.delete(opId);
       if (shouldScheduleRetry) {
-        this.scheduleWebhookRetry(retryKey, attempt, () =>
-          this.dispatchWebhookMessage(senderId, rawMid, text, attachments, sourceLabel, attempt + 1)
+        this.scheduleWebhookRetry(opId, attempt, () =>
+          this.dispatchWebhookMessage(
+            senderId,
+            rawMid,
+            text,
+            attachments,
+            sourceLabel,
+            attempt + 1,
+            opId,
+            retryState
+          )
         );
       }
     }
@@ -948,9 +966,19 @@ export class MetaInstagramBotService {
     // 3. Custom duration command (e.g. "5s", "remind me in 5 days", "tomorrow at 5pm", "12 nov", etc.)
     const customDuration = parseDuration(text, new Date(), senderTz);
     if (customDuration) {
-      const targetReel =
-        (await Repository.getActiveAwaitingReelForSender(senderId)) ||
-        (await Repository.getLastReelForInstagramSender(senderId));
+      let targetReel: SavedReel | null;
+      if (delivery && delivery.retryState.pinnedDurationTargetReel !== undefined) {
+        // Reuse the exact Reel resolved on the initial attempt so an internal retry never
+        // retargets a newer Reel saved after the first attempt failed.
+        targetReel = delivery.retryState.pinnedDurationTargetReel;
+      } else {
+        targetReel =
+          (await Repository.getActiveAwaitingReelForSender(senderId)) ||
+          (await Repository.getLastReelForInstagramSender(senderId));
+        if (delivery) {
+          delivery.retryState.pinnedDurationTargetReel = targetReel;
+        }
+      }
 
       if (targetReel) {
         const nextDate = customDuration.targetDate.toISOString();
