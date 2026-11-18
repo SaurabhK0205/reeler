@@ -29,6 +29,107 @@ function saveViewMode(mode) {
   }
 }
 
+const VAULT_KEY_STORAGE = 'reeler_vault_key';
+
+/**
+ * Reads the stored private vault access key from localStorage.
+ * @returns {string}
+ */
+function getVaultAccessKey() {
+  try {
+    return localStorage.getItem(VAULT_KEY_STORAGE) || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+/**
+ * Stores or clears the private vault access key.
+ * @param {string | null | undefined} key
+ */
+function setVaultAccessKey(key) {
+  try {
+    if (key && key.trim()) {
+      localStorage.setItem(VAULT_KEY_STORAGE, key.trim());
+      syncBrowserTimezone();
+    } else {
+      localStorage.removeItem(VAULT_KEY_STORAGE);
+    }
+  } catch (_) {
+    /* non-fatal */
+  }
+}
+
+/**
+ * Generates a unique Idempotency-Key header value for mutating API requests.
+ * @returns {string}
+ */
+function generateIdempotencyKey() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `idem-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+/**
+ * Automatically syncs the user's browser timezone with their vault profile on the server.
+ */
+function syncBrowserTimezone() {
+  try {
+    const key = getVaultAccessKey();
+    if (!key) return;
+    const clientTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (!clientTz) return;
+    fetch('/api/user/timezone', {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vault-Key': key,
+        'Idempotency-Key': generateIdempotencyKey(),
+      },
+      body: JSON.stringify({ timezone: clientTz }),
+    }).catch(() => {});
+  } catch (_) {
+    /* non-fatal */
+  }
+}
+
+// Extract and store vault access key from URL query (?key=... or ?vault_key=...)
+try {
+  const urlParams = new URLSearchParams(window.location.search);
+  const keyFromUrl = urlParams.get('key') || urlParams.get('vault_key');
+  if (keyFromUrl && keyFromUrl.trim()) {
+    setVaultAccessKey(keyFromUrl.trim());
+    urlParams.delete('key');
+    urlParams.delete('vault_key');
+    const remainingQuery = urlParams.toString();
+    const cleanUrl = window.location.pathname + (remainingQuery ? `?${remainingQuery}` : '') + window.location.hash;
+    window.history.replaceState({}, document.title, cleanUrl);
+  }
+} catch (e) {
+  console.warn('Failed to parse URL vault key:', e);
+}
+
+/**
+ * Performs a fetch attaching the private X-Vault-Key header when stored and an Idempotency-Key
+ * header automatically for mutating requests (POST, PUT, PATCH, DELETE).
+ * @param {string} url
+ * @param {RequestInit} [options]
+ * @returns {Promise<Response>}
+ */
+function vaultFetch(url, options = {}) {
+  const key = getVaultAccessKey();
+  const headers = new Headers(options.headers || {});
+  if (key) {
+    headers.set('X-Vault-Key', key);
+  }
+  const method = String(options.method || 'GET').toUpperCase();
+  if ((method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') && !headers.has('Idempotency-Key')) {
+    headers.set('Idempotency-Key', generateIdempotencyKey());
+  }
+  return fetch(url, { ...options, headers });
+}
+
 const ASPECT_CACHE_STORAGE_KEY = 'reeler_aspect_cache_v1';
 const ASPECT_CACHE_MAX_ENTRIES = 300;
 const CREATOR_TOP_LIMIT = 6;
@@ -307,6 +408,437 @@ const reelsGrid = document.getElementById('reels-grid');
 const reelsTableContainer = document.getElementById('reels-table-container');
 const reelsTable = document.getElementById('reels-table');
 const reelsTableBody = document.getElementById('reels-table-body');
+const vaultGateScreen = document.getElementById('vault-gate-screen');
+const vaultGateTitle = document.getElementById('vault-gate-title');
+const vaultGateDesc = document.getElementById('vault-gate-desc');
+const tabOtpBtn = document.getElementById('tab-otp-btn');
+const tabKeyBtn = document.getElementById('tab-key-btn');
+const vaultOtpPanel = document.getElementById('vault-otp-panel');
+const vaultKeyPanel = document.getElementById('vault-key-panel');
+const vaultOtpForm = document.getElementById('vault-otp-form');
+const vaultOtpInput = document.getElementById('vault-otp-input');
+const vaultOtpSubmitBtn = document.getElementById('vault-otp-submit-btn');
+const vaultKeyForm = document.getElementById('vault-key-form');
+const vaultKeyInput = document.getElementById('vault-key-input');
+const vaultKeySubmitBtn = document.getElementById('vault-key-submit-btn');
+const vaultGateError = document.getElementById('vault-gate-error');
+const vaultGateSwitchActions = document.getElementById('vault-gate-switch-actions');
+const vaultGateCancelBtn = document.getElementById('vault-gate-cancel-btn');
+const vaultGateSignoutBtn = document.getElementById('vault-gate-signout-btn');
+const switchVaultBtn = document.getElementById('switch-vault-btn');
+
+const DEFAULT_VAULT_GATE_TITLE = 'Private Vault';
+const DEFAULT_VAULT_GATE_DESC = "You scroll through 1,000 reels a day. Make sure you don't miss an important one.";
+const SWITCH_VAULT_GATE_TITLE = 'Switch Vault';
+const SWITCH_VAULT_GATE_DESC = 'Sign in to another Instagram account with a fresh single-use 6-digit code or direct key. Your current vault stays active if you cancel.';
+
+let isSwitchingVault = false;
+let vaultAuthGeneration = 0;
+let vaultSessionGeneration = 0;
+let vaultAuthAbortController = null;
+let pendingOtpAttempt = { code: '', key: '' };
+
+/**
+ * Returns the Idempotency-Key bound to the current 6-digit OTP submission attempt so network-error
+ * retries for the same code reuse the original key and replay a consumed OTP's response safely.
+ * @param {string} code
+ * @returns {string}
+ */
+function getOtpAttemptIdempotencyKey(code) {
+  if (pendingOtpAttempt.code === code && pendingOtpAttempt.key) {
+    return pendingOtpAttempt.key;
+  }
+  const key = generateIdempotencyKey();
+  pendingOtpAttempt = { code, key };
+  return key;
+}
+
+/**
+ * Clears any cached OTP attempt key when the code changes, completes, or the flow resets.
+ */
+function clearPendingOtpAttempt() {
+  pendingOtpAttempt = { code: '', key: '' };
+}
+
+/**
+ * Invalidates and aborts any in-flight vault authentication request so late completions from
+ * canceled or signed-out attempts can never overwrite the active vault key or workspace.
+ */
+function invalidatePendingVaultAuth() {
+  vaultAuthGeneration++;
+  if (vaultAuthAbortController) {
+    vaultAuthAbortController.abort();
+    vaultAuthAbortController = null;
+  }
+  if (vaultOtpSubmitBtn) {
+    vaultOtpSubmitBtn.disabled = false;
+    vaultOtpSubmitBtn.textContent = 'Unlock Vault';
+  }
+  if (vaultKeySubmitBtn) {
+    vaultKeySubmitBtn.disabled = false;
+    vaultKeySubmitBtn.textContent = 'Unlock Vault';
+  }
+}
+
+vaultOtpInput?.addEventListener('input', () => {
+  const normalized = (vaultOtpInput.value || '').trim().replace(/\s+/g, '');
+  if (pendingOtpAttempt.code && normalized !== pendingOtpAttempt.code) {
+    clearPendingOtpAttempt();
+  }
+});
+
+/**
+ * Keeps the header Switch Vault button visible only while an active vault session is unlocked.
+ */
+function syncSwitchVaultButtonVisibility() {
+  if (!switchVaultBtn) return;
+  const gateOpen = Boolean(vaultGateScreen && !vaultGateScreen.classList.contains('is-hidden'));
+  switchVaultBtn.hidden = gateOpen || !getVaultAccessKey();
+}
+
+/**
+ * Updates Vault Gate heading, helper copy, and cancel/sign-out controls for locked vs switch mode.
+ */
+function syncVaultGateModeUI() {
+  const switchActive = isSwitchingVault && Boolean(getVaultAccessKey());
+  if (!switchActive) {
+    isSwitchingVault = false;
+  }
+  if (vaultGateTitle) {
+    vaultGateTitle.textContent = switchActive ? SWITCH_VAULT_GATE_TITLE : DEFAULT_VAULT_GATE_TITLE;
+  }
+  if (vaultGateDesc) {
+    vaultGateDesc.textContent = switchActive ? SWITCH_VAULT_GATE_DESC : DEFAULT_VAULT_GATE_DESC;
+  }
+  if (vaultGateSwitchActions) {
+    vaultGateSwitchActions.hidden = !switchActive;
+  }
+}
+
+/**
+ * Switches between 6-digit OTP code and direct access key tab in vault gate.
+ * @param {'otp' | 'key'} tab
+ */
+function switchVaultGateTab(tab) {
+  if (tab === 'otp') {
+    tabOtpBtn?.classList.add('active');
+    tabOtpBtn?.setAttribute('aria-selected', 'true');
+    tabKeyBtn?.classList.remove('active');
+    tabKeyBtn?.setAttribute('aria-selected', 'false');
+    vaultOtpPanel?.classList.remove('is-hidden');
+    vaultKeyPanel?.classList.add('is-hidden');
+    vaultOtpInput?.focus();
+  } else {
+    tabKeyBtn?.classList.add('active');
+    tabKeyBtn?.setAttribute('aria-selected', 'true');
+    tabOtpBtn?.classList.remove('active');
+    tabOtpBtn?.setAttribute('aria-selected', 'false');
+    vaultKeyPanel?.classList.remove('is-hidden');
+    vaultOtpPanel?.classList.add('is-hidden');
+    vaultKeyInput?.focus();
+  }
+}
+
+tabOtpBtn?.addEventListener('click', () => switchVaultGateTab('otp'));
+tabKeyBtn?.addEventListener('click', () => switchVaultGateTab('key'));
+
+/**
+ * Shows the Zero-Login Vault Auth Gate when unauthenticated or switching accounts.
+ * In switch mode, the active vault's DOM/state is preserved so the user can return immediately.
+ * @param {string} [errorMessage]
+ * @param {{ preserveWorkspace?: boolean }} [options]
+ */
+function showVaultGateScreen(errorMessage, options = {}) {
+  if (!vaultGateScreen) return;
+  const preserveWorkspace = Boolean(options.preserveWorkspace ?? (isSwitchingVault && Boolean(getVaultAccessKey())));
+  if (!preserveWorkspace) {
+    isSwitchingVault = false;
+  }
+  if (vaultContainerEl) vaultContainerEl.classList.add('is-vault-locked');
+  vaultGateScreen.classList.remove('is-hidden');
+  syncVaultGateModeUI();
+
+  if (!preserveWorkspace) {
+    if (resultsCount) resultsCount.textContent = 'Private Vault Locked';
+    if (reelsGrid) reelsGrid.innerHTML = '';
+    if (reelsTableBody) reelsTableBody.innerHTML = '';
+    if (reelsTableContainer) reelsTableContainer.classList.add('is-hidden');
+    if (paginationBar) paginationBar.classList.add('is-hidden');
+  }
+  if (vaultGateError) {
+    if (errorMessage) {
+      vaultGateError.textContent = errorMessage;
+      vaultGateError.hidden = false;
+    } else {
+      vaultGateError.hidden = true;
+    }
+  }
+  syncSwitchVaultButtonVisibility();
+}
+
+/**
+ * Hides the Zero-Login Vault Auth Gate when authenticated.
+ */
+function hideVaultGateScreen() {
+  if (!vaultGateScreen) return;
+  isSwitchingVault = false;
+  syncVaultGateModeUI();
+  if (vaultContainerEl) vaultContainerEl.classList.remove('is-vault-locked');
+  vaultGateScreen.classList.add('is-hidden');
+  if (reelsGrid) reelsGrid.classList.toggle('is-hidden', state.viewMode !== 'grid');
+  if (reelsTableContainer) reelsTableContainer.classList.toggle('is-hidden', state.viewMode === 'grid');
+  if (vaultGateError) vaultGateError.hidden = true;
+  syncSwitchVaultButtonVisibility();
+}
+
+/**
+ * Aborts in-flight vault requests and clears displayed vault data & filters before switching
+ * to another account or signing out cleanly.
+ */
+function resetVaultSessionState() {
+  if (fetchReelsAbortController) {
+    fetchReelsAbortController.abort();
+    fetchReelsAbortController = null;
+  }
+  if (creatorsFetchController) {
+    creatorsFetchController.abort();
+    creatorsFetchController = null;
+  }
+  if (statsFetchController) {
+    statsFetchController.abort();
+    statsFetchController = null;
+  }
+  if (typeof state !== 'undefined' && state) {
+    state.reels = [];
+    state.total = 0;
+    state.stats = null;
+    state.creators = [];
+    state.topCreators = [];
+    state.totalCreators = 0;
+    state.creatorMatchTotal = 0;
+    state.selectedCreator = null;
+    state.creatorQuery = '';
+    if (state.filters) {
+      state.filters.creatorId = '';
+      state.filters.page = 1;
+    }
+  }
+  if (creatorFilterInput) creatorFilterInput.value = '';
+  if (typeof syncUrlState === 'function') {
+    syncUrlState();
+  }
+  if (statTotal) statTotal.textContent = '--';
+  if (statMediaSplit) statMediaSplit.textContent = '';
+  if (statCreators) statCreators.textContent = '--';
+  if (statWeek) statWeek.textContent = '--';
+  if (statWatchLater) statWatchLater.textContent = '--';
+  if (statWatched) statWatched.textContent = '--';
+  if (sourceCountAll) sourceCountAll.textContent = '--';
+  if (sourceCountInstagram) sourceCountInstagram.textContent = '--';
+  if (sourceCountBot) sourceCountBot.textContent = '--';
+  if (creatorPillsList) creatorPillsList.innerHTML = '';
+  if (reelsGrid) reelsGrid.innerHTML = '';
+  if (reelsTableBody) reelsTableBody.innerHTML = '';
+  if (reelsTableState) {
+    reelsTableState.hidden = true;
+    reelsTableState.innerHTML = '';
+  }
+  if (paginationBar) paginationBar.classList.add('is-hidden');
+  if (resultsCount) resultsCount.textContent = 'Loading tracked items...';
+}
+
+/**
+ * Opens the Vault Gate in non-destructive switch mode so the user can sign in to another vault
+ * or cancel right back to their active session without getting locked out.
+ */
+function handleSwitchVault() {
+  invalidatePendingVaultAuth();
+  clearPendingOtpAttempt();
+  closeShortcutsPopover(false);
+  if (vaultOtpInput) vaultOtpInput.value = '';
+  if (vaultKeyInput) vaultKeyInput.value = '';
+
+  if (!getVaultAccessKey()) {
+    resetVaultSessionState();
+    showVaultGateScreen();
+    switchVaultGateTab('otp');
+    return;
+  }
+
+  isSwitchingVault = true;
+  showVaultGateScreen(undefined, { preserveWorkspace: true });
+  switchVaultGateTab('otp');
+  if (typeof announceStatus === 'function') {
+    announceStatus('Switch Vault opened. Enter a fresh 6-digit code or direct key, or choose Back to Current Vault.');
+  }
+}
+
+/**
+ * Cancels Switch Vault and immediately returns to the already-authenticated vault.
+ */
+function cancelSwitchVault() {
+  if (!isSwitchingVault || !getVaultAccessKey()) return;
+  invalidatePendingVaultAuth();
+  clearPendingOtpAttempt();
+  hideVaultGateScreen();
+  switchVaultBtn?.focus();
+  if (typeof announceStatus === 'function') {
+    announceStatus('Returned to your current vault.');
+  }
+}
+
+/**
+ * Explicitly signs out of the current device, clears the stored vault key, and resets vault state.
+ */
+function confirmSignOutVault() {
+  invalidatePendingVaultAuth();
+  clearPendingOtpAttempt();
+  vaultSessionGeneration++;
+  isSwitchingVault = false;
+  setVaultAccessKey(null);
+  closeShortcutsPopover(false);
+  resetVaultSessionState();
+  if (vaultOtpInput) vaultOtpInput.value = '';
+  if (vaultKeyInput) vaultKeyInput.value = '';
+  showVaultGateScreen(undefined, { preserveWorkspace: false });
+  switchVaultGateTab('otp');
+  if (typeof announceStatus === 'function') {
+    announceStatus('Signed out of this device. Enter a fresh 6-digit code or vault key to sign back in.');
+  }
+}
+
+/**
+ * Commits a newly authenticated vault key and starts all catalog loads immediately under a
+ * session generation independent of later Switch Vault open/cancel actions.
+ * @param {string} newVaultKey
+ */
+async function commitAuthenticatedVaultKey(newVaultKey) {
+  clearPendingOtpAttempt();
+  const sessionGen = ++vaultSessionGeneration;
+  if (isSwitchingVault) {
+    resetVaultSessionState();
+  }
+  setVaultAccessKey(newVaultKey);
+  hideVaultGateScreen();
+  syncBrowserTimezone();
+  await Promise.all([loadStats(), loadCreators(), fetchReels()]);
+  if (sessionGen !== vaultSessionGeneration) return;
+}
+
+switchVaultBtn?.addEventListener('click', handleSwitchVault);
+vaultGateCancelBtn?.addEventListener('click', cancelSwitchVault);
+vaultGateSignoutBtn?.addEventListener('click', confirmSignOutVault);
+syncSwitchVaultButtonVisibility();
+
+if (vaultOtpForm) {
+  vaultOtpForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const entered = (vaultOtpInput?.value || '').trim().replace(/\s+/g, '');
+    if (!entered || !/^\d{6}$/.test(entered)) {
+      showVaultGateScreen('Please enter the 6-digit code received from your Instagram DM.');
+      return;
+    }
+
+    invalidatePendingVaultAuth();
+    const opGen = vaultAuthGeneration;
+    const controller = new AbortController();
+    vaultAuthAbortController = controller;
+    const idempotencyKey = getOtpAttemptIdempotencyKey(entered);
+
+    if (vaultOtpSubmitBtn) {
+      vaultOtpSubmitBtn.disabled = true;
+      vaultOtpSubmitBtn.textContent = 'Verifying...';
+    }
+    try {
+      const res = await fetch('/api/auth/otp/verify', {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': idempotencyKey,
+        },
+        body: JSON.stringify({ code: entered }),
+      });
+      if (opGen !== vaultAuthGeneration) return;
+      const data = await res.json().catch(() => null);
+      if (opGen !== vaultAuthGeneration) return;
+
+      if (res.ok && data?.vaultKey) {
+        await commitAuthenticatedVaultKey(data.vaultKey);
+      } else {
+        // Keep the attempt key on transient 5xx/409/429 responses so retries replay cleanly;
+        // clear it on terminal 400/422 rejections so the next submission starts fresh.
+        if (res.status === 400 || res.status === 422) {
+          clearPendingOtpAttempt();
+        }
+        showVaultGateScreen(
+          data?.message || 'This 6-digit code is invalid, expired, or already used (codes are single-use). Send "code" to @er_reel_er for a fresh code.'
+        );
+      }
+    } catch (err) {
+      if (opGen !== vaultAuthGeneration || err?.name === 'AbortError') return;
+      // Preserve pendingOtpAttempt on network errors so resubmitting the same OTP reuses the original key
+      showVaultGateScreen('Unable to verify code. Please check your connection and try again.');
+    } finally {
+      if (opGen === vaultAuthGeneration) {
+        if (vaultAuthAbortController === controller) {
+          vaultAuthAbortController = null;
+        }
+        if (vaultOtpSubmitBtn) {
+          vaultOtpSubmitBtn.disabled = false;
+          vaultOtpSubmitBtn.textContent = 'Unlock Vault';
+        }
+      }
+    }
+  });
+}
+
+if (vaultKeyForm) {
+  vaultKeyForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const entered = (vaultKeyInput?.value || '').trim();
+    if (!entered) {
+      showVaultGateScreen('Please enter your vault access key.');
+      return;
+    }
+
+    invalidatePendingVaultAuth();
+    const opGen = vaultAuthGeneration;
+    const controller = new AbortController();
+    vaultAuthAbortController = controller;
+
+    if (vaultKeySubmitBtn) {
+      vaultKeySubmitBtn.disabled = true;
+      vaultKeySubmitBtn.textContent = 'Verifying...';
+    }
+    try {
+      const res = await fetch('/api/session', {
+        signal: controller.signal,
+        headers: { 'X-Vault-Key': entered },
+      });
+      if (opGen !== vaultAuthGeneration) return;
+
+      if (res.ok) {
+        await commitAuthenticatedVaultKey(entered);
+      } else {
+        showVaultGateScreen('Invalid access key. Please check the link from your Instagram DM.');
+      }
+    } catch (err) {
+      if (opGen !== vaultAuthGeneration || err?.name === 'AbortError') return;
+      showVaultGateScreen('Unable to verify key. Please try again.');
+    } finally {
+      if (opGen === vaultAuthGeneration) {
+        if (vaultAuthAbortController === controller) {
+          vaultAuthAbortController = null;
+        }
+        if (vaultKeySubmitBtn) {
+          vaultKeySubmitBtn.disabled = false;
+          vaultKeySubmitBtn.textContent = 'Unlock Vault';
+        }
+      }
+    }
+  });
+}
 const reelsTableState = document.getElementById('reels-table-state');
 const resultsCount = document.getElementById('results-count');
 const activeFilterChips = document.getElementById('active-filter-chips');
@@ -330,6 +862,7 @@ const feedCloseBtn = document.getElementById('feed-close-btn');
 
 let fetchReelsAbortController = null;
 let creatorsFetchController = null;
+let statsFetchController = null;
 let searchTimeout = null;
 let creatorSearchTimeout = null;
 let isCreatorSearching = false;
@@ -843,6 +1376,7 @@ async function init() {
   renderActiveFilterChips();
   setupEventListeners();
   renderInitialSkeletons();
+  syncBrowserTimezone();
   await Promise.all([checkHealth(), loadStats(), loadCreators(), fetchReels()]);
 }
 
@@ -904,15 +1438,35 @@ async function checkHealth() {
 
 /**
  * Fetches summary statistics from the server and populates metric cards.
+ * @param {{ silent?: boolean }} [options]
  */
-async function loadStats() {
-  statsBar?.setAttribute('aria-busy', 'true');
+async function loadStats(options = {}) {
+  const silent = Boolean(options.silent);
+  if (silent && statsFetchController?.isExplicit) {
+    return;
+  }
+  if (statsFetchController) {
+    statsFetchController.abort();
+  }
+  const controller = new AbortController();
+  controller.isExplicit = !silent;
+  statsFetchController = controller;
+  const { signal } = controller;
+  if (!silent) {
+    statsBar?.setAttribute('aria-busy', 'true');
+  }
   try {
-    const res = await fetch('/api/stats');
+    const res = await vaultFetch('/api/stats', { signal });
+    if (signal.aborted) return;
+    if (res.status === 401) {
+      showVaultGateScreen();
+      return;
+    }
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
     }
     const stats = await res.json();
+    if (signal.aborted) return;
     state.stats = stats;
     statsLoadErrorNotified = false;
 
@@ -956,6 +1510,7 @@ async function loadStats() {
     }
     statsBar?.classList.remove('is-initial-loading');
   } catch (e) {
+    if (e?.name === 'AbortError' || signal.aborted) return;
     console.error('Failed to load stats:', e);
     statsBar?.classList.remove('is-initial-loading');
     if (!state.stats) {
@@ -986,7 +1541,7 @@ async function loadStats() {
         }
       }
     }
-    if (!statsLoadErrorNotified) {
+    if (!silent && !statsLoadErrorNotified) {
       statsLoadErrorNotified = true;
       showToast('Could not load library statistics.', 'error', {
         actionLabel: 'Retry',
@@ -994,7 +1549,12 @@ async function loadStats() {
       });
     }
   } finally {
-    statsBar?.setAttribute('aria-busy', 'false');
+    if (statsFetchController === controller) {
+      statsFetchController = null;
+      if (!silent) {
+        statsBar?.setAttribute('aria-busy', 'false');
+      }
+    }
   }
 }
 
@@ -1002,19 +1562,26 @@ async function loadStats() {
  * Fetches bounded top creators (or matching server search results) and populates the quick-filter strip
  * without shipping the full directory over initial page load.
  * @param {string} [query=state.creatorQuery]
+ * @param {{ silent?: boolean }} [options]
  */
-async function loadCreators(query = state.creatorQuery) {
+async function loadCreators(query = state.creatorQuery, options = {}) {
+  const silent = Boolean(options.silent);
+  if (silent && creatorsFetchController?.isExplicit) {
+    return;
+  }
   const trimmedQ = String(query || '').trim();
   if (creatorsFetchController) {
     creatorsFetchController.abort();
   }
-  creatorsFetchController = new AbortController();
-  const { signal } = creatorsFetchController;
+  const controller = new AbortController();
+  controller.isExplicit = !silent;
+  creatorsFetchController = controller;
+  const { signal } = controller;
   isCreatorSearching = Boolean(trimmedQ);
 
-  if (creatorStripMeta && !trimmedQ && state.creators.length === 0) {
+  if (!silent && creatorStripMeta && !trimmedQ && state.creators.length === 0) {
     creatorStripMeta.textContent = 'Loading top creators...';
-  } else if (creatorStripMeta && trimmedQ) {
+  } else if (!silent && creatorStripMeta && trimmedQ) {
     renderCreatorStrip();
   }
 
@@ -1030,7 +1597,11 @@ async function loadCreators(query = state.creatorQuery) {
       }
     }
 
-    const res = await fetch(`/api/creators?${params.toString()}`, { signal });
+    const res = await vaultFetch(`/api/creators?${params.toString()}`, { signal });
+    if (res.status === 401) {
+      showVaultGateScreen();
+      return;
+    }
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
     }
@@ -1065,16 +1636,23 @@ async function loadCreators(query = state.creatorQuery) {
     if (e?.name === 'AbortError') return;
     isCreatorSearching = false;
     console.error('Failed to load creators:', e);
+    if (silent && state.creators.length > 0) {
+      return;
+    }
     if (creatorStripMeta && (trimmedQ || state.creators.length === 0)) {
       creatorStripMeta.innerHTML = '<span>Creator filters unavailable</span> <button type="button" class="strip-inline-retry" data-action="retry-creators">Retry</button>';
       creatorStripMeta.querySelector('[data-action="retry-creators"]')?.addEventListener('click', () => loadCreators(state.creatorQuery));
     }
-    if (!creatorsLoadErrorNotified) {
+    if (!silent && !creatorsLoadErrorNotified) {
       creatorsLoadErrorNotified = true;
       showToast('Could not load creator filters.', 'error', {
         actionLabel: 'Retry',
         onAction: () => loadCreators(state.creatorQuery),
       });
+    }
+  } finally {
+    if (creatorsFetchController === controller) {
+      creatorsFetchController = null;
     }
   }
 }
@@ -1119,6 +1697,7 @@ function renderCreatorStrip() {
     if (cleanAvatar && !isPlaceholderMediaUrl(cleanAvatar)) {
       const img = document.createElement('img');
       img.src = cleanAvatar;
+      img.referrerPolicy = 'no-referrer';
       img.className = 'creator-chip-img';
       img.alt = '';
       img.setAttribute('aria-hidden', 'true');
@@ -1180,17 +1759,30 @@ function selectCreator(id) {
 
 /**
  * Queries reels matching active filters, pagination, and search terms with abort safety and inline error recovery.
+ * @param {{ silent?: boolean; pageOverride?: number }} [options]
  */
-async function fetchReels() {
+async function fetchReels(options = {}) {
+  const silent = Boolean(options.silent);
+  if (silent && fetchReelsAbortController?.isExplicit) {
+    return;
+  }
+  const pageToFetch = Number.isInteger(options.pageOverride) && options.pageOverride >= 1
+    ? options.pageOverride
+    : state.filters.page;
+
   if (fetchReelsAbortController) {
     fetchReelsAbortController.abort();
   }
-  fetchReelsAbortController = new AbortController();
-  const { signal } = fetchReelsAbortController;
+  const controller = new AbortController();
+  controller.isExplicit = !silent;
+  fetchReelsAbortController = controller;
+  const { signal } = controller;
 
   renderActiveFilterChips();
-  const queryLabels = getMediaUnitLabels(state.filters.mediaType, state.filters.source);
-  resultsCount.textContent = `Querying ${queryLabels.scopedPlural}...`;
+  if (!silent) {
+    const queryLabels = getMediaUnitLabels(state.filters.mediaType, state.filters.source);
+    resultsCount.textContent = `Querying ${queryLabels.scopedPlural}...`;
+  }
 
   const params = new URLSearchParams();
   if (state.filters.source && state.filters.source !== 'all') params.set('source', state.filters.source);
@@ -1200,11 +1792,19 @@ async function fetchReels() {
   if (state.filters.watchStatus !== 'all') params.set('watchStatus', state.filters.watchStatus);
   if (state.filters.sortBy) params.set('sortBy', state.filters.sortBy);
   if (state.filters.search.trim()) params.set('search', state.filters.search.trim());
-  params.set('page', String(state.filters.page));
+  params.set('page', String(pageToFetch));
   params.set('limit', String(state.filters.limit));
 
   try {
-    const res = await fetch(`/api/reels?${params.toString()}`, { signal });
+    const res = await vaultFetch(`/api/reels?${params.toString()}`, { signal });
+    if (signal.aborted) return;
+    if (res.status === 401) {
+      showVaultGateScreen();
+      return;
+    }
+    if (!isSwitchingVault) {
+      hideVaultGateScreen();
+    }
     if (!res.ok) {
       let errMsg = `HTTP ${res.status}`;
       try {
@@ -1218,15 +1818,24 @@ async function fetchReels() {
 
     const data = await res.json();
     if (signal.aborted) return;
+    if (silent && feedModal?.classList.contains('active')) return;
 
-    state.reels = data.reels || [];
-    state.total = data.total || 0;
-    const maxPage = Math.max(1, Math.ceil(state.total / state.filters.limit) || 1);
-    if (state.reels.length === 0 && state.filters.page > maxPage) {
-      state.filters.page = maxPage;
-      syncUrlState();
-      return fetchReels();
+    const nextReels = data.reels || [];
+    const nextTotal = data.total || 0;
+    const maxPage = Math.max(1, Math.ceil(nextTotal / state.filters.limit) || 1);
+    if (nextReels.length === 0 && pageToFetch > maxPage) {
+      if (fetchReelsAbortController === controller) {
+        fetchReelsAbortController = null;
+      }
+      return fetchReels({ silent, pageOverride: maxPage });
     }
+
+    if (pageToFetch !== state.filters.page) {
+      state.filters.page = pageToFetch;
+      syncUrlState();
+    }
+    state.reels = nextReels;
+    state.total = nextTotal;
     hasInitialReelsSettled = true;
 
     renderReels();
@@ -1234,8 +1843,15 @@ async function fetchReels() {
   } catch (e) {
     if (e?.name === 'AbortError') return;
     console.error('Failed to fetch reels:', e);
+    if (silent && hasInitialReelsSettled) {
+      return;
+    }
     hasInitialReelsSettled = true;
     renderFetchErrorState(e?.message || 'Unable to reach server');
+  } finally {
+    if (fetchReelsAbortController === controller) {
+      fetchReelsAbortController = null;
+    }
   }
 }
 
@@ -1396,8 +2012,12 @@ function renderReels() {
     resultsCount.textContent = `0 ${typeLabels.scopedPlural} match your view`;
     const filtersActive = hasActiveFilters();
     const subFiltersActive = hasActiveFilters(false);
+    const isVaultEmpty = !filtersActive && state.total === 0;
+    if (creatorsStripContainer) {
+      creatorsStripContainer.classList.toggle('is-hidden', isVaultEmpty);
+    }
     let emptyTitle = 'Your Vault Is Empty';
-    let emptyDesc = 'Import Instagram’s saved_posts.json export to bring in your Instagram Saved collection, or DM reels and posts to Reeler Bot.';
+    let emptyDesc = 'You scroll through 1,000 reels a day. DM any reel or post to @er_reel_er on Instagram, or import saved_posts.json to keep the ones worth revisiting.';
     let emptyActionHtml = '<button type="button" class="nav-btn nav-btn-primary" data-action="empty-import">Import saved_posts.json</button>';
 
     if (subFiltersActive) {
@@ -1406,7 +2026,7 @@ function renderReels() {
       emptyActionHtml = '<button type="button" class="nav-btn nav-btn-primary" data-action="reset-all-filters">Reset Filters</button>';
     } else if (state.filters.source === 'bot') {
       emptyTitle = 'No Bot-Sent Items Yet';
-      emptyDesc = 'DM any Reel or Post link to your Reeler Bot to track it here with Watch Later reminders, without adding it to your Instagram Saved collection.';
+      emptyDesc = 'DM any Reel or Post link to @er_reel_er on Instagram to track it here with Watch Later reminders, without adding it to your Instagram Saved collection.';
       emptyActionHtml = filtersActive
         ? '<button type="button" class="nav-btn nav-btn-primary" data-action="reset-all-filters">Show All Items</button>'
         : emptyActionHtml;
@@ -1442,6 +2062,7 @@ function renderReels() {
     return;
   }
 
+  if (creatorsStripContainer) creatorsStripContainer.classList.remove('is-hidden');
   if (reelsTable) reelsTable.hidden = false;
   if (reelsTableContainer) reelsTableContainer.classList.remove('is-empty-state');
   if (reelsTableState) {
@@ -1534,7 +2155,7 @@ function renderReels() {
 
     const imageLayerHtml = hasRealThumbnail
       ? `
-        <img class="poster-actual-img" src="${escapeHtml(cleanThumbnail)}" alt="${creatorInfo.isAttributedName ? `${badgeLabel} poster by ${safeAriaTarget}` : `${isBotSent ? 'Tracked' : 'Saved'} ${itemWord} poster`}" loading="lazy" />
+        <img class="poster-actual-img" src="${escapeHtml(cleanThumbnail)}" referrerpolicy="no-referrer" alt="${creatorInfo.isAttributedName ? `${badgeLabel} poster by ${safeAriaTarget}` : `${isBotSent ? 'Tracked' : 'Saved'} ${itemWord} poster`}" loading="lazy" />
         <div class="poster-top-scrim"></div>
         <div class="poster-bottom-scrim"></div>
       `
@@ -1847,7 +2468,7 @@ async function updateReelStatus(reelId, newStatus, options = {}) {
   syncReelStatusPendingState(reelId, true);
 
   try {
-    const res = await fetch(`/api/reels/${encodeURIComponent(reelId)}/status`, {
+    const res = await vaultFetch(`/api/reels/${encodeURIComponent(reelId)}/status`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: newStatus }),
@@ -2035,6 +2656,7 @@ function setSlidePosterUrl(slide, reel, url, { recordRatio = true } = {}) {
   let posterImg = viewport.querySelector('.reel-poster-underlay');
   if (!posterImg) {
     posterImg = document.createElement('img');
+    posterImg.referrerPolicy = 'no-referrer';
     posterImg.className = 'reel-poster-underlay';
     posterImg.alt = '';
     posterImg.setAttribute('aria-hidden', 'true');
@@ -3187,6 +3809,7 @@ function setupEventListeners() {
       syncSourceTabsUi();
       syncKpiActiveStates();
       syncUrlState();
+      loadStats();
       fetchReels();
       const label = nextSource === 'bot'
         ? 'Showing items sent to Reeler Bot.'
@@ -3223,9 +3846,12 @@ function setupEventListeners() {
     metricFilterAll.addEventListener('click', () => {
       if (hasActiveFilters()) {
         clearAllFilters();
+        loadStats();
         announceStatus('Filters reset. Showing all tracked items.');
       } else {
         syncKpiActiveStates();
+        loadStats();
+        fetchReels();
       }
     });
   }
@@ -3237,6 +3863,7 @@ function setupEventListeners() {
       state.filters.page = 1;
       syncKpiActiveStates();
       syncUrlState();
+      loadStats();
       fetchReels();
       announceStatus(state.filters.datePreset === '7d' ? 'Filtered to items added in the last 7 days.' : 'Cleared date filter.');
     });
@@ -3249,6 +3876,7 @@ function setupEventListeners() {
       state.filters.page = 1;
       syncKpiActiveStates();
       syncUrlState();
+      loadStats();
       fetchReels();
       announceStatus(state.filters.watchStatus === 'watch_later' ? 'Filtered to Watch Later queue.' : 'Cleared Watch Later filter.');
     });
@@ -3261,6 +3889,7 @@ function setupEventListeners() {
       state.filters.page = 1;
       syncKpiActiveStates();
       syncUrlState();
+      loadStats();
       fetchReels();
       announceStatus(state.filters.watchStatus === 'watched' ? 'Filtered to Watched items.' : 'Cleared Watched filter.');
     });
@@ -3327,6 +3956,12 @@ function setupEventListeners() {
     if (shortcutsPopover && !shortcutsPopover.hidden && e.key === 'Escape') {
       e.preventDefault();
       closeShortcutsPopover(true);
+      return;
+    }
+
+    if (isSwitchingVault && e.key === 'Escape') {
+      e.preventDefault();
+      cancelSwitchVault();
       return;
     }
 
@@ -3454,7 +4089,23 @@ function setupEventListeners() {
     state.filters.page = 1;
     syncKpiActiveStates();
     syncUrlState();
+    loadStats();
     fetchReels();
+  });
+
+  // Automatically sync stats, creators, and cards when returning to this tab after DM bot actions
+  let lastAutoSyncAt = Date.now();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (isSwitchingVault) return;
+    if (vaultGateScreen && !vaultGateScreen.classList.contains('is-hidden')) return;
+    if (feedModal && feedModal.classList.contains('active')) return;
+    const now = Date.now();
+    if (now - lastAutoSyncAt < 5000) return;
+    lastAutoSyncAt = now;
+    loadStats({ silent: true });
+    loadCreators(state.creatorQuery, { silent: true });
+    fetchReels({ silent: true });
   });
 
   sortBySelect.addEventListener('change', (e) => {
@@ -3578,7 +4229,7 @@ function setupEventListeners() {
 
     try {
       const text = await file.text();
-      const res = await fetch('/api/archive/import', {
+      const res = await vaultFetch('/api/archive/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: text,

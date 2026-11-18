@@ -1,24 +1,24 @@
 # REELER (Instagram Saved Reels Tracker & Reminder OS) — CLAUDE.md
 
-Stack: Node.js (v22+ with native `--experimental-strip-types`) + Express.js + Supabase (PostgreSQL) + Meta Graph API (Instagram Messaging Webhooks) + Cloudflare Tunnel
+Stack: Node.js (v22+ with native `--experimental-strip-types`) + Express.js + Supabase (PostgreSQL) + Meta Graph API (Instagram Messaging Webhooks) + Render
 Repository: SaurabhK0205/reeler
-Last updated: November 10, 2026
+Last updated: November 18, 2026
 
 ---
 
-## 1. Git & Branching Rules (CRITICAL — NEVER VIOLATE)
+## 1. Git, Branching & Release Promotion Rules (CRITICAL — NEVER VIOLATE)
 
-1. **NEVER push directly to the `main` branch.**
-2. **NEVER commit work directly onto `main`.** Always verify your current branch before making changes:
+1. **NEVER push directly to `main` or `staging`.**
+2. **NEVER commit work directly onto `main` or `staging`.** Always verify your current branch before making changes:
    ```bash
    git branch --show-current
    ```
-3. **Every unit of work MUST have its own isolated branch** branched off latest `main`:
-   - `feat/<feature-name>`   → New user-facing or backend features (e.g. `feat/reminder-calendar`)
-   - `fix/<bug-name>`       → Bug fixes & UX defect repairs (e.g. `fix/in-app-mentions`)
-   - `refactor/<target>`     → Code refactoring without behavior change (e.g. `refactor/metadata-resolver`)
-   - `chore/<task>`          → Tooling, configs, docs, dependency upgrades (e.g. `chore/agent-guidelines`)
-   - `db/<migration-name>`   → Database schema additions and migrations (e.g. `db/awaiting-choice-column`)
+3. **Every unit of work MUST have its own isolated branch** branched off latest `staging`:
+   - `feat/<feature-name>`   -> New user-facing or backend features (e.g. `feat/reminder-calendar`)
+   - `fix/<bug-name>`       -> Bug fixes & UX defect repairs (e.g. `fix/in-app-mentions`)
+   - `refactor/<target>`     -> Code refactoring without behavior change (e.g. `refactor/metadata-resolver`)
+   - `chore/<task>`          -> Tooling, configs, docs, dependency upgrades (e.g. `chore/agent-guidelines`)
+   - `db/<migration-name>`   -> Database schema additions and migrations (e.g. `db/awaiting-choice-column`)
 4. **Author identity requirement**:
    Every commit MUST be configured and authored as:
    ```
@@ -32,20 +32,27 @@ Last updated: November 10, 2026
    - `chore(...)`: tooling/config/dependencies
    - `docs(...)`: documentation
    - `test(...)`: unit/integration tests
-6. **PR / Merge Workflow**:
-   - Push your topic branch: `git push -u origin <branch-name>`
-   - Open a Pull Request into `staging` (and sync to `main` via PR with zero divergence).
+6. **Environment Roles & Staging-First Promotion Workflow (MANDATORY)**:
+   - **`staging` (Testing Environment)**: Deployed at `reeler-staging` strictly for testing and verification. Every fix, push, change, or feature MUST merge into `staging` via Pull Request first.
+   - **`main` (Production Environment)**: Once Meta App Review is approved, `main` becomes the live production deployment serving all users, while `staging` remains testing-only.
+   - **Promotion Flow**:
+     1. Push your topic branch: `git push -u origin <branch-name>`.
+     2. Open a Pull Request into `staging`, pass tests + CodeRabbit review, and merge into `staging`.
+     3. Verify the change live on the deployed `staging` environment (`reeler-staging`).
+     4. Only after everything is verified healthy on `staging`, open a promotion PR from `staging` -> `main` (regular merge, preserving shared history) to release to production. The promotion PR head commit MUST be the exact commit verified on `reeler-staging`; if any new commit lands on `staging` before merge, re-verify the updated head on `reeler-staging` before merging into `main`.
+     5. Never merge a feature/fix branch directly into `main` bypassing `staging`.
 7. **CodeRabbit Review Gate (MANDATORY & BLOCKING)**:
    - When opening a Pull Request, **NEVER merge immediately**.
    - **ALWAYS wait for CodeRabbit AI review to run and complete** on the current PR head commit before merging.
-   - **NEVER merge while CodeRabbit review findings remain open or unaddressed**.
+   - **NEVER merge while CodeRabbit review findings remain open, in-progress, or unaddressed**.
    - Whenever CodeRabbit posts review comments or findings:
      1. Inspect each finding thoroughly (bugs, security, architecture, performance, edge cases).
      2. For valid findings on topic branches: implement fixes on the branch, verify unit tests (`npm test`), and push.
      3. For promotion PRs (e.g. `staging` -> `main`): route fixes through a separate topic-branch PR into `staging`, rather than pushing directly to `staging`.
      4. For invalid findings or false positives: reply to the review thread with an evidence-based explanation and documented reasoning.
-     5. Reply to each CodeRabbit review comment thread explaining the resolution.
-   - Recheck review status after every push. Only merge after CodeRabbit completes its review on the final head commit and all findings are confirmed resolved and verified.
+     5. Reply to each CodeRabbit review comment thread explaining the resolution citing the commit.
+     6. Resolve every review thread using GitHub GraphQL `resolveReviewThread` after verifying the fix, or after posting the evidence-based explanation for an invalid finding or false positive.
+   - **Incremental Re-Checks Must Complete (CRITICAL)**: Whenever a fix commit is pushed to address review feedback, CodeRabbit automatically triggers an incremental re-review (indicated by the `review in progress` state in its PR comment). You **MUST NEVER merge while a re-check or incremental review is running**. You must wait for the re-check to finish completely—confirming that the in-progress state is cleared, the final review report is posted, all pre-merge checks pass, and zero new findings or open threads remain. Only merge when re-checking is 100% complete and everything is positive.
    - **NO tight polling loops**: Never run tight sleep loops polling GitHub or CodeRabbit status.
 
 ---
@@ -53,9 +60,10 @@ Last updated: November 10, 2026
 ## 2. Pre-Session Rule
 
 Before writing any code or executing commands:
-1. **Branch Check**: Run `git branch --show-current`. If you are on `main`, immediately checkout a new topic branch:
+1. **Branch Check**: Run `git branch --show-current`. If you are on `main` or `staging`, fetch `origin` and immediately checkout a new topic branch off `origin/staging`:
    ```bash
-   git checkout -b <type>/<descriptive-name>
+   git fetch origin
+   git checkout -b <type>/<descriptive-name> origin/staging
    ```
 2. **Environment & Secrets Check**: Run `git status` to ensure `.env` and local credentials remain untracked.
 3. **Running Tasks Check**: Check if the Node server (port 3000) and Cloudflare tunnel are active before restarting them.
@@ -208,8 +216,9 @@ For implementation, debugging, refactoring, review, and migrations:
 
 ## 9. BLOCK Violations (NEVER generate code or execute actions that do this)
 
-* **Direct push to `main` branch** (strictly forbidden).
-* **Committing code directly onto `main`** instead of a topic branch.
+* **Direct push to `main` or `staging` branch** (strictly forbidden).
+* **Committing code directly onto `main` or `staging`** instead of a topic branch.
+* **Merging a feature/fix branch directly into `main` without testing and verifying it on `staging` first**.
 * **Committing any token, secret, credential, or `.env` file**.
 * **Merging a Pull Request without waiting for CodeRabbit review to complete**.
 * **Merging a Pull Request with unresolved CodeRabbit review comments or findings**.

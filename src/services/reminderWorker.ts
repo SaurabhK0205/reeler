@@ -55,28 +55,31 @@ export class ReminderWorker {
    */
   start() {
     const config = loadConfig();
-    if (!config.instagram.isConfigured) {
-      console.log('[ReminderWorker] Instagram credentials not configured. Inbound DM and reminder worker idle.');
-      return;
-    }
+    const hasScraperAuth = config.instagram.isConfigured && Boolean(config.instagram.adminUsername);
+    const hasMetaBotAuth = this.metaBot.isConfigured;
 
-    if (!config.instagram.adminUsername) {
-      console.log('[ReminderWorker] ADMIN_USERNAME not set in .env. DM listener will not know who to listen to.');
+    if (!hasScraperAuth && !hasMetaBotAuth) {
+      console.log('[ReminderWorker] Neither Instagram credentials nor Meta Bot credentials configured. Inbound DM and reminder worker idle.');
       return;
     }
 
     this.isRunning = true;
-    console.log(`[ReminderWorker] Starting DM listener & reminder scheduler for @${config.instagram.adminUsername}...`);
 
-    // 1. Initial check & loop for inbound DMs
-    this.pollInboundDMs();
-    this.dmInterval = setInterval(() => {
-      this.pollInboundDMs().catch((err) => console.error('[ReminderWorker] DM poll error:', err.message));
-    }, config.reminders.dmPollingIntervalMs);
+    // 1. Initial check & loop for inbound DMs (legacy scraper only)
+    if (hasScraperAuth) {
+      console.log(`[ReminderWorker] Starting DM listener for @${config.instagram.adminUsername}...`);
+      this.pollInboundDMs();
+      this.dmInterval = setInterval(() => {
+        this.pollInboundDMs().catch((err) => console.error('[ReminderWorker] DM poll error:', err.message));
+      }, config.reminders.dmPollingIntervalMs);
+    } else {
+      console.log('[ReminderWorker] Legacy DM scraper not configured. Relying on Meta Webhooks for inbound messages.');
+    }
 
     // 2. Loop for dispatching due reminders and checking 10-minute awaiting choice windows
-    this.checkDueReminders();
-    this.checkAwaitingChoices();
+    console.log('[ReminderWorker] Starting reminder dispatcher and choice scheduler...');
+    this.checkDueReminders().catch((err) => console.error('[ReminderWorker] Reminder dispatch error:', err.message));
+    this.checkAwaitingChoices().catch((err) => console.error('[ReminderWorker] Choice check error:', err.message));
     this.reminderInterval = setInterval(() => {
       this.checkDueReminders().catch((err) => console.error('[ReminderWorker] Reminder dispatch error:', err.message));
       this.checkAwaitingChoices().catch((err) => console.error('[ReminderWorker] Choice check error:', err.message));
@@ -171,7 +174,7 @@ export class ReminderWorker {
     // Case 1: Reel or Post was shared!
     if (msg.reel) {
       const { mediaId, shortcode, authorUsername, caption, thumbnailUrl, mediaType, reelUrl } = msg.reel;
-      const existingItem = shortcode ? await Repository.getSavedItemByShortcode(shortcode) : null;
+      const existingItem = shortcode ? await Repository.getSavedItemByShortcode(shortcode, null) : null;
       const isTextFallbackReel = !mediaId && mediaType === 'reel' && !/\/p\//i.test(reelUrl || '');
       const resolvedMediaType =
         isTextFallbackReel && existingItem
@@ -181,7 +184,7 @@ export class ReminderWorker {
         isTextFallbackReel && existingItem
           ? formatCanonicalInstagramUrl(shortcode, resolvedMediaType, existingItem.reel_url)
           : formatCanonicalInstagramUrl(shortcode, resolvedMediaType, reelUrl);
-      console.log(`[ReminderWorker] ${resolvedMediaType === 'post' ? '🖼️' : '🎬'} Detected shared ${resolvedMediaType} from admin: ${shortcode} (Media ID: ${mediaId})`);
+      console.log(`[ReminderWorker] Detected shared ${resolvedMediaType} from admin: ${shortcode} (Media ID: ${mediaId})`);
 
       // 1. Save to native Instagram Saved collection
       let savedOnIg = false;
@@ -189,7 +192,7 @@ export class ReminderWorker {
         const saveRes = await this.actionClient.saveMedia(mediaId);
         savedOnIg = saveRes.success && saveRes.data;
         if (savedOnIg) {
-          console.log(`[ReminderWorker] ✅ Saved ${resolvedMediaType} ${mediaId} natively on Instagram!`);
+          console.log(`[ReminderWorker] Saved ${resolvedMediaType} ${mediaId} natively on Instagram!`);
         }
       }
 
@@ -298,7 +301,7 @@ export class ReminderWorker {
       const config = loadConfig();
       const intervalHours = config.reminders.defaultIntervalHours;
 
-      console.log(`[ReminderWorker] 🔔 Found ${allDueReels.length} Reel(s) due for reminder (dispatching batch of ${dueReels.length}).`);
+      console.log(`[ReminderWorker] Found ${allDueReels.length} Reel(s) due for reminder (dispatching batch of ${dueReels.length}).`);
 
       for (const reel of dueReels) {
         const reminderText = formatWatchLaterReminderMessage(reel);
@@ -307,15 +310,15 @@ export class ReminderWorker {
 
         try {
           if (reel.instagram_sender_id && this.metaBot.isConfigured) {
-            console.log(`[ReminderWorker] 🔔 Dispatching Instagram DM reminder to ${reel.instagram_sender_id}...`);
+            console.log(`[ReminderWorker] Dispatching Instagram DM reminder to ${reel.instagram_sender_id}...`);
             delivered = await this.metaBot.sendDirectMessage(reel.instagram_sender_id, reminderText);
           } else if (!reel.instagram_sender_id && this.adminUserId && config.instagram.isConfigured) {
             // Supported delivery fallback for legacy or unattributed sender reels
-            console.log(`[ReminderWorker] 🔔 Dispatching fallback reminder to admin (${this.adminUserId})...`);
+            console.log(`[ReminderWorker] Dispatching fallback reminder to admin (${this.adminUserId})...`);
             const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reminderText);
             delivered = sendResult.success && sendResult.data === true;
           } else {
-            console.warn(`[ReminderWorker] ⚠️ No active delivery channel or recipient found for reel ${reel.shortcode}.`);
+            console.warn(`[ReminderWorker] No active delivery channel or recipient found for reel ${reel.shortcode}.`);
           }
         } catch (err: any) {
           console.error(`[ReminderWorker] Delivery error for reel ${reel.shortcode}:`, err.message || err);
@@ -382,7 +385,10 @@ export class ReminderWorker {
 
     for (const reel of expiredReels) {
       const { targetTime } = await Repository.activateDefaultReminder(reel.id, defaultHours);
-      const targetStr = formatTargetTime(targetTime);
+      const senderTz = reel.instagram_sender_id
+        ? await Repository.getSenderTimezone(reel.instagram_sender_id)
+        : undefined;
+      const targetStr = formatTargetTime(targetTime, new Date(), senderTz);
 
       const defaultNotice = formatDefaultReminderNotice(reel, defaultHours, targetStr);
 

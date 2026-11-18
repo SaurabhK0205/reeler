@@ -15,6 +15,7 @@ export interface CreatorQueryResult {
 const RESERVED_WORDS = new Set([
   'hi', 'hello', 'hey', 'yo', 'hola', 'sup', 'gm', 'gn',
   'help', 'start', 'menu', 'info', 'ping', 'test', 'status', 'reels', 'reel', 'posts', 'post', 'all', 'list',
+  'vault', 'library', 'web', 'dashboard', 'link', 'code', 'otp', 'login', 'passcode',
   'me', 'it', 'this', 'that', 'none', 'anything', 'something', 'everything', 'snooze', 'later', 'unwatched',
   'reminder', 'reminders',
   'watched', 'done', 'seen', 'finish', 'finished', 'stop', 'cancel', 'halt', 'unsub', 'unsubscribe', 'quit', 'clear',

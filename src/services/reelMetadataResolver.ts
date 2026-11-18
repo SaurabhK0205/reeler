@@ -37,6 +37,7 @@ const META_CACHE_TTL_MS = 30 * 60 * 1000;
 const META_NEGATIVE_CACHE_TTL_MS = 60 * 1000;
 const META_CACHE_MAX_ENTRIES = 500;
 const MAX_IMAGE_PROBE_BYTES = 256 * 1024;
+const MAX_HTML_FETCH_BYTES = 1_500_000;
 const MAX_CONCURRENT_UPSTREAM_RESOLVES = 6;
 const MAX_QUEUED_RESOLVES = 18;
 const UPSTREAM_BUDGET_WINDOW_MS = 60 * 1000;
@@ -59,6 +60,8 @@ const feedMetaInFlight = new Map<string, InFlightMetaEntry>();
 let activeUpstreamResolves = 0;
 const upstreamResolveQueue: ResolveQueueWaiter[] = [];
 const upstreamResolveTimestamps: number[] = [];
+const OEMBED_UNAPPROVED_COOLDOWN_MS = 60 * 60 * 1000;
+let oEmbedBlockedUntil = 0;
 
 /**
  * Clears cached feed metadata and upstream resolve budget state between isolated unit tests.
@@ -66,6 +69,7 @@ const upstreamResolveTimestamps: number[] = [];
 export function resetFeedMetaResolverStateForTests(): void {
   feedMetaCache.clear();
   upstreamResolveTimestamps.length = 0;
+  oEmbedBlockedUntil = 0;
 }
 
 /**
@@ -415,6 +419,317 @@ async function fetchImageDimensions(
  * Fetches Instagram OpenGraph metadata for a saved reel or post shortcode,
  * probing the preferred URL path (`/reel/` or `/p/`) first and falling back to the alternate path on non-OK HTTP status.
  */
+const GENERIC_INSTAGRAM_TITLE_RE = /^(?:instagram|login\s*[•·-]\s*instagram)$/i;
+const OG_ITEM_SHORTCODE_RE = /instagram\.com\/(?:[^/?#]+\/)?(?:reel|reels|p|tv)\/([A-Za-z0-9_-]{5,32})(?:[/?#]|$)/i;
+const DIRECT_PRIMARY_TIMEOUT_MS = 8000;
+const DIRECT_SECONDARY_TIMEOUT_MS = 3000;
+const DIRECT_METADATA_USER_AGENTS = [
+  'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+  'WhatsApp/2.23.20.0',
+];
+
+interface ParsedOpenGraphFields {
+  ogUrl: string;
+  twitterTitle: string;
+  ogTitle: string;
+  ogDesc: string;
+  ogImage?: string;
+  jsonOwnerUsername?: string;
+}
+
+/**
+ * Quote-aware HTML `<meta>` tag tokenizer that safely handles `>` inside quoted attribute values,
+ * arbitrary attribute ordering, and double-quoted, single-quoted, or unquoted attribute values.
+ */
+function extractMetaTagAttributes(html: string): Array<Record<string, string>> {
+  const tags: Array<Record<string, string>> = [];
+  let pos = 0;
+
+  while (pos < html.length) {
+    const lt = html.indexOf('<', pos);
+    if (lt === -1) break;
+
+    // Skip HTML comments so commented-out <meta> tags are never treated as elements
+    if (html.startsWith('<!--', lt)) {
+      const commentEnd = html.indexOf('-->', lt + 4);
+      if (commentEnd === -1) break;
+      pos = commentEnd + 3;
+      continue;
+    }
+
+    // Match ASCII <meta directly on the original string (avoiding Unicode toLowerCase length shifts like İ)
+    const afterName = html[lt + 5];
+    if (
+      html.slice(lt + 1, lt + 5).toLowerCase() !== 'meta' ||
+      (afterName && !/[\s/>]/.test(afterName))
+    ) {
+      pos = lt + 1;
+      continue;
+    }
+
+    let i = lt + 5;
+    const attrs: Record<string, string> = Object.create(null);
+
+    while (i < html.length) {
+      while (i < html.length && /[\s/]/.test(html[i])) i++;
+      if (i >= html.length || html[i] === '>') {
+        i++;
+        break;
+      }
+
+      const nameStart = i;
+      while (i < html.length && !/[\s=/>]/.test(html[i])) i++;
+      const attrName = html.slice(nameStart, i).toLowerCase();
+      while (i < html.length && /\s/.test(html[i])) i++;
+
+      let attrVal = '';
+      if (i < html.length && html[i] === '=') {
+        i++;
+        while (i < html.length && /\s/.test(html[i])) i++;
+        if (i < html.length && (html[i] === '"' || html[i] === "'")) {
+          const quote = html[i++];
+          const valStart = i;
+          while (i < html.length && html[i] !== quote) i++;
+          attrVal = html.slice(valStart, i);
+          if (i < html.length && html[i] === quote) i++;
+        } else {
+          const valStart = i;
+          while (i < html.length && !/[\s>]/.test(html[i])) i++;
+          attrVal = html.slice(valStart, i);
+        }
+      }
+
+      if (attrName && !(attrName in attrs)) {
+        attrs[attrName] = attrVal;
+      }
+    }
+
+    tags.push(attrs);
+    pos = i;
+  }
+
+  return tags;
+}
+
+/**
+ * Extracts OpenGraph, Twitter meta, and embedded JSON owner values once by tokenizing `<meta>` tags
+ * safely across comments, Unicode titles, quoted `>` characters, arbitrary attribute ordering, and entity-encoded selectors.
+ */
+function parseOpenGraphFields(html: string): ParsedOpenGraphFields {
+  let ogUrl = '';
+  let twitterTitle = '';
+  let ogTitle = '';
+  let ogDesc = '';
+  let ogImage: string | undefined;
+
+  for (const attrs of extractMetaTagAttributes(html)) {
+    const contentAttr = attrs.content;
+    if (contentAttr === undefined) continue;
+    const propertyAttr = decodeHtml(attrs.property || '').trim().toLowerCase();
+    const nameAttr = decodeHtml(attrs.name || '').trim().toLowerCase();
+
+    if (propertyAttr === 'og:url' && !ogUrl) {
+      ogUrl = decodeHtml(contentAttr).trim();
+    } else if (nameAttr === 'twitter:title' && !twitterTitle) {
+      twitterTitle = decodeHtml(contentAttr).trim();
+    } else if (propertyAttr === 'og:title' && !ogTitle) {
+      ogTitle = decodeHtml(contentAttr).trim();
+    } else if (propertyAttr === 'og:description' && !ogDesc) {
+      ogDesc = decodeHtml(contentAttr).trim();
+    } else if (propertyAttr === 'og:image' && !ogImage) {
+      const decoded = decodeHtml(contentAttr).trim();
+      if (decoded) ogImage = decoded;
+    }
+  }
+
+  const jsonOwnerUsername = html.match(/"owner":\s*\{[^}]*"username":\s*"([a-zA-Z0-9._]+)"/i)?.[1];
+  return { ogUrl, twitterTitle, ogTitle, ogDesc, ogImage, jsonOwnerUsername };
+}
+
+/**
+ * Validates that parsed OpenGraph metadata belongs to the requested Instagram shortcode rather than
+ * a generic login/interstitial shell or a different Instagram item.
+ */
+function isValidItemOpenGraph(fields: ParsedOpenGraphFields, shortcode: string): boolean {
+  if (fields.ogUrl) {
+    const itemMatch = fields.ogUrl.match(OG_ITEM_SHORTCODE_RE);
+    if (itemMatch && itemMatch[1] !== shortcode) {
+      return false;
+    }
+    if (itemMatch && itemMatch[1] === shortcode) {
+      return true;
+    }
+  }
+  if (fields.ogImage) {
+    return true;
+  }
+  if (fields.twitterTitle && !GENERIC_INSTAGRAM_TITLE_RE.test(fields.twitterTitle)) {
+    return true;
+  }
+  return Boolean(fields.ogTitle && !GENERIC_INSTAGRAM_TITLE_RE.test(fields.ogTitle));
+}
+
+/**
+ * Reads up to `maxBytes` of UTF-8 text from a fetch Response, cancelling the underlying stream
+ * immediately once the byte cap is reached to protect against oversized upstream responses.
+ */
+async function readBoundedText(res: Response, maxBytes: number = MAX_HTML_FETCH_BYTES): Promise<string> {
+  if (!res.body) {
+    const raw = await res.text();
+    return raw.length > maxBytes ? raw.slice(0, maxBytes) : raw;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let output = '';
+  let totalBytes = 0;
+
+  try {
+    while (totalBytes < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      const remaining = maxBytes - totalBytes;
+      if (value.byteLength <= remaining) {
+        output += decoder.decode(value, { stream: true });
+        totalBytes += value.byteLength;
+      } else {
+        output += decoder.decode(value.subarray(0, remaining), { stream: false });
+        totalBytes += remaining;
+        break;
+      }
+    }
+    output += decoder.decode();
+    return output;
+  } finally {
+    try {
+      await reader.cancel().catch(() => {});
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        // Reader already released
+      }
+    }
+  }
+}
+
+/**
+ * Resolves metadata via Meta's official Instagram oEmbed endpoint when a Page Access Token
+ * is configured and Meta oEmbed Read is approved. Applies a 1-hour cooldown if Meta returns
+ * error code 10 (feature not yet approved) to avoid redundant upstream requests.
+ */
+async function fetchViaMetaOEmbed(
+  shortcode: string,
+  preferredPath: 'reel' | 'p',
+  signal?: AbortSignal
+): Promise<ExtractedReelMetadata | null> {
+  const token = process.env.META_PAGE_ACCESS_TOKEN?.trim();
+  if (!token || Date.now() < oEmbedBlockedUntil || signal?.aborted) {
+    return null;
+  }
+
+  const targetUrl = `https://www.instagram.com/${preferredPath}/${encodeURIComponent(shortcode)}/`;
+  const oEmbedUrl = `https://graph.facebook.com/v21.0/instagram_oembed?url=${encodeURIComponent(targetUrl)}`;
+  try {
+    const res = await fetch(oEmbedUrl, {
+      signal: createCombinedSignal(6000, signal),
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    const data = (await res.json().catch(() => null)) as Record<string, any> | null;
+    if (!res.ok) {
+      if (data?.error?.code === 10) {
+        oEmbedBlockedUntil = Date.now() + OEMBED_UNAPPROVED_COOLDOWN_MS;
+        console.warn('[MetadataResolver] Meta oEmbed Read not approved yet (code 10); pausing oEmbed fallback for 1h.');
+      }
+      return null;
+    }
+    const authorName = typeof data?.author_name === 'string' ? data.author_name.trim().replace(/^@/, '') : '';
+    const thumbnailUrl = typeof data?.thumbnail_url === 'string' ? data.thumbnail_url.trim() : undefined;
+    const title = typeof data?.title === 'string' && data.title.trim() ? data.title.trim() : undefined;
+    if (!authorName && !thumbnailUrl && !title) {
+      return null;
+    }
+    const efgMeta = parseEfgMediaKind(thumbnailUrl);
+    return {
+      username: authorName ? authorName.toLowerCase() : undefined,
+      displayName: authorName || undefined,
+      caption: title,
+      thumbnailUrl,
+      mediaKind: efgMeta.mediaKind,
+      isClips: efgMeta.isClips,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetches Instagram HTML through an optional configured HTTPS metadata relay (e.g. a Cloudflare Worker)
+ * when cloud datacenter IPs receive login-walled HTML directly from Instagram.
+ */
+async function fetchHtmlViaProxy(
+  targetUrl: string,
+  shortcode: string,
+  signal?: AbortSignal
+): Promise<ParsedOpenGraphFields | null> {
+  const rawProxy = process.env.METADATA_PROXY_URL?.trim();
+  if (!rawProxy || signal?.aborted) {
+    return null;
+  }
+
+  let parsedProxy: URL;
+  try {
+    parsedProxy = new URL(rawProxy);
+  } catch {
+    return null;
+  }
+  if (parsedProxy.username || parsedProxy.password) {
+    console.warn(`[MetadataResolver] Ignoring METADATA_PROXY_URL with embedded credentials (${parsedProxy.hostname}).`);
+    return null;
+  }
+  const isAllowedProtocol =
+    parsedProxy.protocol === 'https:' ||
+    (parsedProxy.protocol === 'http:' && (parsedProxy.hostname === 'localhost' || parsedProxy.hostname === '127.0.0.1'));
+  if (!isAllowedProtocol) {
+    return null;
+  }
+
+  parsedProxy.searchParams.set('url', targetUrl);
+  const headers: Record<string, string> = {
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+  const proxyToken = process.env.METADATA_PROXY_TOKEN?.trim();
+  if (proxyToken) {
+    headers.Authorization = `Bearer ${proxyToken}`;
+  }
+
+  try {
+    const res = await fetch(parsedProxy.toString(), {
+      signal: createCombinedSignal(8000, signal),
+      headers,
+    });
+    if (!res.ok) {
+      console.warn(`[MetadataResolver] Proxy relay returned HTTP ${res.status} (${parsedProxy.hostname}).`);
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
+    const candidateHtml = await readBoundedText(res);
+    const parsedFields = parseOpenGraphFields(candidateHtml);
+    if (!isValidItemOpenGraph(parsedFields, shortcode)) {
+      console.warn(`[MetadataResolver] Proxy relay returned HTTP 200 without item OpenGraph tags (${parsedProxy.hostname}).`);
+      return null;
+    }
+    return parsedFields;
+  } catch (err: any) {
+    if (!signal?.aborted) {
+      const errorKind = typeof err?.name === 'string' && err.name ? err.name : 'FetchError';
+      console.warn(`[MetadataResolver] Proxy relay request failed (${parsedProxy.hostname}): ${errorKind}`);
+    }
+    return null;
+  }
+}
+
 export async function fetchReelMetadata(
   shortcode: string,
   signal?: AbortSignal,
@@ -430,48 +745,114 @@ export async function fetchReelMetadata(
   const pathsToTry: Array<'reel' | 'p'> = preferredPath === 'p' ? ['p', 'reel'] : ['reel', 'p'];
 
   try {
-    let html: string | null = null;
+    let parsedFields: ParsedOpenGraphFields | null = null;
+    let lastStatus = 0;
+    const loginWallPaths: Array<'reel' | 'p'> = [];
+
+    const tryDirectFetch = async (
+      pathSegment: 'reel' | 'p',
+      userAgent: string,
+      recordLoginWall: boolean,
+      timeoutMs: number
+    ): Promise<ParsedOpenGraphFields | null> => {
+      if (signal?.aborted) {
+        return null;
+      }
+      const url = `https://www.instagram.com/${pathSegment}/${encodeURIComponent(shortcode)}/`;
+      try {
+        const res = await fetch(url, {
+          signal: createCombinedSignal(timeoutMs, signal),
+          headers: {
+            'User-Agent': userAgent,
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+        });
+        lastStatus = res.status;
+
+        if (!res.ok) {
+          await res.body?.cancel().catch(() => {});
+          return null;
+        }
+
+        const candidateHtml = await readBoundedText(res);
+        const candidateFields = parseOpenGraphFields(candidateHtml);
+        if (!isValidItemOpenGraph(candidateFields, shortcode)) {
+          if (recordLoginWall && !loginWallPaths.includes(pathSegment)) {
+            loginWallPaths.push(pathSegment);
+          }
+          return null;
+        }
+        return candidateFields;
+      } catch (err: any) {
+        if (signal?.aborted) {
+          return null;
+        }
+        console.warn(
+          `[MetadataResolver] Direct fetch attempt for ${shortcode} (/${pathSegment}/) failed: ${err?.message || err}`
+        );
+        return null;
+      }
+    };
 
     for (const pathSegment of pathsToTry) {
       if (signal?.aborted) {
         return {};
       }
-      const url = `https://www.instagram.com/${pathSegment}/${encodeURIComponent(shortcode)}/`;
-      const res = await fetch(url, {
-        signal: createCombinedSignal(8000, signal),
-        headers: {
-          'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-      });
-
-      if (!res.ok) {
-        await res.body?.cancel().catch(() => {});
-        continue;
+      const candidate = await tryDirectFetch(
+        pathSegment,
+        DIRECT_METADATA_USER_AGENTS[0],
+        true,
+        DIRECT_PRIMARY_TIMEOUT_MS
+      );
+      if (candidate) {
+        parsedFields = candidate;
+        break;
       }
-
-      const candidateHtml = await res.text();
-      if (!/<meta\s+(?:property|name)="(?:og:url|og:image|twitter:title|og:title)"/i.test(candidateHtml)) {
-        continue;
-      }
-
-      html = candidateHtml;
-      break;
     }
 
-    if (!html) {
-      return {};
+    if (!parsedFields && loginWallPaths.length > 0 && !signal?.aborted) {
+      // Bound secondary UA probe to a single fast 3s attempt on the primary login-walled path so
+      // oEmbed and proxy relay fallbacks are not stalled.
+      const candidate = await tryDirectFetch(
+        loginWallPaths[0],
+        DIRECT_METADATA_USER_AGENTS[1],
+        false,
+        DIRECT_SECONDARY_TIMEOUT_MS
+      );
+      if (candidate) {
+        parsedFields = candidate;
+      }
     }
 
-    const ogUrl = decodeHtml(html.match(/<meta property="og:url" content="([^"]+)"/i)?.[1] || '');
-    const rawTwitterTitle = html.match(/<meta name="twitter:title" content="([^"]+)"/i)?.[1] || '';
-    const twitterTitle = decodeHtml(rawTwitterTitle);
-    const rawTitle = html.match(/<meta property="og:title" content="([^"]+)"/i)?.[1] || '';
-    const ogTitle = decodeHtml(rawTitle);
-    const rawDesc = html.match(/<meta property="og:description" content="([^"]+)"/i)?.[1] || '';
-    const ogDesc = decodeHtml(rawDesc);
-    const rawOgImage = html.match(/<meta property="og:image" content="([^"]+)"/i)?.[1];
-    const ogImage = rawOgImage ? decodeHtml(rawOgImage) : undefined;
+    if (!parsedFields) {
+      // Fallback 1: Official Meta Instagram oEmbed API (works automatically once Meta oEmbed Read is approved)
+      const oEmbedResult = await fetchViaMetaOEmbed(shortcode, pathsToTry[0], signal);
+      if (oEmbedResult) {
+        return oEmbedResult;
+      }
+
+      // Fallback 2: Optional external metadata relay (e.g. Cloudflare Worker) for cloud IPs blocked by Instagram
+      if (process.env.METADATA_PROXY_URL?.trim()) {
+        for (const pathSegment of pathsToTry) {
+          const url = `https://www.instagram.com/${pathSegment}/${encodeURIComponent(shortcode)}/`;
+          const proxiedFields = await fetchHtmlViaProxy(url, shortcode, signal);
+          if (proxiedFields) {
+            parsedFields = proxiedFields;
+            break;
+          }
+        }
+      }
+
+      if (!parsedFields) {
+        console.warn(
+          `[MetadataResolver] No OpenGraph metadata returned for ${shortcode} (lastStatus=${lastStatus}, proxyConfigured=${Boolean(process.env.METADATA_PROXY_URL?.trim())}).`
+        );
+        return {};
+      }
+    }
+
+    const { ogUrl, twitterTitle, ogTitle, ogDesc, ogImage, jsonOwnerUsername } = parsedFields;
 
     let username: string | undefined;
 
@@ -511,11 +892,8 @@ export async function fetchReelMetadata(
     }
 
     // Strategy 6: Embedded JSON in HTML (e.g. "owner":{"username":"..."})
-    if (!username) {
-      const jsonOwnerMatch = html.match(/"owner":\s*\{[^}]*"username":\s*"([a-zA-Z0-9._]+)"/i);
-      if (jsonOwnerMatch) {
-        username = jsonOwnerMatch[1];
-      }
+    if (!username && jsonOwnerUsername) {
+      username = jsonOwnerUsername;
     }
 
     // Extract display name

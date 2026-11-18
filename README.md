@@ -1,57 +1,86 @@
-# Instagram Saved Reels Tracker & Discovery Dashboard
+# Reeler
 
-A fast, intelligent, and lightweight Saved Reels tracker that works alongside Instagram's existing experience. It allows you to search, filter by creator, filter by save date, manage watch status (Unwatched, Watch Later, Watched), and rediscover buried content without manually categorizing Reels into Collections.
+> "You scroll through 1,000 reels a day. Make sure you don't miss an important one."
 
----
+Inspired by Michael De Santa's line in GTA V (*"You forget a thousand things every day, make sure this is one of 'em"*), Reeler exists because Instagram's Saved tab turns into a graveyard fast. You cannot search captions, you cannot filter by creator, and nothing reminds you to come back to a reel you actually meant to watch.
 
-## 🌟 Key Features
-
-- **Date-Based Filtering:** Filter by Today, Yesterday, Last 7 Days, Last 30 Days, Last 3 Months, Last 6 Months, or This Year.
-- **Creator-Based Filtering:** Quick-filter pills and directory showing all creators with count of saved Reels.
-- **Instant Search:** Full-text keyword search across captions, creator usernames, and display names.
-- **Watch State Management:** Toggle Reels between **Unwatched**, **Watch Later (⏰)**, and **Watched (✅)**.
-- **Native Preservation:** Direct links to open the original Reel on Instagram, preserving attribution and video playback.
-- **Dual Database Support:**
-  - **Supabase (PostgreSQL):** High-speed cloud persistence with GIN full-text search indexes (`to_tsvector`).
-  - **In-Memory Demo Fallback:** Zero-setup offline store for instant local testing.
+Reeler pairs an Instagram DM bot (`@er_reel_er`) with a private web vault ([reeler-staging.onrender.com](https://reeler-staging.onrender.com)). Share a Reel or Post to the bot, tell it when to remind you, and browse everything you have saved in one searchable place without giving up your Instagram password.
 
 ---
 
-## 🚀 Quick Start (Running in 1 Minute)
+## How It Works
 
-### 1. Install Dependencies
+### 1. Instagram DM Bot (`@er_reel_er`)
+Built on Meta's official Messenger API for Instagram (`graph.facebook.com/v21.0/me/messages`). Every user's data is isolated per Instagram Scoped User ID (`instagram_sender_id`).
+
+| DM Command | What It Does |
+|---|---|
+| Share a Reel or Post | Adds the item to your Watch Later queue and asks when to remind you (defaults to 10 hours if you do not reply within 10 minutes). |
+| `30m`, `2h`, `tomorrow at 5pm` | Sets or reschedules the reminder on your most recent item. |
+| `watched` | Marks your latest reminded item as watched and stops reminders for it. |
+| `stop all` / `clear all` | Marks all pending Watch Later items as watched and stops their reminders. |
+| `@username`, `reels by @name`, `posts by @name` | Searches your saved items from that creator. |
+| `tz` / `tz <city or zone>` | Checks or updates your local timezone (for example `tz IST`, `tz London`, `tz New York`). |
+| `vault` | Sends your private direct link to the web vault. |
+| `code` | Generates a one-time 6-digit login code (valid for 10 minutes) to unlock your vault on a laptop or desktop browser. |
+| `delete my data` | Permanently deletes all of your saved items, reminders, and preferences from the database. |
+
+### 2. Private Web Vault
+- Zero-login access via the `?key=...` link or 6-digit `code` sent by `@er_reel_er` in DM, plus a **Switch Vault** button in the header to clear the cached key cleanly.
+- Full-text search across captions and creator handles (PostgreSQL GIN `to_tsvector` index).
+- Filters for media type (`All`, `Reels`, `Posts`), source (`Saved on IG` vs `Sent to Bot`), save date (`Today`, `Yesterday`, `7d`, `30d`, `3m`, `6m`, `Year`), watch status (`Unwatched`, `Watch Later`, `Watched`), and creator.
+- Grid view, dense list view, and an adaptive fullscreen player that fits vertical Reels (`9:16`) alongside square and landscape Posts (`1:1`, `4:5`, `3:4`, `16:9`).
+- Additive archive import for Instagram's official `saved_posts.json` export from Accounts Center, so existing Instagram bookmarks can live alongside bot-tracked items without duplicates.
+
+---
+
+## Stack
+
+- **Runtime & API:** Node.js `>=24` (native `--experimental-strip-types`), TypeScript, Express 4
+- **Frontend:** Vanilla HTML, CSS, and JavaScript (`public/`) with no build step or framework runtime
+- **Database:** Supabase (PostgreSQL) with an in-memory fallback when Supabase credentials are omitted
+- **Messaging:** Meta Messenger API for Instagram with HMAC-SHA256 (`X-Hub-Signature-256`) webhook verification
+- **Hosting:** Render (Docker) with an optional HTTPS metadata relay (`METADATA_PROXY_URL`) for OpenGraph lookups on cloud IPs
+
+---
+
+## Running Locally
+
+### 1. Install dependencies
 ```bash
-cd /Users/thismac/projects/instagram-saved-reels
+git clone https://github.com/SaurabhK0205/reeler.git
+cd reeler
 npm install
 ```
 
-### 2. (Optional) Seed Demo Data
-To test the dashboard immediately with realistic sample Reels:
+### 2. Configure environment variables
 ```bash
-npm run seed
+cp .env.example .env
 ```
 
-### 3. Start the Web Dashboard
+If you leave `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` empty, the server starts with an empty in-memory store so you can open the UI immediately and test archive import (`saved_posts.json`) without setting up a database:
+
 ```bash
 npm start
 ```
-Open **[http://localhost:3000](http://localhost:3000)** in your browser!
+
+Open `http://localhost:3000`. Once Supabase is configured in `.env`, you can optionally run `npm run seed` before `npm start` to populate sample items into your database.
+
+### 3. Available scripts
+- `npm start` — Run the server (`src/server.ts`)
+- `npm run dev` — Run with `--watch`
+- `npm test` — Run all 6 regression test suites (archive import, Meta bot & metadata resolver, adaptive player, vault auth, compliance pages, duration/timezone)
+- `npm run import` — Import an Instagram `saved_posts.json` export from the CLI
+- `npm run recover-posts` — Repair legacy `/reel/` URLs that are actually `/p/` posts
+- `npm run seed` — Populate sample data into a configured Supabase database
 
 ---
 
-## 🗄️ Supabase Database Setup
+## Database Setup (Supabase)
 
-1. Create a free project at [supabase.com](https://supabase.com).
-2. Go to the **SQL Editor** tab in your Supabase dashboard.
-3. Paste and run the contents of [`supabase/migrations/001_initial_schema.sql`](supabase/migrations/001_initial_schema.sql).
-4. Go to **Project Settings** ➔ **API** and copy:
-   - **Project URL**
-   - **service_role key** (or anon key)
-5. Create your `.env` file:
-   ```bash
-   cp .env.example .env
-   ```
-6. Add your keys:
+1. Create a project at [supabase.com](https://supabase.com).
+2. Apply all SQL migrations in [`supabase/migrations/`](supabase/migrations/) in order (`001_initial_schema.sql` through `014_saved_reels_shortcode_index.sql`).
+3. Copy your Project URL and `service_role` key into `.env`:
    ```env
    SUPABASE_URL=https://your-project-id.supabase.co
    SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
@@ -59,32 +88,26 @@ Open **[http://localhost:3000](http://localhost:3000)** in your browser!
 
 ---
 
-## 📸 Connecting Your Instagram Account (Syncing Real Saved Reels)
+## Meta Webhook & Deployment
 
-Because Instagram does not expose a public API for personal bookmarks, we use an authenticated session from your desktop browser:
+Set the following environment variables in your host (for example Render using [`render.yaml`](render.yaml)):
 
-1. Open your browser on this Mac and log in to [instagram.com](https://www.instagram.com).
-2. Open Developer Tools (`Cmd + Option + I` or `F12`) ➔ **Application** (or **Storage**) ➔ **Cookies** ➔ `https://www.instagram.com`.
-3. Copy these 3 values into your `.env`:
-   - `sessionid` ➔ `INSTAGRAM_SESSION_ID`
-   - `ds_user_id` ➔ `INSTAGRAM_USER_ID`
-   - `csrftoken` ➔ `INSTAGRAM_CSRF_TOKEN`
+- `META_PAGE_ACCESS_TOKEN` — Page access token for the Facebook Page linked to your Instagram Professional account
+- `META_APP_SECRET` — Meta App Secret used to verify `X-Hub-Signature-256` on every incoming webhook
+- `META_WEBHOOK_VERIFY_TOKEN` — Custom verify token configured in Meta Webhooks
+- `APP_URL` — Public base URL used for vault links (falls back to `RENDER_EXTERNAL_URL`)
+- `METADATA_PROXY_URL` / `METADATA_PROXY_TOKEN` *(optional)* — HTTPS relay (such as a Cloudflare Worker) for fetching public OpenGraph metadata when cloud datacenter IPs hit Instagram's login wall
 
-### Syncing
-You can trigger synchronization either:
-- By clicking the **"🔄 Sync Saved Reels"** button in the top right of the web dashboard.
-- Or running from your terminal:
-  ```bash
-  npm run sync
-  ```
+Endpoints exposed by the server:
+- `GET` / `POST /api/instagram/webhook` (alias: `/webhook`) — Meta webhook verification and DM event handler
+- `GET /api/health` — Service health, database mode, and Meta bot readiness check
+- `GET /privacy`, `GET /terms`, `GET /data-deletion` — Compliance pages required for Meta App Review
 
 ---
 
-## 📐 The Historical Save Date Philosophy
+## Save-Date Integrity
 
-Instagram's internal saved feed returns items in exact reverse chronological order (newest saved first), but does **not** expose an explicit historical `saved_at` timestamp in the JSON payload (only `taken_at`, which is when the creator published the Reel).
-
-To maintain engineering integrity without fabricating timestamps:
-1. Every Reel is assigned an exact **`save_order_rank`** (#1 = most recently saved).
-2. For past saved Reels, `saved_at` remains `NULL` while `first_detected_at` marks the initial sync date.
-3. For newly saved Reels after setup, exact timestamps are captured upon detection.
+Instagram's saved feed orders bookmarks from newest to oldest, while official `saved_posts.json` exports include timestamps only on entries where Meta recorded them. Rather than inventing fake dates:
+- Each item keeps its relative `save_order_rank`.
+- Historical items without an explicit save timestamp leave `saved_at` as `NULL` and record `first_detected_at`.
+- Chronological sorting uses a generated `effective_saved_at` column (`COALESCE(saved_at, first_detected_at)`), and re-importing a newer `saved_posts.json` backfills missing `saved_at` values when present.

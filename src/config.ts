@@ -24,7 +24,8 @@ export interface AppConfig {
 
 export function loadConfig(): AppConfig {
   const supabaseUrl = process.env.SUPABASE_URL?.trim();
-  const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY)?.trim();
+  // Migration 015 revokes anon/authenticated privileges on creators and saved_reels; service_role is required.
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 
   const sessionId = process.env.INSTAGRAM_SESSION_ID?.trim();
   const userId = process.env.INSTAGRAM_USER_ID?.trim();

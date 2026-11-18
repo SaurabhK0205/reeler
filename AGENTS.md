@@ -61,7 +61,10 @@ Follow GRAVITAS invariants for implementation, debugging, refactoring, review, a
 ---
 
 ### Summary of Strict Invariants:
-1. **Branching**: NEVER push or commit directly to `main` or `staging`. Every unit of work must live on a dedicated branch (`feat/*`, `fix/*`, `refactor/*`, `chore/*`, `db/*`).
+1. **Branching & Promotion Flow**:
+   - NEVER push or commit directly to `main` or `staging`. Every unit of work must live on a dedicated branch off latest `staging` (`feat/*`, `fix/*`, `refactor/*`, `chore/*`, `db/*`).
+   - **Staging-first policy**: Every fix, push, change, or feature MUST merge into `staging` via PR and be verified on the live staging deployment (`reeler-staging`) **first**.
+   - **Production promotion**: Once Meta App Review is approved, `main` serves as the live production deployment for all users while `staging` remains testing-only. Promote `staging` to `main` via a promotion PR (`staging` -> `main`) **only after** everything is verified working on `staging`. Never merge feature branches directly into `main`.
 2. **Author Identity**: Commits must always be authored by `saurabhk0205 <saurabhk0205@gmail.com>`.
 3. **Secrets**: Never commit `.env`, credentials, or access tokens.
 4. **Architecture**: Endpoints call services; services call repository (`src/db/repository.ts`). No raw database calls in endpoints.
@@ -71,11 +74,12 @@ Follow GRAVITAS invariants for implementation, debugging, refactoring, review, a
 8. **CodeRabbit Review Gate (MANDATORY & BLOCKING)**:
    - **NEVER merge a Pull Request immediately.**
    - **ALWAYS wait for CodeRabbit AI review to run and complete** on the current head commit of every opened PR before merging.
-   - **NEVER merge while CodeRabbit findings remain open or unaddressed.**
+   - **NEVER merge while CodeRabbit findings remain open, in-progress, or unaddressed.**
    - Whenever CodeRabbit comments or points out any issues (bugs, regressions, security, edge cases, architecture, or code improvements):
      1. Inspect each finding thoroughly.
-     2. For valid findings: implement fixes on the topic branch (or a dedicated topic branch if the PR is a promotion branch), verify tests (`npm test`), and push.
+     2. For valid findings: implement fixes on the topic branch, verify tests (`npm test`), and push.
      3. For invalid findings or false positives: provide an evidence-based explanation and documented reasoning in the review reply.
-     4. Reply to each CodeRabbit review comment thread explaining the resolution.
-   - Recheck review status after every push. Only merge after CodeRabbit completes its review on the final head commit and all findings are confirmed resolved and verified.
+     4. Reply to each CodeRabbit review comment thread explaining the resolution citing the commit.
+     5. Resolve every review thread using GitHub GraphQL `resolveReviewThread` after verifying the fix, or after posting the evidence-based explanation for an invalid finding or false positive.
+   - **Incremental Re-Checks Must Complete (CRITICAL)**: Whenever a fix commit is pushed to address review feedback, CodeRabbit automatically triggers an incremental re-review (indicated by the `review in progress` state in its PR comment). You **MUST NEVER merge while a re-check or incremental review is running**. You must wait for the re-check to finish completely—confirming that the in-progress state is cleared, the final review report is posted, all pre-merge checks pass, and zero new findings or open threads remain. Only merge when re-checking is 100% complete and everything is positive.
    - **No tight polling loops**: Never run tight sleep loops polling GitHub or CodeRabbit status.

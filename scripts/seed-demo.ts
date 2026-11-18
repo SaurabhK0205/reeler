@@ -41,7 +41,7 @@ async function seed() {
       shortcode: 'C_demo_1',
       reel_url: 'https://www.instagram.com/reel/C_demo_1/',
       creator_id: creators[0].id,
-      caption: 'The future of local AI agents and reverse engineering architecture in 2026! 🚀🤖 #ai #architecture',
+      caption: 'The future of local AI agents and reverse engineering architecture in 2026! #ai #architecture',
       thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=600',
       taken_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
       first_detected_at: new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString(),
@@ -54,7 +54,7 @@ async function seed() {
       shortcode: 'C_demo_2',
       reel_url: 'https://www.instagram.com/reel/C_demo_2/',
       creator_id: creators[1].id,
-      caption: '5 glassmorphism UI micro-interactions that elevate your product design instantly. 🎨 #ui #ux #design',
+      caption: '5 glassmorphism UI micro-interactions that elevate your product design instantly. #ui #ux #design',
       thumbnail_url: 'https://images.unsplash.com/photo-1550745165-9bc0b252726f?w=600',
       taken_at: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString(),
       first_detected_at: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
@@ -67,7 +67,7 @@ async function seed() {
       shortcode: 'C_demo_3',
       reel_url: 'https://www.instagram.com/reel/C_demo_3/',
       creator_id: creators[2].id,
-      caption: 'Mastering distributed system design: how caching with Redis saves your database under heavy load 💻 #software #systemdesign',
+      caption: 'Mastering distributed system design: how caching with Redis saves your database under heavy load #software #systemdesign',
       thumbnail_url: 'https://images.unsplash.com/photo-1526374965328-7f61d4dc18c5?w=600',
       taken_at: new Date(Date.now() - 12 * 24 * 60 * 60 * 1000).toISOString(),
       first_detected_at: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(),
@@ -81,7 +81,7 @@ async function seed() {
       reel_url: 'https://www.instagram.com/p/C_demo_4/',
       media_type: 'post' as const,
       creator_id: creators[3].id,
-      caption: 'Authentic 15-minute Neapolitan pizza sauce carousel & step-by-step recipe card 🍕 #food #recipe',
+      caption: 'Authentic 15-minute Neapolitan pizza sauce carousel & step-by-step recipe card #food #recipe',
       thumbnail_url: 'https://images.unsplash.com/photo-1513104890138-7c749659a591?w=600',
       taken_at: new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString(),
       first_detected_at: new Date(Date.now() - 25 * 24 * 60 * 60 * 1000).toISOString(),
@@ -95,7 +95,7 @@ async function seed() {
       reel_url: 'https://www.instagram.com/p/C_demo_5/',
       media_type: 'post' as const,
       creator_id: creators[0].id,
-      caption: 'Why PostgreSQL + Supabase is becoming the default database choice for scalable modern applications in 2026! 🔥',
+      caption: 'Why PostgreSQL + Supabase is becoming the default database choice for scalable modern applications in 2026!',
       thumbnail_url: 'https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=600',
       taken_at: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
       first_detected_at: new Date(Date.now() - 75 * 24 * 60 * 60 * 1000).toISOString(),
@@ -109,7 +109,7 @@ async function seed() {
     await Repository.upsertSavedReel(r);
   }
 
-  console.log('✅ Demo seed completed with 4 creators and 5 reels!');
+  console.log('Demo seed completed with 4 creators and 5 reels!');
 }
 
 seed().catch(console.error);

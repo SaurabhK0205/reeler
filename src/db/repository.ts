@@ -10,6 +10,7 @@ import type {
   BatchReelsResult
 } from '../types.ts';
 import { classifySavedMediaType } from '../utils/mediaType.ts';
+import { resolveTimeZone } from '../utils/timezone.ts';
 import { getSupabase, isSupabaseConfigured } from './client.ts';
 
 /**
@@ -30,6 +31,20 @@ export class SenderReminderConflictError extends Error {
 }
 
 /**
+ * Error thrown when a reel write is attempted for a sender whose account data was recently deleted,
+ * preventing race-condition re-creation from in-flight webhook requests.
+ */
+export class SenderDeletionBarrierError extends Error {
+  readonly senderId: string;
+
+  constructor(senderId: string) {
+    super(`Cannot save reel for sender ${senderId} during active deletion barrier window`);
+    this.name = 'SenderDeletionBarrierError';
+    this.senderId = senderId;
+  }
+}
+
+/**
  * Escapes and quotes a literal string value for inclusion inside a PostgREST filter expression.
  */
 function quotePostgrestLiteral(value: string): string {
@@ -37,17 +52,21 @@ function quotePostgrestLiteral(value: string): string {
 }
 
 /**
- * Returns true when an incoming Instagram sender attempts to schedule/overwrite an active `watch_later`
- * reminder that is currently owned by a different Instagram sender or unattributed (admin/UI queue).
+ * Returns true when an incoming write would clobber another owner's saved reel:
+ * - An unattributed (admin/legacy) write targeting a sender-owned row always conflicts.
+ * - An incoming Instagram sender targeting an active `watch_later` reminder owned by a
+ *   different sender (or unattributed admin/UI queue) conflicts.
  */
 function isConflictingActiveSenderReminder(
   existing: Pick<SavedReel, 'watch_status' | 'instagram_sender_id'>,
   incomingSenderId?: string | null
 ): boolean {
   const incoming = String(incomingSenderId || '').trim();
-  if (!incoming) return false;
-  if (existing.watch_status !== 'watch_later') return false;
   const owner = String(existing.instagram_sender_id || '').trim();
+  if (!incoming) {
+    return Boolean(owner);
+  }
+  if (existing.watch_status !== 'watch_later') return false;
   return owner !== incoming;
 }
 
@@ -76,6 +95,7 @@ export function shouldBackfillSavedAt(
   if (!existing.saved_at) return true;
 
   const isDmIngested =
+    Boolean(existing.instagram_media_id?.startsWith('dm_')) ||
     Boolean(existing.instagram_media_id?.startsWith('shortcode_')) ||
     Boolean(existing.instagram_media_id?.startsWith('id_'));
   if (!isDmIngested) return false;
@@ -151,9 +171,19 @@ class InMemoryStore {
   }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean }): Promise<SavedReel | null> {
     let existing: SavedReel | undefined;
     for (const r of this.reels.values()) {
-      if (r.instagram_media_id === data.instagram_media_id || r.shortcode === data.shortcode) {
+      if (r.instagram_media_id === data.instagram_media_id) {
         existing = r;
         break;
+      }
+    }
+    if (!existing) {
+      const incomingSender = data.instagram_sender_id ? String(data.instagram_sender_id).trim() || null : null;
+      for (const r of this.reels.values()) {
+        const rowSender = r.instagram_sender_id ? String(r.instagram_sender_id).trim() || null : null;
+        if (r.shortcode === data.shortcode && rowSender === incomingSender) {
+          existing = r;
+          break;
+        }
       }
     }
 
@@ -292,10 +322,22 @@ class InMemoryStore {
     for (const r of reels) {
       try {
         let existing: SavedReel | undefined;
+        const incomingSender = r.instagram_sender_id ? String(r.instagram_sender_id).trim() || null : null;
         for (const existingReel of this.reels.values()) {
-          if (existingReel.instagram_media_id === r.instagram_media_id || existingReel.shortcode === r.shortcode) {
+          if (existingReel.instagram_media_id === r.instagram_media_id) {
             existing = existingReel;
             break;
+          }
+        }
+        if (!existing) {
+          for (const existingReel of this.reels.values()) {
+            const rowSender = existingReel.instagram_sender_id
+              ? String(existingReel.instagram_sender_id).trim() || null
+              : null;
+            if (existingReel.shortcode === r.shortcode && rowSender === incomingSender) {
+              existing = existingReel;
+              break;
+            }
           }
         }
 
@@ -341,6 +383,11 @@ class InMemoryStore {
       media_type: classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }),
       creator: this.creators.get(r.creator_id)
     }));
+
+    // Filter by Instagram Sender ID (for non-admin scoped vaults)
+    if (filters.instagramSenderId && filters.instagramSenderId !== 'admin') {
+      list = list.filter(r => r.instagram_sender_id === filters.instagramSenderId);
+    }
 
     // Filter by Creator
     if (filters.creatorId) {
@@ -437,16 +484,23 @@ class InMemoryStore {
     return { reels: paged, total, page, limit };
   }
 
-  async getCreators(): Promise<Creator[]> {
+  async getCreators(senderId?: string): Promise<Creator[]> {
+    const trimmedSender = String(senderId || '').trim();
+    const activeReels = trimmedSender && trimmedSender !== 'admin'
+      ? Array.from(this.reels.values()).filter(r => r.instagram_sender_id === trimmedSender)
+      : Array.from(this.reels.values());
+
     const counts = new Map<string, number>();
-    for (const r of this.reels.values()) {
+    for (const r of activeReels) {
       counts.set(r.creator_id, (counts.get(r.creator_id) || 0) + 1);
     }
 
-    const list = Array.from(this.creators.values()).map(c => ({
-      ...c,
-      saved_count: counts.get(c.id) || 0
-    }));
+    const list = Array.from(this.creators.values())
+      .filter(c => counts.has(c.id))
+      .map(c => ({
+        ...c,
+        saved_count: counts.get(c.id) || 0
+      }));
 
     list.sort((a, b) => (b.saved_count || 0) - (a.saved_count || 0) || a.username.localeCompare(b.username));
     return list;
@@ -455,8 +509,12 @@ class InMemoryStore {
   /**
    * Computes library totals, weekly/monthly save counts via `effective_saved_at`, and top creators from memory.
    */
-  async getStats(): Promise<LibraryStats> {
-    const allReels = Array.from(this.reels.values());
+  async getStats(senderId?: string): Promise<LibraryStats> {
+    const trimmedSender = String(senderId || '').trim();
+    const allReels = trimmedSender && trimmedSender !== 'admin'
+      ? Array.from(this.reels.values()).filter(r => r.instagram_sender_id === trimmedSender)
+      : Array.from(this.reels.values());
+
     const now = Date.now();
     const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
     const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
@@ -493,7 +551,7 @@ class InMemoryStore {
       else if (r.watch_status === 'watch_later') watchLaterCount++;
     }
 
-    const creators = await this.getCreators();
+    const creators = await this.getCreators(senderId);
     const topCreators = creators.slice(0, 5).map(c => ({
       id: c.id,
       username: c.username,
@@ -508,7 +566,7 @@ class InMemoryStore {
       botSentCount,
       reelsCount,
       postsCount,
-      totalCreators: this.creators.size,
+      totalCreators: creators.length,
       savedThisWeek,
       savedThisMonth,
       unwatchedCount,
@@ -518,9 +576,13 @@ class InMemoryStore {
     };
   }
 
-  async updateWatchStatus(id: string, status: WatchStatus): Promise<SavedReel | null> {
+  async updateWatchStatus(id: string, status: WatchStatus, senderId?: string): Promise<SavedReel | null> {
     const reel = this.reels.get(id);
     if (!reel) return null;
+    const trimmedSender = String(senderId || '').trim();
+    if (trimmedSender && trimmedSender !== 'admin' && reel.instagram_sender_id !== trimmedSender) {
+      return null;
+    }
     reel.watch_status = status;
     if (status !== 'watch_later') {
       reel.next_reminder_at = null;
@@ -655,6 +717,7 @@ function applyReelQueryFilters(
   query: any,
   params: {
     creatorId?: string;
+    instagramSenderId?: string | null;
     source?: SavedCollectionSource | 'all';
     watchStatus?: WatchStatus | 'all';
     mediaType?: SavedMediaType | 'all';
@@ -664,6 +727,9 @@ function applyReelQueryFilters(
   }
 ): any {
   let next = query;
+  if (params.instagramSenderId && params.instagramSenderId !== 'admin') {
+    next = next.eq('instagram_sender_id', params.instagramSenderId);
+  }
   if (params.creatorId) {
     next = next.eq('creator_id', params.creatorId);
   }
@@ -783,6 +849,12 @@ export class Repository {
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
   }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean }): Promise<SavedReel | null> {
+    const sender = String(data.instagram_sender_id || '').trim();
+    if (sender && Repository.isSenderInRecentDeletion(sender)) {
+      console.warn(`[Repository] Rejecting reel upsert for sender ${sender} due to active deletion window`);
+      throw new SenderDeletionBarrierError(sender);
+    }
+
     Repository.invalidateCreatorsCache();
     if (!isSupabaseConfigured()) {
       return memoryStore.upsertSavedReel(data, options);
@@ -850,6 +922,7 @@ export class Repository {
         return null;
       }
 
+      const incomingSender = String(data.instagram_sender_id || '').trim();
       const fetchExisting = async () => {
         const byMedia = await supabase
           .from('saved_reels')
@@ -861,11 +934,15 @@ export class Repository {
         }
         if (byMedia.data) return byMedia.data as SavedReel;
 
-        const byShortcode = await supabase
+        let byShortcodeQuery = supabase
           .from('saved_reels')
           .select('*, creator:creators(*)')
-          .eq('shortcode', data.shortcode)
-          .maybeSingle();
+          .eq('shortcode', data.shortcode);
+        byShortcodeQuery = incomingSender
+          ? byShortcodeQuery.eq('instagram_sender_id', incomingSender)
+          : byShortcodeQuery.is('instagram_sender_id', null);
+
+        const byShortcode = await byShortcodeQuery.maybeSingle();
         if (byShortcode.error) {
           throw new Error(`Supabase fetch existing reel failed: ${byShortcode.error.message}`);
         }
@@ -881,7 +958,6 @@ export class Repository {
         return existing;
       }
 
-      const incomingSender = String(data.instagram_sender_id || '').trim();
       if (isConflictingActiveSenderReminder(existing, incomingSender)) {
         throw new SenderReminderConflictError(data.shortcode);
       }
@@ -928,6 +1004,9 @@ export class Repository {
         .eq('id', existing.id);
       if (senderOwnershipGuard) {
         updateQuery = updateQuery.or(senderOwnershipGuard);
+      } else {
+        // Prevent an unattributed/admin write from racing to overwrite a sender-owned row
+        updateQuery = updateQuery.is('instagram_sender_id', null);
       }
 
       const { data: updatedRow, error: updateErr } = await updateQuery
@@ -939,18 +1018,16 @@ export class Repository {
       }
 
       if (!updatedRow) {
-        if (incomingSender) {
-          const { data: currentState, error: checkErr } = await supabase
-            .from('saved_reels')
-            .select('id, watch_status, instagram_sender_id')
-            .eq('id', existing.id)
-            .maybeSingle();
-          if (checkErr) {
-            throw new Error(`Supabase upsertSavedReel ownership check failed: ${checkErr.message}`);
-          }
-          if (currentState && isConflictingActiveSenderReminder(currentState as SavedReel, incomingSender)) {
-            throw new SenderReminderConflictError(data.shortcode);
-          }
+        const { data: currentState, error: checkErr } = await supabase
+          .from('saved_reels')
+          .select('id, watch_status, instagram_sender_id')
+          .eq('id', existing.id)
+          .maybeSingle();
+        if (checkErr) {
+          throw new Error(`Supabase upsertSavedReel ownership check failed: ${checkErr.message}`);
+        }
+        if (currentState && isConflictingActiveSenderReminder(currentState as SavedReel, incomingSender)) {
+          throw new SenderReminderConflictError(data.shortcode);
         }
         throw new Error('Supabase upsertSavedReel update failed: no record updated');
       }
@@ -1080,38 +1157,61 @@ export class Repository {
       >();
 
       if (options?.ignoreDuplicates) {
-        const existingByShortcode = new Map<
-          string,
-          { id: string; instagram_media_id: string; saved_at: string | null; is_saved_on_instagram: boolean }
-        >();
+        type BatchExistingRow = {
+          id: string;
+          instagram_media_id: string;
+          saved_at: string | null;
+          is_saved_on_instagram: boolean;
+        };
+        const existingByMediaId = new Map<string, BatchExistingRow>();
+        const existingBySenderShortcode = new Map<string, BatchExistingRow>();
+        const makeSenderShortcodeKey = (sender: string | null | undefined, shortcode: string) =>
+          `${sender ? String(sender).trim() : ''}\u0000${shortcode}`;
+
         const allShortcodes = Array.from(new Set(reels.map(r => r.shortcode)));
         const LOOKUP_CHUNK = 500;
+        const PAGE_SIZE = 1000;
 
         for (let i = 0; i < allShortcodes.length; i += LOOKUP_CHUNK) {
           const slice = allShortcodes.slice(i, i + LOOKUP_CHUNK);
-          const { data: matched, error } = await supabase
-            .from('saved_reels')
-            .select('id, instagram_media_id, shortcode, saved_at, is_saved_on_instagram')
-            .in('shortcode', slice);
+          let pageOffset = 0;
+          while (true) {
+            const { data: matched, error } = await supabase
+              .from('saved_reels')
+              .select('id, instagram_media_id, shortcode, instagram_sender_id, saved_at, is_saved_on_instagram')
+              .in('shortcode', slice)
+              .order('id', { ascending: true })
+              .range(pageOffset, pageOffset + PAGE_SIZE - 1);
 
-          if (error) {
-            throw new Error(`Failed to query existing shortcodes: ${error.message}`);
-          }
-          if (matched) {
-            for (const row of matched) {
-              existingByShortcode.set(row.shortcode, {
+            if (error) {
+              throw new Error(`Failed to query existing shortcodes: ${error.message}`);
+            }
+            const pageRows = matched || [];
+            for (const row of pageRows) {
+              const entry: BatchExistingRow = {
                 id: String(row.id),
                 instagram_media_id: String(row.instagram_media_id),
                 saved_at: row.saved_at ? String(row.saved_at) : null,
                 is_saved_on_instagram: row.is_saved_on_instagram !== false,
-              });
+              };
+              existingByMediaId.set(entry.instagram_media_id, entry);
+              existingBySenderShortcode.set(
+                makeSenderShortcodeKey(row.instagram_sender_id, String(row.shortcode)),
+                entry
+              );
             }
+            if (pageRows.length < PAGE_SIZE) {
+              break;
+            }
+            pageOffset += PAGE_SIZE;
           }
         }
 
         const freshReels: typeof reels = [];
         for (const r of reels) {
-          const existing = existingByShortcode.get(r.shortcode);
+          const existing =
+            existingByMediaId.get(r.instagram_media_id) ||
+            existingBySenderShortcode.get(makeSenderShortcodeKey(r.instagram_sender_id, r.shortcode));
           if (existing) {
             alreadyPresent++;
             const shouldPromote = r.is_saved_on_instagram !== false && existing.is_saved_on_instagram === false;
@@ -1266,21 +1366,56 @@ export class Repository {
     return (data || []) as SavedReel[];
   }
 
-  static async updateReminderSchedule(id: string, nextReminderAt: string, intervalSeconds?: number): Promise<void> {
+  static async updateReminderSchedule(
+    id: string,
+    nextReminderAt: string,
+    intervalSeconds?: number,
+    options?: {
+      expectedNextReminderAt?: string | null;
+      expectedIntervalSeconds?: number | null;
+      expectedUpdatedAt?: string | null;
+      expectedWatchStatus?: WatchStatus;
+    }
+  ): Promise<boolean> {
     const now = new Date().toISOString();
     if (!isSupabaseConfigured()) {
       const reel = memoryStore.reels.get(id);
-      if (reel) {
-        reel.next_reminder_at = nextReminderAt;
-        reel.watch_status = 'watch_later';
-        reel.awaiting_reminder_choice_until = null;
-        reel.updated_at = now;
-        if (intervalSeconds) {
-          reel.reminder_interval_seconds = intervalSeconds;
-          reel.reminder_interval_hours = Math.round(intervalSeconds / 3600);
+      if (!reel) return false;
+      if (options) {
+        if (
+          options.expectedNextReminderAt !== undefined &&
+          (reel.next_reminder_at ?? null) !== (options.expectedNextReminderAt ?? null)
+        ) {
+          return false;
+        }
+        if (
+          options.expectedIntervalSeconds !== undefined &&
+          (reel.reminder_interval_seconds ?? null) !== (options.expectedIntervalSeconds ?? null)
+        ) {
+          return false;
+        }
+        if (
+          options.expectedUpdatedAt !== undefined &&
+          (reel.updated_at ?? null) !== (options.expectedUpdatedAt ?? null)
+        ) {
+          return false;
+        }
+        if (
+          options.expectedWatchStatus !== undefined &&
+          reel.watch_status !== options.expectedWatchStatus
+        ) {
+          return false;
         }
       }
-      return;
+      reel.next_reminder_at = nextReminderAt;
+      reel.watch_status = 'watch_later';
+      reel.awaiting_reminder_choice_until = null;
+      reel.updated_at = now;
+      if (intervalSeconds) {
+        reel.reminder_interval_seconds = intervalSeconds;
+        reel.reminder_interval_hours = Math.round(intervalSeconds / 3600);
+      }
+      return true;
     }
 
     const supabase = getSupabase();
@@ -1295,7 +1430,33 @@ export class Repository {
       updatePayload.reminder_interval_hours = Math.round(intervalSeconds / 3600);
     }
 
-    await supabase.from('saved_reels').update(updatePayload).eq('id', id);
+    let query = supabase.from('saved_reels').update(updatePayload).eq('id', id);
+    if (options) {
+      if (options.expectedNextReminderAt !== undefined) {
+        query = options.expectedNextReminderAt === null
+          ? query.is('next_reminder_at', null)
+          : query.eq('next_reminder_at', options.expectedNextReminderAt);
+      }
+      if (options.expectedIntervalSeconds !== undefined) {
+        query = options.expectedIntervalSeconds === null
+          ? query.is('reminder_interval_seconds', null)
+          : query.eq('reminder_interval_seconds', options.expectedIntervalSeconds);
+      }
+      if (options.expectedUpdatedAt !== undefined) {
+        query = options.expectedUpdatedAt === null
+          ? query.is('updated_at', null)
+          : query.eq('updated_at', options.expectedUpdatedAt);
+      }
+      if (options.expectedWatchStatus !== undefined) {
+        query = query.eq('watch_status', options.expectedWatchStatus);
+      }
+    }
+
+    const { data, error } = await query.select('id');
+    if (error) {
+      throw new Error(`Supabase updateReminderSchedule failed: ${error.message}`);
+    }
+    return Array.isArray(data) && data.length > 0;
   }
 
   static async getActiveAwaitingReelForSender(senderId: string): Promise<SavedReel | null> {
@@ -1474,6 +1635,7 @@ export class Repository {
 
     const filterState = {
       creatorId: filters.creatorId,
+      instagramSenderId: filters.instagramSenderId,
       source: filters.source,
       watchStatus: filters.watchStatus,
       mediaType: filters.mediaType,
@@ -1545,10 +1707,82 @@ export class Repository {
   /**
    * Fetches all creators across PostgREST 1000-row pages with saved reel counts sorted descending,
    * coalescing concurrent initial scans (`/api/stats` + `/api/creators`) and caching briefly between writes.
+   * When `senderId` is provided (non-admin), filters strictly to creators attributed to that sender's reels.
    */
-  static async getCreators(): Promise<Creator[]> {
+  static async getCreators(senderId?: string): Promise<Creator[]> {
+    const trimmedSender = String(senderId || '').trim();
     if (!isSupabaseConfigured()) {
-      return memoryStore.getCreators();
+      return memoryStore.getCreators(trimmedSender || undefined);
+    }
+
+    if (trimmedSender && trimmedSender !== 'admin') {
+      const supabase = getSupabase();
+      const counts = new Map<string, number>();
+      const PAGE_SIZE = 1000;
+      let from = 0;
+
+      while (true) {
+        const { data: pageRows, error: reelsErr } = await supabase
+          .from('saved_reels')
+          .select('creator_id')
+          .eq('instagram_sender_id', trimmedSender)
+          .order('id', { ascending: true })
+          .range(from, from + PAGE_SIZE - 1);
+
+        if (reelsErr) {
+          throw new Error(`Supabase getCreators for sender failed: ${reelsErr.message}`);
+        }
+
+        if (!pageRows || pageRows.length === 0) {
+          break;
+        }
+
+        for (const row of pageRows) {
+          if (row.creator_id) {
+            counts.set(row.creator_id, (counts.get(row.creator_id) || 0) + 1);
+          }
+        }
+
+        if (pageRows.length < PAGE_SIZE) {
+          break;
+        }
+        from += PAGE_SIZE;
+      }
+
+      const creatorIds = Array.from(counts.keys());
+      if (creatorIds.length === 0) return [];
+
+      const BATCH_SIZE = 200;
+      const creatorRows: any[] = [];
+      for (let i = 0; i < creatorIds.length; i += BATCH_SIZE) {
+        const batchIds = creatorIds.slice(i, i + BATCH_SIZE);
+        const { data: batchData, error: creatorErr } = await supabase
+          .from('creators')
+          .select('*')
+          .in('id', batchIds);
+
+        if (creatorErr) {
+          throw new Error(`Supabase getCreators details for sender failed: ${creatorErr.message}`);
+        }
+
+        if (batchData) {
+          creatorRows.push(...batchData);
+        }
+      }
+
+      const result: Creator[] = creatorRows.map((c: any) => ({
+        id: c.id,
+        instagram_user_id: c.instagram_user_id,
+        username: c.username,
+        display_name: c.display_name,
+        profile_picture_url: c.profile_picture_url,
+        created_at: c.created_at,
+        updated_at: c.updated_at,
+        saved_count: counts.get(c.id) || 0,
+      }));
+
+      result.sort((a, b) => (b.saved_count || 0) - (a.saved_count || 0) || a.username.localeCompare(b.username));
+      return result;
     }
 
     const now = Date.now();
@@ -1651,7 +1885,7 @@ export class Repository {
    * download thousands of unused creator rows.
    */
   static async queryCreators(opts: CreatorQueryOptions = {}): Promise<CreatorQueryResult> {
-    const all = await Repository.getCreators();
+    const all = await Repository.getCreators(opts.instagramSenderId);
     const totalCount = all.length;
 
     const rawQ = String(opts.q || '').trim().toLowerCase();
@@ -1686,13 +1920,16 @@ export class Repository {
 
   /**
    * Retrieves a creator's saved reels and posts ordered chronologically by `effective_saved_at` descending.
+   * When `instagramSenderId` is provided (non-admin), filters items strictly to that sender.
    */
   static async getReelsByCreatorUsername(
     username: string,
-    options?: { mediaType?: SavedMediaType | 'all' }
+    options?: { mediaType?: SavedMediaType | 'all'; instagramSenderId?: string }
   ): Promise<{ creator: Creator | null; reels: SavedReel[]; totalReelsCount: number; totalPostsCount: number }> {
     const cleanUsername = username.replace(/^@/, '').trim().toLowerCase();
     const mediaFilter = options?.mediaType ?? 'all';
+    const trimmedSender = String(options?.instagramSenderId || '').trim();
+    const isScoped = Boolean(trimmedSender && trimmedSender !== 'admin');
     if (!cleanUsername) return { creator: null, reels: [], totalReelsCount: 0, totalPostsCount: 0 };
 
     const sortCreatorItems = (items: SavedReel[]): SavedReel[] =>
@@ -1728,7 +1965,7 @@ export class Repository {
 
       const allItems = sortCreatorItems(
         Array.from(memoryStore.reels.values())
-          .filter(r => creatorIds.has(r.creator_id))
+          .filter(r => creatorIds.has(r.creator_id) && (!isScoped || r.instagram_sender_id === trimmedSender))
           .map(r => ({
             ...r,
             media_type: classifySavedMediaType({ mediaType: r.media_type, reelUrl: r.reel_url }),
@@ -1778,12 +2015,18 @@ export class Repository {
 
     const creatorIds = creators.map(c => c.id);
 
+    const applySenderScope = (query: any) => {
+      return isScoped ? query.eq('instagram_sender_id', trimmedSender) : query;
+    };
+
     const buildTypeQuery = (type: SavedMediaType) =>
-      supabase
-        .from('saved_reels')
-        .select('*, creator:creators(*)')
-        .in('creator_id', creatorIds)
-        .eq('media_type', type)
+      applySenderScope(
+        supabase
+          .from('saved_reels')
+          .select('*, creator:creators(*)')
+          .in('creator_id', creatorIds)
+          .eq('media_type', type)
+      )
         .order('effective_saved_at', { ascending: false })
         .order('save_order_rank', { ascending: true })
         .order('created_at', { ascending: false })
@@ -1791,8 +2034,8 @@ export class Repository {
         .limit(25);
 
     const [reelsCountRes, postsCountRes, reelsRowsRes, postsRowsRes] = await Promise.all([
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).in('creator_id', creatorIds).eq('media_type', 'reel'),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).in('creator_id', creatorIds).eq('media_type', 'post'),
+      applySenderScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).in('creator_id', creatorIds).eq('media_type', 'reel')),
+      applySenderScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).in('creator_id', creatorIds).eq('media_type', 'post')),
       mediaFilter === 'post' ? Promise.resolve({ data: [], error: null }) : buildTypeQuery('reel'),
       mediaFilter === 'reel' ? Promise.resolve({ data: [], error: null }) : buildTypeQuery('post'),
     ]);
@@ -1824,16 +2067,23 @@ export class Repository {
 
   /**
    * Computes aggregate library counts, weekly/monthly `effective_saved_at` activity, and top creators.
+   * When `senderId` is provided (non-admin), scopes all counts and creator rankings strictly to that sender.
    */
-  static async getStats(): Promise<LibraryStats> {
+  static async getStats(senderId?: string): Promise<LibraryStats> {
+    const trimmedSender = String(senderId || '').trim();
     if (!isSupabaseConfigured()) {
-      return memoryStore.getStats();
+      return memoryStore.getStats(trimmedSender || undefined);
     }
 
+    const isScoped = Boolean(trimmedSender && trimmedSender !== 'admin');
     const supabase = getSupabase();
     const now = new Date();
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    const applyScope = (query: any) => {
+      return isScoped ? query.eq('instagram_sender_id', trimmedSender) : query;
+    };
 
     const [
       totalReelsRes,
@@ -1848,17 +2098,17 @@ export class Repository {
       watchedRes,
       watchLaterRes,
     ] = await Promise.all([
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('is_saved_on_instagram', true),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('is_saved_on_instagram', false),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'reel'),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'post'),
-      Repository.getCreators(),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('effective_saved_at', sevenDaysAgo),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('effective_saved_at', thirtyDaysAgo),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'unwatched'),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'watched'),
-      supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'watch_later'),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true })),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('is_saved_on_instagram', true)),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('is_saved_on_instagram', false)),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'reel')),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('media_type', 'post')),
+      Repository.getCreators(trimmedSender || undefined),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('effective_saved_at', sevenDaysAgo)),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).gte('effective_saved_at', thirtyDaysAgo)),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'unwatched')),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'watched')),
+      applyScope(supabase.from('saved_reels').select('*', { count: 'exact', head: true }).eq('watch_status', 'watch_later')),
     ]);
 
     const topCreators = creatorsRes.slice(0, 5).map(c => ({
@@ -1895,9 +2145,10 @@ export class Repository {
     }
   }
 
-  static async updateWatchStatus(id: string, status: WatchStatus): Promise<SavedReel | null> {
+  static async updateWatchStatus(id: string, status: WatchStatus, senderId?: string): Promise<SavedReel | null> {
+    const trimmedSender = String(senderId || '').trim();
     if (!isSupabaseConfigured()) {
-      return memoryStore.updateWatchStatus(id, status);
+      return memoryStore.updateWatchStatus(id, status, trimmedSender || undefined);
     }
 
     const supabase = getSupabase();
@@ -1910,31 +2161,105 @@ export class Repository {
       updatePayload.awaiting_reminder_choice_until = null;
     }
 
-    const { data, error } = await supabase
-      .from('saved_reels')
-      .update(updatePayload)
-      .eq('id', id)
-      .select('*, creator:creators(*)')
-      .single();
-
-    if (error || !data) {
-      throw new Error(`Failed to update watch status: ${error?.message}`);
+    let query = supabase.from('saved_reels').update(updatePayload).eq('id', id);
+    if (trimmedSender && trimmedSender !== 'admin') {
+      query = query.eq('instagram_sender_id', trimmedSender);
     }
 
-    return data as SavedReel;
+    const { data, error } = await query
+      .select('*, creator:creators(*)')
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to update watch status: ${error.message}`);
+    }
+
+    return (data as SavedReel) || null;
   }
 
   /**
-   * Marks either the most recently reminded/updated active Watch Later reel (default)
-   * or all active Watch Later reels (`markAll: true`) as watched for an Instagram sender.
+   * Resolves the ordered Watch Later Reel IDs that a watched/stop command targets for an Instagram sender.
+   * Callers performing retries can pin these IDs before the first write so newer Reels saved later are never targeted.
+   */
+  static async selectWatchLaterTargetIdsForSender(
+    senderId: string,
+    options?: { markAll?: boolean; includeUnattributedFallback?: boolean }
+  ): Promise<string[]> {
+    const trimmedSender = String(senderId || '').trim();
+    const markAll = Boolean(options?.markAll);
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+
+    if (!trimmedSender && !allowUnattributedFallback) {
+      return [];
+    }
+
+    if (!isSupabaseConfigured()) {
+      const activeWatchLater = Array.from(memoryStore.reels.values()).filter(
+        (r) => r.watch_status === 'watch_later'
+      );
+      let candidates = trimmedSender
+        ? activeWatchLater.filter((r) => r.instagram_sender_id === trimmedSender)
+        : [];
+      if (allowUnattributedFallback && candidates.length === 0) {
+        candidates = activeWatchLater.filter((r) => !String(r.instagram_sender_id || '').trim());
+      }
+      if (candidates.length === 0) {
+        return [];
+      }
+      const ordered = sortWatchLaterReelsMostRecentFirst(
+        candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) }))
+      );
+      return (markAll ? ordered : [ordered[0]]).map((r) => r.id);
+    }
+
+    const supabase = getSupabase();
+    const fetchActiveCandidates = async (senderFilter: 'exact' | 'unattributed'): Promise<SavedReel[]> => {
+      let query = supabase
+        .from('saved_reels')
+        .select('id, updated_at, last_reminded_at, created_at, watch_status, instagram_sender_id')
+        .eq('watch_status', 'watch_later')
+        .order('updated_at', { ascending: false })
+        .order('last_reminded_at', { ascending: false, nullsFirst: false })
+        .order('created_at', { ascending: false });
+
+      if (senderFilter === 'exact') {
+        query = query.eq('instagram_sender_id', trimmedSender);
+      } else {
+        query = query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+
+      const { data, error } = await query;
+      if (error) {
+        throw new Error(`Failed to fetch active watch-later reels: ${error.message}`);
+      }
+      return (data || []) as SavedReel[];
+    };
+
+    let candidates = trimmedSender ? await fetchActiveCandidates('exact') : [];
+    if (allowUnattributedFallback && candidates.length === 0) {
+      candidates = await fetchActiveCandidates('unattributed');
+    }
+    if (candidates.length === 0) {
+      return [];
+    }
+
+    const ordered = sortWatchLaterReelsMostRecentFirst(candidates);
+    return (markAll ? ordered : [ordered[0]]).map((r) => r.id);
+  }
+
+  /**
+   * Marks either the most recently reminded/updated active Watch Later reel (default),
+   * all active Watch Later reels (`markAll: true`), or an explicit pinned set (`targetReelIds`)
+   * as watched for an Instagram sender.
    */
   static async markWatchedForInstagramSender(
     senderId: string,
-    options?: { markAll?: boolean; includeUnattributedFallback?: boolean }
+    options?: { markAll?: boolean; includeUnattributedFallback?: boolean; targetReelIds?: string[] }
   ): Promise<MarkWatchedResult> {
     const trimmedSender = String(senderId || '').trim();
     const markAll = Boolean(options?.markAll);
     const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    const pinnedIdSet = options?.targetReelIds !== undefined ? new Set(options.targetReelIds) : null;
     const now = new Date().toISOString();
 
     if (!trimmedSender && !allowUnattributedFallback) {
@@ -1963,7 +2288,11 @@ export class Repository {
       const ordered = sortWatchLaterReelsMostRecentFirst(
         candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) }))
       );
-      const targets = markAll ? ordered : [ordered[0]];
+      const targets = pinnedIdSet
+        ? ordered.filter((r) => pinnedIdSet.has(r.id))
+        : markAll
+          ? ordered
+          : [ordered[0]];
       const updatedReels: SavedReel[] = [];
 
       for (const target of targets) {
@@ -2023,7 +2352,14 @@ export class Repository {
     }
 
     const ordered = sortWatchLaterReelsMostRecentFirst(candidates);
-    const targets = markAll ? ordered : [ordered[0]];
+    const targets = pinnedIdSet
+      ? ordered.filter((r) => pinnedIdSet.has(r.id))
+      : markAll
+        ? ordered
+        : [ordered[0]];
+    if (targets.length === 0) {
+      return { updatedReels: [], remainingCount: ordered.length };
+    }
     const targetIds = targets.map((r) => r.id);
     const orderIndex = new Map(targetIds.map((id, idx) => [id, idx]));
 
@@ -2218,32 +2554,70 @@ export class Repository {
   }
 
   /**
-   * Looks up a saved item (with creator attribution) by its unique Instagram shortcode across both
+   * Looks up a saved item (with creator attribution) by Instagram shortcode across both
    * Supabase and in-memory fallback storage.
+   *
+   * - When `senderId` is a non-empty string, matches only that sender's row.
+   * - When `senderId` is `null`, matches only an unattributed (admin/archive) row.
+   * - When `senderId` is `undefined`, returns a deterministic match (preferring unattributed rows).
    */
-  static async getSavedItemByShortcode(shortcode: string): Promise<SavedReel | null> {
+  static async getSavedItemByShortcode(shortcode: string, senderId?: string | null): Promise<SavedReel | null> {
     const cleanCode = String(shortcode || '').trim();
     if (!cleanCode) return null;
 
+    const hasExplicitScope = senderId !== undefined;
+    const normalizedSender =
+      senderId === null || senderId === undefined ? null : String(senderId).trim() || null;
+
     if (!isSupabaseConfigured()) {
+      let fallbackMatch: SavedReel | null = null;
       for (const reel of memoryStore.reels.values()) {
-        if (reel.shortcode === cleanCode) {
+        if (reel.shortcode !== cleanCode) continue;
+        const rowSender = reel.instagram_sender_id ? String(reel.instagram_sender_id).trim() || null : null;
+        if (hasExplicitScope) {
+          if (rowSender === normalizedSender) {
+            return {
+              ...reel,
+              media_type: classifySavedMediaType({ mediaType: reel.media_type, reelUrl: reel.reel_url }),
+              creator: memoryStore.creators.get(reel.creator_id),
+            };
+          }
+          continue;
+        }
+        if (rowSender === null) {
           return {
             ...reel,
             media_type: classifySavedMediaType({ mediaType: reel.media_type, reelUrl: reel.reel_url }),
             creator: memoryStore.creators.get(reel.creator_id),
           };
         }
+        if (!fallbackMatch) {
+          fallbackMatch = reel;
+        }
       }
-      return null;
+      if (!fallbackMatch) return null;
+      return {
+        ...fallbackMatch,
+        media_type: classifySavedMediaType({ mediaType: fallbackMatch.media_type, reelUrl: fallbackMatch.reel_url }),
+        creator: memoryStore.creators.get(fallbackMatch.creator_id),
+      };
     }
 
     const supabase = getSupabase();
-    const { data, error } = await supabase
+    let query = supabase
       .from('saved_reels')
       .select('*, creator:creators(*)')
-      .eq('shortcode', cleanCode)
-      .maybeSingle();
+      .eq('shortcode', cleanCode);
+
+    if (hasExplicitScope) {
+      query = normalizedSender
+        ? query.eq('instagram_sender_id', normalizedSender)
+        : query.is('instagram_sender_id', null);
+    } else {
+      query = query.order('instagram_sender_id', { ascending: true, nullsFirst: true }).limit(1);
+    }
+
+    const { data, error } = await query.maybeSingle();
 
     if (error) {
       throw new Error(`Failed to look up saved item ${cleanCode}: ${error.message}`);
@@ -2257,5 +2631,245 @@ export class Repository {
       ...row,
       media_type: classifySavedMediaType({ mediaType: row.media_type, reelUrl: row.reel_url }),
     };
+  }
+
+  private static senderDeletionTimestamps = new Map<string, number>();
+  private static activeSenderDeletions = new Map<string, number>();
+  private static senderTimezones = new Map<string, string>();
+  private static senderTimezoneGenerations = new Map<string, number>();
+  private static inFlightPreferenceWrites = new Map<string, Set<Promise<any>>>();
+
+  /**
+   * Clears in-memory caches for testing.
+   */
+  static resetSenderTimezonesForTesting(): void {
+    Repository.senderTimezones.clear();
+    Repository.senderTimezoneGenerations.clear();
+    Repository.inFlightPreferenceWrites.clear();
+    Repository.activeSenderDeletions.clear();
+  }
+
+  private static trackInFlightPreferenceWrite(senderId: string, promise: Promise<any>): void {
+    let set = Repository.inFlightPreferenceWrites.get(senderId);
+    if (!set) {
+      set = new Set();
+      Repository.inFlightPreferenceWrites.set(senderId, set);
+    }
+    set.add(promise);
+  }
+
+  private static untrackInFlightPreferenceWrite(senderId: string, promise: Promise<any>): void {
+    const set = Repository.inFlightPreferenceWrites.get(senderId);
+    if (set) {
+      set.delete(promise);
+      if (set.size === 0) {
+        Repository.inFlightPreferenceWrites.delete(senderId);
+      }
+    }
+  }
+
+  static async waitForInFlightPreferenceWrites(senderId: string): Promise<void> {
+    const set = Repository.inFlightPreferenceWrites.get(senderId);
+    if (set && set.size > 0) {
+      await Promise.allSettled(Array.from(set));
+    }
+  }
+
+  /**
+   * Retrieves the configured timezone for an Instagram sender ID, falling back to
+   * APP_TIMEZONE or 'UTC'.
+   */
+  static async getSenderTimezone(senderId: string): Promise<string> {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) {
+      return process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+    }
+
+    if (Repository.senderTimezones.has(trimmed)) {
+      return Repository.senderTimezones.get(trimmed)!;
+    }
+
+    const lookupGen = Repository.senderTimezoneGenerations.get(trimmed) || 0;
+
+    if (isSupabaseConfigured()) {
+      try {
+        const supabase = getSupabase();
+        const { data, error } = await supabase
+          .from('sender_preferences')
+          .select('timezone')
+          .eq('sender_id', trimmed)
+          .maybeSingle();
+
+        const currentGen = Repository.senderTimezoneGenerations.get(trimmed) || 0;
+        if (currentGen !== lookupGen) {
+          return Repository.senderTimezones.get(trimmed) || process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+        }
+
+        if (!error && data?.timezone) {
+          Repository.senderTimezones.set(trimmed, data.timezone);
+          return data.timezone;
+        }
+      } catch {
+        // Table may not exist yet in older Supabase instances; fall back gracefully
+      }
+    }
+
+    const currentGen = Repository.senderTimezoneGenerations.get(trimmed) || 0;
+    if (currentGen !== lookupGen) {
+      return Repository.senderTimezones.get(trimmed) || process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+    }
+
+    return process.env.APP_TIMEZONE || process.env.TZ || 'UTC';
+  }
+
+  /**
+   * Persists the preferred timezone for an Instagram sender ID.
+   * Resolves common abbreviations (e.g. IST, EST, PST, London) to canonical IANA names.
+   */
+  static async setSenderTimezone(senderId: string, timezoneInput: string): Promise<string | null> {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) return null;
+
+    if (Repository.isSenderInRecentDeletion(trimmed)) {
+      console.warn(`[Repository] Rejecting timezone upsert for sender ${trimmed} due to active deletion barrier window`);
+      throw new SenderDeletionBarrierError(trimmed);
+    }
+
+    const resolved = resolveTimeZone(timezoneInput);
+    if (!resolved) return null;
+
+    let resolveInFlight!: () => void;
+    const inFlightPromise = new Promise<void>((res) => { resolveInFlight = res; });
+    Repository.trackInFlightPreferenceWrite(trimmed, inFlightPromise);
+
+    try {
+      if (isSupabaseConfigured()) {
+        const supabase = getSupabase();
+        const { error } = await supabase
+          .from('sender_preferences')
+          .upsert(
+            {
+              sender_id: trimmed,
+              timezone: resolved,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'sender_id' }
+          );
+        if (error) {
+          throw new Error(`Failed to persist sender timezone preference for ${trimmed}: ${error.message}`);
+        }
+      }
+
+      if (Repository.isSenderInRecentDeletion(trimmed)) {
+        console.warn(`[Repository] Rejecting timezone cache commit for sender ${trimmed} due to active deletion barrier window`);
+        throw new SenderDeletionBarrierError(trimmed);
+      }
+
+      const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+      Repository.senderTimezoneGenerations.set(trimmed, nextGen);
+      Repository.senderTimezones.set(trimmed, resolved);
+
+      return resolved;
+    } finally {
+      Repository.untrackInFlightPreferenceWrite(trimmed, inFlightPromise);
+      resolveInFlight();
+    }
+  }
+
+  static recordSenderDeletion(senderId: string): void {
+    const trimmed = String(senderId || '').trim();
+    if (trimmed) {
+      Repository.senderDeletionTimestamps.set(trimmed, Date.now());
+    }
+  }
+
+  static isSenderInRecentDeletion(senderId: string, windowMs = 60_000): boolean {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) return false;
+    if ((Repository.activeSenderDeletions.get(trimmed) || 0) > 0) {
+      return true;
+    }
+    const ts = Repository.senderDeletionTimestamps.get(trimmed);
+    if (!ts) return false;
+    if (Date.now() - ts > windowMs) {
+      Repository.senderDeletionTimestamps.delete(trimmed);
+      return false;
+    }
+    return true;
+  }
+
+  static resetDeletionTimestampsForTesting(): void {
+    Repository.activeSenderDeletions.clear();
+    Repository.senderDeletionTimestamps.clear();
+  }
+
+  /**
+   * Permanently deletes all saved reels and data associated with an Instagram sender ID
+   * for compliance with Meta User Data Deletion requests.
+   */
+  static async deleteUserDataForSender(senderId: string): Promise<number> {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) return 0;
+
+    const currentActive = (Repository.activeSenderDeletions.get(trimmed) || 0) + 1;
+    Repository.activeSenderDeletions.set(trimmed, currentActive);
+    Repository.recordSenderDeletion(trimmed);
+
+    try {
+      await Repository.waitForInFlightPreferenceWrites(trimmed);
+
+      const nextGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+      Repository.senderTimezoneGenerations.set(trimmed, nextGen);
+      Repository.senderTimezones.delete(trimmed);
+
+      if (!isSupabaseConfigured()) {
+        let count = 0;
+        for (const [id, reel] of memoryStore.reels.entries()) {
+          if (reel.instagram_sender_id === trimmed) {
+            memoryStore.reels.delete(id);
+            count++;
+          }
+        }
+        return count;
+      }
+
+      const supabase = getSupabase();
+      try {
+        const { error: prefError } = await supabase
+          .from('sender_preferences')
+          .delete()
+          .eq('sender_id', trimmed);
+
+        if (prefError) {
+          throw new Error(`Failed to delete sender preferences for sender ${trimmed}: ${prefError.message}`);
+        }
+      } finally {
+        const postDeleteGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+        Repository.senderTimezoneGenerations.set(trimmed, postDeleteGen);
+        Repository.senderTimezones.delete(trimmed);
+      }
+
+      const { data, error } = await supabase
+        .from('saved_reels')
+        .delete()
+        .eq('instagram_sender_id', trimmed)
+        .select('id');
+
+      if (error) {
+        throw new Error(`Failed to delete user data for sender ${trimmed}: ${error.message}`);
+      }
+      return data?.length || 0;
+    } finally {
+      Repository.recordSenderDeletion(trimmed);
+      const remainingActive = (Repository.activeSenderDeletions.get(trimmed) || 1) - 1;
+      if (remainingActive <= 0) {
+        Repository.activeSenderDeletions.delete(trimmed);
+      } else {
+        Repository.activeSenderDeletions.set(trimmed, remainingActive);
+      }
+      const finalGen = (Repository.senderTimezoneGenerations.get(trimmed) || 0) + 1;
+      Repository.senderTimezoneGenerations.set(trimmed, finalGen);
+      Repository.senderTimezones.delete(trimmed);
+    }
   }
 }
