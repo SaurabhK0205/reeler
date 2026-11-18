@@ -1436,18 +1436,26 @@ async function checkHealth() {
   }
 }
 
+let isExplicitStatsFetchInFlight = false;
+let isExplicitCreatorsFetchInFlight = false;
+
 /**
  * Fetches summary statistics from the server and populates metric cards.
  * @param {{ silent?: boolean }} [options]
  */
 async function loadStats(options = {}) {
   const silent = Boolean(options.silent);
+  if (silent && isExplicitStatsFetchInFlight) {
+    return;
+  }
   if (statsFetchController) {
     statsFetchController.abort();
   }
-  statsFetchController = new AbortController();
-  const { signal } = statsFetchController;
+  const controller = new AbortController();
+  statsFetchController = controller;
+  const { signal } = controller;
   if (!silent) {
+    isExplicitStatsFetchInFlight = true;
     statsBar?.setAttribute('aria-busy', 'true');
   }
   try {
@@ -1544,7 +1552,8 @@ async function loadStats(options = {}) {
       });
     }
   } finally {
-    if (!silent) {
+    if (!silent && statsFetchController === controller) {
+      isExplicitStatsFetchInFlight = false;
       statsBar?.setAttribute('aria-busy', 'false');
     }
   }
@@ -1558,12 +1567,19 @@ async function loadStats(options = {}) {
  */
 async function loadCreators(query = state.creatorQuery, options = {}) {
   const silent = Boolean(options.silent);
+  if (silent && isExplicitCreatorsFetchInFlight) {
+    return;
+  }
   const trimmedQ = String(query || '').trim();
   if (creatorsFetchController) {
     creatorsFetchController.abort();
   }
-  creatorsFetchController = new AbortController();
-  const { signal } = creatorsFetchController;
+  const controller = new AbortController();
+  creatorsFetchController = controller;
+  const { signal } = controller;
+  if (!silent) {
+    isExplicitCreatorsFetchInFlight = true;
+  }
   isCreatorSearching = Boolean(trimmedQ);
 
   if (!silent && creatorStripMeta && !trimmedQ && state.creators.length === 0) {
@@ -1636,6 +1652,10 @@ async function loadCreators(query = state.creatorQuery, options = {}) {
         actionLabel: 'Retry',
         onAction: () => loadCreators(state.creatorQuery),
       });
+    }
+  } finally {
+    if (!silent && creatorsFetchController === controller) {
+      isExplicitCreatorsFetchInFlight = false;
     }
   }
 }

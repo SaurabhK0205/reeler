@@ -1299,19 +1299,33 @@ test('MetadataResolver - falls back to secondary crawler User-Agent when primary
     assert.equal(seenRequests[2].pathname, '/reel/DFallbackUA1/');
     assert.match(seenRequests[2].ua, /^WhatsApp\//);
 
-    // Mismatched og:url shortcode (e.g. DFallbackUA12 vs DFallbackUA1) must be rejected even with og:image
+    // Mismatched og:url shortcode (including reversed content/property attribute order) must be rejected
     globalThis.fetch = (async () =>
       new Response(
         '<html><head>' +
-          '<meta property="og:url"\tcontent="https://www.instagram.com/wronguser/reel/DFallbackUA12/" />' +
+          '<meta content="https://www.instagram.com/wronguser/reel/DFallbackUA12/"\tproperty="og:url" />' +
           '<meta property="og:image"\tcontent="https://scontent.cdninstagram.com/v/wrong.jpg" />' +
           '</head></html>',
         { status: 200 }
       )) as typeof fetch;
 
     const mismatched = await fetchReelMetadata('DFallbackUA1', undefined, 'reel');
-    assert.equal(mismatched.username, undefined, 'Mismatched shortcode og:url must be rejected');
+    assert.equal(mismatched.username, undefined, 'Mismatched shortcode og:url (reversed attrs) must be rejected');
     assert.equal(mismatched.thumbnailUrl, undefined, 'Mismatched shortcode og:image must be rejected');
+
+    // Matching og:url with reversed attribute order must parse cleanly
+    globalThis.fetch = (async () =>
+      new Response(
+        '<html><head>' +
+          '<meta content="https://www.instagram.com/rightuser/reel/DFallbackUA1/" property="og:url" />' +
+          '<meta content="https://scontent.cdninstagram.com/v/right.jpg" property="og:image" />' +
+          '</head></html>',
+        { status: 200 }
+      )) as typeof fetch;
+
+    const reversedMatch = await fetchReelMetadata('DFallbackUA1', undefined, 'reel');
+    assert.equal(reversedMatch.username, 'rightuser');
+    assert.equal(reversedMatch.thumbnailUrl, 'https://scontent.cdninstagram.com/v/right.jpg');
   } finally {
     globalThis.fetch = origFetch;
     if (origToken === undefined) delete process.env.META_PAGE_ACCESS_TOKEN;

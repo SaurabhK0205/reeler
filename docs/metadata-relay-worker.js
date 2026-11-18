@@ -10,9 +10,10 @@
  */
 
 const ALLOWED_PATH_RE = /^\/(?:reel|p)\/([A-Za-z0-9_-]{5,32})\/?$/;
-const OG_META_RE = /<meta\s+(?:property|name)="(?:og:url|og:image|twitter:title|og:title)"/i;
 const OG_ITEM_SHORTCODE_RE = /instagram\.com\/(?:[^/?#]+\/)?(?:reel|reels|p|tv)\/([A-Za-z0-9_-]{5,32})(?:[/?#]|$)/i;
 const GENERIC_INSTAGRAM_TITLE_RE = /^(?:instagram|login\s*[•·-]\s*instagram)$/i;
+const META_TAG_RE = /<meta\b[^>]*>/gi;
+const META_ATTR_RE = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
 const MAX_REDIRECT_HOPS = 3;
 const MAX_HTML_BYTES = 1_500_000;
 // Shared relay deadline fits within the app resolver's 8s timeout while keeping primary eligible if slow
@@ -34,6 +35,18 @@ function constantTimeEqual(a, b) {
   return diff === 0;
 }
 
+function decodeHtmlAttribute(value) {
+  return value
+    .replace(/&#064;/g, '@')
+    .replace(/&#x40;/g, '@')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(Number(dec)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
 function isAllowedInstagramUrl(parsed) {
   return (
     parsed.protocol === 'https:' &&
@@ -42,30 +55,61 @@ function isAllowedInstagramUrl(parsed) {
   );
 }
 
-function hasValidItemOpenGraph(html, shortcode) {
-  if (!OG_META_RE.test(html)) {
-    return false;
+/**
+ * Classifies HTML OpenGraph metadata independently of attribute order:
+ * - 'rich': has og:image or non-generic title and no mismatched og:url shortcode
+ * - 'url_only': only has a matching og:url shortcode (held as fallback while other crawler runs)
+ * - 'invalid': login wall, missing tags, or mismatched shortcode
+ */
+function classifyItemOpenGraph(html, shortcode) {
+  let ogUrl = '';
+  let ogImage = '';
+  let twitterTitle = '';
+  let ogTitle = '';
+
+  META_TAG_RE.lastIndex = 0;
+  let tagMatch;
+  while ((tagMatch = META_TAG_RE.exec(html)) !== null) {
+    const tag = tagMatch[0];
+    let propertyAttr = '';
+    let nameAttr = '';
+    let contentAttr;
+
+    META_ATTR_RE.lastIndex = 0;
+    let attrMatch;
+    while ((attrMatch = META_ATTR_RE.exec(tag)) !== null) {
+      const attrName = attrMatch[1].toLowerCase();
+      const attrVal = attrMatch[2] ?? attrMatch[3] ?? '';
+      if (attrName === 'property') propertyAttr = attrVal.toLowerCase();
+      else if (attrName === 'name') nameAttr = attrVal.toLowerCase();
+      else if (attrName === 'content') contentAttr = attrVal;
+    }
+    if (contentAttr === undefined) continue;
+
+    if (propertyAttr === 'og:url' && !ogUrl) ogUrl = decodeHtmlAttribute(contentAttr).trim();
+    else if (propertyAttr === 'og:image' && !ogImage) ogImage = decodeHtmlAttribute(contentAttr).trim();
+    else if (nameAttr === 'twitter:title' && !twitterTitle) twitterTitle = decodeHtmlAttribute(contentAttr).trim();
+    else if (propertyAttr === 'og:title' && !ogTitle) ogTitle = decodeHtmlAttribute(contentAttr).trim();
   }
-  const ogUrl = (html.match(/<meta\s+property="og:url"\s+content="([^"]+)"/i)?.[1] || '').trim();
+
+  let matchedOgUrl = false;
   if (ogUrl) {
     const match = ogUrl.match(OG_ITEM_SHORTCODE_RE);
     if (match && match[1] !== shortcode) {
-      return false;
+      return 'invalid';
     }
     if (match && match[1] === shortcode) {
-      return true;
+      matchedOgUrl = true;
     }
   }
-  const ogImage = (html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i)?.[1] || '').trim();
-  if (ogImage) {
-    return true;
+
+  const hasRichTitle =
+    Boolean(twitterTitle && !GENERIC_INSTAGRAM_TITLE_RE.test(twitterTitle)) ||
+    Boolean(ogTitle && !GENERIC_INSTAGRAM_TITLE_RE.test(ogTitle));
+  if (ogImage || hasRichTitle) {
+    return 'rich';
   }
-  const twitterTitle = (html.match(/<meta\s+name="twitter:title"\s+content="([^"]+)"/i)?.[1] || '').trim();
-  if (twitterTitle && !GENERIC_INSTAGRAM_TITLE_RE.test(twitterTitle)) {
-    return true;
-  }
-  const ogTitle = (html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i)?.[1] || '').trim();
-  return Boolean(ogTitle && !GENERIC_INSTAGRAM_TITLE_RE.test(ogTitle));
+  return matchedOgUrl ? 'url_only' : 'invalid';
 }
 
 async function readBoundedText(response, maxBytes = MAX_HTML_BYTES) {
@@ -142,14 +186,19 @@ async function fetchAllowedInstagramHtml(initialUrl, shortcode, userAgent, signa
     }
 
     const html = await readBoundedText(upstream, MAX_HTML_BYTES);
-    return hasValidItemOpenGraph(html, shortcode) ? html : null;
+    const quality = classifyItemOpenGraph(html, shortcode);
+    if (quality === 'invalid') {
+      return null;
+    }
+    return { html, quality };
   }
   return null;
 }
 
 /**
  * Runs primary crawler immediately and hedges the secondary crawler after a short delay (or immediately
- * if primary fails/returns a login shell), sharing one bounded deadline and cancelling the remaining request on win.
+ * if primary fails/returns a login shell), returning rich metadata immediately while holding a URL-only
+ * result as fallback until both attempts settle or the shared deadline expires.
  */
 async function resolveWithHedgedCrawlers(targetUrl, shortcode) {
   const primaryController = new AbortController();
@@ -161,6 +210,7 @@ async function resolveWithHedgedCrawlers(targetUrl, shortcode) {
   return new Promise((resolve) => {
     let settled = false;
     let remaining = 2;
+    let fallbackHtml = null;
 
     const finish = (html) => {
       if (settled) return;
@@ -172,6 +222,24 @@ async function resolveWithHedgedCrawlers(targetUrl, shortcode) {
       resolve(html);
     };
 
+    const handleOutcome = (result, isPrimary) => {
+      if (settled) return;
+      if (result && result.quality === 'rich') {
+        finish(result.html);
+        return;
+      }
+      if (result && result.quality === 'url_only' && !fallbackHtml) {
+        fallbackHtml = result.html;
+      }
+      remaining--;
+      if (isPrimary) {
+        startSecondary();
+      }
+      if (remaining === 0) {
+        finish(fallbackHtml);
+      }
+    };
+
     const startSecondary = () => {
       if (secondaryStarted || settled) return;
       secondaryStarted = true;
@@ -180,42 +248,16 @@ async function resolveWithHedgedCrawlers(targetUrl, shortcode) {
         hedgeTimer = null;
       }
       fetchAllowedInstagramHtml(targetUrl, shortcode, USER_AGENTS[1], secondaryController.signal)
-        .then((html) => {
-          if (html) {
-            finish(html);
-          } else if (--remaining === 0) {
-            finish(null);
-          }
-        })
-        .catch(() => {
-          if (--remaining === 0) {
-            finish(null);
-          }
-        });
+        .then((res) => handleOutcome(res, false))
+        .catch(() => handleOutcome(null, false));
     };
 
-    deadlineTimer = setTimeout(() => finish(null), SHARED_RELAY_TIMEOUT_MS);
+    deadlineTimer = setTimeout(() => finish(fallbackHtml), SHARED_RELAY_TIMEOUT_MS);
     hedgeTimer = setTimeout(startSecondary, SECONDARY_HEDGE_DELAY_MS);
 
     fetchAllowedInstagramHtml(targetUrl, shortcode, USER_AGENTS[0], primaryController.signal)
-      .then((html) => {
-        if (html) {
-          finish(html);
-        } else {
-          remaining--;
-          startSecondary();
-          if (remaining === 0) {
-            finish(null);
-          }
-        }
-      })
-      .catch(() => {
-        remaining--;
-        startSecondary();
-        if (remaining === 0) {
-          finish(null);
-        }
-      });
+      .then((res) => handleOutcome(res, true))
+      .catch(() => handleOutcome(null, true));
   });
 }
 

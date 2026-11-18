@@ -419,9 +419,12 @@ async function fetchImageDimensions(
  * Fetches Instagram OpenGraph metadata for a saved reel or post shortcode,
  * probing the preferred URL path (`/reel/` or `/p/`) first and falling back to the alternate path on non-OK HTTP status.
  */
-const OG_META_PATTERN = /<meta\s+(?:property|name)="(?:og:url|og:image|twitter:title|og:title)"/i;
 const GENERIC_INSTAGRAM_TITLE_RE = /^(?:instagram|login\s*[•·-]\s*instagram)$/i;
 const OG_ITEM_SHORTCODE_RE = /instagram\.com\/(?:[^/?#]+\/)?(?:reel|reels|p|tv)\/([A-Za-z0-9_-]{5,32})(?:[/?#]|$)/i;
+const META_TAG_RE = /<meta\b[^>]*>/gi;
+const META_ATTR_RE = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+const DIRECT_PRIMARY_TIMEOUT_MS = 8000;
+const DIRECT_SECONDARY_TIMEOUT_MS = 3000;
 const DIRECT_METADATA_USER_AGENTS = [
   'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
   'WhatsApp/2.23.20.0',
@@ -437,19 +440,50 @@ interface ParsedOpenGraphFields {
 }
 
 /**
- * Extracts OpenGraph, Twitter meta, and embedded JSON owner values once using consistent whitespace-tolerant matching.
+ * Extracts OpenGraph, Twitter meta, and embedded JSON owner values once by reading `<meta>` attributes
+ * by name (independent of attribute order or whitespace).
  */
 function parseOpenGraphFields(html: string): ParsedOpenGraphFields {
-  const ogUrl = decodeHtml(html.match(/<meta\s+property="og:url"\s+content="([^"]+)"/i)?.[1] || '').trim();
-  const twitterTitle = decodeHtml(
-    html.match(/<meta\s+name="twitter:title"\s+content="([^"]+)"/i)?.[1] || ''
-  ).trim();
-  const ogTitle = decodeHtml(html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i)?.[1] || '').trim();
-  const ogDesc = decodeHtml(html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i)?.[1] || '').trim();
-  const rawOgImage = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i)?.[1]?.trim();
-  const ogImage = rawOgImage ? decodeHtml(rawOgImage) : undefined;
-  const jsonOwnerUsername = html.match(/"owner":\s*\{[^}]*"username":\s*"([a-zA-Z0-9._]+)"/i)?.[1];
+  let ogUrl = '';
+  let twitterTitle = '';
+  let ogTitle = '';
+  let ogDesc = '';
+  let ogImage: string | undefined;
 
+  META_TAG_RE.lastIndex = 0;
+  let tagMatch: RegExpExecArray | null;
+  while ((tagMatch = META_TAG_RE.exec(html)) !== null) {
+    const tag = tagMatch[0];
+    let propertyAttr = '';
+    let nameAttr = '';
+    let contentAttr: string | undefined;
+
+    META_ATTR_RE.lastIndex = 0;
+    let attrMatch: RegExpExecArray | null;
+    while ((attrMatch = META_ATTR_RE.exec(tag)) !== null) {
+      const attrName = attrMatch[1].toLowerCase();
+      const attrVal = attrMatch[2] ?? attrMatch[3] ?? '';
+      if (attrName === 'property') propertyAttr = attrVal.toLowerCase();
+      else if (attrName === 'name') nameAttr = attrVal.toLowerCase();
+      else if (attrName === 'content') contentAttr = attrVal;
+    }
+    if (contentAttr === undefined) continue;
+
+    if (propertyAttr === 'og:url' && !ogUrl) {
+      ogUrl = decodeHtml(contentAttr).trim();
+    } else if (nameAttr === 'twitter:title' && !twitterTitle) {
+      twitterTitle = decodeHtml(contentAttr).trim();
+    } else if (propertyAttr === 'og:title' && !ogTitle) {
+      ogTitle = decodeHtml(contentAttr).trim();
+    } else if (propertyAttr === 'og:description' && !ogDesc) {
+      ogDesc = decodeHtml(contentAttr).trim();
+    } else if (propertyAttr === 'og:image' && !ogImage) {
+      const decoded = decodeHtml(contentAttr).trim();
+      if (decoded) ogImage = decoded;
+    }
+  }
+
+  const jsonOwnerUsername = html.match(/"owner":\s*\{[^}]*"username":\s*"([a-zA-Z0-9._]+)"/i)?.[1];
   return { ogUrl, twitterTitle, ogTitle, ogDesc, ogImage, jsonOwnerUsername };
 }
 
@@ -622,10 +656,6 @@ async function fetchHtmlViaProxy(
       return null;
     }
     const candidateHtml = await readBoundedText(res);
-    if (!OG_META_PATTERN.test(candidateHtml)) {
-      console.warn(`[MetadataResolver] Proxy relay returned HTTP 200 without OpenGraph tags (${parsedProxy.hostname}).`);
-      return null;
-    }
     const parsedFields = parseOpenGraphFields(candidateHtml);
     if (!isValidItemOpenGraph(parsedFields, shortcode)) {
       console.warn(`[MetadataResolver] Proxy relay returned HTTP 200 without item OpenGraph tags (${parsedProxy.hostname}).`);
@@ -663,7 +693,8 @@ export async function fetchReelMetadata(
     const tryDirectFetch = async (
       pathSegment: 'reel' | 'p',
       userAgent: string,
-      recordLoginWall: boolean
+      recordLoginWall: boolean,
+      timeoutMs: number
     ): Promise<ParsedOpenGraphFields | null> => {
       if (signal?.aborted) {
         return null;
@@ -671,7 +702,7 @@ export async function fetchReelMetadata(
       const url = `https://www.instagram.com/${pathSegment}/${encodeURIComponent(shortcode)}/`;
       try {
         const res = await fetch(url, {
-          signal: createCombinedSignal(8000, signal),
+          signal: createCombinedSignal(timeoutMs, signal),
           headers: {
             'User-Agent': userAgent,
             Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -686,8 +717,8 @@ export async function fetchReelMetadata(
         }
 
         const candidateHtml = await readBoundedText(res);
-        const candidateFields = OG_META_PATTERN.test(candidateHtml) ? parseOpenGraphFields(candidateHtml) : null;
-        if (!candidateFields || !isValidItemOpenGraph(candidateFields, shortcode)) {
+        const candidateFields = parseOpenGraphFields(candidateHtml);
+        if (!isValidItemOpenGraph(candidateFields, shortcode)) {
           if (recordLoginWall && !loginWallPaths.includes(pathSegment)) {
             loginWallPaths.push(pathSegment);
           }
@@ -709,7 +740,12 @@ export async function fetchReelMetadata(
       if (signal?.aborted) {
         return {};
       }
-      const candidate = await tryDirectFetch(pathSegment, DIRECT_METADATA_USER_AGENTS[0], true);
+      const candidate = await tryDirectFetch(
+        pathSegment,
+        DIRECT_METADATA_USER_AGENTS[0],
+        true,
+        DIRECT_PRIMARY_TIMEOUT_MS
+      );
       if (candidate) {
         parsedFields = candidate;
         break;
@@ -717,17 +753,16 @@ export async function fetchReelMetadata(
     }
 
     if (!parsedFields && loginWallPaths.length > 0 && !signal?.aborted) {
-      for (const fallbackUserAgent of DIRECT_METADATA_USER_AGENTS.slice(1)) {
-        for (const wallPath of loginWallPaths) {
-          const candidate = await tryDirectFetch(wallPath, fallbackUserAgent, false);
-          if (candidate) {
-            parsedFields = candidate;
-            break;
-          }
-        }
-        if (parsedFields) {
-          break;
-        }
+      // Bound secondary UA probe to a single fast 3s attempt on the primary login-walled path so
+      // oEmbed and proxy relay fallbacks are not stalled.
+      const candidate = await tryDirectFetch(
+        loginWallPaths[0],
+        DIRECT_METADATA_USER_AGENTS[1],
+        false,
+        DIRECT_SECONDARY_TIMEOUT_MS
+      );
+      if (candidate) {
+        parsedFields = candidate;
       }
     }
 
