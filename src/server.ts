@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.ts';
 import { apiRouter } from './api/router.ts';
+import { Repository } from './db/repository.ts';
 import { ReminderWorker } from './services/reminderWorker.ts';
 import { vaultAuthMiddleware, resolveConfiguredVaultSecret } from './services/vaultAuthService.ts';
 import { createRateLimiter, getClientIp, securityHeadersMiddleware } from './middleware/security.ts';
@@ -136,6 +137,10 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
 
     activePrincipals.add(rateLimitKey);
     activeUploads++;
+    // Capture sender deletion generation at upload admission (before body upload or execution queueing)
+    if (req.vaultUser?.role === 'user' && req.vaultUser.senderId) {
+      (req as any).archiveAdmissionDeletionGeneration = Repository.getSenderDeletionGeneration(req.vaultUser.senderId);
+    }
     let uploadReleased = false;
     let principalReleased = false;
     let executionHeld = false;

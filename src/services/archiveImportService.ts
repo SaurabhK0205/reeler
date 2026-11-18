@@ -61,14 +61,24 @@ export class ArchiveImportService {
    *
    * @param input Raw parsed JSON object, array, or JSON string from Instagram data download
    * @param senderId Optional Instagram sender ID to associate imported reels with
+   * @param expectedDeletionGeneration Optional sender deletion generation captured at upload admission
    */
-  static async importArchive(input: unknown, senderId?: string): Promise<ArchiveImportResult> {
+  static async importArchive(
+    input: unknown,
+    senderId?: string,
+    expectedDeletionGeneration?: number
+  ): Promise<ArchiveImportResult> {
     const scopedSenderId = typeof senderId === 'string' && senderId.trim() ? senderId.trim() : undefined;
-    if (scopedSenderId && Repository.isSenderInRecentDeletion(scopedSenderId)) {
+    if (
+      scopedSenderId &&
+      (Repository.isSenderInRecentDeletion(scopedSenderId) ||
+        (expectedDeletionGeneration !== undefined &&
+          Repository.getSenderDeletionGeneration(scopedSenderId) !== expectedDeletionGeneration))
+    ) {
       throw new SenderDeletionBarrierError(scopedSenderId);
     }
     const admissionDeletionGeneration = scopedSenderId
-      ? Repository.getSenderDeletionGeneration(scopedSenderId)
+      ? expectedDeletionGeneration ?? Repository.getSenderDeletionGeneration(scopedSenderId)
       : undefined;
     let data = input;
     if (typeof input === 'string') {

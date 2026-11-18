@@ -1370,9 +1370,16 @@ test('Archive Import - authenticated vault users import into isolated sender vau
 
   try {
     let preParseCalls = 0;
+    let resolveSlowUploadAdmitted: (() => void) | null = null;
+    const slowUploadAdmittedPromise = new Promise<void>((res) => {
+      resolveSlowUploadAdmitted = res;
+    });
     const app = createApp({
-      onArchiveImportPreParse: () => {
+      onArchiveImportPreParse: (req) => {
         preParseCalls++;
+        if (req.vaultUser?.senderId === 'user_slow_upload') {
+          resolveSlowUploadAdmitted?.();
+        }
       },
     });
 
@@ -1658,18 +1665,36 @@ test('Archive Import - authenticated vault users import into isolated sender vau
         }
       );
 
-      await enteredPromise;
-      const deletePromise = Repository.deleteUserDataForSender(raceSender);
-      await new Promise((r) => setTimeout(r, 20));
+      let deletePromise: Promise<number> | null = null;
+      try {
+        let entryTimer: NodeJS.Timeout | undefined;
+        const entryOutcome = await Promise.race([
+          enteredPromise.then(() => 'entered' as const),
+          batchWritePromise.then(
+            () => 'settled_early' as const,
+            () => 'rejected_early' as const
+          ),
+          new Promise<'timeout'>((res) => {
+            entryTimer = setTimeout(() => res('timeout'), 2000);
+          }),
+        ]);
+        if (entryTimer) clearTimeout(entryTimer);
+        assert.equal(entryOutcome, 'entered', 'Batch write must reach memory write hook before deadline');
 
-      // Deletion must NOT have removed the pre-existing row while the in-flight archive write is still open
-      const whileHeld = await Repository.getReels({ instagramSenderId: raceSender, page: 1, limit: 20 });
-      assert.equal(whileHeld.total, 1, 'deleteUserDataForSender must wait for in-flight archive write before deleting rows');
+        deletePromise = Repository.deleteUserDataForSender(raceSender);
+        await new Promise((r) => setTimeout(r, 20));
 
-      releaseMemoryWrite();
-      const deletedCount = await deletePromise;
-      assert.ok(deletedCount >= 1, 'deleteUserDataForSender must fulfill and delete sender rows');
-      await Promise.allSettled([batchWritePromise]);
+        // Deletion must NOT have removed the pre-existing row while the in-flight archive write is still open
+        const whileHeld = await Repository.getReels({ instagramSenderId: raceSender, page: 1, limit: 20 });
+        assert.equal(whileHeld.total, 1, 'deleteUserDataForSender must wait for in-flight archive write before deleting rows');
+
+        releaseMemoryWrite();
+        const deletedCount = await deletePromise;
+        assert.ok(deletedCount >= 1, 'deleteUserDataForSender must fulfill and delete sender rows');
+      } finally {
+        releaseMemoryWrite();
+        await Promise.allSettled([batchWritePromise, ...(deletePromise ? [deletePromise] : [])]);
+      }
 
       const surviving = await Repository.getReels({ instagramSenderId: raceSender, page: 1, limit: 20 });
       assert.equal(surviving.total, 0, 'Zero sender rows may survive concurrent archive import + deletion');
@@ -1722,8 +1747,16 @@ test('Archive Import - authenticated vault users import into isolated sender vau
         // Expected ECONNRESET when test aborts the intentionally stalled upload
       });
       slowReq.write('{"saved_saved_media":[');
-      // Give the server a tick to admit the slow upload and enter express.json body reading
-      await new Promise((r) => setTimeout(r, 30));
+      // Wait deterministically for the server to admit slowReq before issuing concurrent probes
+      let slowAdmitTimer: NodeJS.Timeout | undefined;
+      const slowAdmitOutcome = await Promise.race([
+        slowUploadAdmittedPromise.then(() => 'admitted' as const),
+        new Promise<'timeout'>((res) => {
+          slowAdmitTimer = setTimeout(() => res('timeout'), 2000);
+        }),
+      ]);
+      if (slowAdmitTimer) clearTimeout(slowAdmitTimer);
+      assert.equal(slowAdmitOutcome, 'admitted', 'Slow upload request must be admitted before sending concurrent requests');
 
       try {
         // Same principal attempting a 2nd concurrent upload is rejected with 429

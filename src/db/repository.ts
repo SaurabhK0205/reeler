@@ -290,7 +290,7 @@ class InMemoryStore {
           }
         }
         if (existing) {
-          result.set(existing.username, existing);
+          result.set(c.username, existing);
           continue;
         }
       }
@@ -1111,6 +1111,7 @@ export class Repository {
 
         if (preserveExisting) {
           const chunkIds = chunk.map(c => c.instagram_user_id);
+          const requestedUsernameById = new Map(chunk.map(c => [c.instagram_user_id, c.username]));
           const MAX_BULK_ATTEMPTS = 2;
           let resolvedChunk = false;
 
@@ -1134,7 +1135,7 @@ export class Repository {
 
             if (!fetchErr && fetchedRows) {
               for (const c of fetchedRows) {
-                result.set(c.username, c as Creator);
+                result.set(requestedUsernameById.get(c.instagram_user_id) ?? c.username, c as Creator);
               }
               resolvedChunk = true;
               break;
@@ -1155,7 +1156,7 @@ export class Repository {
               console.error(`[Repository] Failed to recover creator batch chunk (${chunk.length} creators):`, recoverErr.message);
             } else if (existingRows) {
               for (const c of existingRows) {
-                result.set(c.username, c as Creator);
+                result.set(requestedUsernameById.get(c.instagram_user_id) ?? c.username, c as Creator);
               }
             }
           }

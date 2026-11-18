@@ -410,7 +410,11 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await ArchiveImportService.importArchive(rawData, targetSenderId);
+    const admissionDeletionGeneration =
+      typeof (req as any).archiveAdmissionDeletionGeneration === 'number'
+        ? (req as any).archiveAdmissionDeletionGeneration
+        : undefined;
+    const result = await ArchiveImportService.importArchive(rawData, targetSenderId, admissionDeletionGeneration);
     if (result.status === 'too_large') {
       res.status(413).json({ success: false, ...result });
       return;
