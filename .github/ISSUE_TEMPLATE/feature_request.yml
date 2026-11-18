@@ -1,0 +1,45 @@
+name: Feature Request
+description: Suggest a new capability or workflow improvement for Reeler.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of Reeler does this apply to?
+      options:
+        - Instagram DM Bot
+        - Web Vault UI
+        - Reminders & Scheduling
+        - Search, Filters & Organization
+        - Archive Import
+        - Self-Hosting / API
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow gap
+      description: What are you trying to do today that Reeler does not handle well?
+      placeholder: "Example: I want to tag Reels by topic when sending them to the bot so I can filter them later."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe how you would like this to work.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Examples, mockups, or related issues (optional).
+    validations:
+      required: false
