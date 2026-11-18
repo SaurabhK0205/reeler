@@ -585,6 +585,8 @@ function hideVaultGateScreen() {
   syncVaultGateModeUI();
   if (vaultContainerEl) vaultContainerEl.classList.remove('is-vault-locked');
   vaultGateScreen.classList.add('is-hidden');
+  if (reelsGrid) reelsGrid.classList.toggle('is-hidden', state.viewMode !== 'grid');
+  if (reelsTableContainer) reelsTableContainer.classList.toggle('is-hidden', state.viewMode === 'grid');
   if (vaultGateError) vaultGateError.hidden = true;
   syncSwitchVaultButtonVisibility();
 }

@@ -19,9 +19,11 @@ import {
   createOtp,
   generateUserVaultKey,
   getAdminVaultKey,
+  getVaultSecret,
   OtpCapacityError,
   requestOtpForUsername,
   requireAdminVaultMiddleware,
+  resolveConfiguredVaultSecret,
   vaultAuthMiddleware,
   verifyOtp,
 } from '../src/services/vaultAuthService.ts';
@@ -41,7 +43,23 @@ async function withServer<T>(
   try {
     return await fn(baseUrl);
   } finally {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(forceCloseTimer);
+          resolve();
+        }
+      };
+      const forceCloseTimer = setTimeout(() => {
+        server.closeAllConnections?.();
+        finish();
+      }, 1000);
+      forceCloseTimer.unref();
+      server.close(() => finish());
+      server.closeIdleConnections?.();
+    });
   }
 }
 
@@ -109,7 +127,9 @@ test('Security - createRateLimiter enforces limits and evicts oldest keys under 
 
 test('Security - vaultAuthMiddleware rejects spoofed /meta paths and requireAdminVaultMiddleware blocks non-admins before body parsing', async () => {
   const origEnv = process.env.NODE_ENV;
+  const origVaultSecret = process.env.VAULT_SECRET;
   process.env.NODE_ENV = 'production';
+  process.env.VAULT_SECRET = 'test-production-vault-secret';
   try {
     // 1. Spoofed /meta paths must NOT bypass auth
     for (const spoofPath of ['/stats/meta', '/reels/a/b/meta', '/meta', '/user/meta']) {
@@ -163,7 +183,48 @@ test('Security - vaultAuthMiddleware rejects spoofed /meta paths and requireAdmi
       assert.equal(parserCalled, true, 'Verified admin must proceed to body parser');
     });
   } finally {
-    process.env.NODE_ENV = origEnv;
+    if (origEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = origEnv;
+    if (origVaultSecret === undefined) delete process.env.VAULT_SECRET;
+    else process.env.VAULT_SECRET = origVaultSecret;
+  }
+});
+
+test('Security - getVaultSecret fails closed in production without non-blank VAULT_SECRET or SUPABASE_SERVICE_ROLE_KEY', () => {
+  const origEnv = process.env.NODE_ENV;
+  const origVaultSecret = process.env.VAULT_SECRET;
+  const origServiceRole = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  try {
+    process.env.NODE_ENV = 'production';
+    delete process.env.VAULT_SECRET;
+    delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+    assert.equal(resolveConfiguredVaultSecret(), null);
+    assert.throws(
+      () => getVaultSecret(),
+      /VAULT_SECRET|SUPABASE_SERVICE_ROLE_KEY/,
+      'Production must never fall back to the public default vault secret'
+    );
+
+    // Whitespace-only VAULT_SECRET must not mask SUPABASE_SERVICE_ROLE_KEY
+    process.env.VAULT_SECRET = '   ';
+    assert.equal(resolveConfiguredVaultSecret(), null);
+    assert.throws(() => getVaultSecret(), /VAULT_SECRET|SUPABASE_SERVICE_ROLE_KEY/);
+
+    process.env.SUPABASE_SERVICE_ROLE_KEY = '  svc-role-secret-123  ';
+    assert.equal(resolveConfiguredVaultSecret(), 'svc-role-secret-123');
+    assert.equal(getVaultSecret(), 'svc-role-secret-123');
+
+    process.env.VAULT_SECRET = '  explicit-vault-secret  ';
+    assert.equal(resolveConfiguredVaultSecret(), 'explicit-vault-secret');
+    assert.equal(getVaultSecret(), 'explicit-vault-secret');
+  } finally {
+    if (origEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = origEnv;
+    if (origVaultSecret === undefined) delete process.env.VAULT_SECRET;
+    else process.env.VAULT_SECRET = origVaultSecret;
+    if (origServiceRole === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = origServiceRole;
   }
 });
 
@@ -314,24 +375,26 @@ test('Idempotency - replays deterministic POST/PUT/PATCH responses, rejects conf
       },
       body: JSON.stringify({ slow: true }),
     });
-    // Wait briefly until handler is in-flight
-    while (!releaseSlowRequest) {
-      await new Promise((r) => setTimeout(r, 5));
+    try {
+      // Wait briefly until handler is in-flight
+      while (!releaseSlowRequest) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      const dupRes = await fetch(`${baseUrl}/slow`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': 'idem-key-inflight',
+          'x-test-user': 'user_a',
+        },
+        body: JSON.stringify({ slow: true }),
+      });
+      assert.equal(dupRes.status, 409);
+      assert.equal(((await dupRes.json()) as any).error, 'IDEMPOTENCY_REQUEST_IN_PROGRESS');
+      assert.equal(dupRes.headers.get('retry-after'), '2');
+    } finally {
+      releaseSlowRequest?.();
     }
-    const dupRes = await fetch(`${baseUrl}/slow`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'Idempotency-Key': 'idem-key-inflight',
-        'x-test-user': 'user_a',
-      },
-      body: JSON.stringify({ slow: true }),
-    });
-    assert.equal(dupRes.status, 409);
-    assert.equal(((await dupRes.json()) as any).error, 'IDEMPOTENCY_REQUEST_IN_PROGRESS');
-    assert.equal(dupRes.headers.get('retry-after'), '2');
-
-    releaseSlowRequest!();
     const slowFinal = await slowPromise;
     assert.equal(slowFinal.status, 200);
   });
@@ -608,35 +671,37 @@ test('Idempotency - keeps active entries locked on client disconnect and rejects
       body: JSON.stringify({ step: 1 }),
     }).catch(() => null);
 
-    while (!releaseHandler) {
-      await new Promise((r) => setTimeout(r, 5));
+    try {
+      while (!releaseHandler) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+
+      // Disconnect client while handler is still running
+      ac.abort();
+      await firstReq;
+      await new Promise((r) => setTimeout(r, 25));
+
+      // 2. Retry with the SAME key must still receive 409 (lock NOT prematurely dropped on disconnect)
+      const dupRes = await fetch(`${baseUrl}/mutate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'active-lock-1' },
+        body: JSON.stringify({ step: 1 }),
+      });
+      assert.equal(dupRes.status, 409);
+      assert.equal(executions, 1);
+
+      // 3. New distinct key while maxActiveEntries=1 is full must return 503 instead of evicting active-lock-1
+      const overflowRes = await fetch(`${baseUrl}/mutate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'active-lock-2' },
+        body: JSON.stringify({ step: 2 }),
+      });
+      assert.equal(overflowRes.status, 503);
+      assert.equal(((await overflowRes.json()) as any).error, 'IDEMPOTENCY_CAPACITY_EXCEEDED');
+    } finally {
+      // 4. Always release the original mutation so teardown never hangs on assertion failure
+      releaseHandler?.();
     }
-
-    // Disconnect client while handler is still running
-    ac.abort();
-    await firstReq;
-    await new Promise((r) => setTimeout(r, 25));
-
-    // 2. Retry with the SAME key must still receive 409 (lock NOT prematurely dropped on disconnect)
-    const dupRes = await fetch(`${baseUrl}/mutate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'active-lock-1' },
-      body: JSON.stringify({ step: 1 }),
-    });
-    assert.equal(dupRes.status, 409);
-    assert.equal(executions, 1);
-
-    // 3. New distinct key while maxActiveEntries=1 is full must return 503 instead of evicting active-lock-1
-    const overflowRes = await fetch(`${baseUrl}/mutate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'active-lock-2' },
-      body: JSON.stringify({ step: 2 }),
-    });
-    assert.equal(overflowRes.status, 503);
-    assert.equal(((await overflowRes.json()) as any).error, 'IDEMPOTENCY_CAPACITY_EXCEEDED');
-
-    // 4. Let the original mutation finish -> retry now replays the cached 200 without re-executing!
-    releaseHandler!();
     await new Promise((r) => setTimeout(r, 25));
 
     const replayRes = await fetch(`${baseUrl}/mutate`, {

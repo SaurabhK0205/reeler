@@ -330,12 +330,34 @@ declare global {
 }
 
 /**
+ * Resolves the configured non-blank vault signing secret using canonical precedence
+ * (`VAULT_SECRET`, then `SUPABASE_SERVICE_ROLE_KEY`). Returns null if neither is set.
+ */
+export function resolveConfiguredVaultSecret(): string | null {
+  const vaultSecret = process.env.VAULT_SECRET?.trim();
+  if (vaultSecret) {
+    return vaultSecret;
+  }
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+  if (serviceRoleKey) {
+    return serviceRoleKey;
+  }
+  return null;
+}
+
+/**
  * Resolves the server secret used to sign and verify zero-login vault tokens.
+ * Fails closed in production if neither VAULT_SECRET nor SUPABASE_SERVICE_ROLE_KEY is configured.
  */
 export function getVaultSecret(): string {
-  const configuredSecret = process.env.VAULT_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (configuredSecret && configuredSecret.trim()) {
-    return configuredSecret.trim();
+  const configuredSecret = resolveConfiguredVaultSecret();
+  if (configuredSecret) {
+    return configuredSecret;
+  }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'Production requires a non-blank VAULT_SECRET or SUPABASE_SERVICE_ROLE_KEY to sign vault tokens.'
+    );
   }
   return 'reeler-default-vault-secret-do-not-use-in-production';
 }

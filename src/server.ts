@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.ts';
 import { apiRouter } from './api/router.ts';
 import { ReminderWorker } from './services/reminderWorker.ts';
-import { requireAdminVaultMiddleware } from './services/vaultAuthService.ts';
+import { requireAdminVaultMiddleware, resolveConfiguredVaultSecret } from './services/vaultAuthService.ts';
 import { createRateLimiter, getClientIp, securityHeadersMiddleware } from './middleware/security.ts';
 
 // Server runtime defaults to UTC standard; user-specific timezones are dynamically resolved per session
@@ -23,6 +23,12 @@ if (process.env.SUPABASE_URL?.trim() && !process.env.SUPABASE_SERVICE_ROLE_KEY?.
   console.error(
     '[Startup] FATAL: SUPABASE_URL is set without SUPABASE_SERVICE_ROLE_KEY. ' +
       'Migration 015 revokes anon/authenticated access on creators and saved_reels; SUPABASE_SERVICE_ROLE_KEY is required.'
+  );
+  process.exit(1);
+}
+if (process.env.NODE_ENV === 'production' && !resolveConfiguredVaultSecret()) {
+  console.error(
+    '[Startup] FATAL: production requires a non-blank VAULT_SECRET or SUPABASE_SERVICE_ROLE_KEY to sign vault tokens.'
   );
   process.exit(1);
 }
@@ -208,13 +214,6 @@ const server = app.listen(PORT, () => {
   console.log('================================================================');
   console.log(`- Database:    ${config.supabase.isConfigured ? 'Supabase (' + config.supabase.url + ')' : 'In-Memory (Development/Demo Mode)'}`);
   console.log(`- Reminders:   Default interval: ${config.reminders.defaultIntervalHours} hours`);
-  if (
-    process.env.NODE_ENV === 'production' &&
-    !process.env.VAULT_SECRET?.trim() &&
-    !process.env.SUPABASE_SERVICE_ROLE_KEY?.trim()
-  ) {
-    console.warn('[Security] WARNING: Running in production without VAULT_SECRET or SUPABASE_SERVICE_ROLE_KEY configured!');
-  }
   console.log('================================================================\n');
 
   reminderWorker.start();

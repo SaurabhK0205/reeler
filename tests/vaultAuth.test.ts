@@ -78,7 +78,9 @@ test('VaultAuthService - vaultAuthMiddleware permits public endpoints without ke
 
 test('VaultAuthService - vaultAuthMiddleware enforces authentication in production and parses valid keys', () => {
   const origEnv = process.env.NODE_ENV;
+  const origVaultSecret = process.env.VAULT_SECRET;
   process.env.NODE_ENV = 'production';
+  process.env.VAULT_SECRET = 'test-production-vault-secret';
 
   try {
     // 1. Missing key -> 401
@@ -120,7 +122,10 @@ test('VaultAuthService - vaultAuthMiddleware enforces authentication in producti
     assert.equal(reqWithKey.vaultUser?.role, 'user');
     assert.equal(reqWithKey.vaultUser?.senderId, 'sender_bob');
   } finally {
-    process.env.NODE_ENV = origEnv;
+    if (origEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = origEnv;
+    if (origVaultSecret === undefined) delete process.env.VAULT_SECRET;
+    else process.env.VAULT_SECRET = origVaultSecret;
   }
 });
 
