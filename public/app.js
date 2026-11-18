@@ -447,6 +447,7 @@ tabKeyBtn?.addEventListener('click', () => switchVaultGateTab('key'));
  */
 function showVaultGateScreen(errorMessage) {
   if (!vaultGateScreen) return;
+  if (vaultContainerEl) vaultContainerEl.classList.add('is-vault-locked');
   vaultGateScreen.classList.remove('is-hidden');
   if (resultsCount) resultsCount.textContent = 'Private Vault Locked';
   if (reelsGrid) reelsGrid.innerHTML = '';
@@ -469,6 +470,7 @@ function showVaultGateScreen(errorMessage) {
  */
 function hideVaultGateScreen() {
   if (!vaultGateScreen) return;
+  if (vaultContainerEl) vaultContainerEl.classList.remove('is-vault-locked');
   vaultGateScreen.classList.add('is-hidden');
   if (vaultGateError) vaultGateError.hidden = true;
   syncSwitchVaultButtonVisibility();
@@ -1721,8 +1723,12 @@ function renderReels() {
     resultsCount.textContent = `0 ${typeLabels.scopedPlural} match your view`;
     const filtersActive = hasActiveFilters();
     const subFiltersActive = hasActiveFilters(false);
+    const isVaultEmpty = !filtersActive && state.total === 0;
+    if (creatorsStripContainer) {
+      creatorsStripContainer.classList.toggle('is-hidden', isVaultEmpty);
+    }
     let emptyTitle = 'Your Vault Is Empty';
-    let emptyDesc = 'Import Instagram’s saved_posts.json export to bring in your Instagram Saved collection, or DM reels and posts to Reeler Bot.';
+    let emptyDesc = 'You scroll through 1,000 reels a day. DM any reel or post to @er_reel_er on Instagram, or import saved_posts.json to keep the ones worth revisiting.';
     let emptyActionHtml = '<button type="button" class="nav-btn nav-btn-primary" data-action="empty-import">Import saved_posts.json</button>';
 
     if (subFiltersActive) {
@@ -1731,7 +1737,7 @@ function renderReels() {
       emptyActionHtml = '<button type="button" class="nav-btn nav-btn-primary" data-action="reset-all-filters">Reset Filters</button>';
     } else if (state.filters.source === 'bot') {
       emptyTitle = 'No Bot-Sent Items Yet';
-      emptyDesc = 'DM any Reel or Post link to your Reeler Bot to track it here with Watch Later reminders, without adding it to your Instagram Saved collection.';
+      emptyDesc = 'DM any Reel or Post link to @er_reel_er on Instagram to track it here with Watch Later reminders, without adding it to your Instagram Saved collection.';
       emptyActionHtml = filtersActive
         ? '<button type="button" class="nav-btn nav-btn-primary" data-action="reset-all-filters">Show All Items</button>'
         : emptyActionHtml;
@@ -1767,6 +1773,7 @@ function renderReels() {
     return;
   }
 
+  if (creatorsStripContainer) creatorsStripContainer.classList.remove('is-hidden');
   if (reelsTable) reelsTable.hidden = false;
   if (reelsTableContainer) reelsTableContainer.classList.remove('is-empty-state');
   if (reelsTableState) {

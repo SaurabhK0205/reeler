@@ -578,3 +578,34 @@ test('Vault UI exposes Switch Vault control with reduced-motion and logout state
   assert.ok(css.includes('.nav-btn:active:not(:disabled)'), 'style.css must provide tactile :active feedback for nav buttons');
   assert.ok(css.includes('.nav-btn:active'), 'style.css must respect prefers-reduced-motion for nav buttons');
 });
+
+test('Frontend CSS tokens, locked workspace isolation, and optical craft invariants hold', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const root = path.resolve(process.cwd());
+
+  const css = fs.readFileSync(path.join(root, 'public/style.css'), 'utf8');
+  const js = fs.readFileSync(path.join(root, 'public/app.js'), 'utf8');
+  const html = fs.readFileSync(path.join(root, 'public/index.html'), 'utf8');
+
+  // 1. Every var(--token) referenced in style.css must be defined in style.css (prevents silent fallback breakage)
+  const definedTokens = new Set([...css.matchAll(/(--[a-zA-Z0-9_-]+)\s*:/g)].map((m) => m[1]));
+  const referencedTokens = [...css.matchAll(/var\((--[a-zA-Z0-9_-]+)/g)].map((m) => m[1]);
+  const undefinedTokens = [...new Set(referencedTokens.filter((token) => !definedTokens.has(token)))];
+  assert.deepEqual(undefinedTokens, [], `Found undefined CSS custom properties in public/style.css: ${undefinedTokens.join(', ')}`);
+
+  // 2. Locked workspace isolation: showVaultGateScreen / hideVaultGateScreen must toggle .is-vault-locked
+  assert.ok(js.includes("vaultContainerEl.classList.add('is-vault-locked')"), 'showVaultGateScreen must lock workspace container');
+  assert.ok(js.includes("vaultContainerEl.classList.remove('is-vault-locked')"), 'hideVaultGateScreen must unlock workspace container');
+  assert.ok(css.includes('.vault-container.is-vault-locked .stats-bar'), 'style.css must hide stats-bar while vault is locked');
+
+  // 3. Performance & craft invariants (Emil Kowalski + Benji Taylor)
+  assert.ok(css.includes('contain: layout paint;'), 'Poster cards must apply layout/paint containment');
+  assert.ok(css.includes('transform: translateX(1px);'), 'Play triangle icons must be optically centered');
+  assert.ok(css.includes('.metric-filter-btn:active'), 'Stat filter cards must include tactile :active feedback and reduced-motion override');
+  assert.ok(css.includes('.vault-gate-card {\n    animation: none;'), 'Vault gate entrance animation must be disabled under prefers-reduced-motion');
+
+  // 4. HTML cache-busting query versions stay aligned
+  assert.ok(html.includes('style.css?v=4.5'), 'index.html must reference style.css?v=4.5');
+  assert.ok(html.includes('app.js?v=4.5'), 'index.html must reference app.js?v=4.5');
+});
