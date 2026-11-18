@@ -420,10 +420,35 @@ async function fetchImageDimensions(
  * probing the preferred URL path (`/reel/` or `/p/`) first and falling back to the alternate path on non-OK HTTP status.
  */
 const OG_META_PATTERN = /<meta\s+(?:property|name)="(?:og:url|og:image|twitter:title|og:title)"/i;
+const GENERIC_INSTAGRAM_TITLE_RE = /^(?:instagram|login\s*[•·-]\s*instagram)$/i;
 const DIRECT_METADATA_USER_AGENTS = [
   'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
   'WhatsApp/2.23.20.0',
 ];
+
+/**
+ * Verifies that an HTML document contains item-specific OpenGraph metadata rather than
+ * a generic Instagram login or interstitial shell (e.g. only `<meta property="og:title" content="Instagram">`).
+ */
+function hasItemOpenGraphMetadata(html: string, shortcode: string): boolean {
+  if (!OG_META_PATTERN.test(html)) {
+    return false;
+  }
+  const ogImage = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i)?.[1]?.trim();
+  if (ogImage) {
+    return true;
+  }
+  const ogUrl = decodeHtml(html.match(/<meta\s+property="og:url"\s+content="([^"]+)"/i)?.[1] || '');
+  if (ogUrl && ogUrl.toLowerCase().includes(`/${shortcode.toLowerCase()}`)) {
+    return true;
+  }
+  const twitterTitle = decodeHtml(html.match(/<meta\s+name="twitter:title"\s+content="([^"]+)"/i)?.[1] || '').trim();
+  if (twitterTitle && !GENERIC_INSTAGRAM_TITLE_RE.test(twitterTitle)) {
+    return true;
+  }
+  const ogTitle = decodeHtml(html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i)?.[1] || '').trim();
+  return Boolean(ogTitle && !GENERIC_INSTAGRAM_TITLE_RE.test(ogTitle));
+}
 
 /**
  * Reads up to `maxBytes` of UTF-8 text from a fetch Response, cancelling the underlying stream
@@ -526,6 +551,7 @@ async function fetchViaMetaOEmbed(
  */
 async function fetchHtmlViaProxy(
   targetUrl: string,
+  shortcode: string,
   signal?: AbortSignal
 ): Promise<string | null> {
   const rawProxy = process.env.METADATA_PROXY_URL?.trim();
@@ -566,8 +592,8 @@ async function fetchHtmlViaProxy(
       return null;
     }
     const candidateHtml = await readBoundedText(res);
-    if (!OG_META_PATTERN.test(candidateHtml)) {
-      console.warn(`[MetadataResolver] Proxy relay returned HTTP 200 without OpenGraph tags (${parsedProxy.hostname}).`);
+    if (!hasItemOpenGraphMetadata(candidateHtml, shortcode)) {
+      console.warn(`[MetadataResolver] Proxy relay returned HTTP 200 without item OpenGraph tags (${parsedProxy.hostname}).`);
       return null;
     }
     return candidateHtml;
@@ -596,9 +622,13 @@ export async function fetchReelMetadata(
   try {
     let html: string | null = null;
     let lastStatus = 0;
-    let sawLoginWallHtml = false;
+    const loginWallPaths: Array<'reel' | 'p'> = [];
 
-    const tryDirectFetch = async (pathSegment: 'reel' | 'p', userAgent: string): Promise<string | null> => {
+    const tryDirectFetch = async (
+      pathSegment: 'reel' | 'p',
+      userAgent: string,
+      recordLoginWall: boolean
+    ): Promise<string | null> => {
       if (signal?.aborted) {
         return null;
       }
@@ -620,8 +650,10 @@ export async function fetchReelMetadata(
         }
 
         const candidateHtml = await readBoundedText(res);
-        if (!OG_META_PATTERN.test(candidateHtml)) {
-          sawLoginWallHtml = true;
+        if (!hasItemOpenGraphMetadata(candidateHtml, shortcode)) {
+          if (recordLoginWall && !loginWallPaths.includes(pathSegment)) {
+            loginWallPaths.push(pathSegment);
+          }
           return null;
         }
         return candidateHtml;
@@ -640,18 +672,23 @@ export async function fetchReelMetadata(
       if (signal?.aborted) {
         return {};
       }
-      const candidate = await tryDirectFetch(pathSegment, DIRECT_METADATA_USER_AGENTS[0]);
+      const candidate = await tryDirectFetch(pathSegment, DIRECT_METADATA_USER_AGENTS[0], true);
       if (candidate) {
         html = candidate;
         break;
       }
     }
 
-    if (!html && sawLoginWallHtml && !signal?.aborted) {
+    if (!html && loginWallPaths.length > 0 && !signal?.aborted) {
       for (const fallbackUserAgent of DIRECT_METADATA_USER_AGENTS.slice(1)) {
-        const candidate = await tryDirectFetch(pathsToTry[0], fallbackUserAgent);
-        if (candidate) {
-          html = candidate;
+        for (const wallPath of loginWallPaths) {
+          const candidate = await tryDirectFetch(wallPath, fallbackUserAgent, false);
+          if (candidate) {
+            html = candidate;
+            break;
+          }
+        }
+        if (html) {
           break;
         }
       }
@@ -668,7 +705,7 @@ export async function fetchReelMetadata(
       if (process.env.METADATA_PROXY_URL?.trim()) {
         for (const pathSegment of pathsToTry) {
           const url = `https://www.instagram.com/${pathSegment}/${encodeURIComponent(shortcode)}/`;
-          const proxiedHtml = await fetchHtmlViaProxy(url, signal);
+          const proxiedHtml = await fetchHtmlViaProxy(url, shortcode, signal);
           if (proxiedHtml) {
             html = proxiedHtml;
             break;

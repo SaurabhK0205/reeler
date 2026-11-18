@@ -1261,13 +1261,18 @@ test('MetadataResolver - falls back to secondary crawler User-Agent when primary
   delete process.env.META_PAGE_ACCESS_TOKEN;
   delete process.env.METADATA_PROXY_URL;
 
-  const seenUAs: string[] = [];
+  const seenRequests: Array<{ pathname: string; ua: string }> = [];
   try {
-    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const parsed = new URL(String(url));
       const ua = String((init?.headers as Record<string, string> | undefined)?.['User-Agent'] || '');
-      seenUAs.push(ua);
+      seenRequests.push({ pathname: parsed.pathname, ua });
       if (ua.startsWith('facebookexternalhit')) {
-        return new Response('<html><title>Instagram</title></html>', { status: 200 });
+        // Generic login-wall shell with og:title="Instagram" must NOT falsely pass as item metadata
+        return new Response(
+          '<html><head><meta property="og:title" content="Instagram" /></head></html>',
+          { status: 200 }
+        );
       }
       return new Response(
         '<html><head>' +
@@ -1282,10 +1287,17 @@ test('MetadataResolver - falls back to secondary crawler User-Agent when primary
     const meta = await fetchReelMetadata('DFallbackUA1', undefined, 'reel');
     assert.equal(meta.username, 'shiadanni');
     assert.equal(meta.thumbnailUrl, 'https://scontent.cdninstagram.com/v/thumb.jpg');
-    assert.equal(seenUAs.length, 3, 'Should probe /reel/ and /p/ with primary UA, then fall back to secondary crawler UA');
-    assert.match(seenUAs[0], /^facebookexternalhit/);
-    assert.match(seenUAs[1], /^facebookexternalhit/);
-    assert.match(seenUAs[2], /^WhatsApp\//);
+    assert.equal(
+      seenRequests.length,
+      3,
+      'Should probe /reel/ and /p/ with primary UA, then fall back to secondary crawler UA on /reel/'
+    );
+    assert.equal(seenRequests[0].pathname, '/reel/DFallbackUA1/');
+    assert.match(seenRequests[0].ua, /^facebookexternalhit/);
+    assert.equal(seenRequests[1].pathname, '/p/DFallbackUA1/');
+    assert.match(seenRequests[1].ua, /^facebookexternalhit/);
+    assert.equal(seenRequests[2].pathname, '/reel/DFallbackUA1/');
+    assert.match(seenRequests[2].ua, /^WhatsApp\//);
   } finally {
     globalThis.fetch = origFetch;
     if (origToken === undefined) delete process.env.META_PAGE_ACCESS_TOKEN;

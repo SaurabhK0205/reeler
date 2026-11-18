@@ -1732,7 +1732,8 @@ function selectCreator(id) {
 /**
  * Queries reels matching active filters, pagination, and search terms with abort safety and inline error recovery.
  */
-async function fetchReels() {
+async function fetchReels(options = {}) {
+  const silent = Boolean(options.silent);
   if (fetchReelsAbortController) {
     fetchReelsAbortController.abort();
   }
@@ -1740,8 +1741,10 @@ async function fetchReels() {
   const { signal } = fetchReelsAbortController;
 
   renderActiveFilterChips();
-  const queryLabels = getMediaUnitLabels(state.filters.mediaType, state.filters.source);
-  resultsCount.textContent = `Querying ${queryLabels.scopedPlural}...`;
+  if (!silent) {
+    const queryLabels = getMediaUnitLabels(state.filters.mediaType, state.filters.source);
+    resultsCount.textContent = `Querying ${queryLabels.scopedPlural}...`;
+  }
 
   const params = new URLSearchParams();
   if (state.filters.source && state.filters.source !== 'all') params.set('source', state.filters.source);
@@ -1777,6 +1780,7 @@ async function fetchReels() {
 
     const data = await res.json();
     if (signal.aborted) return;
+    if (silent && feedModal?.classList.contains('active')) return;
 
     state.reels = data.reels || [];
     state.total = data.total || 0;
@@ -1784,7 +1788,7 @@ async function fetchReels() {
     if (state.reels.length === 0 && state.filters.page > maxPage) {
       state.filters.page = maxPage;
       syncUrlState();
-      return fetchReels();
+      return fetchReels({ silent });
     }
     hasInitialReelsSettled = true;
 
@@ -1793,6 +1797,9 @@ async function fetchReels() {
   } catch (e) {
     if (e?.name === 'AbortError') return;
     console.error('Failed to fetch reels:', e);
+    if (silent && hasInitialReelsSettled) {
+      return;
+    }
     hasInitialReelsSettled = true;
     renderFetchErrorState(e?.message || 'Unable to reach server');
   }
@@ -4048,7 +4055,7 @@ function setupEventListeners() {
     lastAutoSyncAt = now;
     loadStats();
     loadCreators(state.creatorQuery);
-    fetchReels();
+    fetchReels({ silent: true });
   });
 
   sortBySelect.addEventListener('change', (e) => {
