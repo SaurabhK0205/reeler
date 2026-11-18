@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { generateUserVaultKey, getAdminVaultKey, createOtp } from './vaultAuthService.ts';
+import { safeStringEqual } from '../middleware/security.ts';
 import { loadConfig } from '../config.ts';
 import { Repository, SenderReminderConflictError, SenderDeletionBarrierError } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
@@ -59,10 +60,14 @@ export function isMetaMessagingWindowError(errorData: unknown): boolean {
   return false;
 }
 
+const WEBHOOK_MID_DEDUP_TTL_MS = 10 * 60 * 1000;
+const WEBHOOK_MID_MAX_ENTRIES = 2000;
+
 export class MetaInstagramBotService {
   private accessToken: string;
   private verifyToken: string;
   private appSecret: string;
+  private processedMessageIds = new Map<string, number>();
   public adminUserId: string | null = null;
 
   constructor(options?: { adminUserId?: string | null }) {
@@ -128,15 +133,48 @@ export class MetaInstagramBotService {
   }
 
   /**
-   * Validates Meta Webhook Verification Challenge (GET /webhook)
+   * Tracks processed Meta message IDs (mid) with bounded TTL/LRU eviction so webhook retries
+   * and duplicate messaging/changes dispatches remain idempotent.
+   */
+  private isDuplicateWebhookMid(mid: unknown): boolean {
+    if (typeof mid !== 'string') return false;
+    const trimmed = mid.trim();
+    if (!trimmed) return false;
+
+    const now = Date.now();
+    const existingExpiry = this.processedMessageIds.get(trimmed);
+    if (existingExpiry !== undefined && existingExpiry > now) {
+      return true;
+    }
+
+    if (this.processedMessageIds.size >= WEBHOOK_MID_MAX_ENTRIES) {
+      for (const [key, exp] of this.processedMessageIds.entries()) {
+        if (exp <= now) {
+          this.processedMessageIds.delete(key);
+        }
+      }
+      while (this.processedMessageIds.size >= WEBHOOK_MID_MAX_ENTRIES) {
+        const oldest = this.processedMessageIds.keys().next().value;
+        if (oldest === undefined) break;
+        this.processedMessageIds.delete(oldest);
+      }
+    }
+
+    this.processedMessageIds.set(trimmed, now + WEBHOOK_MID_DEDUP_TTL_MS);
+    return false;
+  }
+
+  /**
+   * Validates Meta Webhook Verification Challenge (GET /webhook) using constant-time comparison.
    */
   verifyWebhook(mode: string, token: string, challenge: string): string | null {
-    const validTokens = [
-      this.verifyToken,
-      'rea_instagram_saved_token',
-      'ig_reels_tracker_webhook_secret_2026',
-    ];
-    if (mode === 'subscribe' && validTokens.includes(token)) {
+    if (mode !== 'subscribe' || typeof token !== 'string' || !token) {
+      return null;
+    }
+    const validTokens = process.env.META_WEBHOOK_VERIFY_TOKEN?.trim()
+      ? [this.verifyToken]
+      : [this.verifyToken, 'rea_instagram_saved_token', 'ig_reels_tracker_webhook_secret_2026'];
+    if (validTokens.some((candidate) => candidate && safeStringEqual(token, candidate))) {
       return challenge;
     }
     return null;
@@ -164,7 +202,11 @@ export class MetaInstagramBotService {
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       try {
-        const url = `https://graph.facebook.com/v21.0/me/messages?access_token=${this.accessToken}`;
+        const url = 'https://graph.facebook.com/v21.0/me/messages';
+        const authHeaders = {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.accessToken}`,
+        };
         const basePayload: Record<string, unknown> = {
           recipient: { id: recipientId },
           message: { text: chunk },
@@ -175,7 +217,7 @@ export class MetaInstagramBotService {
 
         let res = await fetch(url, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders,
           body: JSON.stringify(basePayload),
           signal: AbortSignal.timeout(10000),
         });
@@ -194,7 +236,7 @@ export class MetaInstagramBotService {
           };
           res = await fetch(url, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: authHeaders,
             body: JSON.stringify(fallbackPayload),
             signal: AbortSignal.timeout(10000),
           });
@@ -335,6 +377,9 @@ export class MetaInstagramBotService {
           // Ignore echoes / own sent messages
           if (event.message?.is_echo) continue;
 
+          // Deduplicate repeated Meta webhook deliveries by message ID
+          if (this.isDuplicateWebhookMid(event.message?.mid)) continue;
+
           const text = event.message?.text || '';
           
           // Check for attachments (e.g. shared Reel clip, ig_reel, share, photo/carousel post)
@@ -372,6 +417,7 @@ export class MetaInstagramBotService {
             const val = change.value;
             const senderId = val.sender?.id;
             if (!senderId || val.message?.is_echo) continue;
+            if (this.isDuplicateWebhookMid(val.message?.mid)) continue;
             const text = val.message?.text || '';
             let reelUrl: string | null = null;
             let attachmentType: string | null = null;

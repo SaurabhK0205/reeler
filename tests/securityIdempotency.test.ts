@@ -1,0 +1,478 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import express from 'express';
+import {
+  createRateLimiter,
+  safeStringEqual,
+  securityHeadersMiddleware,
+} from '../src/middleware/security.ts';
+import {
+  clearIdempotencyStoreForTesting,
+  computePayloadFingerprint,
+  idempotencyMiddleware,
+} from '../src/middleware/idempotency.ts';
+import {
+  clearOtpRateLimitsForTesting,
+  clearOtpsForTesting,
+  createOtp,
+  generateUserVaultKey,
+  getAdminVaultKey,
+  requireAdminVaultMiddleware,
+  vaultAuthMiddleware,
+} from '../src/services/vaultAuthService.ts';
+import { apiRouter, resetApiRateLimitersForTesting } from '../src/api/router.ts';
+import { MetaInstagramBotService } from '../src/services/metaInstagramBotService.ts';
+import { Repository } from '../src/db/repository.ts';
+
+async function withServer<T>(
+  app: express.Express,
+  fn: (baseUrl: string) => Promise<T>
+): Promise<T> {
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  try {
+    return await fn(baseUrl);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+test('Security - safeStringEqual performs constant-time comparison across lengths and UTF-8 strings', () => {
+  assert.equal(safeStringEqual('abc123', 'abc123'), true);
+  assert.equal(safeStringEqual('abc123', 'abc124'), false);
+  assert.equal(safeStringEqual('short', 'much-longer-string'), false);
+  assert.equal(safeStringEqual('café', 'cafe'), false);
+});
+
+test('Security - securityHeadersMiddleware sets CSP, nosniff, frame deny, and HSTS on HTTPS', async () => {
+  const app = express();
+  app.set('trust proxy', 1);
+  app.use(securityHeadersMiddleware);
+  app.get('/ping', (_req, res) => res.json({ ok: true }));
+
+  await withServer(app, async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/ping`, {
+      headers: { 'X-Forwarded-Proto': 'https' },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(res.headers.get('x-frame-options'), 'DENY');
+    assert.equal(res.headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
+    assert.equal(res.headers.get('cross-origin-opener-policy'), 'same-origin');
+    assert.match(res.headers.get('content-security-policy') || '', /script-src 'self'/);
+    assert.match(res.headers.get('content-security-policy') || '', /frame-ancestors 'none'/);
+    assert.match(res.headers.get('strict-transport-security') || '', /max-age=31536000/);
+  });
+});
+
+test('Security - createRateLimiter enforces limits and evicts oldest keys under IP rotation instead of locking out users', async () => {
+  const limiter = createRateLimiter({
+    windowMs: 60_000,
+    maxRequests: 2,
+    maxTrackedKeys: 10,
+    errorCode: 'TEST_RATE_LIMITED',
+    keyGenerator: (req) => String(req.headers['x-test-ip'] || 'default'),
+  });
+
+  const app = express();
+  app.use(limiter.middleware);
+  app.get('/data', (_req, res) => res.json({ ok: true }));
+
+  await withServer(app, async (baseUrl) => {
+    // 1. Standard per-key enforcement
+    const r1 = await fetch(`${baseUrl}/data`, { headers: { 'x-test-ip': '10.0.0.1' } });
+    const r2 = await fetch(`${baseUrl}/data`, { headers: { 'x-test-ip': '10.0.0.1' } });
+    const r3 = await fetch(`${baseUrl}/data`, { headers: { 'x-test-ip': '10.0.0.1' } });
+    assert.equal(r1.status, 200);
+    assert.equal(r2.status, 200);
+    assert.equal(r3.status, 429);
+    assert.ok(r3.headers.get('retry-after'), '429 must include Retry-After header');
+    const body3 = (await r3.json()) as any;
+    assert.equal(body3.error, 'TEST_RATE_LIMITED');
+
+    // 2. Flood 25 rotating attacker IPs beyond maxTrackedKeys=10
+    for (let i = 0; i < 25; i++) {
+      const res = await fetch(`${baseUrl}/data`, { headers: { 'x-test-ip': `198.51.100.${i}` } });
+      assert.equal(res.status, 200, 'Rotating IPs must evict oldest entries instead of locking out new visitors');
+    }
+    assert.ok(limiter.size() <= 10, `Rate limiter map must stay bounded (got ${limiter.size()})`);
+  });
+});
+
+test('Security - vaultAuthMiddleware rejects spoofed /meta paths and requireAdminVaultMiddleware blocks non-admins before body parsing', async () => {
+  const origEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+  try {
+    // 1. Spoofed /meta paths must NOT bypass auth
+    for (const spoofPath of ['/stats/meta', '/reels/a/b/meta', '/meta', '/user/meta']) {
+      let status = 200;
+      const req: any = { path: spoofPath, headers: {}, query: {} };
+      const res: any = {
+        status: (code: number) => {
+          status = code;
+          return { json: () => {} };
+        },
+      };
+      let nextCalled = false;
+      vaultAuthMiddleware(req, res, () => {
+        nextCalled = true;
+      });
+      assert.equal(nextCalled, false, `Spoofed path ${spoofPath} must NOT bypass vaultAuthMiddleware`);
+      assert.equal(status, 401);
+    }
+
+    // 2. requireAdminVaultMiddleware blocks anonymous (401) and regular user (403) before body parsing
+    const app = express();
+    let parserCalled = false;
+    app.post(
+      '/import',
+      requireAdminVaultMiddleware,
+      (_req, _res, next) => {
+        parserCalled = true;
+        next();
+      },
+      (_req, res) => res.json({ imported: true })
+    );
+
+    await withServer(app, async (baseUrl) => {
+      const anonRes = await fetch(`${baseUrl}/import`, { method: 'POST' });
+      assert.equal(anonRes.status, 401);
+      assert.equal(parserCalled, false, 'Unauthenticated request must be rejected before body parser');
+
+      const userKey = generateUserVaultKey('non_admin_user');
+      const userRes = await fetch(`${baseUrl}/import`, {
+        method: 'POST',
+        headers: { 'X-Vault-Key': userKey },
+      });
+      assert.equal(userRes.status, 403);
+      assert.equal(parserCalled, false, 'Non-admin user must be rejected before body parser');
+
+      const adminRes = await fetch(`${baseUrl}/import`, {
+        method: 'POST',
+        headers: { 'X-Vault-Key': getAdminVaultKey() },
+      });
+      assert.equal(adminRes.status, 200);
+      assert.equal(parserCalled, true, 'Verified admin must proceed to body parser');
+    });
+  } finally {
+    process.env.NODE_ENV = origEnv;
+  }
+});
+
+test('Idempotency - replays deterministic POST/PUT/PATCH responses, rejects conflicts (422), concurrent duplicates (409), malformed keys (400), and isolates principals', async () => {
+  clearIdempotencyStoreForTesting();
+
+  // Verify canonical payload fingerprinting ignores key order
+  assert.equal(
+    computePayloadFingerprint({ a: 1, b: { x: 2, y: 3 } }),
+    computePayloadFingerprint({ b: { y: 3, x: 2 }, a: 1 })
+  );
+
+  let executions = 0;
+  let shouldFailServer = false;
+  let releaseSlowRequest: (() => void) | null = null;
+
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    const user = req.headers['x-test-user'];
+    if (user === 'admin') req.vaultUser = { role: 'admin' };
+    else if (typeof user === 'string') req.vaultUser = { role: 'user', senderId: user };
+    next();
+  });
+  app.use(idempotencyMiddleware);
+
+  app.post('/items', (req, res) => {
+    executions++;
+    if (shouldFailServer) {
+      res.status(500).json({ error: 'TRANSIENT_FAILURE' });
+      return;
+    }
+    res.status(201).json({ execution: executions, echo: req.body });
+  });
+
+  app.put('/slow', async (_req, res) => {
+    executions++;
+    await new Promise<void>((resolve) => {
+      releaseSlowRequest = resolve;
+    });
+    res.status(200).json({ done: true, execution: executions });
+  });
+
+  await withServer(app, async (baseUrl) => {
+    // 1. Malformed key -> 400
+    const badRes = await fetch(`${baseUrl}/items`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'bad key with spaces' },
+      body: JSON.stringify({ name: 'a' }),
+    });
+    assert.equal(badRes.status, 400);
+    assert.equal(((await badRes.json()) as any).error, 'INVALID_IDEMPOTENCY_KEY');
+
+    // 2. First call executes; second call with reordered keys replays exact cached body without re-executing
+    const r1 = await fetch(`${baseUrl}/items`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'idem-key-001',
+        'x-test-user': 'user_a',
+      },
+      body: JSON.stringify({ first: 1, second: 2 }),
+    });
+    assert.equal(r1.status, 201);
+    assert.equal(r1.headers.get('idempotency-replayed'), null);
+    const body1 = (await r1.json()) as any;
+    assert.equal(body1.execution, 1);
+
+    const r2 = await fetch(`${baseUrl}/items`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'idem-key-001',
+        'x-test-user': 'user_a',
+      },
+      body: JSON.stringify({ second: 2, first: 1 }),
+    });
+    assert.equal(r2.status, 201);
+    assert.equal(r2.headers.get('idempotency-replayed'), 'true');
+    const body2 = (await r2.json()) as any;
+    assert.equal(body2.execution, 1, 'Replayed request must not execute handler twice');
+
+    // 3. Same key with DIFFERENT payload -> 422
+    const conflictRes = await fetch(`${baseUrl}/items`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'idem-key-001',
+        'x-test-user': 'user_a',
+      },
+      body: JSON.stringify({ first: 999, second: 2 }),
+    });
+    assert.equal(conflictRes.status, 422);
+    assert.equal(((await conflictRes.json()) as any).error, 'IDEMPOTENCY_KEY_CONFLICT');
+
+    // 4. Different principal reusing the same key executes independently (strict isolation)
+    const userBRes = await fetch(`${baseUrl}/items`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'idem-key-001',
+        'x-test-user': 'user_b',
+      },
+      body: JSON.stringify({ first: 1, second: 2 }),
+    });
+    assert.equal(userBRes.status, 201);
+    assert.equal(userBRes.headers.get('idempotency-replayed'), null);
+    assert.equal(((await userBRes.json()) as any).execution, 2);
+
+    // 5. Transient 500 error is NOT cached, so retry succeeds cleanly
+    shouldFailServer = true;
+    const errRes = await fetch(`${baseUrl}/items`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'idem-key-retry',
+        'x-test-user': 'user_a',
+      },
+      body: JSON.stringify({ retry: true }),
+    });
+    assert.equal(errRes.status, 500);
+
+    shouldFailServer = false;
+    const retryRes = await fetch(`${baseUrl}/items`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'idem-key-retry',
+        'x-test-user': 'user_a',
+      },
+      body: JSON.stringify({ retry: true }),
+    });
+    assert.equal(retryRes.status, 201);
+    assert.equal(retryRes.headers.get('idempotency-replayed'), null);
+
+    // 6. Concurrent in-flight request with identical key -> 409 Conflict
+    const slowPromise = fetch(`${baseUrl}/slow`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'idem-key-inflight',
+        'x-test-user': 'user_a',
+      },
+      body: JSON.stringify({ slow: true }),
+    });
+    // Wait briefly until handler is in-flight
+    while (!releaseSlowRequest) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const dupRes = await fetch(`${baseUrl}/slow`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'idem-key-inflight',
+        'x-test-user': 'user_a',
+      },
+      body: JSON.stringify({ slow: true }),
+    });
+    assert.equal(dupRes.status, 409);
+    assert.equal(((await dupRes.json()) as any).error, 'IDEMPOTENCY_REQUEST_IN_PROGRESS');
+    assert.equal(dupRes.headers.get('retry-after'), '2');
+
+    releaseSlowRequest!();
+    const slowFinal = await slowPromise;
+    assert.equal(slowFinal.status, 200);
+  });
+});
+
+test('API Router - end-to-end idempotency on PATCH /reels/:id/status, POST /auth/otp/verify, and rate limit on POST /auth/otp/request', async () => {
+  clearIdempotencyStoreForTesting();
+  clearOtpsForTesting();
+  clearOtpRateLimitsForTesting();
+  resetApiRateLimitersForTesting();
+  Repository.resetMemoryStoreForTests();
+
+  const creator = await Repository.upsertCreator({
+    instagram_user_id: 'creator_idem_test',
+    username: 'creator_idem_test',
+  });
+  const now = new Date().toISOString();
+  const reel = await Repository.upsertSavedReel({
+    instagram_media_id: 'media_idem_01',
+    creator_id: creator.id,
+    shortcode: 'IdemShort01',
+    reel_url: 'https://www.instagram.com/reel/IdemShort01/',
+    instagram_sender_id: 'sender_idem_user',
+    is_saved_on_instagram: false,
+    taken_at: now,
+    first_detected_at: now,
+    save_order_rank: 1,
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use('/api', apiRouter);
+
+  await withServer(app, async (baseUrl) => {
+    const userKey = generateUserVaultKey('sender_idem_user');
+
+    // 1. PATCH /api/reels/:id/status with Idempotency-Key replays cleanly
+    const patch1 = await fetch(`${baseUrl}/api/reels/${encodeURIComponent(reel.id)}/status`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vault-Key': userKey,
+        'Idempotency-Key': 'status-idem-1',
+      },
+      body: JSON.stringify({ status: 'watched' }),
+    });
+    assert.equal(patch1.status, 200);
+    assert.equal(((await patch1.json()) as any).watch_status, 'watched');
+
+    const patch2 = await fetch(`${baseUrl}/api/reels/${encodeURIComponent(reel.id)}/status`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vault-Key': userKey,
+        'Idempotency-Key': 'status-idem-1',
+      },
+      body: JSON.stringify({ status: 'watched' }),
+    });
+    assert.equal(patch2.status, 200);
+    assert.equal(patch2.headers.get('idempotency-replayed'), 'true');
+
+    // 2. Retrying POST /api/auth/otp/verify with the SAME Idempotency-Key replays the vaultKey safely
+    // (handles dropped network response after single-use OTP consumption)
+    const otpCode = createOtp({ role: 'user', senderId: 'sender_idem_user' });
+    const otp1 = await fetch(`${baseUrl}/api/auth/otp/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'otp-idem-1',
+      },
+      body: JSON.stringify({ code: otpCode }),
+    });
+    assert.equal(otp1.status, 200);
+    const otpBody1 = (await otp1.json()) as any;
+    assert.equal(otpBody1.vaultKey, userKey);
+
+    const otpRetrySameKey = await fetch(`${baseUrl}/api/auth/otp/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'otp-idem-1',
+      },
+      body: JSON.stringify({ code: otpCode }),
+    });
+    assert.equal(otpRetrySameKey.status, 200);
+    assert.equal(otpRetrySameKey.headers.get('idempotency-replayed'), 'true');
+    assert.equal(((await otpRetrySameKey.json()) as any).vaultKey, userKey);
+
+    // Reusing the consumed OTP WITHOUT the same Idempotency-Key is still rejected as single-use!
+    const otpReuseNoKey = await fetch(`${baseUrl}/api/auth/otp/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: otpCode }),
+    });
+    assert.equal(otpReuseNoKey.status, 400);
+    assert.equal(((await otpReuseNoKey.json()) as any).error, 'INVALID_OR_EXPIRED_CODE');
+
+    // 3. POST /api/auth/otp/request is rate-limited after 5 calls per IP
+    for (let i = 0; i < 5; i++) {
+      const reqRes = await fetch(`${baseUrl}/api/auth/otp/request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'unknown_user' }),
+      });
+      assert.equal(reqRes.status, 200);
+    }
+    const throttled = await fetch(`${baseUrl}/api/auth/otp/request`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'unknown_user' }),
+    });
+    assert.equal(throttled.status, 429);
+    assert.equal(((await throttled.json()) as any).error, 'TOO_MANY_OTP_REQUESTS');
+  });
+});
+
+test('MetaInstagramBotService - deduplicates repeated webhook deliveries by message ID (mid)', async () => {
+  const bot = new MetaInstagramBotService();
+  let dmCalls = 0;
+  bot.sendDirectMessage = async () => {
+    dmCalls++;
+    return true;
+  };
+
+  const webhookBody = {
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: 'sender_dedup_test' },
+            message: { mid: 'mid.duplicate_12345', text: 'help' },
+          },
+        ],
+        changes: [
+          {
+            field: 'messages',
+            value: {
+              sender: { id: 'sender_dedup_test' },
+              message: { mid: 'mid.duplicate_12345', text: 'help' },
+            },
+          },
+        ],
+      },
+    ],
+  };
+
+  // Dispatch identical payload twice (and with both messaging + changes containing same mid)
+  await bot.handleWebhookPayload(webhookBody);
+  await bot.handleWebhookPayload(webhookBody);
+
+  assert.equal(dmCalls, 1, 'Identical webhook mid across messaging/changes and retries must execute only once');
+});

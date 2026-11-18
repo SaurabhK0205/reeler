@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { loadConfig } from '../config.ts';
+import { createRateLimiter, getClientIp, safeStringEqual, setResponseHeader } from '../middleware/security.ts';
 
 export interface VaultUserSession {
   role: 'admin' | 'user';
@@ -16,6 +17,8 @@ interface PendingOtp {
 }
 
 const pendingOtps = new Map<string, PendingOtp>();
+const MAX_PENDING_OTPS = 500;
+const REEL_META_PATH_RE = /^\/reels\/[^/]+\/meta$/;
 
 /**
  * Default OTP Time-To-Live: 10 minutes.
@@ -40,6 +43,12 @@ function cleanupExpiredOtps(): void {
  */
 export function createOtp(session: VaultUserSession, ttlMs: number = OTP_DEFAULT_TTL_MS): string {
   cleanupExpiredOtps();
+
+  while (pendingOtps.size >= MAX_PENDING_OTPS) {
+    const oldestCode = pendingOtps.keys().next().value;
+    if (oldestCode === undefined) break;
+    pendingOtps.delete(oldestCode);
+  }
 
   let code: string;
   let attempts = 0;
@@ -117,21 +126,48 @@ export function clearOtpsForTesting(): void {
 
 const MAX_OTP_VERIFY_ATTEMPTS = 5;
 const OTP_RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
-const MAX_TRACKED_OTP_IPS = 1000;
+const MAX_TRACKED_OTP_IPS = 2000;
 const otpIpAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function pruneExpiredOtpAttempts(now: number): void {
+  for (const [ip, record] of otpIpAttempts.entries()) {
+    if (record.resetAt <= now) {
+      otpIpAttempts.delete(ip);
+    }
+  }
+}
+
+const otpAttemptCleanupInterval = setInterval(() => {
+  pruneExpiredOtpAttempts(Date.now());
+}, 60_000);
+otpAttemptCleanupInterval.unref();
+
+const otpRequestLimiter = createRateLimiter({
+  windowMs: 10 * 60 * 1000,
+  maxRequests: 5,
+  maxTrackedKeys: 2000,
+  errorCode: 'TOO_MANY_OTP_REQUESTS',
+  message: 'Too many login code requests. Please wait before requesting another code.',
+});
+
+/**
+ * Express middleware protecting /api/auth/otp/request against DM spam and OTP flooding.
+ */
+export const otpRequestRateLimiter = otpRequestLimiter.middleware;
 
 /**
  * Express middleware protecting /api/auth/otp/verify with per-client-IP rate limiting (CWE-307 mitigation).
+ * Evicts expired entries first, then oldest entry if at capacity, preventing IP-rotation lockout DoS.
  */
 export function otpVerifyRateLimiter(req: Request, res: Response, next: NextFunction): void {
-  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  const ip = getClientIp(req);
   const now = Date.now();
 
   const record = otpIpAttempts.get(ip);
   if (record && record.resetAt > now) {
     if (record.count >= MAX_OTP_VERIFY_ATTEMPTS) {
       const retryAfterSec = Math.ceil((record.resetAt - now) / 1000);
-      res.set('Retry-After', String(retryAfterSec));
+      setResponseHeader(res, 'Retry-After', String(retryAfterSec));
       res.status(429).json({
         error: 'TOO_MANY_ATTEMPTS',
         message: `Too many failed verification attempts. Please wait ${retryAfterSec} seconds before trying again.`,
@@ -139,12 +175,17 @@ export function otpVerifyRateLimiter(req: Request, res: Response, next: NextFunc
       return;
     }
   } else {
+    if (record) {
+      otpIpAttempts.delete(ip);
+    }
     if (otpIpAttempts.size >= MAX_TRACKED_OTP_IPS) {
-      res.status(429).json({
-        error: 'RATE_LIMIT_CAPACITY_REACHED',
-        message: 'Too many verification attempts in progress. Please retry later.',
-      });
-      return;
+      pruneExpiredOtpAttempts(now);
+    }
+    if (otpIpAttempts.size >= MAX_TRACKED_OTP_IPS) {
+      const oldestIp = otpIpAttempts.keys().next().value;
+      if (oldestIp !== undefined) {
+        otpIpAttempts.delete(oldestIp);
+      }
     }
     otpIpAttempts.set(ip, { count: 0, resetAt: now + OTP_RATE_LIMIT_WINDOW_MS });
   }
@@ -161,6 +202,9 @@ export function recordOtpFailure(ip: string): void {
   if (record && record.resetAt > now) {
     record.count++;
   } else {
+    if (otpIpAttempts.size >= MAX_TRACKED_OTP_IPS) {
+      pruneExpiredOtpAttempts(now);
+    }
     otpIpAttempts.set(ip, { count: 1, resetAt: now + OTP_RATE_LIMIT_WINDOW_MS });
   }
 }
@@ -177,6 +221,7 @@ export function resetOtpAttempts(ip: string): void {
  */
 export function clearOtpRateLimitsForTesting(): void {
   otpIpAttempts.clear();
+  otpRequestLimiter.resetForTesting();
 }
 
 export interface RequestOtpResult {
@@ -282,9 +327,9 @@ export function verifyVaultKey(key: string): { valid: boolean; session?: VaultUs
   }
   const trimmedKey = key.trim();
 
-  // 1. Check against Admin Key
+  // 1. Check against Admin Key using constant-time comparison
   const adminKey = getAdminVaultKey();
-  if (trimmedKey === adminKey) {
+  if (safeStringEqual(trimmedKey, adminKey)) {
     return {
       valid: true,
       session: { role: 'admin' },
@@ -297,9 +342,10 @@ export function verifyVaultKey(key: string): { valid: boolean; session?: VaultUs
     const parts = raw.split('.');
     if (parts.length === 3 && parts[0] === 'admin') {
       const [, adminId, signature] = parts;
+      if (!adminId) return { valid: false };
       const secret = getVaultSecret();
       const expectedSig = crypto.createHmac('sha256', secret).update(`admin:${adminId}`).digest('hex').slice(0, 24);
-      if (crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSig))) {
+      if (safeStringEqual(signature, expectedSig)) {
         return {
           valid: true,
           session: { role: 'admin' },
@@ -313,7 +359,7 @@ export function verifyVaultKey(key: string): { valid: boolean; session?: VaultUs
       if (!senderId) return { valid: false };
       const secret = getVaultSecret();
       const expectedSig = crypto.createHmac('sha256', secret).update(`user:${senderId}`).digest('hex').slice(0, 24);
-      if (signature.length === expectedSig.length && crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSig))) {
+      if (safeStringEqual(signature, expectedSig)) {
         return {
           valid: true,
           session: { role: 'user', senderId },
@@ -332,13 +378,15 @@ export function verifyVaultKey(key: string): { valid: boolean; session?: VaultUs
  * Automatically permits local development fallback when running outside production.
  */
 export function vaultAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
-  // Public bypass paths: Meta webhook, health check, image dimension probe, and OTP verification
-  const path = req.path || '';
+  // Public bypass paths: Meta webhook, health check, reel metadata probe, and OTP endpoints
+  const reqPath = req.path || '';
   if (
-    path === '/health' ||
-    path.startsWith('/instagram/webhook') ||
-    path.includes('/meta') ||
-    path.startsWith('/auth/otp')
+    reqPath === '/health' ||
+    reqPath === '/instagram/webhook' ||
+    reqPath.startsWith('/instagram/webhook/') ||
+    REEL_META_PATH_RE.test(reqPath) ||
+    reqPath === '/auth/otp/verify' ||
+    reqPath === '/auth/otp/request'
   ) {
     return next();
   }
@@ -371,5 +419,21 @@ export function vaultAuthMiddleware(req: Request, res: Response, next: NextFunct
     error: 'UNAUTHORIZED',
     code: 'VAULT_KEY_REQUIRED',
     message: 'To access your private vault, send a reel or message "vault" to our Instagram bot to receive your access key.',
+  });
+}
+
+/**
+ * Express middleware enforcing authenticated admin access before expensive parsers or guards run.
+ */
+export function requireAdminVaultMiddleware(req: Request, res: Response, next: NextFunction): void {
+  vaultAuthMiddleware(req, res, () => {
+    if (req.vaultUser?.role !== 'admin') {
+      res.status(403).json({
+        success: false,
+        error: 'Only the vault administrator can perform this action.',
+      });
+      return;
+    }
+    next();
   });
 }

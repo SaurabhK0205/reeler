@@ -7,7 +7,7 @@
   <title>Reeler | Reels &amp; Posts Vault</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="apple-touch-icon" href="/icons/meta-app-icon-512.png">
-  <link rel="stylesheet" href="style.css?v=4.5">
+  <link rel="stylesheet" href="style.css?v=4.6">
 </head>
 <body>
   <div class="app-layout">
@@ -40,7 +40,7 @@
           <span class="badge-label badge-label-short" aria-hidden="true">Checking</span>
         </div>
 
-        <button type="button" id="switch-vault-btn" class="nav-btn nav-btn-secondary nav-btn-switch" aria-label="Sign out and switch vault" title="Sign out / Switch Vault" hidden>
+        <button type="button" id="switch-vault-btn" class="nav-btn nav-btn-secondary nav-btn-switch" aria-label="Switch to another vault or sign out" title="Switch to another Instagram vault or sign out (keeps current vault if you cancel)" hidden>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
             <polyline points="16 17 21 12 16 7"></polyline>
@@ -293,7 +293,7 @@
               </svg>
             </div>
             <h2 id="vault-gate-title" class="vault-gate-title">Private Vault</h2>
-            <p class="vault-gate-desc">
+            <p id="vault-gate-desc" class="vault-gate-desc">
               You scroll through 1,000 reels a day. Make sure you don't miss an important one.
             </p>
 
@@ -322,7 +322,7 @@
                 <button type="submit" id="vault-otp-submit-btn" class="nav-btn nav-btn-primary">Unlock Vault</button>
               </form>
               <p class="vault-panel-hint">
-                Send <kbd>code</kbd> to <strong>@er_reel_er</strong> on Instagram to get a 6-digit code.
+                Send <kbd>code</kbd> to <strong>@er_reel_er</strong> on Instagram for a fresh single-use 6-digit code.
               </p>
             </div>
 
@@ -339,6 +339,12 @@
             </div>
 
             <p id="vault-gate-error" class="vault-gate-error" role="alert" hidden></p>
+
+            <!-- Shown only when switching vaults from an active session so the user can never be trapped -->
+            <div id="vault-gate-switch-actions" class="vault-gate-switch-actions" hidden>
+              <button type="button" id="vault-gate-cancel-btn" class="nav-btn nav-btn-secondary vault-gate-cancel-btn">Back to Current Vault</button>
+              <button type="button" id="vault-gate-signout-btn" class="vault-gate-signout-btn">Sign out of this device</button>
+            </div>
 
             <nav class="vault-gate-footer-links" aria-label="Compliance and Legal Links">
               <a href="/privacy" class="vault-footer-link" target="_blank" rel="noopener noreferrer">Privacy Policy</a>
@@ -445,6 +451,6 @@
   </div>
 
   <script src="playerGeometry.js?v=1.3"></script>
-  <script src="app.js?v=4.5"></script>
+  <script src="app.js?v=4.6"></script>
 </body>
 </html>
