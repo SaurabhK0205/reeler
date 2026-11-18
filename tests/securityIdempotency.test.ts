@@ -476,3 +476,73 @@ test('MetaInstagramBotService - deduplicates repeated webhook deliveries by mess
 
   assert.equal(dmCalls, 1, 'Identical webhook mid across messaging/changes and retries must execute only once');
 });
+
+test('Security - Supabase migration 015 locks down over-permissive RLS policies on creators and saved_reels', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const sql = fs.readFileSync(
+    path.join(process.cwd(), 'supabase/migrations/015_lock_down_rls_policies.sql'),
+    'utf8'
+  );
+
+  assert.ok(sql.includes('DROP POLICY IF EXISTS "Allow public read on creators" ON public.creators;'));
+  assert.ok(sql.includes('DROP POLICY IF EXISTS "Allow service_role all on creators" ON public.creators;'));
+  assert.ok(sql.includes('DROP POLICY IF EXISTS "Allow public read on saved_reels" ON public.saved_reels;'));
+  assert.ok(sql.includes('DROP POLICY IF EXISTS "Allow service_role all on saved_reels" ON public.saved_reels;'));
+  assert.ok(sql.includes('REVOKE ALL ON public.creators FROM anon, authenticated;'));
+  assert.ok(sql.includes('REVOKE ALL ON public.saved_reels FROM anon, authenticated;'));
+  assert.ok(sql.includes('REVOKE ALL ON FUNCTION public.search_saved_reels(TEXT) FROM PUBLIC, anon, authenticated;'));
+});
+
+test('Security - ArchiveImportService rejects oversized item arrays (> 50,000 items) before DB processing', async () => {
+  const { ArchiveImportService } = await import('../src/services/archiveImportService.ts');
+  const hugePayload = Array.from({ length: 50_001 }, () => ({}));
+  const result = await ArchiveImportService.importArchive(hugePayload);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.reelsImported, 0);
+  assert.match(result.errors[0] || '', /50,000/);
+});
+
+test('Security - Meta oEmbed metadata lookup passes token in Authorization Bearer header, never URL query string', async () => {
+  const { fetchReelMetadata, resetFeedMetaResolverStateForTests } = await import(
+    '../src/services/reelMetadataResolver.ts'
+  );
+  const origFetch = globalThis.fetch;
+  const origToken = process.env.META_PAGE_ACCESS_TOKEN;
+  const origProxy = process.env.METADATA_PROXY_URL;
+  resetFeedMetaResolverStateForTests();
+  process.env.META_PAGE_ACCESS_TOKEN = 'secret_bearer_token_xyz';
+  delete process.env.METADATA_PROXY_URL;
+
+  let seenUrl = '';
+  let seenAuth = '';
+  try {
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const target = String(url);
+      if (target.includes('graph.facebook.com/v21.0/instagram_oembed')) {
+        seenUrl = target;
+        seenAuth = String((init?.headers as Record<string, string> | undefined)?.Authorization || '');
+        return new Response(
+          JSON.stringify({
+            author_name: 'HeaderAuthCreator',
+            thumbnail_url: 'https://scontent.cdninstagram.com/v/t.jpg',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('<html><title>Login</title></html>', { status: 200 });
+    }) as typeof fetch;
+
+    const meta = await fetchReelMetadata('DBearerAuth1', undefined, 'reel');
+    assert.equal(meta.username, 'headerauthcreator');
+    assert.equal(seenAuth, 'Bearer secret_bearer_token_xyz');
+    assert.ok(!seenUrl.includes('access_token='), 'Meta access token must never be placed in URL query string');
+  } finally {
+    globalThis.fetch = origFetch;
+    if (origToken === undefined) delete process.env.META_PAGE_ACCESS_TOKEN;
+    else process.env.META_PAGE_ACCESS_TOKEN = origToken;
+    if (origProxy === undefined) delete process.env.METADATA_PROXY_URL;
+    else process.env.METADATA_PROXY_URL = origProxy;
+    resetFeedMetaResolverStateForTests();
+  }
+});

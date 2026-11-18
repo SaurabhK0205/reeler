@@ -37,6 +37,7 @@ const META_CACHE_TTL_MS = 30 * 60 * 1000;
 const META_NEGATIVE_CACHE_TTL_MS = 60 * 1000;
 const META_CACHE_MAX_ENTRIES = 500;
 const MAX_IMAGE_PROBE_BYTES = 256 * 1024;
+const MAX_HTML_FETCH_BYTES = 1_500_000;
 const MAX_CONCURRENT_UPSTREAM_RESOLVES = 6;
 const MAX_QUEUED_RESOLVES = 18;
 const UPSTREAM_BUDGET_WINDOW_MS = 60 * 1000;
@@ -421,6 +422,49 @@ async function fetchImageDimensions(
 const OG_META_PATTERN = /<meta\s+(?:property|name)="(?:og:url|og:image|twitter:title|og:title)"/i;
 
 /**
+ * Reads up to `maxBytes` of UTF-8 text from a fetch Response, cancelling the underlying stream
+ * immediately once the byte cap is reached to protect against oversized upstream responses.
+ */
+async function readBoundedText(res: Response, maxBytes: number = MAX_HTML_FETCH_BYTES): Promise<string> {
+  if (!res.body) {
+    const raw = await res.text();
+    return raw.length > maxBytes ? raw.slice(0, maxBytes) : raw;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let output = '';
+  let totalBytes = 0;
+
+  try {
+    while (totalBytes < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      const remaining = maxBytes - totalBytes;
+      if (value.byteLength <= remaining) {
+        output += decoder.decode(value, { stream: true });
+        totalBytes += value.byteLength;
+      } else {
+        output += decoder.decode(value.subarray(0, remaining), { stream: false });
+        totalBytes += remaining;
+        break;
+      }
+    }
+    output += decoder.decode();
+    return output;
+  } finally {
+    try {
+      await reader.cancel().catch(() => {});
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        // Reader already released
+      }
+    }
+  }
+}
+
+/**
  * Resolves metadata via Meta's official Instagram oEmbed endpoint when a Page Access Token
  * is configured and Meta oEmbed Read is approved. Applies a 1-hour cooldown if Meta returns
  * error code 10 (feature not yet approved) to avoid redundant upstream requests.
@@ -436,10 +480,13 @@ async function fetchViaMetaOEmbed(
   }
 
   const targetUrl = `https://www.instagram.com/${preferredPath}/${encodeURIComponent(shortcode)}/`;
-  const oEmbedUrl = `https://graph.facebook.com/v21.0/instagram_oembed?url=${encodeURIComponent(targetUrl)}&access_token=${encodeURIComponent(token)}`;
+  const oEmbedUrl = `https://graph.facebook.com/v21.0/instagram_oembed?url=${encodeURIComponent(targetUrl)}`;
   try {
     const res = await fetch(oEmbedUrl, {
       signal: createCombinedSignal(6000, signal),
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
     });
     const data = (await res.json().catch(() => null)) as Record<string, any> | null;
     if (!res.ok) {
@@ -513,7 +560,7 @@ async function fetchHtmlViaProxy(
       await res.body?.cancel().catch(() => {});
       return null;
     }
-    const candidateHtml = await res.text();
+    const candidateHtml = await readBoundedText(res);
     return OG_META_PATTERN.test(candidateHtml) ? candidateHtml : null;
   } catch {
     return null;
@@ -558,7 +605,7 @@ export async function fetchReelMetadata(
           continue;
         }
 
-        const candidateHtml = await res.text();
+        const candidateHtml = await readBoundedText(res);
         if (!OG_META_PATTERN.test(candidateHtml)) {
           continue;
         }
