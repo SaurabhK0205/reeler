@@ -419,7 +419,155 @@ async function fetchImageDimensions(
  * Fetches Instagram OpenGraph metadata for a saved reel or post shortcode,
  * probing the preferred URL path (`/reel/` or `/p/`) first and falling back to the alternate path on non-OK HTTP status.
  */
-const OG_META_PATTERN = /<meta\s+(?:property|name)="(?:og:url|og:image|twitter:title|og:title)"/i;
+const GENERIC_INSTAGRAM_TITLE_RE = /^(?:instagram|login\s*[•·-]\s*instagram)$/i;
+const OG_ITEM_SHORTCODE_RE = /instagram\.com\/(?:[^/?#]+\/)?(?:reel|reels|p|tv)\/([A-Za-z0-9_-]{5,32})(?:[/?#]|$)/i;
+const DIRECT_PRIMARY_TIMEOUT_MS = 8000;
+const DIRECT_SECONDARY_TIMEOUT_MS = 3000;
+const DIRECT_METADATA_USER_AGENTS = [
+  'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+  'WhatsApp/2.23.20.0',
+];
+
+interface ParsedOpenGraphFields {
+  ogUrl: string;
+  twitterTitle: string;
+  ogTitle: string;
+  ogDesc: string;
+  ogImage?: string;
+  jsonOwnerUsername?: string;
+}
+
+/**
+ * Quote-aware HTML `<meta>` tag tokenizer that safely handles `>` inside quoted attribute values,
+ * arbitrary attribute ordering, and double-quoted, single-quoted, or unquoted attribute values.
+ */
+function extractMetaTagAttributes(html: string): Array<Record<string, string>> {
+  const tags: Array<Record<string, string>> = [];
+  let pos = 0;
+
+  while (pos < html.length) {
+    const lt = html.indexOf('<', pos);
+    if (lt === -1) break;
+
+    // Skip HTML comments so commented-out <meta> tags are never treated as elements
+    if (html.startsWith('<!--', lt)) {
+      const commentEnd = html.indexOf('-->', lt + 4);
+      if (commentEnd === -1) break;
+      pos = commentEnd + 3;
+      continue;
+    }
+
+    // Match ASCII <meta directly on the original string (avoiding Unicode toLowerCase length shifts like İ)
+    const afterName = html[lt + 5];
+    if (
+      html.slice(lt + 1, lt + 5).toLowerCase() !== 'meta' ||
+      (afterName && !/[\s/>]/.test(afterName))
+    ) {
+      pos = lt + 1;
+      continue;
+    }
+
+    let i = lt + 5;
+    const attrs: Record<string, string> = Object.create(null);
+
+    while (i < html.length) {
+      while (i < html.length && /[\s/]/.test(html[i])) i++;
+      if (i >= html.length || html[i] === '>') {
+        i++;
+        break;
+      }
+
+      const nameStart = i;
+      while (i < html.length && !/[\s=/>]/.test(html[i])) i++;
+      const attrName = html.slice(nameStart, i).toLowerCase();
+      while (i < html.length && /\s/.test(html[i])) i++;
+
+      let attrVal = '';
+      if (i < html.length && html[i] === '=') {
+        i++;
+        while (i < html.length && /\s/.test(html[i])) i++;
+        if (i < html.length && (html[i] === '"' || html[i] === "'")) {
+          const quote = html[i++];
+          const valStart = i;
+          while (i < html.length && html[i] !== quote) i++;
+          attrVal = html.slice(valStart, i);
+          if (i < html.length && html[i] === quote) i++;
+        } else {
+          const valStart = i;
+          while (i < html.length && !/[\s>]/.test(html[i])) i++;
+          attrVal = html.slice(valStart, i);
+        }
+      }
+
+      if (attrName && !(attrName in attrs)) {
+        attrs[attrName] = attrVal;
+      }
+    }
+
+    tags.push(attrs);
+    pos = i;
+  }
+
+  return tags;
+}
+
+/**
+ * Extracts OpenGraph, Twitter meta, and embedded JSON owner values once by tokenizing `<meta>` tags
+ * safely across comments, Unicode titles, quoted `>` characters, arbitrary attribute ordering, and entity-encoded selectors.
+ */
+function parseOpenGraphFields(html: string): ParsedOpenGraphFields {
+  let ogUrl = '';
+  let twitterTitle = '';
+  let ogTitle = '';
+  let ogDesc = '';
+  let ogImage: string | undefined;
+
+  for (const attrs of extractMetaTagAttributes(html)) {
+    const contentAttr = attrs.content;
+    if (contentAttr === undefined) continue;
+    const propertyAttr = decodeHtml(attrs.property || '').trim().toLowerCase();
+    const nameAttr = decodeHtml(attrs.name || '').trim().toLowerCase();
+
+    if (propertyAttr === 'og:url' && !ogUrl) {
+      ogUrl = decodeHtml(contentAttr).trim();
+    } else if (nameAttr === 'twitter:title' && !twitterTitle) {
+      twitterTitle = decodeHtml(contentAttr).trim();
+    } else if (propertyAttr === 'og:title' && !ogTitle) {
+      ogTitle = decodeHtml(contentAttr).trim();
+    } else if (propertyAttr === 'og:description' && !ogDesc) {
+      ogDesc = decodeHtml(contentAttr).trim();
+    } else if (propertyAttr === 'og:image' && !ogImage) {
+      const decoded = decodeHtml(contentAttr).trim();
+      if (decoded) ogImage = decoded;
+    }
+  }
+
+  const jsonOwnerUsername = html.match(/"owner":\s*\{[^}]*"username":\s*"([a-zA-Z0-9._]+)"/i)?.[1];
+  return { ogUrl, twitterTitle, ogTitle, ogDesc, ogImage, jsonOwnerUsername };
+}
+
+/**
+ * Validates that parsed OpenGraph metadata belongs to the requested Instagram shortcode rather than
+ * a generic login/interstitial shell or a different Instagram item.
+ */
+function isValidItemOpenGraph(fields: ParsedOpenGraphFields, shortcode: string): boolean {
+  if (fields.ogUrl) {
+    const itemMatch = fields.ogUrl.match(OG_ITEM_SHORTCODE_RE);
+    if (itemMatch && itemMatch[1] !== shortcode) {
+      return false;
+    }
+    if (itemMatch && itemMatch[1] === shortcode) {
+      return true;
+    }
+  }
+  if (fields.ogImage) {
+    return true;
+  }
+  if (fields.twitterTitle && !GENERIC_INSTAGRAM_TITLE_RE.test(fields.twitterTitle)) {
+    return true;
+  }
+  return Boolean(fields.ogTitle && !GENERIC_INSTAGRAM_TITLE_RE.test(fields.ogTitle));
+}
 
 /**
  * Reads up to `maxBytes` of UTF-8 text from a fetch Response, cancelling the underlying stream
@@ -522,8 +670,9 @@ async function fetchViaMetaOEmbed(
  */
 async function fetchHtmlViaProxy(
   targetUrl: string,
+  shortcode: string,
   signal?: AbortSignal
-): Promise<string | null> {
+): Promise<ParsedOpenGraphFields | null> {
   const rawProxy = process.env.METADATA_PROXY_URL?.trim();
   if (!rawProxy || signal?.aborted) {
     return null;
@@ -533,6 +682,10 @@ async function fetchHtmlViaProxy(
   try {
     parsedProxy = new URL(rawProxy);
   } catch {
+    return null;
+  }
+  if (parsedProxy.username || parsedProxy.password) {
+    console.warn(`[MetadataResolver] Ignoring METADATA_PROXY_URL with embedded credentials (${parsedProxy.hostname}).`);
     return null;
   }
   const isAllowedProtocol =
@@ -557,12 +710,22 @@ async function fetchHtmlViaProxy(
       headers,
     });
     if (!res.ok) {
+      console.warn(`[MetadataResolver] Proxy relay returned HTTP ${res.status} (${parsedProxy.hostname}).`);
       await res.body?.cancel().catch(() => {});
       return null;
     }
     const candidateHtml = await readBoundedText(res);
-    return OG_META_PATTERN.test(candidateHtml) ? candidateHtml : null;
-  } catch {
+    const parsedFields = parseOpenGraphFields(candidateHtml);
+    if (!isValidItemOpenGraph(parsedFields, shortcode)) {
+      console.warn(`[MetadataResolver] Proxy relay returned HTTP 200 without item OpenGraph tags (${parsedProxy.hostname}).`);
+      return null;
+    }
+    return parsedFields;
+  } catch (err: any) {
+    if (!signal?.aborted) {
+      const errorKind = typeof err?.name === 'string' && err.name ? err.name : 'FetchError';
+      console.warn(`[MetadataResolver] Proxy relay request failed (${parsedProxy.hostname}): ${errorKind}`);
+    }
     return null;
   }
 }
@@ -582,19 +745,26 @@ export async function fetchReelMetadata(
   const pathsToTry: Array<'reel' | 'p'> = preferredPath === 'p' ? ['p', 'reel'] : ['reel', 'p'];
 
   try {
-    let html: string | null = null;
+    let parsedFields: ParsedOpenGraphFields | null = null;
     let lastStatus = 0;
+    const loginWallPaths: Array<'reel' | 'p'> = [];
 
-    for (const pathSegment of pathsToTry) {
+    const tryDirectFetch = async (
+      pathSegment: 'reel' | 'p',
+      userAgent: string,
+      recordLoginWall: boolean,
+      timeoutMs: number
+    ): Promise<ParsedOpenGraphFields | null> => {
       if (signal?.aborted) {
-        return {};
+        return null;
       }
       const url = `https://www.instagram.com/${pathSegment}/${encodeURIComponent(shortcode)}/`;
       try {
         const res = await fetch(url, {
-          signal: createCombinedSignal(8000, signal),
+          signal: createCombinedSignal(timeoutMs, signal),
           headers: {
-            'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+            'User-Agent': userAgent,
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
           },
         });
@@ -602,27 +772,60 @@ export async function fetchReelMetadata(
 
         if (!res.ok) {
           await res.body?.cancel().catch(() => {});
-          continue;
+          return null;
         }
 
         const candidateHtml = await readBoundedText(res);
-        if (!OG_META_PATTERN.test(candidateHtml)) {
-          continue;
+        const candidateFields = parseOpenGraphFields(candidateHtml);
+        if (!isValidItemOpenGraph(candidateFields, shortcode)) {
+          if (recordLoginWall && !loginWallPaths.includes(pathSegment)) {
+            loginWallPaths.push(pathSegment);
+          }
+          return null;
         }
-
-        html = candidateHtml;
-        break;
+        return candidateFields;
       } catch (err: any) {
         if (signal?.aborted) {
-          return {};
+          return null;
         }
         console.warn(
           `[MetadataResolver] Direct fetch attempt for ${shortcode} (/${pathSegment}/) failed: ${err?.message || err}`
         );
+        return null;
+      }
+    };
+
+    for (const pathSegment of pathsToTry) {
+      if (signal?.aborted) {
+        return {};
+      }
+      const candidate = await tryDirectFetch(
+        pathSegment,
+        DIRECT_METADATA_USER_AGENTS[0],
+        true,
+        DIRECT_PRIMARY_TIMEOUT_MS
+      );
+      if (candidate) {
+        parsedFields = candidate;
+        break;
       }
     }
 
-    if (!html) {
+    if (!parsedFields && loginWallPaths.length > 0 && !signal?.aborted) {
+      // Bound secondary UA probe to a single fast 3s attempt on the primary login-walled path so
+      // oEmbed and proxy relay fallbacks are not stalled.
+      const candidate = await tryDirectFetch(
+        loginWallPaths[0],
+        DIRECT_METADATA_USER_AGENTS[1],
+        false,
+        DIRECT_SECONDARY_TIMEOUT_MS
+      );
+      if (candidate) {
+        parsedFields = candidate;
+      }
+    }
+
+    if (!parsedFields) {
       // Fallback 1: Official Meta Instagram oEmbed API (works automatically once Meta oEmbed Read is approved)
       const oEmbedResult = await fetchViaMetaOEmbed(shortcode, pathsToTry[0], signal);
       if (oEmbedResult) {
@@ -633,31 +836,23 @@ export async function fetchReelMetadata(
       if (process.env.METADATA_PROXY_URL?.trim()) {
         for (const pathSegment of pathsToTry) {
           const url = `https://www.instagram.com/${pathSegment}/${encodeURIComponent(shortcode)}/`;
-          const proxiedHtml = await fetchHtmlViaProxy(url, signal);
-          if (proxiedHtml) {
-            html = proxiedHtml;
+          const proxiedFields = await fetchHtmlViaProxy(url, shortcode, signal);
+          if (proxiedFields) {
+            parsedFields = proxiedFields;
             break;
           }
         }
       }
 
-      if (!html) {
+      if (!parsedFields) {
         console.warn(
-          `[MetadataResolver] No OpenGraph metadata returned for ${shortcode} (lastStatus=${lastStatus}).`
+          `[MetadataResolver] No OpenGraph metadata returned for ${shortcode} (lastStatus=${lastStatus}, proxyConfigured=${Boolean(process.env.METADATA_PROXY_URL?.trim())}).`
         );
         return {};
       }
     }
 
-    const ogUrl = decodeHtml(html.match(/<meta property="og:url" content="([^"]+)"/i)?.[1] || '');
-    const rawTwitterTitle = html.match(/<meta name="twitter:title" content="([^"]+)"/i)?.[1] || '';
-    const twitterTitle = decodeHtml(rawTwitterTitle);
-    const rawTitle = html.match(/<meta property="og:title" content="([^"]+)"/i)?.[1] || '';
-    const ogTitle = decodeHtml(rawTitle);
-    const rawDesc = html.match(/<meta property="og:description" content="([^"]+)"/i)?.[1] || '';
-    const ogDesc = decodeHtml(rawDesc);
-    const rawOgImage = html.match(/<meta property="og:image" content="([^"]+)"/i)?.[1];
-    const ogImage = rawOgImage ? decodeHtml(rawOgImage) : undefined;
+    const { ogUrl, twitterTitle, ogTitle, ogDesc, ogImage, jsonOwnerUsername } = parsedFields;
 
     let username: string | undefined;
 
@@ -697,11 +892,8 @@ export async function fetchReelMetadata(
     }
 
     // Strategy 6: Embedded JSON in HTML (e.g. "owner":{"username":"..."})
-    if (!username) {
-      const jsonOwnerMatch = html.match(/"owner":\s*\{[^}]*"username":\s*"([a-zA-Z0-9._]+)"/i);
-      if (jsonOwnerMatch) {
-        username = jsonOwnerMatch[1];
-      }
+    if (!username && jsonOwnerUsername) {
+      username = jsonOwnerUsername;
     }
 
     // Extract display name

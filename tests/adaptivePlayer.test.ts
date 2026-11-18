@@ -457,7 +457,7 @@ test('resolveFeedMediaMetadata enforces upstream per-minute budget while allowin
   let fetchCalls = 0;
   globalThis.fetch = (async (url: unknown) => {
     fetchCalls++;
-    const match = String(url).match(/\/p\/([A-Za-z0-9_-]+)\//);
+    const match = String(url).match(/\/(?:reel|p)\/([A-Za-z0-9_-]+)\//);
     const sc = match?.[1] || 'Demo01';
     const html = `<meta property="og:url" content="https://www.instagram.com/reel/${sc}/"><meta property="og:title" content="@demo on Instagram">`;
     return new Response(html, { status: 200, headers: { 'content-type': 'text/html' } });

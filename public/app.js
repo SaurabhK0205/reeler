@@ -1438,14 +1438,23 @@ async function checkHealth() {
 
 /**
  * Fetches summary statistics from the server and populates metric cards.
+ * @param {{ silent?: boolean }} [options]
  */
-async function loadStats() {
+async function loadStats(options = {}) {
+  const silent = Boolean(options.silent);
+  if (silent && statsFetchController?.isExplicit) {
+    return;
+  }
   if (statsFetchController) {
     statsFetchController.abort();
   }
-  statsFetchController = new AbortController();
-  const { signal } = statsFetchController;
-  statsBar?.setAttribute('aria-busy', 'true');
+  const controller = new AbortController();
+  controller.isExplicit = !silent;
+  statsFetchController = controller;
+  const { signal } = controller;
+  if (!silent) {
+    statsBar?.setAttribute('aria-busy', 'true');
+  }
   try {
     const res = await vaultFetch('/api/stats', { signal });
     if (signal.aborted) return;
@@ -1532,7 +1541,7 @@ async function loadStats() {
         }
       }
     }
-    if (!statsLoadErrorNotified) {
+    if (!silent && !statsLoadErrorNotified) {
       statsLoadErrorNotified = true;
       showToast('Could not load library statistics.', 'error', {
         actionLabel: 'Retry',
@@ -1540,7 +1549,12 @@ async function loadStats() {
       });
     }
   } finally {
-    statsBar?.setAttribute('aria-busy', 'false');
+    if (statsFetchController === controller) {
+      statsFetchController = null;
+      if (!silent) {
+        statsBar?.setAttribute('aria-busy', 'false');
+      }
+    }
   }
 }
 
@@ -1548,19 +1562,26 @@ async function loadStats() {
  * Fetches bounded top creators (or matching server search results) and populates the quick-filter strip
  * without shipping the full directory over initial page load.
  * @param {string} [query=state.creatorQuery]
+ * @param {{ silent?: boolean }} [options]
  */
-async function loadCreators(query = state.creatorQuery) {
+async function loadCreators(query = state.creatorQuery, options = {}) {
+  const silent = Boolean(options.silent);
+  if (silent && creatorsFetchController?.isExplicit) {
+    return;
+  }
   const trimmedQ = String(query || '').trim();
   if (creatorsFetchController) {
     creatorsFetchController.abort();
   }
-  creatorsFetchController = new AbortController();
-  const { signal } = creatorsFetchController;
+  const controller = new AbortController();
+  controller.isExplicit = !silent;
+  creatorsFetchController = controller;
+  const { signal } = controller;
   isCreatorSearching = Boolean(trimmedQ);
 
-  if (creatorStripMeta && !trimmedQ && state.creators.length === 0) {
+  if (!silent && creatorStripMeta && !trimmedQ && state.creators.length === 0) {
     creatorStripMeta.textContent = 'Loading top creators...';
-  } else if (creatorStripMeta && trimmedQ) {
+  } else if (!silent && creatorStripMeta && trimmedQ) {
     renderCreatorStrip();
   }
 
@@ -1615,16 +1636,23 @@ async function loadCreators(query = state.creatorQuery) {
     if (e?.name === 'AbortError') return;
     isCreatorSearching = false;
     console.error('Failed to load creators:', e);
+    if (silent && state.creators.length > 0) {
+      return;
+    }
     if (creatorStripMeta && (trimmedQ || state.creators.length === 0)) {
       creatorStripMeta.innerHTML = '<span>Creator filters unavailable</span> <button type="button" class="strip-inline-retry" data-action="retry-creators">Retry</button>';
       creatorStripMeta.querySelector('[data-action="retry-creators"]')?.addEventListener('click', () => loadCreators(state.creatorQuery));
     }
-    if (!creatorsLoadErrorNotified) {
+    if (!silent && !creatorsLoadErrorNotified) {
       creatorsLoadErrorNotified = true;
       showToast('Could not load creator filters.', 'error', {
         actionLabel: 'Retry',
         onAction: () => loadCreators(state.creatorQuery),
       });
+    }
+  } finally {
+    if (creatorsFetchController === controller) {
+      creatorsFetchController = null;
     }
   }
 }
@@ -1669,6 +1697,7 @@ function renderCreatorStrip() {
     if (cleanAvatar && !isPlaceholderMediaUrl(cleanAvatar)) {
       const img = document.createElement('img');
       img.src = cleanAvatar;
+      img.referrerPolicy = 'no-referrer';
       img.className = 'creator-chip-img';
       img.alt = '';
       img.setAttribute('aria-hidden', 'true');
@@ -1730,17 +1759,30 @@ function selectCreator(id) {
 
 /**
  * Queries reels matching active filters, pagination, and search terms with abort safety and inline error recovery.
+ * @param {{ silent?: boolean; pageOverride?: number }} [options]
  */
-async function fetchReels() {
+async function fetchReels(options = {}) {
+  const silent = Boolean(options.silent);
+  if (silent && fetchReelsAbortController?.isExplicit) {
+    return;
+  }
+  const pageToFetch = Number.isInteger(options.pageOverride) && options.pageOverride >= 1
+    ? options.pageOverride
+    : state.filters.page;
+
   if (fetchReelsAbortController) {
     fetchReelsAbortController.abort();
   }
-  fetchReelsAbortController = new AbortController();
-  const { signal } = fetchReelsAbortController;
+  const controller = new AbortController();
+  controller.isExplicit = !silent;
+  fetchReelsAbortController = controller;
+  const { signal } = controller;
 
   renderActiveFilterChips();
-  const queryLabels = getMediaUnitLabels(state.filters.mediaType, state.filters.source);
-  resultsCount.textContent = `Querying ${queryLabels.scopedPlural}...`;
+  if (!silent) {
+    const queryLabels = getMediaUnitLabels(state.filters.mediaType, state.filters.source);
+    resultsCount.textContent = `Querying ${queryLabels.scopedPlural}...`;
+  }
 
   const params = new URLSearchParams();
   if (state.filters.source && state.filters.source !== 'all') params.set('source', state.filters.source);
@@ -1750,7 +1792,7 @@ async function fetchReels() {
   if (state.filters.watchStatus !== 'all') params.set('watchStatus', state.filters.watchStatus);
   if (state.filters.sortBy) params.set('sortBy', state.filters.sortBy);
   if (state.filters.search.trim()) params.set('search', state.filters.search.trim());
-  params.set('page', String(state.filters.page));
+  params.set('page', String(pageToFetch));
   params.set('limit', String(state.filters.limit));
 
   try {
@@ -1776,15 +1818,24 @@ async function fetchReels() {
 
     const data = await res.json();
     if (signal.aborted) return;
+    if (silent && feedModal?.classList.contains('active')) return;
 
-    state.reels = data.reels || [];
-    state.total = data.total || 0;
-    const maxPage = Math.max(1, Math.ceil(state.total / state.filters.limit) || 1);
-    if (state.reels.length === 0 && state.filters.page > maxPage) {
-      state.filters.page = maxPage;
-      syncUrlState();
-      return fetchReels();
+    const nextReels = data.reels || [];
+    const nextTotal = data.total || 0;
+    const maxPage = Math.max(1, Math.ceil(nextTotal / state.filters.limit) || 1);
+    if (nextReels.length === 0 && pageToFetch > maxPage) {
+      if (fetchReelsAbortController === controller) {
+        fetchReelsAbortController = null;
+      }
+      return fetchReels({ silent, pageOverride: maxPage });
     }
+
+    if (pageToFetch !== state.filters.page) {
+      state.filters.page = pageToFetch;
+      syncUrlState();
+    }
+    state.reels = nextReels;
+    state.total = nextTotal;
     hasInitialReelsSettled = true;
 
     renderReels();
@@ -1792,8 +1843,15 @@ async function fetchReels() {
   } catch (e) {
     if (e?.name === 'AbortError') return;
     console.error('Failed to fetch reels:', e);
+    if (silent && hasInitialReelsSettled) {
+      return;
+    }
     hasInitialReelsSettled = true;
     renderFetchErrorState(e?.message || 'Unable to reach server');
+  } finally {
+    if (fetchReelsAbortController === controller) {
+      fetchReelsAbortController = null;
+    }
   }
 }
 
@@ -2097,7 +2155,7 @@ function renderReels() {
 
     const imageLayerHtml = hasRealThumbnail
       ? `
-        <img class="poster-actual-img" src="${escapeHtml(cleanThumbnail)}" alt="${creatorInfo.isAttributedName ? `${badgeLabel} poster by ${safeAriaTarget}` : `${isBotSent ? 'Tracked' : 'Saved'} ${itemWord} poster`}" loading="lazy" />
+        <img class="poster-actual-img" src="${escapeHtml(cleanThumbnail)}" referrerpolicy="no-referrer" alt="${creatorInfo.isAttributedName ? `${badgeLabel} poster by ${safeAriaTarget}` : `${isBotSent ? 'Tracked' : 'Saved'} ${itemWord} poster`}" loading="lazy" />
         <div class="poster-top-scrim"></div>
         <div class="poster-bottom-scrim"></div>
       `
@@ -2598,6 +2656,7 @@ function setSlidePosterUrl(slide, reel, url, { recordRatio = true } = {}) {
   let posterImg = viewport.querySelector('.reel-poster-underlay');
   if (!posterImg) {
     posterImg = document.createElement('img');
+    posterImg.referrerPolicy = 'no-referrer';
     posterImg.className = 'reel-poster-underlay';
     posterImg.alt = '';
     posterImg.setAttribute('aria-hidden', 'true');
@@ -3750,6 +3809,7 @@ function setupEventListeners() {
       syncSourceTabsUi();
       syncKpiActiveStates();
       syncUrlState();
+      loadStats();
       fetchReels();
       const label = nextSource === 'bot'
         ? 'Showing items sent to Reeler Bot.'
@@ -3786,9 +3846,12 @@ function setupEventListeners() {
     metricFilterAll.addEventListener('click', () => {
       if (hasActiveFilters()) {
         clearAllFilters();
+        loadStats();
         announceStatus('Filters reset. Showing all tracked items.');
       } else {
         syncKpiActiveStates();
+        loadStats();
+        fetchReels();
       }
     });
   }
@@ -3800,6 +3863,7 @@ function setupEventListeners() {
       state.filters.page = 1;
       syncKpiActiveStates();
       syncUrlState();
+      loadStats();
       fetchReels();
       announceStatus(state.filters.datePreset === '7d' ? 'Filtered to items added in the last 7 days.' : 'Cleared date filter.');
     });
@@ -3812,6 +3876,7 @@ function setupEventListeners() {
       state.filters.page = 1;
       syncKpiActiveStates();
       syncUrlState();
+      loadStats();
       fetchReels();
       announceStatus(state.filters.watchStatus === 'watch_later' ? 'Filtered to Watch Later queue.' : 'Cleared Watch Later filter.');
     });
@@ -3824,6 +3889,7 @@ function setupEventListeners() {
       state.filters.page = 1;
       syncKpiActiveStates();
       syncUrlState();
+      loadStats();
       fetchReels();
       announceStatus(state.filters.watchStatus === 'watched' ? 'Filtered to Watched items.' : 'Cleared Watched filter.');
     });
@@ -4023,7 +4089,23 @@ function setupEventListeners() {
     state.filters.page = 1;
     syncKpiActiveStates();
     syncUrlState();
+    loadStats();
     fetchReels();
+  });
+
+  // Automatically sync stats, creators, and cards when returning to this tab after DM bot actions
+  let lastAutoSyncAt = Date.now();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (isSwitchingVault) return;
+    if (vaultGateScreen && !vaultGateScreen.classList.contains('is-hidden')) return;
+    if (feedModal && feedModal.classList.contains('active')) return;
+    const now = Date.now();
+    if (now - lastAutoSyncAt < 5000) return;
+    lastAutoSyncAt = now;
+    loadStats({ silent: true });
+    loadCreators(state.creatorQuery, { silent: true });
+    fetchReels({ silent: true });
   });
 
   sortBySelect.addEventListener('change', (e) => {

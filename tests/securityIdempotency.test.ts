@@ -1249,3 +1249,106 @@ test('MetaInstagramBotService - pins watched targets and guards timezone prefere
     Repository.setSenderTimezone = origSetTz;
   }
 });
+
+test('MetadataResolver - falls back to secondary crawler User-Agent when primary UA receives login-walled HTML', async () => {
+  const { fetchReelMetadata, resetFeedMetaResolverStateForTests } = await import(
+    '../src/services/reelMetadataResolver.ts'
+  );
+  const origFetch = globalThis.fetch;
+  const origToken = process.env.META_PAGE_ACCESS_TOKEN;
+  const origProxy = process.env.METADATA_PROXY_URL;
+  resetFeedMetaResolverStateForTests();
+  delete process.env.META_PAGE_ACCESS_TOKEN;
+  delete process.env.METADATA_PROXY_URL;
+
+  const seenRequests: Array<{ pathname: string; ua: string }> = [];
+  try {
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const parsed = new URL(String(url));
+      const ua = String((init?.headers as Record<string, string> | undefined)?.['User-Agent'] || '');
+      seenRequests.push({ pathname: parsed.pathname, ua });
+      if (ua.startsWith('facebookexternalhit')) {
+        // Generic login-wall shell with og:title="Instagram" must NOT falsely pass as item metadata
+        return new Response(
+          '<html><head><meta property="og:title" content="Instagram" /></head></html>',
+          { status: 200 }
+        );
+      }
+      return new Response(
+        '<html><head>' +
+          '<meta property="og:url" content="https://www.instagram.com/shiadanni/reel/DFallbackUA1/" />' +
+          '<meta name="twitter:title" content="S H I A D A N N I (&#064;shiadanni) &#x2022; Instagram reel" />' +
+          '<meta property="og:image" content="https://scontent.cdninstagram.com/v/thumb.jpg" />' +
+          '</head></html>',
+        { status: 200 }
+      );
+    }) as typeof fetch;
+
+    const meta = await fetchReelMetadata('DFallbackUA1', undefined, 'reel');
+    assert.equal(meta.username, 'shiadanni');
+    assert.equal(meta.thumbnailUrl, 'https://scontent.cdninstagram.com/v/thumb.jpg');
+    assert.equal(
+      seenRequests.length,
+      3,
+      'Should probe /reel/ and /p/ with primary UA, then fall back to secondary crawler UA on /reel/'
+    );
+    assert.equal(seenRequests[0].pathname, '/reel/DFallbackUA1/');
+    assert.match(seenRequests[0].ua, /^facebookexternalhit/);
+    assert.equal(seenRequests[1].pathname, '/p/DFallbackUA1/');
+    assert.match(seenRequests[1].ua, /^facebookexternalhit/);
+    assert.equal(seenRequests[2].pathname, '/reel/DFallbackUA1/');
+    assert.match(seenRequests[2].ua, /^WhatsApp\//);
+
+    // Mismatched og:url shortcode (including reversed content/property attribute order) must be rejected
+    globalThis.fetch = (async () =>
+      new Response(
+        '<html><head>' +
+          '<meta content="https://www.instagram.com/wronguser/reel/DFallbackUA12/"\tproperty="og:url" />' +
+          '<meta property="og:image"\tcontent="https://scontent.cdninstagram.com/v/wrong.jpg" />' +
+          '</head></html>',
+        { status: 200 }
+      )) as typeof fetch;
+
+    const mismatched = await fetchReelMetadata('DFallbackUA1', undefined, 'reel');
+    assert.equal(mismatched.username, undefined, 'Mismatched shortcode og:url (reversed attrs) must be rejected');
+    assert.equal(mismatched.thumbnailUrl, undefined, 'Mismatched shortcode og:image must be rejected');
+
+    // Matching og:url preceded by Unicode İ (which expands under toLowerCase) must preserve tag offsets
+    globalThis.fetch = (async () =>
+      new Response(
+        '<html><head><title>İ</title>' +
+          '<meta content="https://www.instagram.com/rightuser/reel/DFallbackUA1/" property="og:url" />' +
+          '<meta property="og:description" content="5 likes: &quot;A > B comparison clip&quot;" />' +
+          '<meta content="https://scontent.cdninstagram.com/v/right.jpg" property="og:image" />' +
+          '</head></html>',
+        { status: 200 }
+      )) as typeof fetch;
+
+    const reversedMatch = await fetchReelMetadata('DFallbackUA1', undefined, 'reel');
+    assert.equal(reversedMatch.username, 'rightuser');
+    assert.equal(reversedMatch.thumbnailUrl, 'https://scontent.cdninstagram.com/v/right.jpg');
+    assert.match(reversedMatch.caption || '', /A > B/);
+
+    // Commented-out matching og:url + entity-encoded property=og&#58;url mismatch must be rejected
+    globalThis.fetch = (async () =>
+      new Response(
+        '<html><head>' +
+          '<!-- <meta content="https://www.instagram.com/fake/reel/DFallbackUA1/" property="og:url" /> -->' +
+          '<meta data-note="A > B" property=og&#58;url content=https://www.instagram.com/wronguser/reel/DFallbackUA12/ />' +
+          '<meta property="og:image" content="https://scontent.cdninstagram.com/v/wrong2.jpg" />' +
+          '</head></html>',
+        { status: 200 }
+      )) as typeof fetch;
+
+    const quotedGtMismatch = await fetchReelMetadata('DFallbackUA1', undefined, 'reel');
+    assert.equal(quotedGtMismatch.username, undefined, 'Commented og:url and encoded/unquoted mismatch must be rejected');
+    assert.equal(quotedGtMismatch.thumbnailUrl, undefined, 'Mismatched og:image must not leak on commented/encoded og:url');
+  } finally {
+    globalThis.fetch = origFetch;
+    if (origToken === undefined) delete process.env.META_PAGE_ACCESS_TOKEN;
+    else process.env.META_PAGE_ACCESS_TOKEN = origToken;
+    if (origProxy === undefined) delete process.env.METADATA_PROXY_URL;
+    else process.env.METADATA_PROXY_URL = origProxy;
+    resetFeedMetaResolverStateForTests();
+  }
+});

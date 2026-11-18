@@ -661,6 +661,6 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
   );
 
   // 4. HTML cache-busting query versions stay aligned
-  assert.ok(html.includes('style.css?v=4.6'), 'index.html must reference style.css?v=4.6');
-  assert.ok(html.includes('app.js?v=4.6'), 'index.html must reference app.js?v=4.6');
+  assert.ok(html.includes('style.css?v=4.7'), 'index.html must reference style.css?v=4.7');
+  assert.ok(html.includes('app.js?v=4.7'), 'index.html must reference app.js?v=4.7');
 });
