@@ -10,7 +10,7 @@ export interface RawSavedExportItem {
   caption?: string;
 }
 
-export type ArchiveImportStatus = 'success' | 'empty' | 'failed' | 'partial';
+export type ArchiveImportStatus = 'success' | 'empty' | 'failed' | 'partial' | 'too_large';
 
 export interface ArchiveImportResult {
   totalProcessed: number;
@@ -27,6 +27,7 @@ export interface ArchiveImportResult {
 const UNKNOWN_CREATOR_HANDLE = 'unattributed';
 const INSTAGRAM_HANDLE_REGEX = /^[a-zA-Z0-9._]{1,30}$/;
 const UTF8_DECODER_FATAL = new TextDecoder('utf-8', { fatal: true });
+const MAX_ARCHIVE_IMPORT_ITEMS = 50_000;
 
 /**
  * Decodes Meta export Latin-1-wrapped UTF-8 mojibake sequences (e.g. `thereâ\x80\x99s`, `ð\x9F\x98\xad`)
@@ -127,6 +128,20 @@ export class ArchiveImportService {
         skipped: 0,
         errors: ['No saved media items found in the provided export file.'],
         status: 'empty',
+      };
+    }
+
+    if (rawItems.length > MAX_ARCHIVE_IMPORT_ITEMS) {
+      return {
+        totalProcessed: 0,
+        reelsImported: 0,
+        alreadyPresent: 0,
+        savedAtBackfilled: 0,
+        promotedToSaved: 0,
+        creatorsAdded: 0,
+        skipped: 0,
+        errors: [`Archive exceeds the maximum supported limit of ${MAX_ARCHIVE_IMPORT_ITEMS.toLocaleString()} items per import.`],
+        status: 'too_large',
       };
     }
 

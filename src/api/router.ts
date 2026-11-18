@@ -10,11 +10,51 @@ import {
   vaultAuthMiddleware,
   verifyOtp,
   otpVerifyRateLimiter,
+  otpRequestRateLimiter,
   recordOtpFailure,
   resetOtpAttempts,
   requestOtpForUsername,
 } from '../services/vaultAuthService.ts';
+import { createRateLimiter, getClientIp, setResponseHeader } from '../middleware/security.ts';
+import { idempotencyMiddleware } from '../middleware/idempotency.ts';
 import type { ReelQueryFilters, WatchStatus, DateFilterPreset, SavedMediaType, SavedCollectionSource } from '../types.ts';
+
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const SAFE_REEL_ID_RE = /^[\x21-\x7E]{1,128}$/;
+
+const apiRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 120,
+  maxTrackedKeys: 5000,
+  errorCode: 'API_RATE_LIMITED',
+  message: 'Too many requests. Please slow down and try again shortly.',
+  skip: (req) => req.path === '/health' || req.path.startsWith('/instagram/webhook'),
+});
+
+const mutationRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 40,
+  maxTrackedKeys: 5000,
+  errorCode: 'MUTATION_RATE_LIMITED',
+  message: 'Too many write requests. Please wait a moment before trying again.',
+  keyGenerator: (req) => {
+    const principal = req.vaultUser?.role === 'admin'
+      ? 'admin'
+      : req.vaultUser?.senderId
+        ? `user:${req.vaultUser.senderId}`
+        : `ip:${getClientIp(req)}`;
+    return `${principal}:${getClientIp(req)}`;
+  },
+  skip: (req) =>
+    !MUTATING_METHODS.has(req.method.toUpperCase()) ||
+    req.path.startsWith('/instagram/webhook') ||
+    req.path.startsWith('/auth/otp'),
+});
+
+export function resetApiRateLimitersForTesting(): void {
+  apiRateLimiter.resetForTesting();
+  mutationRateLimiter.resetForTesting();
+}
 
 /**
  * Express API router handling Meta webhooks, vault queries, metadata resolution, status updates, and archive imports.
@@ -22,7 +62,10 @@ import type { ReelQueryFilters, WatchStatus, DateFilterPreset, SavedMediaType, S
 export const apiRouter = express.Router();
 const metaBotService = new MetaInstagramBotService();
 
+apiRouter.use(apiRateLimiter.middleware);
 apiRouter.use(vaultAuthMiddleware);
+apiRouter.use(mutationRateLimiter.middleware);
+apiRouter.use(idempotencyMiddleware);
 
 /**
  * Verifies Meta Instagram webhook subscriptions using the configured verify token.
@@ -82,6 +125,7 @@ apiRouter.get('/health', (_req: Request, res: Response) => {
  * Returns current authenticated session details.
  */
 apiRouter.get('/session', (req: Request, res: Response) => {
+  setResponseHeader(res, 'Cache-Control', 'no-store');
   res.json({
     authenticated: Boolean(req.vaultUser),
     role: req.vaultUser?.role || 'anonymous',
@@ -93,7 +137,8 @@ apiRouter.get('/session', (req: Request, res: Response) => {
  * Verifies a 6-digit login code and returns the user's permanent vault access key.
  */
 apiRouter.post('/auth/otp/verify', otpVerifyRateLimiter, (req: Request, res: Response) => {
-  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  setResponseHeader(res, 'Cache-Control', 'no-store');
+  const ip = getClientIp(req);
   if (typeof req.body?.code !== 'string' || req.body.code.length > 20) {
     recordOtpFailure(ip);
     res.status(400).json({
@@ -109,7 +154,7 @@ apiRouter.post('/auth/otp/verify', otpVerifyRateLimiter, (req: Request, res: Res
     recordOtpFailure(ip);
     res.status(400).json({
       error: 'INVALID_OR_EXPIRED_CODE',
-      message: 'The 6-digit login code is invalid or has expired. Please message "code" to our Instagram bot to get a new code.',
+      message: 'This 6-digit code is invalid, expired, or already used (codes are single-use). Send "code" to @er_reel_er on Instagram for a fresh code.',
     });
     return;
   }
@@ -126,7 +171,8 @@ apiRouter.post('/auth/otp/verify', otpVerifyRateLimiter, (req: Request, res: Res
 /**
  * Dispatches a 6-digit login code to the user's Instagram DM if their handle is mapped.
  */
-apiRouter.post('/auth/otp/request', async (req: Request, res: Response) => {
+apiRouter.post('/auth/otp/request', otpRequestRateLimiter, async (req: Request, res: Response) => {
+  setResponseHeader(res, 'Cache-Control', 'no-store');
   if (typeof req.body?.username !== 'string' || req.body.username.length > 50) {
     res.status(400).json({
       error: 'INVALID_REQUEST',
@@ -141,7 +187,13 @@ apiRouter.post('/auth/otp/request', async (req: Request, res: Response) => {
     metaBotService.adminUserId
   );
 
-  const httpStatus = result.success ? 200 : result.code === 'DELIVERY_FAILED' ? 502 : 200;
+  const httpStatus = result.success
+    ? 200
+    : result.code === 'DELIVERY_FAILED'
+      ? 502
+      : result.code === 'OTP_CAPACITY_REACHED'
+        ? 503
+        : 200;
   res.status(httpStatus).json(result);
 });
 
@@ -150,11 +202,13 @@ apiRouter.post('/auth/otp/request', async (req: Request, res: Response) => {
  */
 apiRouter.get('/stats', async (req: Request, res: Response) => {
   try {
+    setResponseHeader(res, 'Cache-Control', 'no-store');
     const senderId = req.vaultUser?.role === 'admin' ? undefined : req.vaultUser?.senderId;
     const stats = await Repository.getStats(senderId);
     res.json(stats);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error('[API] Error in GET /stats:', error);
+    res.status(500).json({ error: 'Failed to load vault statistics.' });
   }
 });
 
@@ -164,14 +218,15 @@ apiRouter.get('/stats', async (req: Request, res: Response) => {
  */
 apiRouter.get('/creators', async (req: Request, res: Response) => {
   try {
+    setResponseHeader(res, 'Cache-Control', 'no-store');
     const senderId = req.vaultUser?.role === 'admin' ? undefined : req.vaultUser?.senderId;
-    const q = typeof req.query.q === 'string' ? req.query.q : undefined;
+    const q = typeof req.query.q === 'string' ? req.query.q.slice(0, 100) : undefined;
     const rawLimit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
     const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0
       ? Math.min(100, Math.floor(rawLimit))
       : undefined;
     const includeId = typeof req.query.includeId === 'string' && req.query.includeId.trim()
-      ? req.query.includeId.trim()
+      ? req.query.includeId.trim().slice(0, 128)
       : undefined;
 
     if (q !== undefined || limit !== undefined || includeId !== undefined) {
@@ -192,7 +247,8 @@ apiRouter.get('/creators', async (req: Request, res: Response) => {
     res.setHeader('X-Match-Count', String(creators.length));
     res.json(creators);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error('[API] Error in GET /creators:', error);
+    res.status(500).json({ error: 'Failed to load creators.' });
   }
 });
 
@@ -201,6 +257,7 @@ apiRouter.get('/creators', async (req: Request, res: Response) => {
  */
 apiRouter.get('/reels', async (req: Request, res: Response) => {
   try {
+    setResponseHeader(res, 'Cache-Control', 'no-store');
     const senderId = req.vaultUser?.role === 'admin' ? undefined : req.vaultUser?.senderId;
     const rawMediaType = typeof req.query.mediaType === 'string' ? req.query.mediaType.trim().toLowerCase() : '';
     if (rawMediaType && rawMediaType !== 'all' && rawMediaType !== 'reel' && rawMediaType !== 'post') {
@@ -214,25 +271,37 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
       return;
     }
 
+    const parsedPage = Number(req.query.page);
+    const parsedLimit = Number(req.query.limit);
+    const safePage = Number.isFinite(parsedPage) && parsedPage >= 1 ? Math.min(10000, Math.floor(parsedPage)) : 1;
+    const safeLimit = Number.isFinite(parsedLimit) && parsedLimit >= 1 ? Math.min(100, Math.floor(parsedLimit)) : 24;
+    const safeSearch = typeof req.query.search === 'string' && req.query.search.trim()
+      ? req.query.search.trim().slice(0, 200)
+      : undefined;
+    const safeCreatorId = typeof req.query.creatorId === 'string' && req.query.creatorId.trim()
+      ? req.query.creatorId.trim().slice(0, 128)
+      : undefined;
+
     const filters: ReelQueryFilters = {
-      creatorId: req.query.creatorId as string || undefined,
+      creatorId: safeCreatorId,
       instagramSenderId: senderId,
       datePreset: (req.query.datePreset as DateFilterPreset) || 'all',
-      startDate: req.query.startDate as string || undefined,
-      endDate: req.query.endDate as string || undefined,
+      startDate: typeof req.query.startDate === 'string' ? req.query.startDate.slice(0, 40) : undefined,
+      endDate: typeof req.query.endDate === 'string' ? req.query.endDate.slice(0, 40) : undefined,
       watchStatus: (req.query.watchStatus as WatchStatus | 'all') || 'all',
       mediaType: (rawMediaType as SavedMediaType | 'all') || 'all',
       source: (rawSource as SavedCollectionSource | 'all') || 'all',
-      search: req.query.search as string || undefined,
+      search: safeSearch,
       sortBy: (req.query.sortBy as any) || 'newest_saved',
-      page: Number(req.query.page) || 1,
-      limit: Number(req.query.limit) || 24,
+      page: safePage,
+      limit: safeLimit,
     };
 
     const result = await Repository.getReels(filters);
     res.json(result);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error('[API] Error in GET /reels:', error);
+    res.status(500).json({ error: 'Failed to load saved reels.' });
   }
 });
 
@@ -283,7 +352,8 @@ apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
       res.status(429).json({ error: 'Too many metadata requests, please retry shortly' });
       return;
     }
-    res.status(500).json({ error: error.message || 'Failed to resolve media metadata' });
+    console.error('[API] Error in GET /reels/:shortcode/meta:', error);
+    res.status(500).json({ error: 'Failed to resolve media metadata.' });
   }
 });
 
@@ -292,9 +362,14 @@ apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
  */
 apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    const { status } = req.body;
+    setResponseHeader(res, 'Cache-Control', 'no-store');
+    const id = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+    if (!id || !SAFE_REEL_ID_RE.test(id)) {
+      res.status(400).json({ error: 'Invalid reel identifier' });
+      return;
+    }
 
+    const status = req.body?.status;
     if (!['unwatched', 'watched', 'watch_later'].includes(status)) {
       res.status(400).json({ error: 'Invalid watch status' });
       return;
@@ -309,7 +384,8 @@ apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
 
     res.json(updated);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error('[API] Error in PATCH /reels/:id/status:', error);
+    res.status(500).json({ error: 'Failed to update watch status.' });
   }
 });
 
@@ -317,7 +393,9 @@ apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
  * Imports an official Instagram `saved_posts.json` archive export into the repository.
  */
 apiRouter.post('/archive/import', async (req: Request, res: Response) => {
+  setResponseHeader(res, 'Cache-Control', 'no-store');
   if (req.vaultUser?.role !== 'admin') {
+    (req as any).releaseImportSlot?.();
     res.status(403).json({ success: false, error: 'Only the vault administrator can import archive files.' });
     return;
   }
@@ -330,6 +408,10 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
     }
 
     const result = await ArchiveImportService.importArchive(rawData);
+    if (result.status === 'too_large') {
+      res.status(413).json({ success: false, ...result });
+      return;
+    }
     if (result.status === 'empty') {
       res.status(400).json({ success: false, ...result });
       return;
@@ -352,6 +434,7 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
  * Returns the active timezone for the authenticated vault user (or system default).
  */
 apiRouter.get('/user/timezone', async (req: Request, res: Response) => {
+  setResponseHeader(res, 'Cache-Control', 'no-store');
   const preferenceKey = req.vaultUser?.senderId || (req.vaultUser?.role === 'admin' ? 'admin' : null);
   const timezone = preferenceKey
     ? await Repository.getSenderTimezone(preferenceKey)
@@ -366,6 +449,7 @@ apiRouter.get('/user/timezone', async (req: Request, res: Response) => {
  * Updates the active timezone for the authenticated vault user.
  */
 apiRouter.patch('/user/timezone', async (req: Request, res: Response, next: NextFunction) => {
+  setResponseHeader(res, 'Cache-Control', 'no-store');
   const preferenceKey = req.vaultUser?.senderId || (req.vaultUser?.role === 'admin' ? 'admin' : null);
   const rawTz = typeof req.body?.timezone === 'string' ? req.body.timezone.trim() : '';
 

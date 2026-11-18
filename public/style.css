@@ -3887,6 +3887,49 @@ kbd {
   min-height: 16px;
 }
 
+/* Switch-Vault Non-Destructive Cancel & Explicit Sign-Out Controls */
+.vault-gate-switch-actions {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.vault-gate-switch-actions[hidden] {
+  display: none !important;
+}
+
+.vault-gate-cancel-btn {
+  width: 100%;
+  min-height: 40px;
+  justify-content: center;
+  font-size: var(--text-sm);
+}
+
+.vault-gate-signout-btn {
+  background: transparent;
+  border: none;
+  color: var(--ink-muted);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  padding: 6px 10px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  transition: color 0.14s ease, background-color 0.14s ease, transform 0.08s ease-out;
+}
+
+.vault-gate-signout-btn:hover {
+  color: var(--accent-error-text);
+  background: var(--accent-error-bg);
+}
+
+.vault-gate-signout-btn:active {
+  transform: scale(0.97);
+}
+
 /* Vault Gate & Site Compliance Links */
 .vault-gate-footer-links {
   width: 100%;
@@ -3987,7 +4030,8 @@ kbd {
   .metric-filter-btn,
   .vault-tab-btn,
   .table-action-icon-btn,
-  .popover-close-btn {
+  .popover-close-btn,
+  .vault-gate-signout-btn {
     transition-property: opacity, background-color, border-color, color;
     transition-duration: 0.12s;
     transform: none !important;
@@ -4012,7 +4056,8 @@ kbd {
   .metric-filter-btn:active,
   .vault-tab-btn:active,
   .table-action-icon-btn:active,
-  .popover-close-btn:active {
+  .popover-close-btn:active,
+  .vault-gate-signout-btn:active {
     transform: none !important;
   }
   .reel-media-viewport,

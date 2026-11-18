@@ -61,6 +61,17 @@ function setVaultAccessKey(key) {
 }
 
 /**
+ * Generates a unique Idempotency-Key header value for mutating API requests.
+ * @returns {string}
+ */
+function generateIdempotencyKey() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `idem-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+/**
  * Automatically syncs the user's browser timezone with their vault profile on the server.
  */
 function syncBrowserTimezone() {
@@ -74,6 +85,7 @@ function syncBrowserTimezone() {
       headers: {
         'Content-Type': 'application/json',
         'X-Vault-Key': key,
+        'Idempotency-Key': generateIdempotencyKey(),
       },
       body: JSON.stringify({ timezone: clientTz }),
     }).catch(() => {});
@@ -99,7 +111,8 @@ try {
 }
 
 /**
- * Performs a fetch attaching the private X-Vault-Key header when stored.
+ * Performs a fetch attaching the private X-Vault-Key header when stored and an Idempotency-Key
+ * header automatically for mutating requests (POST, PUT, PATCH, DELETE).
  * @param {string} url
  * @param {RequestInit} [options]
  * @returns {Promise<Response>}
@@ -109,6 +122,10 @@ function vaultFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
   if (key) {
     headers.set('X-Vault-Key', key);
+  }
+  const method = String(options.method || 'GET').toUpperCase();
+  if ((method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') && !headers.has('Idempotency-Key')) {
+    headers.set('Idempotency-Key', generateIdempotencyKey());
   }
   return fetch(url, { ...options, headers });
 }
@@ -392,6 +409,8 @@ const reelsTableContainer = document.getElementById('reels-table-container');
 const reelsTable = document.getElementById('reels-table');
 const reelsTableBody = document.getElementById('reels-table-body');
 const vaultGateScreen = document.getElementById('vault-gate-screen');
+const vaultGateTitle = document.getElementById('vault-gate-title');
+const vaultGateDesc = document.getElementById('vault-gate-desc');
 const tabOtpBtn = document.getElementById('tab-otp-btn');
 const tabKeyBtn = document.getElementById('tab-key-btn');
 const vaultOtpPanel = document.getElementById('vault-otp-panel');
@@ -403,7 +422,70 @@ const vaultKeyForm = document.getElementById('vault-key-form');
 const vaultKeyInput = document.getElementById('vault-key-input');
 const vaultKeySubmitBtn = document.getElementById('vault-key-submit-btn');
 const vaultGateError = document.getElementById('vault-gate-error');
+const vaultGateSwitchActions = document.getElementById('vault-gate-switch-actions');
+const vaultGateCancelBtn = document.getElementById('vault-gate-cancel-btn');
+const vaultGateSignoutBtn = document.getElementById('vault-gate-signout-btn');
 const switchVaultBtn = document.getElementById('switch-vault-btn');
+
+const DEFAULT_VAULT_GATE_TITLE = 'Private Vault';
+const DEFAULT_VAULT_GATE_DESC = "You scroll through 1,000 reels a day. Make sure you don't miss an important one.";
+const SWITCH_VAULT_GATE_TITLE = 'Switch Vault';
+const SWITCH_VAULT_GATE_DESC = 'Sign in to another Instagram account with a fresh single-use 6-digit code or direct key. Your current vault stays active if you cancel.';
+
+let isSwitchingVault = false;
+let vaultAuthGeneration = 0;
+let vaultSessionGeneration = 0;
+let vaultAuthAbortController = null;
+let pendingOtpAttempt = { code: '', key: '' };
+
+/**
+ * Returns the Idempotency-Key bound to the current 6-digit OTP submission attempt so network-error
+ * retries for the same code reuse the original key and replay a consumed OTP's response safely.
+ * @param {string} code
+ * @returns {string}
+ */
+function getOtpAttemptIdempotencyKey(code) {
+  if (pendingOtpAttempt.code === code && pendingOtpAttempt.key) {
+    return pendingOtpAttempt.key;
+  }
+  const key = generateIdempotencyKey();
+  pendingOtpAttempt = { code, key };
+  return key;
+}
+
+/**
+ * Clears any cached OTP attempt key when the code changes, completes, or the flow resets.
+ */
+function clearPendingOtpAttempt() {
+  pendingOtpAttempt = { code: '', key: '' };
+}
+
+/**
+ * Invalidates and aborts any in-flight vault authentication request so late completions from
+ * canceled or signed-out attempts can never overwrite the active vault key or workspace.
+ */
+function invalidatePendingVaultAuth() {
+  vaultAuthGeneration++;
+  if (vaultAuthAbortController) {
+    vaultAuthAbortController.abort();
+    vaultAuthAbortController = null;
+  }
+  if (vaultOtpSubmitBtn) {
+    vaultOtpSubmitBtn.disabled = false;
+    vaultOtpSubmitBtn.textContent = 'Unlock Vault';
+  }
+  if (vaultKeySubmitBtn) {
+    vaultKeySubmitBtn.disabled = false;
+    vaultKeySubmitBtn.textContent = 'Unlock Vault';
+  }
+}
+
+vaultOtpInput?.addEventListener('input', () => {
+  const normalized = (vaultOtpInput.value || '').trim().replace(/\s+/g, '');
+  if (pendingOtpAttempt.code && normalized !== pendingOtpAttempt.code) {
+    clearPendingOtpAttempt();
+  }
+});
 
 /**
  * Keeps the header Switch Vault button visible only while an active vault session is unlocked.
@@ -412,6 +494,25 @@ function syncSwitchVaultButtonVisibility() {
   if (!switchVaultBtn) return;
   const gateOpen = Boolean(vaultGateScreen && !vaultGateScreen.classList.contains('is-hidden'));
   switchVaultBtn.hidden = gateOpen || !getVaultAccessKey();
+}
+
+/**
+ * Updates Vault Gate heading, helper copy, and cancel/sign-out controls for locked vs switch mode.
+ */
+function syncVaultGateModeUI() {
+  const switchActive = isSwitchingVault && Boolean(getVaultAccessKey());
+  if (!switchActive) {
+    isSwitchingVault = false;
+  }
+  if (vaultGateTitle) {
+    vaultGateTitle.textContent = switchActive ? SWITCH_VAULT_GATE_TITLE : DEFAULT_VAULT_GATE_TITLE;
+  }
+  if (vaultGateDesc) {
+    vaultGateDesc.textContent = switchActive ? SWITCH_VAULT_GATE_DESC : DEFAULT_VAULT_GATE_DESC;
+  }
+  if (vaultGateSwitchActions) {
+    vaultGateSwitchActions.hidden = !switchActive;
+  }
 }
 
 /**
@@ -442,18 +543,28 @@ tabOtpBtn?.addEventListener('click', () => switchVaultGateTab('otp'));
 tabKeyBtn?.addEventListener('click', () => switchVaultGateTab('key'));
 
 /**
- * Shows the Zero-Login Vault Auth Gate when unauthenticated.
+ * Shows the Zero-Login Vault Auth Gate when unauthenticated or switching accounts.
+ * In switch mode, the active vault's DOM/state is preserved so the user can return immediately.
  * @param {string} [errorMessage]
+ * @param {{ preserveWorkspace?: boolean }} [options]
  */
-function showVaultGateScreen(errorMessage) {
+function showVaultGateScreen(errorMessage, options = {}) {
   if (!vaultGateScreen) return;
+  const preserveWorkspace = Boolean(options.preserveWorkspace ?? (isSwitchingVault && Boolean(getVaultAccessKey())));
+  if (!preserveWorkspace) {
+    isSwitchingVault = false;
+  }
   if (vaultContainerEl) vaultContainerEl.classList.add('is-vault-locked');
   vaultGateScreen.classList.remove('is-hidden');
-  if (resultsCount) resultsCount.textContent = 'Private Vault Locked';
-  if (reelsGrid) reelsGrid.innerHTML = '';
-  if (reelsTableBody) reelsTableBody.innerHTML = '';
-  if (reelsTableContainer) reelsTableContainer.classList.add('is-hidden');
-  if (paginationBar) paginationBar.classList.add('is-hidden');
+  syncVaultGateModeUI();
+
+  if (!preserveWorkspace) {
+    if (resultsCount) resultsCount.textContent = 'Private Vault Locked';
+    if (reelsGrid) reelsGrid.innerHTML = '';
+    if (reelsTableBody) reelsTableBody.innerHTML = '';
+    if (reelsTableContainer) reelsTableContainer.classList.add('is-hidden');
+    if (paginationBar) paginationBar.classList.add('is-hidden');
+  }
   if (vaultGateError) {
     if (errorMessage) {
       vaultGateError.textContent = errorMessage;
@@ -470,17 +581,21 @@ function showVaultGateScreen(errorMessage) {
  */
 function hideVaultGateScreen() {
   if (!vaultGateScreen) return;
+  isSwitchingVault = false;
+  syncVaultGateModeUI();
   if (vaultContainerEl) vaultContainerEl.classList.remove('is-vault-locked');
   vaultGateScreen.classList.add('is-hidden');
+  if (reelsGrid) reelsGrid.classList.toggle('is-hidden', state.viewMode !== 'grid');
+  if (reelsTableContainer) reelsTableContainer.classList.toggle('is-hidden', state.viewMode === 'grid');
   if (vaultGateError) vaultGateError.hidden = true;
   syncSwitchVaultButtonVisibility();
 }
 
 /**
- * Clears the stored vault key, resets displayed vault data, and reopens the auth gate
- * so the user can switch to a different account/bot vault without clearing browser storage manually.
+ * Aborts in-flight vault requests and clears displayed vault data & filters before switching
+ * to another account or signing out cleanly.
  */
-function handleSwitchVault() {
+function resetVaultSessionState() {
   if (fetchReelsAbortController) {
     fetchReelsAbortController.abort();
     fetchReelsAbortController = null;
@@ -493,8 +608,6 @@ function handleSwitchVault() {
     statsFetchController.abort();
     statsFetchController = null;
   }
-  setVaultAccessKey(null);
-  closeShortcutsPopover(false);
   if (typeof state !== 'undefined' && state) {
     state.reels = [];
     state.total = 0;
@@ -524,16 +637,97 @@ function handleSwitchVault() {
   if (sourceCountInstagram) sourceCountInstagram.textContent = '--';
   if (sourceCountBot) sourceCountBot.textContent = '--';
   if (creatorPillsList) creatorPillsList.innerHTML = '';
+  if (reelsGrid) reelsGrid.innerHTML = '';
+  if (reelsTableBody) reelsTableBody.innerHTML = '';
+  if (reelsTableState) {
+    reelsTableState.hidden = true;
+    reelsTableState.innerHTML = '';
+  }
+  if (paginationBar) paginationBar.classList.add('is-hidden');
+  if (resultsCount) resultsCount.textContent = 'Loading tracked items...';
+}
+
+/**
+ * Opens the Vault Gate in non-destructive switch mode so the user can sign in to another vault
+ * or cancel right back to their active session without getting locked out.
+ */
+function handleSwitchVault() {
+  invalidatePendingVaultAuth();
+  clearPendingOtpAttempt();
+  closeShortcutsPopover(false);
   if (vaultOtpInput) vaultOtpInput.value = '';
   if (vaultKeyInput) vaultKeyInput.value = '';
-  showVaultGateScreen();
+
+  if (!getVaultAccessKey()) {
+    resetVaultSessionState();
+    showVaultGateScreen();
+    switchVaultGateTab('otp');
+    return;
+  }
+
+  isSwitchingVault = true;
+  showVaultGateScreen(undefined, { preserveWorkspace: true });
   switchVaultGateTab('otp');
   if (typeof announceStatus === 'function') {
-    announceStatus('Signed out of current vault. Enter a 6-digit code or vault key to switch vaults.');
+    announceStatus('Switch Vault opened. Enter a fresh 6-digit code or direct key, or choose Back to Current Vault.');
   }
 }
 
+/**
+ * Cancels Switch Vault and immediately returns to the already-authenticated vault.
+ */
+function cancelSwitchVault() {
+  if (!isSwitchingVault || !getVaultAccessKey()) return;
+  invalidatePendingVaultAuth();
+  clearPendingOtpAttempt();
+  hideVaultGateScreen();
+  switchVaultBtn?.focus();
+  if (typeof announceStatus === 'function') {
+    announceStatus('Returned to your current vault.');
+  }
+}
+
+/**
+ * Explicitly signs out of the current device, clears the stored vault key, and resets vault state.
+ */
+function confirmSignOutVault() {
+  invalidatePendingVaultAuth();
+  clearPendingOtpAttempt();
+  vaultSessionGeneration++;
+  isSwitchingVault = false;
+  setVaultAccessKey(null);
+  closeShortcutsPopover(false);
+  resetVaultSessionState();
+  if (vaultOtpInput) vaultOtpInput.value = '';
+  if (vaultKeyInput) vaultKeyInput.value = '';
+  showVaultGateScreen(undefined, { preserveWorkspace: false });
+  switchVaultGateTab('otp');
+  if (typeof announceStatus === 'function') {
+    announceStatus('Signed out of this device. Enter a fresh 6-digit code or vault key to sign back in.');
+  }
+}
+
+/**
+ * Commits a newly authenticated vault key and starts all catalog loads immediately under a
+ * session generation independent of later Switch Vault open/cancel actions.
+ * @param {string} newVaultKey
+ */
+async function commitAuthenticatedVaultKey(newVaultKey) {
+  clearPendingOtpAttempt();
+  const sessionGen = ++vaultSessionGeneration;
+  if (isSwitchingVault) {
+    resetVaultSessionState();
+  }
+  setVaultAccessKey(newVaultKey);
+  hideVaultGateScreen();
+  syncBrowserTimezone();
+  await Promise.all([loadStats(), loadCreators(), fetchReels()]);
+  if (sessionGen !== vaultSessionGeneration) return;
+}
+
 switchVaultBtn?.addEventListener('click', handleSwitchVault);
+vaultGateCancelBtn?.addEventListener('click', cancelSwitchVault);
+vaultGateSignoutBtn?.addEventListener('click', confirmSignOutVault);
 syncSwitchVaultButtonVisibility();
 
 if (vaultOtpForm) {
@@ -544,6 +738,13 @@ if (vaultOtpForm) {
       showVaultGateScreen('Please enter the 6-digit code received from your Instagram DM.');
       return;
     }
+
+    invalidatePendingVaultAuth();
+    const opGen = vaultAuthGeneration;
+    const controller = new AbortController();
+    vaultAuthAbortController = controller;
+    const idempotencyKey = getOtpAttemptIdempotencyKey(entered);
+
     if (vaultOtpSubmitBtn) {
       vaultOtpSubmitBtn.disabled = true;
       vaultOtpSubmitBtn.textContent = 'Verifying...';
@@ -551,25 +752,42 @@ if (vaultOtpForm) {
     try {
       const res = await fetch('/api/auth/otp/verify', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': idempotencyKey,
+        },
         body: JSON.stringify({ code: entered }),
       });
+      if (opGen !== vaultAuthGeneration) return;
       const data = await res.json().catch(() => null);
+      if (opGen !== vaultAuthGeneration) return;
+
       if (res.ok && data?.vaultKey) {
-        setVaultAccessKey(data.vaultKey);
-        hideVaultGateScreen();
-        await loadStats();
-        await loadCreators();
-        await fetchReels();
+        await commitAuthenticatedVaultKey(data.vaultKey);
       } else {
-        showVaultGateScreen(data?.message || 'Invalid or expired code. Please message "code" to our bot to get a new code.');
+        // Keep the attempt key on transient 5xx/409/429 responses so retries replay cleanly;
+        // clear it on terminal 400/422 rejections so the next submission starts fresh.
+        if (res.status === 400 || res.status === 422) {
+          clearPendingOtpAttempt();
+        }
+        showVaultGateScreen(
+          data?.message || 'This 6-digit code is invalid, expired, or already used (codes are single-use). Send "code" to @er_reel_er for a fresh code.'
+        );
       }
-    } catch {
+    } catch (err) {
+      if (opGen !== vaultAuthGeneration || err?.name === 'AbortError') return;
+      // Preserve pendingOtpAttempt on network errors so resubmitting the same OTP reuses the original key
       showVaultGateScreen('Unable to verify code. Please check your connection and try again.');
     } finally {
-      if (vaultOtpSubmitBtn) {
-        vaultOtpSubmitBtn.disabled = false;
-        vaultOtpSubmitBtn.textContent = 'Unlock Vault';
+      if (opGen === vaultAuthGeneration) {
+        if (vaultAuthAbortController === controller) {
+          vaultAuthAbortController = null;
+        }
+        if (vaultOtpSubmitBtn) {
+          vaultOtpSubmitBtn.disabled = false;
+          vaultOtpSubmitBtn.textContent = 'Unlock Vault';
+        }
       }
     }
   });
@@ -583,29 +801,40 @@ if (vaultKeyForm) {
       showVaultGateScreen('Please enter your vault access key.');
       return;
     }
+
+    invalidatePendingVaultAuth();
+    const opGen = vaultAuthGeneration;
+    const controller = new AbortController();
+    vaultAuthAbortController = controller;
+
     if (vaultKeySubmitBtn) {
       vaultKeySubmitBtn.disabled = true;
       vaultKeySubmitBtn.textContent = 'Verifying...';
     }
     try {
       const res = await fetch('/api/session', {
+        signal: controller.signal,
         headers: { 'X-Vault-Key': entered },
       });
+      if (opGen !== vaultAuthGeneration) return;
+
       if (res.ok) {
-        setVaultAccessKey(entered);
-        hideVaultGateScreen();
-        await loadStats();
-        await loadCreators();
-        await fetchReels();
+        await commitAuthenticatedVaultKey(entered);
       } else {
         showVaultGateScreen('Invalid access key. Please check the link from your Instagram DM.');
       }
-    } catch {
+    } catch (err) {
+      if (opGen !== vaultAuthGeneration || err?.name === 'AbortError') return;
       showVaultGateScreen('Unable to verify key. Please try again.');
     } finally {
-      if (vaultKeySubmitBtn) {
-        vaultKeySubmitBtn.disabled = false;
-        vaultKeySubmitBtn.textContent = 'Unlock Vault';
+      if (opGen === vaultAuthGeneration) {
+        if (vaultAuthAbortController === controller) {
+          vaultAuthAbortController = null;
+        }
+        if (vaultKeySubmitBtn) {
+          vaultKeySubmitBtn.disabled = false;
+          vaultKeySubmitBtn.textContent = 'Unlock Vault';
+        }
       }
     }
   });
@@ -1531,7 +1760,9 @@ async function fetchReels() {
       showVaultGateScreen();
       return;
     }
-    hideVaultGateScreen();
+    if (!isSwitchingVault) {
+      hideVaultGateScreen();
+    }
     if (!res.ok) {
       let errMsg = `HTTP ${res.status}`;
       try {
@@ -3659,6 +3890,12 @@ function setupEventListeners() {
     if (shortcutsPopover && !shortcutsPopover.hidden && e.key === 'Escape') {
       e.preventDefault();
       closeShortcutsPopover(true);
+      return;
+    }
+
+    if (isSwitchingVault && e.key === 'Escape') {
+      e.preventDefault();
+      cancelSwitchVault();
       return;
     }
 

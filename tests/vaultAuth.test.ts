@@ -78,7 +78,9 @@ test('VaultAuthService - vaultAuthMiddleware permits public endpoints without ke
 
 test('VaultAuthService - vaultAuthMiddleware enforces authentication in production and parses valid keys', () => {
   const origEnv = process.env.NODE_ENV;
+  const origVaultSecret = process.env.VAULT_SECRET;
   process.env.NODE_ENV = 'production';
+  process.env.VAULT_SECRET = 'test-production-vault-secret';
 
   try {
     // 1. Missing key -> 401
@@ -120,7 +122,10 @@ test('VaultAuthService - vaultAuthMiddleware enforces authentication in producti
     assert.equal(reqWithKey.vaultUser?.role, 'user');
     assert.equal(reqWithKey.vaultUser?.senderId, 'sender_bob');
   } finally {
-    process.env.NODE_ENV = origEnv;
+    if (origEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = origEnv;
+    if (origVaultSecret === undefined) delete process.env.VAULT_SECRET;
+    else process.env.VAULT_SECRET = origVaultSecret;
   }
 });
 
@@ -550,7 +555,7 @@ test('VaultAuthService - requestOtpForUsername checks delivery and returns struc
   }
 });
 
-test('Vault UI exposes Switch Vault control with reduced-motion and logout state reset wiring', async () => {
+test('Vault UI exposes reversible Switch Vault, explicit Sign Out, and Idempotency-Key wiring', async () => {
   const fs = await import('node:fs');
   const path = await import('node:path');
   const root = path.resolve(process.cwd());
@@ -560,20 +565,44 @@ test('Vault UI exposes Switch Vault control with reduced-motion and logout state
   const css = fs.readFileSync(path.join(root, 'public/style.css'), 'utf8');
 
   assert.ok(html.includes('id="switch-vault-btn"'), 'Header must include Switch Vault button');
-  assert.ok(html.includes('aria-label="Sign out and switch vault"'), 'Switch Vault button must have accessible aria-label');
-  const fnMatch = js.match(/function handleSwitchVault\(\)\s*\{[\s\S]*?\n\}/);
-  assert.ok(fnMatch, 'app.js must define handleSwitchVault');
-  const fnBody = fnMatch[0];
-  assert.ok(fnBody.includes('setVaultAccessKey(null)'), 'handleSwitchVault must clear stored vault key');
-  assert.ok(fnBody.includes('fetchReelsAbortController.abort()'), 'handleSwitchVault must cancel in-flight reels fetches');
-  assert.ok(fnBody.includes('creatorsFetchController.abort()'), 'handleSwitchVault must cancel in-flight creator fetches');
-  assert.ok(fnBody.includes('statsFetchController.abort()'), 'handleSwitchVault must cancel in-flight stats fetches');
-  assert.ok(fnBody.includes('state.creators = []'), 'handleSwitchVault must clear previous vault creators');
-  assert.ok(fnBody.includes('state.topCreators = []'), 'handleSwitchVault must clear previous vault topCreators');
-  assert.ok(fnBody.includes('state.selectedCreator = null'), 'handleSwitchVault must clear selectedCreator');
-  assert.ok(fnBody.includes("state.filters.creatorId = ''"), 'handleSwitchVault must clear creator filter');
-  assert.ok(fnBody.includes('state.filters.page = 1'), 'handleSwitchVault must reset pagination to page 1');
-  assert.ok(fnBody.includes('syncUrlState()'), 'handleSwitchVault must sync reset filters to URL');
+  assert.ok(html.includes('id="vault-gate-cancel-btn"'), 'Vault gate must include Back to Current Vault cancel button');
+  assert.ok(html.includes('id="vault-gate-signout-btn"'), 'Vault gate must include explicit Sign out button');
+
+  const switchFnMatch = js.match(/function handleSwitchVault\(\)\s*\{[\s\S]*?\n\}/);
+  assert.ok(switchFnMatch, 'app.js must define handleSwitchVault');
+  assert.ok(!switchFnMatch[0].includes('setVaultAccessKey(null)'), 'handleSwitchVault must NOT wipe active vault key before switching succeeds');
+  assert.ok(switchFnMatch[0].includes('preserveWorkspace: true'), 'handleSwitchVault must preserve active workspace so user can cancel cleanly');
+
+  const cancelFnMatch = js.match(/function cancelSwitchVault\(\)\s*\{[\s\S]*?\n\}/);
+  assert.ok(cancelFnMatch, 'app.js must define cancelSwitchVault');
+  assert.ok(cancelFnMatch[0].includes('hideVaultGateScreen()'), 'cancelSwitchVault must return directly to the active vault');
+  assert.ok(cancelFnMatch[0].includes('invalidatePendingVaultAuth()'), 'cancelSwitchVault must invalidate any pending auth request');
+
+  assert.ok(js.includes('if (!isSwitchingVault) {\n      hideVaultGateScreen();'), 'Background fetchReels must not close an active Switch Vault gate');
+  assert.ok(js.includes('getOtpAttemptIdempotencyKey(entered)'), 'OTP verification must reuse the attempt Idempotency-Key across network retries');
+  assert.ok(js.includes('await Promise.all([loadStats(), loadCreators(), fetchReels()]);'), 'Authenticated vault commit must kick off all catalog loads together independent of later switch attempts');
+
+  const resetFnMatch = js.match(/function resetVaultSessionState\(\)\s*\{[\s\S]*?\n\}/);
+  assert.ok(resetFnMatch, 'app.js must define resetVaultSessionState');
+  const resetBody = resetFnMatch[0];
+  assert.ok(resetBody.includes('fetchReelsAbortController.abort()'), 'resetVaultSessionState must cancel in-flight reels fetches');
+  assert.ok(resetBody.includes('creatorsFetchController.abort()'), 'resetVaultSessionState must cancel in-flight creator fetches');
+  assert.ok(resetBody.includes('statsFetchController.abort()'), 'resetVaultSessionState must cancel in-flight stats fetches');
+  assert.ok(resetBody.includes('state.creators = []'), 'resetVaultSessionState must clear previous vault creators');
+  assert.ok(resetBody.includes('state.topCreators = []'), 'resetVaultSessionState must clear previous vault topCreators');
+  assert.ok(resetBody.includes('state.selectedCreator = null'), 'resetVaultSessionState must clear selectedCreator');
+  assert.ok(resetBody.includes("state.filters.creatorId = ''"), 'resetVaultSessionState must clear creator filter');
+  assert.ok(resetBody.includes('state.filters.page = 1'), 'resetVaultSessionState must reset pagination to page 1');
+  assert.ok(resetBody.includes('syncUrlState()'), 'resetVaultSessionState must sync reset filters to URL');
+  assert.ok(resetBody.includes("reelsGrid.innerHTML = ''"), 'resetVaultSessionState must clear previous catalog grid DOM on commit/sign-out');
+  assert.ok(resetBody.includes("reelsTableBody.innerHTML = ''"), 'resetVaultSessionState must clear previous catalog table DOM on commit/sign-out');
+
+  const signOutFnMatch = js.match(/function confirmSignOutVault\(\)\s*\{[\s\S]*?\n\}/);
+  assert.ok(signOutFnMatch, 'app.js must define confirmSignOutVault');
+  assert.ok(signOutFnMatch[0].includes('setVaultAccessKey(null)'), 'confirmSignOutVault must clear stored vault key');
+  assert.ok(signOutFnMatch[0].includes('resetVaultSessionState()'), 'confirmSignOutVault must reset vault session state');
+
+  assert.ok(js.includes("'Idempotency-Key'"), 'app.js must send Idempotency-Key headers on mutating requests');
   assert.ok(js.includes('syncSwitchVaultButtonVisibility()'), 'app.js must sync Switch Vault visibility with auth state');
   assert.ok(css.includes('.nav-btn:active:not(:disabled)'), 'style.css must provide tactile :active feedback for nav buttons');
   assert.ok(css.includes('.nav-btn:active'), 'style.css must respect prefers-reduced-motion for nav buttons');
@@ -632,6 +661,6 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
   );
 
   // 4. HTML cache-busting query versions stay aligned
-  assert.ok(html.includes('style.css?v=4.5'), 'index.html must reference style.css?v=4.5');
-  assert.ok(html.includes('app.js?v=4.5'), 'index.html must reference app.js?v=4.5');
+  assert.ok(html.includes('style.css?v=4.6'), 'index.html must reference style.css?v=4.6');
+  assert.ok(html.includes('app.js?v=4.6'), 'index.html must reference app.js?v=4.6');
 });
