@@ -28,6 +28,8 @@ import {
   verifyOtp,
 } from '../src/services/vaultAuthService.ts';
 import { apiRouter, resetApiRateLimitersForTesting } from '../src/api/router.ts';
+import { resetFeedMetaResolverStateForTests } from '../src/services/reelMetadataResolver.ts';
+import { createApp } from '../src/server.ts';
 import { MetaInstagramBotService } from '../src/services/metaInstagramBotService.ts';
 import { Repository } from '../src/db/repository.ts';
 
@@ -1350,5 +1352,717 @@ test('MetadataResolver - falls back to secondary crawler User-Agent when primary
     if (origProxy === undefined) delete process.env.METADATA_PROXY_URL;
     else process.env.METADATA_PROXY_URL = origProxy;
     resetFeedMetaResolverStateForTests();
+  }
+});
+
+test('Archive Import - authenticated vault users import into isolated sender vaults while blocking anonymous, subpath bypasses, shared creator overwrites, and deleting senders', async () => {
+  const origEnv = process.env.NODE_ENV;
+  const origVaultSecret = process.env.VAULT_SECRET;
+  const origSupabaseUrl = process.env.SUPABASE_URL;
+  const origSupabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  process.env.NODE_ENV = 'production';
+  process.env.VAULT_SECRET = 'test-archive-import-secret';
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  Repository.resetMemoryStoreForTests();
+  Repository.resetDeletionTimestampsForTesting();
+  resetApiRateLimitersForTesting();
+  clearIdempotencyStoreForTesting();
+
+  try {
+    let preParseCalls = 0;
+    let resolveSlowUploadAdmitted: (() => void) | null = null;
+    const slowUploadAdmittedPromise = new Promise<void>((res) => {
+      resolveSlowUploadAdmitted = res;
+    });
+    const app = createApp({
+      onArchiveImportPreParse: (req) => {
+        preParseCalls++;
+        if (req.vaultUser?.senderId === 'user_slow_upload') {
+          resolveSlowUploadAdmitted?.();
+        }
+      },
+    });
+
+    const payload = {
+      saved_saved_media: [
+        {
+          title: 'creator_one',
+          string_map_data: {
+            'Saved on': {
+              href: 'https://www.instagram.com/reel/SharedUserImp1/',
+              timestamp: 1700000100,
+            },
+          },
+        },
+        {
+          label_values: [
+            { label: 'URL', href: 'https://www.instagram.com/p/SharedPostImp2/' },
+            {
+              title: 'Owner',
+              dict: [
+                {
+                  dict: [
+                    { label: 'Username', value: 'creator_one' },
+                    { label: 'Name', value: 'Spoofed Display Name' },
+                  ],
+                },
+              ],
+            },
+          ],
+          timestamp: 1700000200,
+        },
+      ],
+    };
+
+    // Seed shared creator with an authoritative display name + a bot-sent DM reel for user A
+    const seedCreator = await Repository.upsertCreator({
+      instagram_user_id: 'creator_creator_one',
+      username: 'creator_one',
+      display_name: 'Official Creator Name',
+    });
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'dm_user_import_a_SharedUserImp1',
+      shortcode: 'SharedUserImp1',
+      reel_url: 'https://www.instagram.com/reel/SharedUserImp1/',
+      media_type: 'reel',
+      creator_id: seedCreator.id,
+      taken_at: '2026-01-01T00:00:00.000Z',
+      saved_at: null,
+      first_detected_at: '2026-01-01T00:00:00.000Z',
+      save_order_rank: 1,
+      watch_status: 'unwatched',
+      is_saved_on_instagram: false,
+      instagram_sender_id: 'user_import_a',
+    });
+
+    await withServer(app, async (baseUrl) => {
+      // 1a. Anonymous POST /api/archive/import rejected with 401 BEFORE guard/50MB parser runs
+      const anonRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(anonRes.status, 401);
+      assert.equal(preParseCalls, 0, 'Anonymous archive import must be rejected before guard/body parser');
+
+      // 1b. Anonymous subpath probe /api/archive/import/health must NOT bypass auth or hit import guard
+      const subpathBypassRes = await fetch(`${baseUrl}/api/archive/import/health`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(subpathBypassRes.status, 401);
+      assert.equal(preParseCalls, 0, 'Subpath /api/archive/import/health must not reach archive import guard/parser');
+
+      const userAKey = generateUserVaultKey('user_import_a');
+      const userBKey = generateUserVaultKey('user_import_b');
+      const user123Key = generateUserVaultKey('123');
+      const deletingKey = generateUserVaultKey('user_import_deleting');
+
+      // 2. User A imports archive: promotes their DM reel + imports second item without overwriting shared creator name
+      const userARes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': userAKey },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(userARes.status, 200);
+      assert.equal(preParseCalls, 1);
+      const userABody = await userARes.json();
+      assert.equal(userABody.success, true);
+      assert.equal(userABody.reelsImported, 1);
+      assert.equal(userABody.alreadyPresent, 1);
+      assert.equal(userABody.promotedToSaved, 1);
+      assert.equal(userABody.savedAtBackfilled, 1);
+
+      const creatorsAfterUserA = await Repository.getCreators();
+      const creatorOne = creatorsAfterUserA.find((c) => c.username === 'creator_one');
+      assert.equal(
+        creatorOne?.display_name,
+        'Official Creator Name',
+        'Regular user archive import must not overwrite existing shared creator display_name'
+      );
+
+      // 2b. Brand-new creator in regular user archive must not store user-supplied Owner.Name in shared creators
+      const brandNewCreatorRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': userAKey },
+        body: JSON.stringify({
+          saved_saved_media: [
+            {
+              label_values: [
+                { label: 'URL', href: 'https://www.instagram.com/reel/BrandNewCreator1/' },
+                {
+                  title: 'Owner',
+                  dict: [
+                    {
+                      dict: [
+                        { label: 'Username', value: 'brand_new_creator' },
+                        { label: 'Name', value: 'Untrusted Spoofed Name' },
+                      ],
+                    },
+                  ],
+                },
+              ],
+              timestamp: 1700000250,
+            },
+          ],
+        }),
+      });
+      assert.equal(brandNewCreatorRes.status, 200);
+      const brandNewCreator = (await Repository.getCreators()).find((c) => c.username === 'brand_new_creator');
+      assert.ok(brandNewCreator, 'Brand new creator placeholder should be created');
+      assert.equal(
+        brandNewCreator?.display_name,
+        null,
+        'User-supplied archive Owner.Name must not populate shared creator display_name'
+      );
+
+      // User B sees 0 items before importing
+      const userBReelsBefore = await (await fetch(`${baseUrl}/api/reels`, {
+        headers: { 'X-Vault-Key': userBKey },
+      })).json();
+      assert.equal(userBReelsBefore.total, 0, 'User A archive import must not leak into User B vault');
+
+      // 3. User B imports the SAME shortcodes independently without colliding with User A
+      const userBRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': userBKey },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(userBRes.status, 200);
+      const userBBody = await userBRes.json();
+      assert.equal(userBBody.success, true);
+      assert.equal(userBBody.reelsImported, 2);
+      assert.equal(userBBody.alreadyPresent, 0);
+
+      const userBReelsAfter = await (await fetch(`${baseUrl}/api/reels`, {
+        headers: { 'X-Vault-Key': userBKey },
+      })).json();
+      assert.equal(userBReelsAfter.total, 2);
+      assert.ok(userBReelsAfter.reels.every((r: any) => r.instagram_sender_id === 'user_import_b'));
+
+      // 4. Disjoint media ID namespace: unattributed shortcode "123_Clip" vs sender "123" shortcode "Clip"
+      const adminUnderscoreRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': getAdminVaultKey() },
+        body: JSON.stringify({
+          saved_saved_media: [
+            {
+              title: 'creator_one',
+              string_map_data: {
+                'Saved on': { href: 'https://www.instagram.com/reel/123_Clip/', timestamp: 1700000300 },
+              },
+            },
+          ],
+        }),
+      });
+      assert.equal(adminUnderscoreRes.status, 200);
+
+      const user123Res = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': user123Key },
+        body: JSON.stringify({
+          saved_saved_media: [
+            {
+              title: 'creator_one',
+              string_map_data: {
+                'Saved on': { href: 'https://www.instagram.com/reel/Clip/', timestamp: 1700000400 },
+              },
+            },
+          ],
+        }),
+      });
+      assert.equal(user123Res.status, 200);
+      const user123Body = await user123Res.json();
+      assert.equal(user123Body.reelsImported, 1, 'Sender 123 importing Clip must not collide with unattributed 123_Clip');
+
+      const user123Reels = await (await fetch(`${baseUrl}/api/reels`, {
+        headers: { 'X-Vault-Key': user123Key },
+      })).json();
+      assert.equal(user123Reels.total, 1);
+      assert.equal(user123Reels.reels[0].instagram_media_id, 'user_export:123:Clip');
+
+      // 5. Sender under active deletion barrier receives 409, no rows are inserted, AND 409 is NOT cached by idempotency
+      Repository.recordSenderDeletion('user_import_deleting');
+      const deletingIdemKey = 'archive-idem-deleting-retry-1';
+      const deletingRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Vault-Key': deletingKey,
+          'Idempotency-Key': deletingIdemKey,
+        },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(deletingRes.status, 409);
+
+      const deletingReels = await (await fetch(`${baseUrl}/api/reels`, {
+        headers: { 'X-Vault-Key': deletingKey },
+      })).json();
+      assert.equal(deletingReels.total, 0);
+
+      // Once barrier clears, retrying with the SAME Idempotency-Key must succeed (not replay cached 409)
+      Repository.resetDeletionTimestampsForTesting();
+      const retryAfterBarrierRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Vault-Key': deletingKey,
+          'Idempotency-Key': deletingIdemKey,
+        },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(retryAfterBarrierRes.status, 200, 'Deletion-barrier 409 must not be replayed from idempotency cache');
+      assert.equal(retryAfterBarrierRes.headers.get('idempotency-replayed'), null);
+
+      // 6a. Real deferred-promise race test: deleteUserDataForSender waits for in-flight memory write, fulfills, and leaves 0 rows
+      const raceSender = 'user_import_race_del';
+      await Repository.upsertSavedReel({
+        instagram_media_id: `dm_${raceSender}_PreExisting`,
+        shortcode: 'PreExisting',
+        reel_url: 'https://www.instagram.com/reel/PreExisting/',
+        media_type: 'reel',
+        creator_id: seedCreator.id,
+        taken_at: '2026-01-01T00:00:00.000Z',
+        saved_at: null,
+        first_detected_at: '2026-01-01T00:00:00.000Z',
+        save_order_rank: 1,
+        watch_status: 'unwatched',
+        is_saved_on_instagram: false,
+        instagram_sender_id: raceSender,
+      });
+
+      let enteredMemoryWrite!: () => void;
+      const enteredPromise = new Promise<void>((res) => { enteredMemoryWrite = res; });
+      let releaseMemoryWrite!: () => void;
+      const holdPromise = new Promise<void>((res) => { releaseMemoryWrite = res; });
+
+      const preDeletionGen = Repository.getSenderDeletionGeneration(raceSender);
+      const batchWritePromise = Repository.upsertSavedReelsBatch(
+        [
+          {
+            instagram_media_id: `user_export:${raceSender}:RaceClip1`,
+            shortcode: 'RaceClip1',
+            reel_url: 'https://www.instagram.com/reel/RaceClip1/',
+            media_type: 'reel',
+            creator_id: seedCreator.id,
+            taken_at: '2026-01-01T00:00:00.000Z',
+            saved_at: '2026-01-01T00:00:00.000Z',
+            first_detected_at: '2026-01-01T00:00:00.000Z',
+            save_order_rank: 2,
+            watch_status: 'unwatched',
+            is_saved_on_instagram: true,
+            instagram_sender_id: raceSender,
+          },
+        ],
+        {
+          ignoreDuplicates: true,
+          expectedDeletionGeneration: preDeletionGen,
+          onBeforeMemoryWriteForTesting: async () => {
+            enteredMemoryWrite();
+            await holdPromise;
+          },
+        }
+      );
+
+      let deletePromise: Promise<number> | null = null;
+      try {
+        let entryTimer: NodeJS.Timeout | undefined;
+        const entryOutcome = await Promise.race([
+          enteredPromise.then(() => 'entered' as const),
+          batchWritePromise.then(
+            () => 'settled_early' as const,
+            () => 'rejected_early' as const
+          ),
+          new Promise<'timeout'>((res) => {
+            entryTimer = setTimeout(() => res('timeout'), 2000);
+          }),
+        ]);
+        if (entryTimer) clearTimeout(entryTimer);
+        assert.equal(entryOutcome, 'entered', 'Batch write must reach memory write hook before deadline');
+
+        deletePromise = Repository.deleteUserDataForSender(raceSender);
+        await new Promise((r) => setTimeout(r, 20));
+
+        // Deletion must NOT have removed the pre-existing row while the in-flight archive write is still open
+        const whileHeld = await Repository.getReels({ instagramSenderId: raceSender, page: 1, limit: 20 });
+        assert.equal(whileHeld.total, 1, 'deleteUserDataForSender must wait for in-flight archive write before deleting rows');
+
+        releaseMemoryWrite();
+        const deletedCount = await deletePromise;
+        assert.ok(deletedCount >= 1, 'deleteUserDataForSender must fulfill and delete sender rows');
+      } finally {
+        releaseMemoryWrite();
+        await Promise.allSettled([batchWritePromise, ...(deletePromise ? [deletePromise] : [])]);
+      }
+
+      const surviving = await Repository.getReels({ instagramSenderId: raceSender, page: 1, limit: 20 });
+      assert.equal(surviving.total, 0, 'Zero sender rows may survive concurrent archive import + deletion');
+
+      // 6b. Stale admission deletion generation must reject even after the 60s cooldown map is cleared
+      const postDeletionGen = Repository.getSenderDeletionGeneration(raceSender);
+      assert.ok(postDeletionGen > preDeletionGen, 'Completed deletion must increment sender deletion generation');
+      (Repository as any).senderDeletionTimestamps.delete(raceSender);
+      await assert.rejects(
+        () =>
+          Repository.upsertSavedReelsBatch(
+            [
+              {
+                instagram_media_id: `user_export:${raceSender}:StaleGenClip`,
+                shortcode: 'StaleGenClip',
+                reel_url: 'https://www.instagram.com/reel/StaleGenClip/',
+                media_type: 'reel',
+                creator_id: seedCreator.id,
+                taken_at: '2026-01-01T00:00:00.000Z',
+                saved_at: '2026-01-01T00:00:00.000Z',
+                first_detected_at: '2026-01-01T00:00:00.000Z',
+                save_order_rank: 3,
+                watch_status: 'unwatched',
+                is_saved_on_instagram: true,
+                instagram_sender_id: raceSender,
+              },
+            ],
+            { ignoreDuplicates: true, expectedDeletionGeneration: preDeletionGen }
+          ),
+        /deletion barrier/i,
+        'Stale deletion generation from pre-deletion admission must be rejected even after 60s window expires'
+      );
+
+      // 6c. Slow upload by one vault must NOT block another vault's archive import, while same vault gets 429
+      const slowUserKey = generateUserVaultKey('user_slow_upload');
+      const fastUserKey = generateUserVaultKey('user_fast_upload');
+      const parsedUrl = new URL(baseUrl);
+      const slowReq = http.request({
+        hostname: parsedUrl.hostname,
+        port: Number(parsedUrl.port),
+        path: '/api/archive/import',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Vault-Key': slowUserKey,
+          'Transfer-Encoding': 'chunked',
+        },
+      });
+      slowReq.on('error', () => {
+        // Expected ECONNRESET when test aborts the intentionally stalled upload
+      });
+      slowReq.write('{"saved_saved_media":[');
+      // Wait deterministically for the server to admit slowReq before issuing concurrent probes
+      let slowAdmitTimer: NodeJS.Timeout | undefined;
+      const slowAdmitOutcome = await Promise.race([
+        slowUploadAdmittedPromise.then(() => 'admitted' as const),
+        new Promise<'timeout'>((res) => {
+          slowAdmitTimer = setTimeout(() => res('timeout'), 2000);
+        }),
+      ]);
+      if (slowAdmitTimer) clearTimeout(slowAdmitTimer);
+      assert.equal(slowAdmitOutcome, 'admitted', 'Slow upload request must be admitted before sending concurrent requests');
+
+      try {
+        // Same principal attempting a 2nd concurrent upload is rejected with 429
+        const dupSlowRes = await fetch(`${baseUrl}/api/archive/import`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Vault-Key': slowUserKey },
+          body: JSON.stringify(payload),
+        });
+        assert.equal(dupSlowRes.status, 429, 'Same vault must not hold multiple concurrent upload slots');
+
+        // A different vault can still upload and complete its import cleanly while slowUserKey is mid-upload
+        const fastRes = await fetch(`${baseUrl}/api/archive/import`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Vault-Key': fastUserKey },
+          body: JSON.stringify(payload),
+        });
+        assert.equal(fastRes.status, 200, 'Another vault must not be blocked by a slow upload from a different vault');
+      } finally {
+        slowReq.destroy();
+        await new Promise((r) => setTimeout(r, 20));
+      }
+
+      // 7. Admin import continues to work cleanly into the unattributed admin vault
+      const adminRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': getAdminVaultKey() },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(adminRes.status, 200);
+      const adminBody = await adminRes.json();
+      assert.equal(adminBody.success, true);
+      assert.equal(adminBody.reelsImported, 2);
+
+      // 8. GET /api/reels/:shortcode/meta uses its own rate-limit bucket so heavy grid thumbnail hydration never starves /api/stats
+      const origFetchMeta = globalThis.fetch;
+      const origMetaProxy = process.env.METADATA_PROXY_URL;
+      delete process.env.METADATA_PROXY_URL;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.startsWith(baseUrl)) {
+          return origFetchMeta(input, init);
+        }
+        return new Response(
+          '<html><head>' +
+            '<meta property="og:url" content="https://www.instagram.com/u/reel/MetaRateIso1/" />' +
+            '<meta property="og:image" content="https://scontent.cdninstagram.com/v/cover.jpg" />' +
+            '</head></html>',
+          { status: 200 }
+        );
+      }) as typeof fetch;
+      try {
+        resetApiRateLimitersForTesting();
+        resetFeedMetaResolverStateForTests();
+        // Exhaust metaRateLimiter (all 120 requests must succeed across GET, HEAD, and percent-encoded shortcodes)
+        const probeUrls = [
+          { method: 'GET', url: `${baseUrl}/api/reels/MetaRateIso1/meta` },
+          { method: 'HEAD', url: `${baseUrl}/api/reels/MetaRateIso1/meta` },
+          { method: 'GET', url: `${baseUrl}/api/reels/Meta%5FRate1/meta` },
+        ];
+        for (let i = 0; i < 120; i++) {
+          const probe = probeUrls[i % probeUrls.length];
+          const r = await origFetchMeta(probe.url, { method: probe.method });
+          assert.equal(
+            r.status,
+            200,
+            `Dedicated metaRateLimiter must allow probe ${i + 1}/120 (${probe.method} ${probe.url})`
+          );
+        }
+
+        // Probe 121 (distinct GET) must hit dedicated metaRateLimiter with META_RATE_LIMITED
+        const overLimitRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta`, { method: 'GET' });
+        assert.equal(overLimitRes.status, 429, 'Dedicated metaRateLimiter must cap probe 121 at 429');
+        const overLimitBody = (await overLimitRes.json()) as { error?: string };
+        assert.equal(
+          overLimitBody.error,
+          'META_RATE_LIMITED',
+          'Metadata 429 must come specifically from dedicated metaRateLimiter'
+        );
+
+        // Core vault API endpoints must still have full untouched quota (119 remaining after 1 call)
+        const statsRes = await origFetchMeta(`${baseUrl}/api/stats`, {
+          headers: { 'X-Vault-Key': userAKey },
+        });
+        assert.equal(statsRes.status, 200, 'Core /api/stats must not be rate-limited by /meta thumbnail hydration');
+        assert.equal(
+          statsRes.headers.get('ratelimit-remaining'),
+          '119',
+          'Supported GET/HEAD/encoded /meta probes must not consume any core apiRateLimiter quota'
+        );
+
+        // Trailing-slash /meta/ must NOT bypass vaultAuthMiddleware or apiRateLimiter
+        const trailingSlashRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta/`);
+        assert.equal(trailingSlashRes.status, 401, 'Trailing-slash /meta/ must not bypass vaultAuthMiddleware');
+
+        // Non-string refresh query parameter must be rejected with HTTP 400
+        resetApiRateLimitersForTesting();
+        const invalidRefreshRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta?refresh[]=1`);
+        assert.equal(invalidRefreshRes.status, 400, 'Non-string refresh query parameter must return HTTP 400');
+
+        // ?refresh=1 bypasses cached metadata and responds with Cache-Control: no-store
+        const refreshRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta?refresh=1`);
+        assert.equal(refreshRes.status, 200);
+        assert.equal(refreshRes.headers.get('cache-control'), 'no-store');
+      } finally {
+        globalThis.fetch = origFetchMeta;
+        if (origMetaProxy === undefined) delete process.env.METADATA_PROXY_URL;
+        else process.env.METADATA_PROXY_URL = origMetaProxy;
+        resetFeedMetaResolverStateForTests();
+      }
+    });
+  } finally {
+    Repository.resetMemoryStoreForTests();
+    Repository.resetDeletionTimestampsForTesting();
+    resetApiRateLimitersForTesting();
+    clearIdempotencyStoreForTesting();
+    if (origEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = origEnv;
+    if (origVaultSecret === undefined) delete process.env.VAULT_SECRET;
+    else process.env.VAULT_SECRET = origVaultSecret;
+    if (origSupabaseUrl === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = origSupabaseUrl;
+    if (origSupabaseKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = origSupabaseKey;
+  }
+});
+
+test('Archive Import - rejects non-JSON media types with 415, enforces bounded execution deadline, and sanitizes batch DB errors', async () => {
+  const origEnv = process.env.NODE_ENV;
+  const origVaultSecret = process.env.VAULT_SECRET;
+  const origSupabaseUrl = process.env.SUPABASE_URL;
+  const origSupabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  process.env.NODE_ENV = 'test';
+  process.env.VAULT_SECRET = 'archive-hardening-secret-key';
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  Repository.resetMemoryStoreForTests();
+  Repository.resetDeletionTimestampsForTesting();
+  resetApiRateLimitersForTesting();
+  clearIdempotencyStoreForTesting();
+
+  let preParseHits = 0;
+  const app = createApp({
+    archiveImportExecutionTimeoutMs: 120,
+    onArchiveImportPreParse: () => {
+      preParseHits++;
+    },
+  });
+
+  const payload = {
+    saved_saved_media: [
+      {
+        title: 'hardening_creator',
+        string_map_data: {
+          'Saved on': {
+            href: 'https://www.instagram.com/reel/HardenReel01/',
+            timestamp: 1710000000,
+          },
+        },
+      },
+    ],
+  };
+
+  const user1Key = generateUserVaultKey('user_harden_1');
+  const user2Key = generateUserVaultKey('user_harden_2');
+  const user3Key = generateUserVaultKey('user_harden_3');
+  const origUpsertBatch = Repository.upsertSavedReelsBatch;
+
+  try {
+    await withServer(app, async (baseUrl) => {
+      // 1. Non-JSON Content-Type (and suffix types not parsed by express.json) rejected with sanitized 415 BEFORE admission
+      const textPlainRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain', 'X-Vault-Key': user1Key },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(textPlainRes.status, 415, 'text/plain archive import must return HTTP 415');
+      const vndJsonRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/vnd.archive+json', 'X-Vault-Key': user1Key },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(vndJsonRes.status, 415, 'application/vnd.archive+json must return HTTP 415 to match express.json');
+      assert.equal(preParseHits, 0, 'Unsupported media type must be rejected before admission/scheduler');
+
+      // 2. Stalled DB work hits execution deadline -> 504, cancels work, releases slot only after abort settles
+      let stalledAborted = false;
+      let stallOnce = true;
+      Repository.upsertSavedReelsBatch = (async (reels, opts) => {
+        if (stallOnce) {
+          stallOnce = false;
+          await new Promise<void>((resolve, reject) => {
+            if (opts?.signal?.aborted) {
+              stalledAborted = true;
+              resolve();
+              return;
+            }
+            const watchdog = setTimeout(
+              () => reject(new Error('Expected archive execution abort signal never arrived')),
+              3000
+            );
+            opts?.signal?.addEventListener(
+              'abort',
+              () => {
+                clearTimeout(watchdog);
+                stalledAborted = true;
+                resolve();
+              },
+              { once: true }
+            );
+          });
+        }
+        return origUpsertBatch.call(Repository, reels, opts);
+      }) as typeof Repository.upsertSavedReelsBatch;
+
+      const timedOutRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': user1Key },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(timedOutRes.status, 504, 'Stalled archive import must time out with HTTP 504');
+      assert.equal(stalledAborted, true, 'Execution deadline must signal abort to active DB work before releasing slot');
+
+      // Next vault must immediately succeed once the timed-out import settles and releases its slot
+      const followUpRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': user2Key },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(followUpRes.status, 200, 'Follow-up vault import must succeed after timed-out import releases slot');
+
+      // 3. Batch DB error must be sanitized and never leak internal Postgres table/column details
+      Repository.upsertSavedReelsBatch = (async () => {
+        throw new Error('Failed to query existing shortcodes: relation "saved_reels" column "internal_secret_col" does not exist');
+      }) as typeof Repository.upsertSavedReelsBatch;
+
+      const errRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': user3Key },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(errRes.status, 500);
+      const errBody = await errRes.json();
+      const serialized = JSON.stringify(errBody);
+      assert.equal(serialized.includes('saved_reels'), false, 'Response must not leak internal table names');
+      assert.equal(serialized.includes('internal_secret_col'), false, 'Response must not leak internal column names');
+
+      // 4. Partial import result must NOT be cached by Idempotency-Key so retries can recover failed items
+      let partialAttempts = 0;
+      Repository.upsertSavedReelsBatch = (async (reels, opts) => {
+        partialAttempts++;
+        if (partialAttempts === 1) {
+          return {
+            newlyImported: 1,
+            alreadyPresent: 0,
+            savedAtBackfilled: 0,
+            promotedToSaved: 0,
+            failedCount: 1,
+            failedShortcodes: ['HardenReel01'],
+          };
+        }
+        return origUpsertBatch.call(Repository, reels, opts);
+      }) as typeof Repository.upsertSavedReelsBatch;
+
+      const partialIdemKey = 'idem-partial-retry-001';
+      const firstPartialRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Vault-Key': user3Key,
+          'Idempotency-Key': partialIdemKey,
+        },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(firstPartialRes.status, 200);
+      const firstPartialBody = (await firstPartialRes.json()) as { status?: string };
+      assert.equal(firstPartialBody.status, 'partial');
+
+      const retryPartialRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Vault-Key': user3Key,
+          'Idempotency-Key': partialIdemKey,
+        },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(retryPartialRes.status, 200);
+      const retryPartialBody = (await retryPartialRes.json()) as { status?: string };
+      assert.equal(retryPartialBody.status, 'success', 'Retry after partial import must execute instead of replaying partial');
+      assert.equal(partialAttempts, 2, 'Partial result must not be cached by idempotencyMiddleware');
+    });
+  } finally {
+    Repository.upsertSavedReelsBatch = origUpsertBatch;
+    Repository.resetMemoryStoreForTests();
+    Repository.resetDeletionTimestampsForTesting();
+    resetApiRateLimitersForTesting();
+    clearIdempotencyStoreForTesting();
+    if (origEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = origEnv;
+    if (origVaultSecret === undefined) delete process.env.VAULT_SECRET;
+    else process.env.VAULT_SECRET = origVaultSecret;
+    if (origSupabaseUrl === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = origSupabaseUrl;
+    if (origSupabaseKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = origSupabaseKey;
   }
 });

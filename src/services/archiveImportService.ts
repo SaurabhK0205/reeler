@@ -1,4 +1,4 @@
-import { Repository } from '../db/repository.ts';
+import { ArchiveImportTimeoutError, Repository, SenderDeletionBarrierError } from '../db/repository.ts';
 import type { Creator, SavedMediaType } from '../types.ts';
 import { formatCanonicalInstagramUrl, parseCanonicalInstagramMediaUrl } from '../utils/mediaType.ts';
 
@@ -61,8 +61,29 @@ export class ArchiveImportService {
    *
    * @param input Raw parsed JSON object, array, or JSON string from Instagram data download
    * @param senderId Optional Instagram sender ID to associate imported reels with
+   * @param expectedDeletionGeneration Optional sender deletion generation captured at upload admission
    */
-  static async importArchive(input: unknown, senderId?: string): Promise<ArchiveImportResult> {
+  static async importArchive(
+    input: unknown,
+    senderId?: string,
+    expectedDeletionGeneration?: number,
+    signal?: AbortSignal
+  ): Promise<ArchiveImportResult> {
+    if (signal?.aborted) {
+      throw signal.reason instanceof ArchiveImportTimeoutError ? signal.reason : new ArchiveImportTimeoutError();
+    }
+    const scopedSenderId = typeof senderId === 'string' && senderId.trim() ? senderId.trim() : undefined;
+    if (
+      scopedSenderId &&
+      (Repository.isSenderInRecentDeletion(scopedSenderId) ||
+        (expectedDeletionGeneration !== undefined &&
+          Repository.getSenderDeletionGeneration(scopedSenderId) !== expectedDeletionGeneration))
+    ) {
+      throw new SenderDeletionBarrierError(scopedSenderId);
+    }
+    const admissionDeletionGeneration = scopedSenderId
+      ? expectedDeletionGeneration ?? Repository.getSenderDeletionGeneration(scopedSenderId)
+      : undefined;
     let data = input;
     if (typeof input === 'string') {
       try {
@@ -335,27 +356,55 @@ export class ArchiveImportService {
 
     for (const c of parsedCandidates) {
       if (!creatorsToUpsert.has(c.creatorHandle)) {
+        // Keep user-supplied archive Owner names out of shared creator records; create placeholders for user imports
+        const safeDisplayName = scopedSenderId
+          ? null
+          : c.creatorDisplayName || (c.creatorHandle !== UNKNOWN_CREATOR_HANDLE ? c.creatorHandle : null);
         creatorsToUpsert.set(c.creatorHandle, {
           instagram_user_id: `creator_${c.creatorHandle}`,
           username: c.creatorHandle,
-          display_name: c.creatorDisplayName || (c.creatorHandle !== UNKNOWN_CREATOR_HANDLE ? c.creatorHandle : null),
+          display_name: safeDisplayName,
         });
       }
     }
 
     if (parsedCandidates.length > 0) {
       try {
-        // Batch upsert creators
-        const creatorMap = await Repository.upsertCreatorsBatch(Array.from(creatorsToUpsert.values()));
+        // Batch upsert creators (preserve existing shared creator metadata for non-admin user imports)
+        const creatorMap = await Repository.upsertCreatorsBatch(Array.from(creatorsToUpsert.values()), {
+          preserveExisting: Boolean(scopedSenderId),
+          signal,
+        });
 
         const fallbackCreator = creatorMap.get(UNKNOWN_CREATOR_HANDLE);
         if (!fallbackCreator) {
-          const createdFallback = await Repository.upsertCreator({
-            instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
-            username: UNKNOWN_CREATOR_HANDLE,
-            display_name: null,
-          });
-          creatorMap.set(UNKNOWN_CREATOR_HANDLE, createdFallback);
+          if (scopedSenderId) {
+            // Preserve shared creator metadata for scoped user imports: never merge null display_name
+            const fallbackMap = await Repository.upsertCreatorsBatch(
+              [
+                {
+                  instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
+                  username: UNKNOWN_CREATOR_HANDLE,
+                  display_name: null,
+                },
+              ],
+              { preserveExisting: true, signal }
+            );
+            const resolvedFallback = fallbackMap.get(UNKNOWN_CREATOR_HANDLE);
+            if (resolvedFallback) {
+              creatorMap.set(UNKNOWN_CREATOR_HANDLE, resolvedFallback);
+            }
+          } else {
+            const createdFallback = await Repository.upsertCreator(
+              {
+                instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
+                username: UNKNOWN_CREATOR_HANDLE,
+                display_name: null,
+              },
+              { signal }
+            );
+            creatorMap.set(UNKNOWN_CREATOR_HANDLE, createdFallback);
+          }
         }
 
         // Prepare reels payload with resolved creator IDs
@@ -377,7 +426,7 @@ export class ArchiveImportService {
         }> = [];
 
         for (const c of parsedCandidates) {
-          const scopedMediaId = senderId ? `export_${senderId}_${c.shortcode}` : c.mediaId;
+          const scopedMediaId = scopedSenderId ? `user_export:${scopedSenderId}:${c.shortcode}` : c.mediaId;
           if (c.creatorHandle !== UNKNOWN_CREATOR_HANDLE) {
             const creator = creatorMap.get(c.creatorHandle);
             if (!creator?.id) {
@@ -399,7 +448,7 @@ export class ArchiveImportService {
               save_order_rank: c.rank,
               watch_status: 'unwatched',
               is_saved_on_instagram: true,
-              instagram_sender_id: senderId || null,
+              instagram_sender_id: scopedSenderId || null,
             });
           } else {
             const fallback = creatorMap.get(UNKNOWN_CREATOR_HANDLE) || fallbackCreator;
@@ -418,7 +467,7 @@ export class ArchiveImportService {
                 save_order_rank: c.rank,
                 watch_status: 'unwatched',
                 is_saved_on_instagram: true,
-                instagram_sender_id: senderId || null,
+                instagram_sender_id: scopedSenderId || null,
               });
             } else {
               errors.push(`Failed to resolve fallback unattributed creator for reel ${c.shortcode}`);
@@ -431,6 +480,8 @@ export class ArchiveImportService {
         const batchResult = await Repository.upsertSavedReelsBatch(reelsPayload, {
           ignoreDuplicates: true,
           backfillMissingSavedAt: true,
+          expectedDeletionGeneration: admissionDeletionGeneration,
+          signal,
         });
         reelsImported = batchResult.newlyImported;
         alreadyPresent = batchResult.alreadyPresent;
@@ -443,8 +494,11 @@ export class ArchiveImportService {
           }
         }
       } catch (batchErr: any) {
-        console.error('[ArchiveImport] Batch import error, attempting recovery:', batchErr.message);
-        errors.push(`Batch import error: ${batchErr.message || 'unknown error'}`);
+        if (batchErr instanceof SenderDeletionBarrierError || batchErr instanceof ArchiveImportTimeoutError) {
+          throw batchErr;
+        }
+        console.error('[ArchiveImport] Batch import error, attempting recovery:', batchErr?.message || batchErr);
+        errors.push('Failed to import archive batch due to a temporary storage error. Please try again.');
       }
     }
 

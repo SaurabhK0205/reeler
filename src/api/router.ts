@@ -1,6 +1,6 @@
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
-import { Repository, SenderDeletionBarrierError } from '../db/repository.ts';
+import { ArchiveImportTimeoutError, Repository, SenderDeletionBarrierError } from '../db/repository.ts';
 import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
@@ -21,6 +21,23 @@ import type { ReelQueryFilters, WatchStatus, DateFilterPreset, SavedMediaType, S
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const SAFE_REEL_ID_RE = /^[\x21-\x7E]{1,128}$/;
+const REEL_META_SEGMENT_RE = /^\/reels\/([^/]+)\/meta$/;
+
+/**
+ * Identifies canonical GET/HEAD metadata probe requests (matching Express's decoded shortcode routing
+ * and vaultAuthMiddleware's exact non-trailing-slash exemption) so they use only metaRateLimiter.
+ */
+function isSupportedReelMetaRequest(req: Request): boolean {
+  const method = req.method.toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD') return false;
+  const match = REEL_META_SEGMENT_RE.exec(req.path || '');
+  if (!match) return false;
+  try {
+    return isValidShortcode(decodeURIComponent(match[1]));
+  } catch {
+    return false;
+  }
+}
 
 const apiRateLimiter = createRateLimiter({
   windowMs: 60 * 1000,
@@ -28,7 +45,18 @@ const apiRateLimiter = createRateLimiter({
   maxTrackedKeys: 5000,
   errorCode: 'API_RATE_LIMITED',
   message: 'Too many requests. Please slow down and try again shortly.',
-  skip: (req) => req.path === '/health' || req.path.startsWith('/instagram/webhook'),
+  skip: (req) =>
+    req.path === '/health' ||
+    req.path.startsWith('/instagram/webhook') ||
+    isSupportedReelMetaRequest(req),
+});
+
+const metaRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 120,
+  maxTrackedKeys: 5000,
+  errorCode: 'META_RATE_LIMITED',
+  message: 'Too many thumbnail metadata requests. Please retry shortly.',
 });
 
 const mutationRateLimiter = createRateLimiter({
@@ -53,6 +81,7 @@ const mutationRateLimiter = createRateLimiter({
 
 export function resetApiRateLimitersForTesting(): void {
   apiRateLimiter.resetForTesting();
+  metaRateLimiter.resetForTesting();
   mutationRateLimiter.resetForTesting();
 }
 
@@ -309,7 +338,7 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
  * Resolves live media kind and cover aspect ratio for an Instagram shortcode with disconnect cancellation
  * and bounded upstream concurrency.
  */
-apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
+apiRouter.get('/reels/:shortcode/meta', metaRateLimiter.middleware, async (req: Request, res: Response) => {
   const controller = new AbortController();
   res.on('close', () => {
     if (!res.writableEnded) {
@@ -331,12 +360,34 @@ apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
         : rawTypeHint === 'reel'
           ? 'reel'
           : undefined;
+    const rawRefresh = req.query.refresh;
+    if (rawRefresh !== undefined && typeof rawRefresh !== 'string') {
+      res.status(400).json({ error: 'Invalid refresh query parameter' });
+      return;
+    }
+    const rawThumb = req.query.thumb;
+    if (rawThumb !== undefined && typeof rawThumb !== 'string') {
+      res.status(400).json({ error: 'Invalid thumb query parameter' });
+      return;
+    }
+    const bypassCache = rawRefresh === '1';
+    const requireThumbnail = rawThumb === '1';
 
-    const meta = await resolveFeedMediaMetadata(shortcode, controller.signal, preferredPath);
+    const meta = await resolveFeedMediaMetadata(
+      shortcode,
+      controller.signal,
+      preferredPath,
+      bypassCache,
+      requireThumbnail
+    );
     if (controller.signal.aborted || res.writableEnded) {
       return;
     }
-    res.setHeader('Cache-Control', feedMetaCacheControl(meta));
+    const cacheControl =
+      bypassCache || (requireThumbnail && !meta.thumbnailUrl)
+        ? 'no-store'
+        : feedMetaCacheControl(meta);
+    res.setHeader('Cache-Control', cacheControl);
     res.json(meta);
   } catch (error: any) {
     if (controller.signal.aborted || res.writableEnded) {
@@ -348,7 +399,11 @@ apiRouter.get('/reels/:shortcode/meta', async (req: Request, res: Response) => {
       return;
     }
     if (error?.code === 'RATE_LIMITED') {
-      res.setHeader('Retry-After', '5');
+      const retryAfterSec =
+        typeof error?.retryAfterMs === 'number' && Number.isFinite(error.retryAfterMs)
+          ? Math.max(1, Math.ceil(error.retryAfterMs / 1000))
+          : 5;
+      res.setHeader('Retry-After', String(retryAfterSec));
       res.status(429).json({ error: 'Too many metadata requests, please retry shortly' });
       return;
     }
@@ -390,16 +445,39 @@ apiRouter.patch('/reels/:id/status', async (req: Request, res: Response) => {
 });
 
 /**
- * Imports an official Instagram `saved_posts.json` archive export into the repository.
+ * Imports an official Instagram `saved_posts.json` archive export into the authenticated user's vault
+ * (or the unattributed admin vault for administrator sessions).
  */
 apiRouter.post('/archive/import', async (req: Request, res: Response) => {
   setResponseHeader(res, 'Cache-Control', 'no-store');
-  if (req.vaultUser?.role !== 'admin') {
+  const vaultUser = req.vaultUser;
+  if (!vaultUser || (vaultUser.role !== 'admin' && !vaultUser.senderId)) {
     (req as any).releaseImportSlot?.();
-    res.status(403).json({ success: false, error: 'Only the vault administrator can import archive files.' });
+    res.status(403).json({ success: false, error: 'An authenticated vault session is required to import archive files.' });
     return;
   }
+  const targetSenderId = vaultUser.role === 'admin' ? undefined : vaultUser.senderId;
   (req as any).markHandlerStarted?.();
+  const executionSignal = (req as any).archiveExecutionSignal as AbortSignal | undefined;
+  const sendExecutionTimeoutResponse = () => {
+    if (!res.writableEnded) {
+      if (!res.locals) (res as any).locals = {};
+      res.locals.skipIdempotencyCache = true;
+      res.status(504).json({
+        success: false,
+        error: 'Archive import timed out before completion. Please retry.',
+      });
+    }
+  };
+  if (executionSignal) {
+    if (executionSignal.aborted) {
+      sendExecutionTimeoutResponse();
+      (req as any).clearArchiveExecutionTimer?.();
+      (req as any).releaseImportSlot?.();
+      return;
+    }
+    executionSignal.addEventListener('abort', sendExecutionTimeoutResponse, { once: true });
+  }
   try {
     const rawData = req.body;
     if (!rawData) {
@@ -407,7 +485,19 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await ArchiveImportService.importArchive(rawData);
+    const admissionDeletionGeneration =
+      typeof (req as any).archiveAdmissionDeletionGeneration === 'number'
+        ? (req as any).archiveAdmissionDeletionGeneration
+        : undefined;
+    const result = await ArchiveImportService.importArchive(
+      rawData,
+      targetSenderId,
+      admissionDeletionGeneration,
+      executionSignal
+    );
+    if (res.writableEnded) {
+      return;
+    }
     if (result.status === 'too_large') {
       res.status(413).json({ success: false, ...result });
       return;
@@ -417,15 +507,42 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
       return;
     }
     if (result.status === 'failed') {
+      if (!res.locals) (res as any).locals = {};
+      res.locals.skipIdempotencyCache = true;
       res.status(500).json({ success: false, ...result });
       return;
+    }
+    if (result.status === 'partial') {
+      if (!res.locals) (res as any).locals = {};
+      res.locals.skipIdempotencyCache = true;
     }
 
     res.status(200).json({ success: true, ...result });
   } catch (error: any) {
+    if (error instanceof ArchiveImportTimeoutError) {
+      sendExecutionTimeoutResponse();
+      return;
+    }
+    if (error instanceof SenderDeletionBarrierError) {
+      if (!res.locals) (res as any).locals = {};
+      res.locals.skipIdempotencyCache = true;
+      if (!res.writableEnded) {
+        res.status(409).json({
+          success: false,
+          error: 'Account data deletion is currently in progress. Please try importing again shortly.',
+        });
+      }
+      return;
+    }
     console.error('[ArchiveImport] Unexpected error in /archive/import endpoint:', error);
-    res.status(500).json({ success: false, error: 'An unexpected internal error occurred during archive import.' });
+    if (!res.writableEnded) {
+      res.status(500).json({ success: false, error: 'An unexpected internal error occurred during archive import.' });
+    }
   } finally {
+    if (executionSignal) {
+      executionSignal.removeEventListener('abort', sendExecutionTimeoutResponse);
+    }
+    (req as any).clearArchiveExecutionTimer?.();
     (req as any).releaseImportSlot?.();
   }
 });
@@ -473,6 +590,8 @@ apiRouter.patch('/user/timezone', async (req: Request, res: Response, next: Next
     await Repository.setSenderTimezone(preferenceKey, resolved);
   } catch (error) {
     if (error instanceof SenderDeletionBarrierError) {
+      if (!res.locals) (res as any).locals = {};
+      res.locals.skipIdempotencyCache = true;
       res.status(409).json({ error: 'DELETION_IN_PROGRESS', message: error.message });
       return;
     }

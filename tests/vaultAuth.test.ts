@@ -661,6 +661,188 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
   );
 
   // 4. HTML cache-busting query versions stay aligned
-  assert.ok(html.includes('style.css?v=4.7'), 'index.html must reference style.css?v=4.7');
-  assert.ok(html.includes('app.js?v=4.7'), 'index.html must reference app.js?v=4.7');
+  assert.ok(html.includes('style.css?v=4.8'), 'index.html must reference style.css?v=4.8');
+  assert.ok(html.includes('app.js?v=4.8'), 'index.html must reference app.js?v=4.8');
+
+  // 5. Emil Kowalski + Benji Taylor motion craft invariants hold
+  assert.ok(css.includes('--ease-out: cubic-bezier(0.23, 1, 0.32, 1);'), 'style.css must define custom --ease-out token');
+  const easeInTransitionRe = /transition(?:-timing-function)?\s*:[^;}]*(?:^|[\s:,])ease-in(?=$|[\s,;}])/;
+  assert.doesNotMatch(
+    css,
+    easeInTransitionRe,
+    'style.css must not use sluggish ease-in on UI transitions (ease-in-out remains permitted)'
+  );
+  assert.match('.test { transition: opacity 120ms ease-in}', easeInTransitionRe);
+  assert.match('.test { transition-timing-function: ease-in; }', easeInTransitionRe);
+  assert.doesNotMatch('.test { transition: opacity 120ms ease-in-out}', easeInTransitionRe);
+  assert.doesNotMatch('.test { transition-timing-function: ease-in-out; }', easeInTransitionRe);
+
+  /**
+   * Extracts effective CSS transition property names across all rules whose selector subject
+   * matches a given class selector, applying per-rule declaration precedence and expanding
+   * omitted shorthand properties to `all`.
+   */
+  const extractEffectiveTransitionProperties = (stylesheet: string, targetClass: string): string[] => {
+    const props: string[] = [];
+    const cleaned = stylesheet.replace(/\/\*[\s\S]*?\*\//g, '');
+    const ruleRe = /([^{}@]+)\{([^{}]+)\}/g;
+
+    const extractSubjectCompound = (selector: string): string => {
+      let depth = 0;
+      let lastCombinatorIdx = -1;
+      for (let i = 0; i < selector.length; i++) {
+        const ch = selector[i];
+        if (ch === '[' || ch === '(') depth++;
+        else if (ch === ']' || ch === ')') depth = Math.max(0, depth - 1);
+        else if (depth === 0 && (ch === ' ' || ch === '\t' || ch === '\n' || ch === '>' || ch === '+' || ch === '~')) {
+          lastCombinatorIdx = i;
+        }
+      }
+      return selector.slice(lastCombinatorIdx + 1).trim();
+    };
+
+    const subjectHasClass = (selector: string, className: string): boolean => {
+      const subject = extractSubjectCompound(selector);
+      const classes = subject.match(/\.[a-zA-Z_-][a-zA-Z0-9_-]*/g) || [];
+      return classes.includes(className);
+    };
+
+    let match: RegExpExecArray | null;
+    while ((match = ruleRe.exec(cleaned)) !== null) {
+      const selectors = match[1].split(',').map((s) => s.trim());
+      if (!selectors.some((sel) => subjectHasClass(sel, targetClass))) continue;
+      const decls = match[2].split(';');
+      let ruleProps: string[] | null = null;
+      let rulePropsImportant = false;
+      for (const decl of decls) {
+        const colonIdx = decl.indexOf(':');
+        if (colonIdx === -1) continue;
+        const propName = decl.slice(0, colonIdx).trim().toLowerCase();
+        if (propName !== 'transition' && propName !== 'transition-property') continue;
+        const rawDeclVal = decl.slice(colonIdx + 1);
+        const isImportant = /!important\b/i.test(rawDeclVal);
+        if (rulePropsImportant && !isImportant) continue;
+        const rawValue = rawDeclVal.replace(/!important\b/gi, '').trim();
+        if (!rawValue) continue;
+        if (propName === 'transition-property') {
+          const parsed = rawValue
+            .split(',')
+            .map((item) => item.trim().toLowerCase())
+            .filter(Boolean);
+          if (parsed.length > 0) {
+            ruleProps = parsed;
+            rulePropsImportant = isImportant;
+          }
+        } else {
+          const items: string[] = [];
+          let depth = 0;
+          let buf = '';
+          for (const ch of rawValue) {
+            if (ch === '(') depth++;
+            else if (ch === ')') depth = Math.max(0, depth - 1);
+            if (ch === ',' && depth === 0) {
+              items.push(buf.trim());
+              buf = '';
+            } else {
+              buf += ch;
+            }
+          }
+          if (buf.trim()) items.push(buf.trim());
+          const parsed: string[] = [];
+          for (const item of items) {
+            const stripped = item
+              .replace(/[a-z-]+\([^)]*\)/gi, ' ')
+              .replace(/\b\d*\.?\d+(?:m?s)\b/gi, ' ')
+              .trim();
+            const tokens = stripped
+              .split(/\s+/)
+              .map((t) => t.toLowerCase())
+              .filter(
+                (t) =>
+                  t &&
+                  ![
+                    'ease',
+                    'ease-in',
+                    'ease-out',
+                    'ease-in-out',
+                    'linear',
+                    'step-start',
+                    'step-end',
+                    'normal',
+                    'allow-discrete',
+                  ].includes(t)
+              );
+            parsed.push(tokens[0] || 'all');
+          }
+          if (parsed.length > 0) {
+            ruleProps = parsed;
+            rulePropsImportant = isImportant;
+          }
+        }
+      }
+      if (ruleProps) {
+        props.push(...ruleProps);
+      }
+    }
+    return props;
+  };
+
+  const forbiddenViewportProps = new Set(['width', 'height', 'all']);
+  const viewportTransitionProps = extractEffectiveTransitionProperties(css, '.reel-media-viewport');
+  assert.ok(
+    viewportTransitionProps.every((p) => !forbiddenViewportProps.has(p)),
+    `.reel-media-viewport must not animate width/height/all (found: ${viewportTransitionProps.join(', ')})`
+  );
+  assert.deepEqual(
+    extractEffectiveTransitionProperties('.reel-media-viewport { transition: 120ms linear; }', '.reel-media-viewport'),
+    ['all'],
+    'Shorthand transition without explicit property must resolve to implicit all'
+  );
+  assert.deepEqual(
+    extractEffectiveTransitionProperties(
+      '.reel-media-viewport { transition: 120ms linear; transition-property: opacity; }',
+      '.reel-media-viewport'
+    ),
+    ['opacity'],
+    'Explicit transition-property declaration must override preceding shorthand transition property in the same rule'
+  );
+  assert.deepEqual(
+    extractEffectiveTransitionProperties(
+      '.reel-media-viewport { transition: opacity 0.12s linear; }',
+      '.reel-media-viewport'
+    ),
+    ['opacity'],
+    'Opacity-only transition on .reel-media-viewport must remain permitted'
+  );
+  assert.deepEqual(
+    extractEffectiveTransitionProperties(
+      '.active.reel-media-viewport { transition: width 120ms linear; }',
+      '.reel-media-viewport'
+    ),
+    ['width'],
+    'Compound subject selector .active.reel-media-viewport must be checked'
+  );
+  assert.deepEqual(
+    extractEffectiveTransitionProperties(
+      '.reel-media-viewport .reel-poster-underlay { transition: width 120ms linear; }',
+      '.reel-media-viewport'
+    ),
+    [],
+    'Descendant selector targeting child element must not be treated as a viewport rule'
+  );
+  assert.match(
+    css,
+    /\.shortcuts-popover\s*\{[^}]*transform-origin\s*:\s*top right\s*;/,
+    '.shortcuts-popover must scale from top right trigger origin'
+  );
+  assert.match(
+    reducedMotionBlock,
+    /\.shortcuts-popover[\s\S]*?animation\s*:\s*none\s*;/,
+    'Reduced-motion block must disable .shortcuts-popover animation'
+  );
+
+  // 6. Lazy grid thumbnail hydration is wired cleanly in app.js
+  assert.ok(js.includes('function observeGridCardsForThumbnails()'), 'app.js must wire lazy viewport grid thumbnail hydration');
+  assert.ok(js.includes('function resetGridThumbnailHydration()'), 'app.js must cancel stale grid thumbnail lookups on navigation/reset');
+  assert.ok(js.includes('MAX_GRID_THUMB_CONCURRENCY'), 'app.js must bound concurrent grid thumbnail lookups');
 });
