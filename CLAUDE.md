@@ -39,7 +39,7 @@ Last updated: November 18, 2026
      1. Push your topic branch: `git push -u origin <branch-name>`.
      2. Open a Pull Request into `staging`, pass tests + CodeRabbit review, and merge into `staging`.
      3. Verify the change live on the deployed `staging` environment (`reeler-staging`).
-     4. Only after everything is verified healthy on `staging`, open a promotion PR from `staging` -> `main` (regular merge, preserving shared history) to release to production.
+     4. Only after everything is verified healthy on `staging`, open a promotion PR from `staging` -> `main` (regular merge, preserving shared history) to release to production. The promotion PR head commit MUST be the exact commit verified on `reeler-staging`; if any new commit lands on `staging` before merge, re-verify the updated head on `reeler-staging` before merging into `main`.
      5. Never merge a feature/fix branch directly into `main` bypassing `staging`.
 7. **CodeRabbit Review Gate (MANDATORY & BLOCKING)**:
    - When opening a Pull Request, **NEVER merge immediately**.
@@ -60,9 +60,10 @@ Last updated: November 18, 2026
 ## 2. Pre-Session Rule
 
 Before writing any code or executing commands:
-1. **Branch Check**: Run `git branch --show-current`. If you are on `main` or `staging`, immediately checkout a new topic branch off `staging`:
+1. **Branch Check**: Run `git branch --show-current`. If you are on `main` or `staging`, fetch `origin` and immediately checkout a new topic branch off `origin/staging`:
    ```bash
-   git checkout -b <type>/<descriptive-name> staging
+   git fetch origin
+   git checkout -b <type>/<descriptive-name> origin/staging
    ```
 2. **Environment & Secrets Check**: Run `git status` to ensure `.env` and local credentials remain untracked.
 3. **Running Tasks Check**: Check if the Node server (port 3000) and Cloudflare tunnel are active before restarting them.
