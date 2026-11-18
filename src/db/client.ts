@@ -3,6 +3,19 @@ import { loadConfig } from '../config.ts';
 
 let supabaseClient: SupabaseClient | null = null;
 
+/**
+ * Hard per-request fetch timeout (30s, exceeding PostgREST/Postgres statement timeouts) so a dead
+ * transport socket cannot hold archive execution slots or deletion barriers indefinitely while still
+ * allowing dispatched writes to receive server-side commit/rollback confirmation.
+ */
+const SUPABASE_FETCH_TIMEOUT_MS = 30_000;
+
+const boundedSupabaseFetch: typeof fetch = (input, init) => {
+  const timeoutSignal = AbortSignal.timeout(SUPABASE_FETCH_TIMEOUT_MS);
+  const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+  return fetch(input, { ...init, signal });
+};
+
 export function getSupabase(): SupabaseClient {
   if (supabaseClient) {
     return supabaseClient;
@@ -19,6 +32,9 @@ export function getSupabase(): SupabaseClient {
     auth: {
       persistSession: false,
       autoRefreshToken: false,
+    },
+    global: {
+      fetch: boundedSupabaseFetch,
     },
   });
 

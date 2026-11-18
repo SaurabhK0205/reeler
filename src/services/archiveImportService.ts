@@ -378,15 +378,33 @@ export class ArchiveImportService {
 
         const fallbackCreator = creatorMap.get(UNKNOWN_CREATOR_HANDLE);
         if (!fallbackCreator) {
-          const createdFallback = await Repository.upsertCreator(
-            {
-              instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
-              username: UNKNOWN_CREATOR_HANDLE,
-              display_name: null,
-            },
-            { signal }
-          );
-          creatorMap.set(UNKNOWN_CREATOR_HANDLE, createdFallback);
+          if (scopedSenderId) {
+            // Preserve shared creator metadata for scoped user imports: never merge null display_name
+            const fallbackMap = await Repository.upsertCreatorsBatch(
+              [
+                {
+                  instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
+                  username: UNKNOWN_CREATOR_HANDLE,
+                  display_name: null,
+                },
+              ],
+              { preserveExisting: true, signal }
+            );
+            const resolvedFallback = fallbackMap.get(UNKNOWN_CREATOR_HANDLE);
+            if (resolvedFallback) {
+              creatorMap.set(UNKNOWN_CREATOR_HANDLE, resolvedFallback);
+            }
+          } else {
+            const createdFallback = await Repository.upsertCreator(
+              {
+                instagram_user_id: `creator_${UNKNOWN_CREATOR_HANDLE}`,
+                username: UNKNOWN_CREATOR_HANDLE,
+                display_name: null,
+              },
+              { signal }
+            );
+            creatorMap.set(UNKNOWN_CREATOR_HANDLE, createdFallback);
+          }
         }
 
         // Prepare reels payload with resolved creator IDs

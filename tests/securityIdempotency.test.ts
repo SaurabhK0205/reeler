@@ -1949,15 +1949,20 @@ test('Archive Import - rejects non-JSON media types with 415, enforces bounded e
       Repository.upsertSavedReelsBatch = (async (reels, opts) => {
         if (stallOnce) {
           stallOnce = false;
-          await new Promise<void>((resolve) => {
+          await new Promise<void>((resolve, reject) => {
             if (opts?.signal?.aborted) {
               stalledAborted = true;
               resolve();
               return;
             }
+            const watchdog = setTimeout(
+              () => reject(new Error('Expected archive execution abort signal never arrived')),
+              3000
+            );
             opts?.signal?.addEventListener(
               'abort',
               () => {
+                clearTimeout(watchdog);
                 stalledAborted = true;
                 resolve();
               },
