@@ -82,8 +82,12 @@ function consumeUpstreamResolveBudget(): void {
     upstreamResolveTimestamps.shift();
   }
   if (upstreamResolveTimestamps.length >= MAX_UPSTREAM_RESOLVES_PER_MINUTE) {
-    const budgetErr = new Error('Metadata resolver upstream rate budget reached') as Error & { code?: string };
+    const budgetErr = new Error('Metadata resolver upstream rate budget reached') as Error & {
+      code?: string;
+      retryAfterMs?: number;
+    };
     budgetErr.code = 'RATE_LIMITED';
+    budgetErr.retryAfterMs = Math.max(1000, upstreamResolveTimestamps[0] + UPSTREAM_BUDGET_WINDOW_MS - Date.now());
     throw budgetErr;
   }
   upstreamResolveTimestamps.push(Date.now());
@@ -966,7 +970,8 @@ export function feedMetaCacheControl(meta: FeedMediaMetadata): string {
 export async function resolveFeedMediaMetadata(
   shortcode: string,
   signal?: AbortSignal,
-  preferredPath?: 'reel' | 'p'
+  preferredPath?: 'reel' | 'p',
+  bypassCache = false
 ): Promise<FeedMediaMetadata> {
   if (!isValidShortcode(shortcode)) {
     throw new Error('Invalid shortcode format');
@@ -976,17 +981,20 @@ export async function resolveFeedMediaMetadata(
   }
 
   const now = Date.now();
-  const cached = feedMetaCache.get(shortcode);
-  if (cached && cached.expiresAt > now) {
-    return cached.value;
-  }
-  if (cached) {
-    feedMetaCache.delete(shortcode);
+  if (!bypassCache) {
+    const cached = feedMetaCache.get(shortcode);
+    if (cached && cached.expiresAt > now) {
+      return cached.value;
+    }
+    if (cached) {
+      feedMetaCache.delete(shortcode);
+    }
   }
 
-  let entry = feedMetaInFlight.get(shortcode);
+  const inFlightKey = bypassCache ? `refresh:${shortcode}` : shortcode;
+  let entry = feedMetaInFlight.get(inFlightKey);
   if (entry?.controller.signal.aborted) {
-    feedMetaInFlight.delete(shortcode);
+    feedMetaInFlight.delete(inFlightKey);
     entry = undefined;
   }
   if (!entry) {
@@ -1034,10 +1042,10 @@ export async function resolveFeedMediaMetadata(
     })();
 
     entry = { promise, controller, waiters: 0 };
-    feedMetaInFlight.set(shortcode, entry);
+    feedMetaInFlight.set(inFlightKey, entry);
     promise.finally(() => {
-      if (feedMetaInFlight.get(shortcode) === entry) {
-        feedMetaInFlight.delete(shortcode);
+      if (feedMetaInFlight.get(inFlightKey) === entry) {
+        feedMetaInFlight.delete(inFlightKey);
       }
     }).catch(() => {});
   }

@@ -599,6 +599,7 @@ function resetVaultSessionState() {
   resetGridThumbnailHydration();
   gridThumbUnavailableShortcodes.clear();
   gridThumbRefreshedExpired.clear();
+  gridThumbReplacedUrls.clear();
   if (fetchReelsAbortController) {
     fetchReelsAbortController.abort();
     fetchReelsAbortController = null;
@@ -2116,11 +2117,14 @@ function renderReels() {
     const rawCaption = cleanCaption || 'No caption provided';
     const safeCaption = escapeHtml(rawCaption);
     const rankNum = (rangeStart + idx).toLocaleString();
-    const cachedMetaThumb = reel.shortcode ? sanitizeMediaUrl(state.metaCache.get(reel.shortcode)?.thumbnailUrl) : null;
     const rawCleanThumbnail = sanitizeMediaUrl(reel.thumbnail_url);
-    const cleanThumbnail = (rawCleanThumbnail && !isPlaceholderMediaUrl(rawCleanThumbnail))
-      ? rawCleanThumbnail
-      : ((cachedMetaThumb && !isPlaceholderMediaUrl(cachedMetaThumb)) ? cachedMetaThumb : null);
+    const replacedStoredThumb = rawCleanThumbnail ? sanitizeMediaUrl(gridThumbReplacedUrls.get(rawCleanThumbnail)) : null;
+    const cachedMetaThumb = reel.shortcode ? sanitizeMediaUrl(state.metaCache.get(reel.shortcode)?.thumbnailUrl) : null;
+    const cleanThumbnail = (replacedStoredThumb && !isPlaceholderMediaUrl(replacedStoredThumb))
+      ? replacedStoredThumb
+      : ((rawCleanThumbnail && !isPlaceholderMediaUrl(rawCleanThumbnail))
+        ? rawCleanThumbnail
+        : ((cachedMetaThumb && !isPlaceholderMediaUrl(cachedMetaThumb)) ? cachedMetaThumb : null));
     const hasRealThumbnail = Boolean(cleanThumbnail);
     const thumbMeta = ReelerGeometry.parseThumbMeta(cleanThumbnail);
     const posterAltText = creatorInfo.isAttributedName
@@ -2269,13 +2273,24 @@ function renderReels() {
         card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
         // One-shot refresh when a previously cached or DB-stored Instagram CDN URL expires
         const sc = reel.shortcode ? String(reel.shortcode).trim() : '';
-        if (sc && !gridThumbRefreshedExpired.has(sc) && !gridThumbUnavailableShortcodes.has(sc)) {
-          gridThumbRefreshedExpired.add(sc);
+        if (
+          sc &&
+          !gridThumbRefreshedExpired.has(sc) &&
+          !gridThumbPendingRefresh.has(sc) &&
+          !isGridThumbUnavailable(sc)
+        ) {
+          gridThumbPendingRefresh.add(sc);
           const cachedMeta = state.metaCache.get(sc);
           if (cachedMeta && sanitizeMediaUrl(cachedMeta.thumbnailUrl) === cleanThumbnail) {
             state.metaCache.delete(sc);
           }
-          registerGridCardForThumbnailHydration(card, reel, posterAltText, isPost);
+          if (rawCleanThumbnail && gridThumbReplacedUrls.get(rawCleanThumbnail) === cleanThumbnail) {
+            gridThumbReplacedUrls.delete(rawCleanThumbnail);
+          }
+          registerGridCardForThumbnailHydration(card, reel, posterAltText, isPost, {
+            bypassCache: true,
+            failedStoredUrl: rawCleanThumbnail || cleanThumbnail,
+          });
         }
       }, { once: true });
 
@@ -2570,24 +2585,26 @@ const MAX_CLIENT_META_CACHE = 500;
 let lastMetaRateLimitUntil = 0;
 
 /**
- * Fetches server-side media kind & natural cover aspect ratio for a shortcode when DB thumbnail/efg is missing.
- * Deduplicates concurrent requests with ref-counted cancellation so aborting one caller never cancels another,
- * and caches non-empty resolutions in state.metaCache.
+ * Fetches server-side media kind & natural cover aspect ratio for a shortcode with structured status,
+ * ref-counted cancellation, optional cache bypass for expired-cover refreshes, and full Retry-After tracking.
  * @param {string} shortcode
  * @param {AbortSignal} [signal]
  * @param {'p' | 'reel'} [preferredType]
- * @returns {Promise<{ isClips: boolean | null, mediaKind: string, thumbAspectRatio: number | null, thumbnailUrl: string | null } | null>}
+ * @param {{ bypassCache?: boolean }} [options]
+ * @returns {Promise<{ status: 'ok' | 'rate_limited' | 'transient_error' | 'aborted', data: { isClips: boolean | null, mediaKind: string, thumbAspectRatio: number | null, thumbnailUrl: string | null } | null, retryAfterMs: number }>}
  */
-async function fetchShortcodeMeta(shortcode, signal, preferredType) {
-  if (!shortcode) return null;
-  if (signal?.aborted) return null;
-  if (state.metaCache.has(shortcode)) {
-    return state.metaCache.get(shortcode);
+async function fetchShortcodeMetaWithStatus(shortcode, signal, preferredType, options = {}) {
+  const bypassCache = Boolean(options?.bypassCache);
+  if (!shortcode) return { status: 'transient_error', data: null, retryAfterMs: 0 };
+  if (signal?.aborted) return { status: 'aborted', data: null, retryAfterMs: 0 };
+  if (!bypassCache && state.metaCache.has(shortcode)) {
+    return { status: 'ok', data: state.metaCache.get(shortcode), retryAfterMs: 0 };
   }
 
-  let entry = metaInFlightMap.get(shortcode);
+  const inFlightKey = bypassCache ? `refresh:${shortcode}` : shortcode;
+  let entry = metaInFlightMap.get(inFlightKey);
   if (entry?.controller.signal.aborted) {
-    metaInFlightMap.delete(shortcode);
+    metaInFlightMap.delete(inFlightKey);
     entry = undefined;
   }
 
@@ -2595,17 +2612,29 @@ async function fetchShortcodeMeta(shortcode, signal, preferredType) {
     const controller = new AbortController();
     const promise = (async () => {
       try {
-        const qs = preferredType === 'p' || preferredType === 'reel' ? `?type=${encodeURIComponent(preferredType)}` : '';
-        const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}/meta${qs}`, { signal: controller.signal });
+        const params = new URLSearchParams();
+        if (preferredType === 'p' || preferredType === 'reel') {
+          params.set('type', preferredType);
+        }
+        if (bypassCache) {
+          params.set('refresh', '1');
+        }
+        const qs = params.toString() ? `?${params.toString()}` : '';
+        const fetchOpts = bypassCache
+          ? { signal: controller.signal, cache: 'no-store' }
+          : { signal: controller.signal };
+        const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}/meta${qs}`, fetchOpts);
         if (res.status === 429) {
           const retryAfterHeader = Number(res.headers.get('retry-after'));
           const retryMs = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
-            ? Math.min(15000, Math.max(2000, retryAfterHeader * 1000))
+            ? Math.max(2000, retryAfterHeader * 1000)
             : 5000;
           lastMetaRateLimitUntil = Math.max(lastMetaRateLimitUntil, Date.now() + retryMs);
-          return null;
+          return { status: 'rate_limited', data: null, retryAfterMs: retryMs };
         }
-        if (!res.ok) return null;
+        if (!res.ok) {
+          return { status: 'transient_error', data: null, retryAfterMs: 0 };
+        }
         const data = await res.json();
         if (data && (data.thumbnailUrl !== null || data.isClips !== null)) {
           if (state.metaCache.size >= MAX_CLIENT_META_CACHE) {
@@ -2614,18 +2643,21 @@ async function fetchShortcodeMeta(shortcode, signal, preferredType) {
           }
           state.metaCache.set(shortcode, data);
         }
-        return data;
-      } catch (_) {
-        return null;
+        return { status: 'ok', data, retryAfterMs: 0 };
+      } catch (err) {
+        if (err?.name === 'AbortError' || controller.signal.aborted) {
+          return { status: 'aborted', data: null, retryAfterMs: 0 };
+        }
+        return { status: 'transient_error', data: null, retryAfterMs: 0 };
       } finally {
-        if (metaInFlightMap.get(shortcode) === entry) {
-          metaInFlightMap.delete(shortcode);
+        if (metaInFlightMap.get(inFlightKey) === entry) {
+          metaInFlightMap.delete(inFlightKey);
         }
       }
     })();
 
     entry = { promise, controller, waiters: 0 };
-    metaInFlightMap.set(shortcode, entry);
+    metaInFlightMap.set(inFlightKey, entry);
   }
 
   entry.waiters++;
@@ -2648,20 +2680,20 @@ async function fetchShortcodeMeta(shortcode, signal, preferredType) {
       return await entry.promise;
     }
     return await new Promise((resolve) => {
-      const onAbort = () => resolve(null);
+      const onAbort = () => resolve({ status: 'aborted', data: null, retryAfterMs: 0 });
       if (signal.aborted) {
-        resolve(null);
+        resolve({ status: 'aborted', data: null, retryAfterMs: 0 });
         return;
       }
       signal.addEventListener('abort', onAbort, { once: true });
       entry.promise.then(
-        (data) => {
+        (outcome) => {
           signal.removeEventListener('abort', onAbort);
-          resolve(signal.aborted ? null : data);
+          resolve(signal.aborted ? { status: 'aborted', data: null, retryAfterMs: 0 } : outcome);
         },
         () => {
           signal.removeEventListener('abort', onAbort);
-          resolve(null);
+          resolve({ status: 'transient_error', data: null, retryAfterMs: 0 });
         }
       );
     });
@@ -2676,12 +2708,26 @@ async function fetchShortcodeMeta(shortcode, signal, preferredType) {
   }
 }
 
+/**
+ * Fetches server-side media kind & natural cover aspect ratio for a shortcode when DB thumbnail/efg is missing.
+ * @param {string} shortcode
+ * @param {AbortSignal} [signal]
+ * @param {'p' | 'reel'} [preferredType]
+ * @returns {Promise<{ isClips: boolean | null, mediaKind: string, thumbAspectRatio: number | null, thumbnailUrl: string | null } | null>}
+ */
+async function fetchShortcodeMeta(shortcode, signal, preferredType) {
+  const outcome = await fetchShortcodeMetaWithStatus(shortcode, signal, preferredType);
+  return outcome.status === 'ok' ? outcome.data : null;
+}
+
 // ==============================================================================
 // LAZY VIEWPORT GRID THUMBNAIL HYDRATION (Archive-Imported & Expired Covers)
 // ==============================================================================
 
 const MAX_GRID_THUMB_CONCURRENCY = 3;
 const MAX_GRID_UNAVAILABLE_TRACKED = 500;
+const GRID_THUMB_UNAVAILABLE_TTL_MS = 60 * 1000;
+const MAX_GRID_REPLACED_TRACKED = 500;
 let gridThumbnailObserver = null;
 let gridThumbAbortController = null;
 let gridThumbGeneration = 0;
@@ -2690,8 +2736,10 @@ let gridThumbResumeTimer = null;
 const gridThumbQueue = [];
 let gridThumbQueuedCards = new WeakSet();
 const gridCardHydrationMap = new WeakMap();
-const gridThumbUnavailableShortcodes = new Set();
+const gridThumbUnavailableShortcodes = new Map();
+const gridThumbPendingRefresh = new Set();
 const gridThumbRefreshedExpired = new Set();
+const gridThumbReplacedUrls = new Map();
 
 /**
  * Cancels all in-flight and queued grid thumbnail hydrations (e.g. on page change, filter, or vault switch).
@@ -2712,20 +2760,51 @@ function resetGridThumbnailHydration() {
   }
   gridThumbQueue.length = 0;
   gridThumbQueuedCards = new WeakSet();
+  gridThumbPendingRefresh.clear();
   gridThumbActiveCount = 0;
 }
 
 /**
- * Tracks a shortcode whose cover metadata resolved empty or failed to load so we do not re-fetch it in this session.
+ * Returns true if a shortcode is currently within its negative-cache unavailable window.
+ * @param {string} shortcode
+ * @returns {boolean}
+ */
+function isGridThumbUnavailable(shortcode) {
+  if (!shortcode) return false;
+  const expiresAt = gridThumbUnavailableShortcodes.get(shortcode);
+  if (expiresAt === undefined) return false;
+  if (expiresAt <= Date.now()) {
+    gridThumbUnavailableShortcodes.delete(shortcode);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Tracks a shortcode whose cover metadata resolved empty or failed to load for the negative-cache window.
  * @param {string} shortcode
  */
 function markGridThumbUnavailable(shortcode) {
   if (!shortcode) return;
   if (gridThumbUnavailableShortcodes.size >= MAX_GRID_UNAVAILABLE_TRACKED) {
-    const oldest = gridThumbUnavailableShortcodes.values().next().value;
+    const oldest = gridThumbUnavailableShortcodes.keys().next().value;
     if (oldest) gridThumbUnavailableShortcodes.delete(oldest);
   }
-  gridThumbUnavailableShortcodes.add(shortcode);
+  gridThumbUnavailableShortcodes.set(shortcode, Date.now() + GRID_THUMB_UNAVAILABLE_TTL_MS);
+}
+
+/**
+ * Retains a verified replacement URL scoped to a failed stored URL so catalog reloads do not regress.
+ * @param {string | null | undefined} failedStoredUrl
+ * @param {string} replacementUrl
+ */
+function recordReplacedGridThumbUrl(failedStoredUrl, replacementUrl) {
+  if (!failedStoredUrl || !replacementUrl || failedStoredUrl === replacementUrl) return;
+  if (gridThumbReplacedUrls.size >= MAX_GRID_REPLACED_TRACKED) {
+    const oldest = gridThumbReplacedUrls.keys().next().value;
+    if (oldest) gridThumbReplacedUrls.delete(oldest);
+  }
+  gridThumbReplacedUrls.set(failedStoredUrl, replacementUrl);
 }
 
 /**
@@ -2734,24 +2813,38 @@ function markGridThumbUnavailable(shortcode) {
  * @param {object} reel
  * @param {string} altText
  * @param {boolean} isPost
+ * @param {{ bypassCache?: boolean, failedStoredUrl?: string | null }} [options]
  */
-function registerGridCardForThumbnailHydration(card, reel, altText, isPost) {
+function registerGridCardForThumbnailHydration(card, reel, altText, isPost, options = {}) {
   const shortcode = reel?.shortcode ? String(reel.shortcode).trim() : '';
-  if (!card || !shortcode || gridThumbUnavailableShortcodes.has(shortcode)) return;
-  gridCardHydrationMap.set(card, { card, reel, shortcode, altText, isPost, retriedAfter429: false });
-  if (gridThumbnailObserver && state.viewMode === 'grid' && card.isConnected) {
+  if (!card || !shortcode || isGridThumbUnavailable(shortcode)) return;
+  gridCardHydrationMap.set(card, {
+    card,
+    reel,
+    shortcode,
+    altText,
+    isPost,
+    bypassCache: Boolean(options?.bypassCache),
+    failedStoredUrl: options?.failedStoredUrl || null,
+    retriedAfter429: false,
+    retriedAfterError: false,
+  });
+  if (state.viewMode !== 'grid' || !card.isConnected) return;
+  if (gridThumbnailObserver) {
     gridThumbnailObserver.observe(card);
+  } else {
+    observeGridCardsForThumbnails();
   }
 }
 
 /**
  * Applies a freshly resolved thumbnail URL to a grid poster card, keeping the monogram visible until the image paints.
- * @param {{ card: HTMLElement, reel: object, shortcode: string, altText: string, isPost: boolean }} entry
+ * @param {{ card: HTMLElement, reel: object, shortcode: string, altText: string, isPost: boolean, failedStoredUrl?: string | null }} entry
  * @param {{ thumbnailUrl?: string | null, isClips?: boolean | null }} meta
  * @param {number} generation
  */
 function applyHydratedGridThumbnail(entry, meta, generation) {
-  const { card, reel, shortcode, altText, isPost } = entry;
+  const { card, reel, shortcode, altText, isPost, failedStoredUrl } = entry;
   if (generation !== gridThumbGeneration || !card.isConnected) return;
   const cleanUrl = sanitizeMediaUrl(meta?.thumbnailUrl);
   if (!cleanUrl || isPlaceholderMediaUrl(cleanUrl)) {
@@ -2776,6 +2869,9 @@ function applyHydratedGridThumbnail(entry, meta, generation) {
     if (revealed || generation !== gridThumbGeneration || !card.isConnected) return;
     revealed = true;
     reel.thumbnail_url = cleanUrl;
+    if (failedStoredUrl) {
+      recordReplacedGridThumbUrl(failedStoredUrl, cleanUrl);
+    }
     if (!mediaBox.querySelector('.poster-top-scrim')) {
       const topScrim = document.createElement('div');
       topScrim.className = 'poster-top-scrim';
@@ -2805,11 +2901,10 @@ function applyHydratedGridThumbnail(entry, meta, generation) {
   img.addEventListener('load', revealLoadedCover, { once: true });
   img.addEventListener('error', () => {
     img.remove();
-    if (card.isConnected) {
-      card.classList.remove('has-thumbnail');
-      card.classList.add('is-monogram');
-      card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
-    }
+    if (generation !== gridThumbGeneration || !card.isConnected) return;
+    card.classList.remove('has-thumbnail');
+    card.classList.add('is-monogram');
+    card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
     markGridThumbUnavailable(shortcode);
   }, { once: true });
 
@@ -2855,28 +2950,49 @@ function drainGridThumbnailQueue() {
     if (!entry || !entry.card.isConnected || entry.card.classList.contains('has-thumbnail')) {
       continue;
     }
-    if (gridThumbUnavailableShortcodes.has(entry.shortcode)) {
+    if (isGridThumbUnavailable(entry.shortcode)) {
+      if (entry.bypassCache) {
+        gridThumbPendingRefresh.delete(entry.shortcode);
+      }
       continue;
     }
 
     gridThumbActiveCount++;
     const preferredType = entry.isPost ? 'p' : 'reel';
-    const beforeRateLimit = lastMetaRateLimitUntil;
 
-    fetchShortcodeMeta(entry.shortcode, signal, preferredType)
-      .then((meta) => {
-        if (generation !== gridThumbGeneration || signal.aborted) return;
-        if (meta && meta.thumbnailUrl) {
-          applyHydratedGridThumbnail(entry, meta, generation);
+    fetchShortcodeMetaWithStatus(entry.shortcode, signal, preferredType, { bypassCache: entry.bypassCache })
+      .then((outcome) => {
+        if (generation !== gridThumbGeneration || signal.aborted || outcome.status === 'aborted') return;
+        if (outcome.status === 'ok') {
+          if (entry.bypassCache) {
+            gridThumbPendingRefresh.delete(entry.shortcode);
+            gridThumbRefreshedExpired.add(entry.shortcode);
+          }
+          if (outcome.data && outcome.data.thumbnailUrl) {
+            applyHydratedGridThumbnail(entry, outcome.data, generation);
+          } else {
+            markGridThumbUnavailable(entry.shortcode);
+          }
           return;
         }
-        if (lastMetaRateLimitUntil > beforeRateLimit && !entry.retriedAfter429) {
-          entry.retriedAfter429 = true;
-          gridThumbQueue.unshift(entry);
+        if (outcome.status === 'rate_limited') {
+          if (!entry.retriedAfter429) {
+            entry.retriedAfter429 = true;
+            gridThumbQueue.unshift(entry);
+          } else if (entry.bypassCache) {
+            gridThumbPendingRefresh.delete(entry.shortcode);
+          }
           return;
         }
-        if (meta !== null) {
-          markGridThumbUnavailable(entry.shortcode);
+        // Transient non-429 error (e.g. 503/network blip): separate bounded retry without consuming 429 quota
+        if (!entry.retriedAfterError) {
+          entry.retriedAfterError = true;
+          gridThumbQueue.push(entry);
+        } else {
+          gridThumbQueuedCards.delete(entry.card);
+          if (entry.bypassCache) {
+            gridThumbPendingRefresh.delete(entry.shortcode);
+          }
         }
       })
       .finally(() => {
@@ -2895,7 +3011,7 @@ function observeGridCardsForThumbnails() {
   const cards = Array.from(reelsGrid.querySelectorAll('.vault-poster-card.is-monogram'));
   const pendingCards = cards.filter((card) => {
     const entry = gridCardHydrationMap.get(card);
-    return Boolean(entry && !gridThumbUnavailableShortcodes.has(entry.shortcode));
+    return Boolean(entry && !isGridThumbUnavailable(entry.shortcode));
   });
   if (pendingCards.length === 0) return;
 
@@ -2918,12 +3034,16 @@ function observeGridCardsForThumbnails() {
   if (gridThumbnailObserver) {
     gridThumbnailObserver.disconnect();
   }
-  gridThumbnailObserver = new IntersectionObserver((entries) => {
+  const obsGeneration = gridThumbGeneration;
+  gridThumbnailObserver = new IntersectionObserver((entries, obs) => {
+    if (obs !== gridThumbnailObserver || obsGeneration !== gridThumbGeneration || state.viewMode !== 'grid') {
+      return;
+    }
     let added = false;
     for (const obsEntry of entries) {
       if (!obsEntry.isIntersecting) continue;
       const card = obsEntry.target;
-      gridThumbnailObserver?.unobserve(card);
+      obs.unobserve(card);
       const data = gridCardHydrationMap.get(card);
       if (!data || gridThumbQueuedCards.has(card) || card.classList.contains('has-thumbnail')) {
         continue;

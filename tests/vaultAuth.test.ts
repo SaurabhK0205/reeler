@@ -666,10 +666,14 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
 
   // 5. Emil Kowalski + Benji Taylor motion craft invariants hold
   assert.ok(css.includes('--ease-out: cubic-bezier(0.23, 1, 0.32, 1);'), 'style.css must define custom --ease-out token');
-  assert.doesNotMatch(css, /transition\s*:[^;]*\bease-in\b/, 'style.css must not use sluggish ease-in on UI transitions');
   assert.doesNotMatch(
     css,
-    /\.reel-media-viewport\s*\{[^}]*transition\s*:[^}]*\b(width|height)\b/,
+    /transition\s*:[^;}]*(?:^|[\s,])ease-in(?=$|[\s,;])/,
+    'style.css must not use sluggish ease-in on UI transitions (ease-in-out remains permitted)'
+  );
+  assert.doesNotMatch(
+    css,
+    /\.reel-media-viewport\s*\{[^}]*transition\s*:[^;}]*\b(width|height)\b/,
     '.reel-media-viewport must not animate layout width/height'
   );
   assert.match(

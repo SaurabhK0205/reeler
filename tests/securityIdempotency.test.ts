@@ -1811,10 +1811,16 @@ test('Archive Import - authenticated vault users import into isolated sender vau
       try {
         resetApiRateLimitersForTesting();
         resetFeedMetaResolverStateForTests();
-        // Exhaust metaRateLimiter (120 requests) on a cached shortcode
+        // Exhaust metaRateLimiter (120 requests) across GET, HEAD, and percent-encoded shortcodes
         let sawMeta429 = false;
+        const probeUrls = [
+          { method: 'GET', url: `${baseUrl}/api/reels/MetaRateIso1/meta` },
+          { method: 'HEAD', url: `${baseUrl}/api/reels/MetaRateIso1/meta` },
+          { method: 'GET', url: `${baseUrl}/api/reels/Meta%5FRate1/meta` },
+        ];
         for (let i = 0; i < 121; i++) {
-          const r = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta`);
+          const probe = probeUrls[i % probeUrls.length];
+          const r = await origFetchMeta(probe.url, { method: probe.method });
           if (r.status === 429) {
             sawMeta429 = true;
             break;
@@ -1823,11 +1829,21 @@ test('Archive Import - authenticated vault users import into isolated sender vau
         }
         assert.equal(sawMeta429, true, 'Dedicated metaRateLimiter must cap excessive /meta calls at 120/min');
 
-        // Core vault API endpoints must still succeed (not starved by /meta bucket)
+        // Core vault API endpoints must still succeed (not starved by GET/HEAD/encoded /meta hydration)
         const statsRes = await origFetchMeta(`${baseUrl}/api/stats`, {
           headers: { 'X-Vault-Key': userAKey },
         });
         assert.equal(statsRes.status, 200, 'Core /api/stats must not be rate-limited by /meta thumbnail hydration');
+
+        // Trailing-slash /meta/ must NOT bypass vaultAuthMiddleware or apiRateLimiter
+        const trailingSlashRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta/`);
+        assert.equal(trailingSlashRes.status, 401, 'Trailing-slash /meta/ must not bypass vaultAuthMiddleware');
+
+        // ?refresh=1 bypasses cached metadata and responds with Cache-Control: no-store
+        resetApiRateLimitersForTesting();
+        const refreshRes = await origFetchMeta(`${baseUrl}/api/reels/MetaRateIso1/meta?refresh=1`);
+        assert.equal(refreshRes.status, 200);
+        assert.equal(refreshRes.headers.get('cache-control'), 'no-store');
       } finally {
         globalThis.fetch = origFetchMeta;
         if (origMetaProxy === undefined) delete process.env.METADATA_PROXY_URL;
