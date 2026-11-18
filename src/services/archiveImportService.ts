@@ -67,6 +67,9 @@ export class ArchiveImportService {
     if (scopedSenderId && Repository.isSenderInRecentDeletion(scopedSenderId)) {
       throw new SenderDeletionBarrierError(scopedSenderId);
     }
+    const admissionDeletionGeneration = scopedSenderId
+      ? Repository.getSenderDeletionGeneration(scopedSenderId)
+      : undefined;
     let data = input;
     if (typeof input === 'string') {
       try {
@@ -339,10 +342,14 @@ export class ArchiveImportService {
 
     for (const c of parsedCandidates) {
       if (!creatorsToUpsert.has(c.creatorHandle)) {
+        // Keep user-supplied archive Owner names out of shared creator records; create placeholders for user imports
+        const safeDisplayName = scopedSenderId
+          ? null
+          : c.creatorDisplayName || (c.creatorHandle !== UNKNOWN_CREATOR_HANDLE ? c.creatorHandle : null);
         creatorsToUpsert.set(c.creatorHandle, {
           instagram_user_id: `creator_${c.creatorHandle}`,
           username: c.creatorHandle,
-          display_name: c.creatorDisplayName || (c.creatorHandle !== UNKNOWN_CREATOR_HANDLE ? c.creatorHandle : null),
+          display_name: safeDisplayName,
         });
       }
     }
@@ -437,6 +444,7 @@ export class ArchiveImportService {
         const batchResult = await Repository.upsertSavedReelsBatch(reelsPayload, {
           ignoreDuplicates: true,
           backfillMissingSavedAt: true,
+          expectedDeletionGeneration: admissionDeletionGeneration,
         });
         reelsImported = batchResult.newlyImported;
         alreadyPresent = batchResult.alreadyPresent;

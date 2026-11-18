@@ -427,6 +427,8 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
     res.status(200).json({ success: true, ...result });
   } catch (error: any) {
     if (error instanceof SenderDeletionBarrierError) {
+      if (!res.locals) (res as any).locals = {};
+      res.locals.skipIdempotencyCache = true;
       res.status(409).json({
         success: false,
         error: 'Account data deletion is currently in progress. Please try importing again shortly.',
@@ -483,6 +485,8 @@ apiRouter.patch('/user/timezone', async (req: Request, res: Response, next: Next
     await Repository.setSenderTimezone(preferenceKey, resolved);
   } catch (error) {
     if (error instanceof SenderDeletionBarrierError) {
+      if (!res.locals) (res as any).locals = {};
+      res.locals.skipIdempotencyCache = true;
       res.status(409).json({ error: 'DELETION_IN_PROGRESS', message: error.message });
       return;
     }

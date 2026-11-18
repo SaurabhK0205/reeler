@@ -1475,6 +1475,41 @@ test('Archive Import - authenticated vault users import into isolated sender vau
         'Regular user archive import must not overwrite existing shared creator display_name'
       );
 
+      // 2b. Brand-new creator in regular user archive must not store user-supplied Owner.Name in shared creators
+      const brandNewCreatorRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': userAKey },
+        body: JSON.stringify({
+          saved_saved_media: [
+            {
+              label_values: [
+                { label: 'URL', href: 'https://www.instagram.com/reel/BrandNewCreator1/' },
+                {
+                  title: 'Owner',
+                  dict: [
+                    {
+                      dict: [
+                        { label: 'Username', value: 'brand_new_creator' },
+                        { label: 'Name', value: 'Untrusted Spoofed Name' },
+                      ],
+                    },
+                  ],
+                },
+              ],
+              timestamp: 1700000250,
+            },
+          ],
+        }),
+      });
+      assert.equal(brandNewCreatorRes.status, 200);
+      const brandNewCreator = (await Repository.getCreators()).find((c) => c.username === 'brand_new_creator');
+      assert.ok(brandNewCreator, 'Brand new creator placeholder should be created');
+      assert.equal(
+        brandNewCreator?.display_name,
+        null,
+        'User-supplied archive Owner.Name must not populate shared creator display_name'
+      );
+
       // User B sees 0 items before importing
       const userBReelsBefore = await (await fetch(`${baseUrl}/api/reels`, {
         headers: { 'X-Vault-Key': userBKey },
@@ -1540,11 +1575,16 @@ test('Archive Import - authenticated vault users import into isolated sender vau
       assert.equal(user123Reels.total, 1);
       assert.equal(user123Reels.reels[0].instagram_media_id, 'user_export:123:Clip');
 
-      // 5. Sender under active deletion barrier receives 409 and no rows are inserted
+      // 5. Sender under active deletion barrier receives 409, no rows are inserted, AND 409 is NOT cached by idempotency
       Repository.recordSenderDeletion('user_import_deleting');
+      const deletingIdemKey = 'archive-idem-deleting-retry-1';
       const deletingRes = await fetch(`${baseUrl}/api/archive/import`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Vault-Key': deletingKey },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Vault-Key': deletingKey,
+          'Idempotency-Key': deletingIdemKey,
+        },
         body: JSON.stringify(payload),
       });
       assert.equal(deletingRes.status, 409);
@@ -1554,55 +1594,156 @@ test('Archive Import - authenticated vault users import into isolated sender vau
       })).json();
       assert.equal(deletingReels.total, 0);
 
-      // 6. Concurrent deletion waits for in-flight archive batch writes so zero rows survive
+      // Once barrier clears, retrying with the SAME Idempotency-Key must succeed (not replay cached 409)
+      Repository.resetDeletionTimestampsForTesting();
+      const retryAfterBarrierRes = await fetch(`${baseUrl}/api/archive/import`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Vault-Key': deletingKey,
+          'Idempotency-Key': deletingIdemKey,
+        },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(retryAfterBarrierRes.status, 200, 'Deletion-barrier 409 must not be replayed from idempotency cache');
+      assert.equal(retryAfterBarrierRes.headers.get('idempotency-replayed'), null);
+
+      // 6a. Real deferred-promise race test: deleteUserDataForSender waits for in-flight memory write, fulfills, and leaves 0 rows
       const raceSender = 'user_import_race_del';
-      const origWait = Repository.waitForInFlightReelWrites;
-      let sawInFlightWrite = false;
-      Repository.waitForInFlightReelWrites = async (senderId: string) => {
-        if (senderId === raceSender) sawInFlightWrite = true;
-        return origWait.call(Repository, senderId);
-      };
+      await Repository.upsertSavedReel({
+        instagram_media_id: `dm_${raceSender}_PreExisting`,
+        shortcode: 'PreExisting',
+        reel_url: 'https://www.instagram.com/reel/PreExisting/',
+        media_type: 'reel',
+        creator_id: seedCreator.id,
+        taken_at: '2026-01-01T00:00:00.000Z',
+        saved_at: null,
+        first_detected_at: '2026-01-01T00:00:00.000Z',
+        save_order_rank: 1,
+        watch_status: 'unwatched',
+        is_saved_on_instagram: false,
+        instagram_sender_id: raceSender,
+      });
+
+      let enteredMemoryWrite!: () => void;
+      const enteredPromise = new Promise<void>((res) => { enteredMemoryWrite = res; });
+      let releaseMemoryWrite!: () => void;
+      const holdPromise = new Promise<void>((res) => { releaseMemoryWrite = res; });
+
+      const preDeletionGen = Repository.getSenderDeletionGeneration(raceSender);
+      const batchWritePromise = Repository.upsertSavedReelsBatch(
+        [
+          {
+            instagram_media_id: `user_export:${raceSender}:RaceClip1`,
+            shortcode: 'RaceClip1',
+            reel_url: 'https://www.instagram.com/reel/RaceClip1/',
+            media_type: 'reel',
+            creator_id: seedCreator.id,
+            taken_at: '2026-01-01T00:00:00.000Z',
+            saved_at: '2026-01-01T00:00:00.000Z',
+            first_detected_at: '2026-01-01T00:00:00.000Z',
+            save_order_rank: 2,
+            watch_status: 'unwatched',
+            is_saved_on_instagram: true,
+            instagram_sender_id: raceSender,
+          },
+        ],
+        {
+          ignoreDuplicates: true,
+          expectedDeletionGeneration: preDeletionGen,
+          onBeforeMemoryWriteForTesting: async () => {
+            enteredMemoryWrite();
+            await holdPromise;
+          },
+        }
+      );
+
+      await enteredPromise;
+      const deletePromise = Repository.deleteUserDataForSender(raceSender);
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Deletion must NOT have removed the pre-existing row while the in-flight archive write is still open
+      const whileHeld = await Repository.getReels({ instagramSenderId: raceSender, page: 1, limit: 20 });
+      assert.equal(whileHeld.total, 1, 'deleteUserDataForSender must wait for in-flight archive write before deleting rows');
+
+      releaseMemoryWrite();
+      const deletedCount = await deletePromise;
+      assert.ok(deletedCount >= 1, 'deleteUserDataForSender must fulfill and delete sender rows');
+      await Promise.allSettled([batchWritePromise]);
+
+      const surviving = await Repository.getReels({ instagramSenderId: raceSender, page: 1, limit: 20 });
+      assert.equal(surviving.total, 0, 'Zero sender rows may survive concurrent archive import + deletion');
+
+      // 6b. Stale admission deletion generation must reject even after the 60s cooldown map is cleared
+      const postDeletionGen = Repository.getSenderDeletionGeneration(raceSender);
+      assert.ok(postDeletionGen > preDeletionGen, 'Completed deletion must increment sender deletion generation');
+      (Repository as any).senderDeletionTimestamps.delete(raceSender);
+      await assert.rejects(
+        () =>
+          Repository.upsertSavedReelsBatch(
+            [
+              {
+                instagram_media_id: `user_export:${raceSender}:StaleGenClip`,
+                shortcode: 'StaleGenClip',
+                reel_url: 'https://www.instagram.com/reel/StaleGenClip/',
+                media_type: 'reel',
+                creator_id: seedCreator.id,
+                taken_at: '2026-01-01T00:00:00.000Z',
+                saved_at: '2026-01-01T00:00:00.000Z',
+                first_detected_at: '2026-01-01T00:00:00.000Z',
+                save_order_rank: 3,
+                watch_status: 'unwatched',
+                is_saved_on_instagram: true,
+                instagram_sender_id: raceSender,
+              },
+            ],
+            { ignoreDuplicates: true, expectedDeletionGeneration: preDeletionGen }
+          ),
+        /deletion barrier/i,
+        'Stale deletion generation from pre-deletion admission must be rejected even after 60s window expires'
+      );
+
+      // 6c. Slow upload by one vault must NOT block another vault's archive import, while same vault gets 429
+      const slowUserKey = generateUserVaultKey('user_slow_upload');
+      const fastUserKey = generateUserVaultKey('user_fast_upload');
+      const parsedUrl = new URL(baseUrl);
+      const slowReq = http.request({
+        hostname: parsedUrl.hostname,
+        port: Number(parsedUrl.port),
+        path: '/api/archive/import',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Vault-Key': slowUserKey,
+          'Transfer-Encoding': 'chunked',
+        },
+      });
+      slowReq.on('error', () => {
+        // Expected ECONNRESET when test aborts the intentionally stalled upload
+      });
+      slowReq.write('{"saved_saved_media":[');
+      // Give the server a tick to admit the slow upload and enter express.json body reading
+      await new Promise((r) => setTimeout(r, 30));
+
       try {
-        const batchWritePromise = Repository.upsertSavedReelsBatch(
-          [
-            {
-              instagram_media_id: `user_export:${raceSender}:RaceClip1`,
-              shortcode: 'RaceClip1',
-              reel_url: 'https://www.instagram.com/reel/RaceClip1/',
-              media_type: 'reel',
-              creator_id: seedCreator.id,
-              taken_at: '2026-01-01T00:00:00.000Z',
-              saved_at: '2026-01-01T00:00:00.000Z',
-              first_detected_at: '2026-01-01T00:00:00.000Z',
-              save_order_rank: 1,
-              watch_status: 'unwatched',
-              is_saved_on_instagram: true,
-              instagram_sender_id: raceSender,
-            },
-            {
-              instagram_media_id: `user_export:${raceSender}:RaceClip2`,
-              shortcode: 'RaceClip2',
-              reel_url: 'https://www.instagram.com/reel/RaceClip2/',
-              media_type: 'reel',
-              creator_id: seedCreator.id,
-              taken_at: '2026-01-01T00:00:00.000Z',
-              saved_at: '2026-01-01T00:00:00.000Z',
-              first_detected_at: '2026-01-01T00:00:00.000Z',
-              save_order_rank: 2,
-              watch_status: 'unwatched',
-              is_saved_on_instagram: true,
-              instagram_sender_id: raceSender,
-            },
-          ],
-          { ignoreDuplicates: true }
-        );
-        const deletePromise = Repository.deleteUserDataForSender(raceSender);
-        await Promise.allSettled([batchWritePromise, deletePromise]);
-        assert.equal(sawInFlightWrite, true, 'deleteUserDataForSender must coordinate with waitForInFlightReelWrites');
-        const surviving = await Repository.getReels({ instagramSenderId: raceSender, page: 1, limit: 20 });
-        assert.equal(surviving.total, 0, 'Zero sender rows may survive concurrent archive import + deletion');
+        // Same principal attempting a 2nd concurrent upload is rejected with 429
+        const dupSlowRes = await fetch(`${baseUrl}/api/archive/import`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Vault-Key': slowUserKey },
+          body: JSON.stringify(payload),
+        });
+        assert.equal(dupSlowRes.status, 429, 'Same vault must not hold multiple concurrent upload slots');
+
+        // A different vault can still upload and complete its import cleanly while slowUserKey is mid-upload
+        const fastRes = await fetch(`${baseUrl}/api/archive/import`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Vault-Key': fastUserKey },
+          body: JSON.stringify(payload),
+        });
+        assert.equal(fastRes.status, 200, 'Another vault must not be blocked by a slow upload from a different vault');
       } finally {
-        Repository.waitForInFlightReelWrites = origWait;
+        slowReq.destroy();
+        await new Promise((r) => setTimeout(r, 20));
       }
 
       // 7. Admin import continues to work cleanly into the unattributed admin vault
