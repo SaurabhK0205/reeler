@@ -418,8 +418,33 @@ class InMemoryStore {
           continue;
         }
 
+        if (options?.ignoreDuplicates) {
+          // Detect incompatible-owner media ID collision (matches Supabase owner-scoped reconciliation)
+          let foreignOwnerCollision = false;
+          for (const existingReel of this.reels.values()) {
+            const rowSender = existingReel.instagram_sender_id
+              ? String(existingReel.instagram_sender_id).trim() || null
+              : null;
+            if (existingReel.instagram_media_id === r.instagram_media_id && rowSender !== incomingSender) {
+              foreignOwnerCollision = true;
+              break;
+            }
+          }
+          if (foreignOwnerCollision) {
+            failedCount++;
+            failedShortcodes.push(r.shortcode);
+            continue;
+          }
+        }
+
+        const countBefore = this.reels.size;
         await this.upsertSavedReel(r, { ignoreDuplicates: options?.ignoreDuplicates, skipReturn: true });
-        newlyImported++;
+        if (this.reels.size > countBefore || !options?.ignoreDuplicates) {
+          newlyImported++;
+        } else {
+          failedCount++;
+          failedShortcodes.push(r.shortcode);
+        }
       } catch (err: any) {
         if (err instanceof SenderDeletionBarrierError || err instanceof ArchiveImportTimeoutError) {
           throw err;
@@ -1340,10 +1365,16 @@ export class Repository {
       const failedShortcodes: string[] = [];
 
       let reelsToInsert = reels;
+      type ReconcileRow = {
+        id: string;
+        instagram_media_id: string;
+        saved_at: string | null;
+        is_saved_on_instagram: boolean;
+      };
       const updatesById = new Map<
         string,
         {
-          id: string;
+          row: ReconcileRow;
           shortcode: string;
           promoteToSaved: boolean;
           saved_at?: string;
@@ -1432,7 +1463,12 @@ export class Repository {
             );
             if (shouldPromote || shouldBackfill) {
               const prev = updatesById.get(existing.id) || {
-                id: existing.id,
+                row: {
+                  id: existing.id,
+                  instagram_media_id: existing.instagram_media_id,
+                  saved_at: existing.saved_at,
+                  is_saved_on_instagram: existing.is_saved_on_instagram,
+                },
                 shortcode: r.shortcode,
                 promoteToSaved: false,
               };
@@ -1452,9 +1488,130 @@ export class Repository {
         reelsToInsert = freshReels;
       }
 
+      /**
+       * Applies archive promotion and/or CAS-guarded saved_at backfill to a matched row.
+       * Dispatched write queries are awaited to server-side completion (not aborted client-side)
+       * so the sender-deletion barrier cannot release while PostgreSQL may still commit a write.
+       */
+      const applyArchiveRowUpgradeWithCas = async (
+        initialRow: ReconcileRow,
+        item: {
+          shortcode: string;
+          is_saved_on_instagram?: boolean;
+          saved_at?: string | null;
+          save_order_rank?: number;
+        }
+      ): Promise<{ ok: boolean; promoted: boolean; backfilled: boolean }> => {
+        let currentRow: ReconcileRow = initialRow;
+        let promoted = false;
+        let backfilled = false;
+        let completed = false;
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+          assertNoActiveDeletion();
+          assertImportNotAborted(signal);
+          const shouldPromote = item.is_saved_on_instagram !== false && currentRow.is_saved_on_instagram === false;
+          const shouldBackfill = Boolean(
+            options?.backfillMissingSavedAt && item.saved_at && shouldBackfillSavedAt(currentRow, item.saved_at)
+          );
+          if (!shouldPromote && !shouldBackfill) {
+            completed = true;
+            break;
+          }
+
+          const payload: Record<string, any> = {
+            updated_at: new Date().toISOString(),
+          };
+          if (shouldPromote) {
+            payload.is_saved_on_instagram = true;
+          }
+          if (shouldBackfill && item.saved_at) {
+            payload.saved_at = item.saved_at;
+            if (item.save_order_rank !== undefined) {
+              payload.save_order_rank = item.save_order_rank;
+            }
+          }
+
+          const isPromoteOnly = shouldPromote && !shouldBackfill;
+          if (isPromoteOnly) {
+            const { data: updatedRows, error: updateErr } = await supabase
+              .from('saved_reels')
+              .update(payload)
+              .eq('id', currentRow.id)
+              .eq('is_saved_on_instagram', false)
+              .select('id');
+            assertImportNotAborted(signal);
+            if (updateErr) {
+              throw new Error(`Failed to promote archive reel: ${updateErr.message}`);
+            }
+            if ((updatedRows?.length ?? 0) > 0) {
+              promoted = true;
+            }
+            completed = true;
+            break;
+          }
+
+          let conditionalUpdate = supabase
+            .from('saved_reels')
+            .update(payload)
+            .eq('id', currentRow.id);
+          conditionalUpdate =
+            currentRow.saved_at === null
+              ? conditionalUpdate.is('saved_at', null)
+              : conditionalUpdate.eq('saved_at', currentRow.saved_at);
+
+          const { data: updatedRows, error: updateErr } = await conditionalUpdate.select('id');
+          assertImportNotAborted(signal);
+          if (updateErr) {
+            throw new Error(`Failed to backfill archive reel: ${updateErr.message}`);
+          }
+          if ((updatedRows?.length ?? 0) > 0) {
+            if (shouldPromote) promoted = true;
+            if (shouldBackfill) backfilled = true;
+            completed = true;
+            break;
+          }
+
+          // Observed saved_at changed concurrently: re-read current row and re-evaluate backfill/promotion
+          const { data: refreshed, error: refreshErr } = await applyAbortSignal(
+            supabase
+              .from('saved_reels')
+              .select('id, instagram_media_id, saved_at, is_saved_on_instagram')
+              .eq('id', currentRow.id)
+              .maybeSingle(),
+            signal
+          );
+          assertImportNotAborted(signal);
+          if (refreshErr) {
+            throw new Error(`Failed to re-read archive reel during CAS retry: ${refreshErr.message}`);
+          }
+          if (!refreshed) {
+            return { ok: false, promoted: false, backfilled: false };
+          }
+          currentRow = {
+            id: String(refreshed.id),
+            instagram_media_id: String(refreshed.instagram_media_id),
+            saved_at: refreshed.saved_at ? String(refreshed.saved_at) : null,
+            is_saved_on_instagram: refreshed.is_saved_on_instagram !== false,
+          };
+        }
+
+        if (!completed) {
+          const stillNeedsPromote =
+            item.is_saved_on_instagram !== false && currentRow.is_saved_on_instagram === false;
+          const stillNeedsBackfill = Boolean(
+            options?.backfillMissingSavedAt && item.saved_at && shouldBackfillSavedAt(currentRow, item.saved_at)
+          );
+          if (stillNeedsPromote || stillNeedsBackfill) {
+            throw new Error('Concurrent modification prevented archive backfill');
+          }
+        }
+
+        return { ok: true, promoted, backfilled };
+      };
+
       if (updatesById.size > 0) {
         const upgradeItems = Array.from(updatesById.values());
-        const upgradeNow = new Date().toISOString();
         const BACKFILL_CONCURRENCY = 20;
         for (let i = 0; i < upgradeItems.length; i += BACKFILL_CONCURRENCY) {
           assertNoActiveDeletion();
@@ -1462,48 +1619,35 @@ export class Repository {
           const slice = upgradeItems.slice(i, i + BACKFILL_CONCURRENCY);
           const results = await Promise.all(
             slice.map(async (item) => {
-              const payload: Record<string, any> = {
-                updated_at: upgradeNow,
-              };
-              if (item.promoteToSaved) {
-                payload.is_saved_on_instagram = true;
+              try {
+                const outcome = await applyArchiveRowUpgradeWithCas(item.row, {
+                  shortcode: item.shortcode,
+                  is_saved_on_instagram: item.promoteToSaved ? true : false,
+                  saved_at: item.saved_at ?? null,
+                  save_order_rank: item.save_order_rank,
+                });
+                return { item, outcome, error: null as Error | null };
+              } catch (err: any) {
+                return { item, outcome: null, error: err };
               }
-              if (item.saved_at) {
-                payload.saved_at = item.saved_at;
-                payload.save_order_rank = item.save_order_rank;
-              }
-              const isPromoteOnly = item.promoteToSaved && !item.saved_at;
-              if (isPromoteOnly) {
-                const { data: updatedRows, error: updateErr } = await applyAbortSignal(
-                  supabase
-                    .from('saved_reels')
-                    .update(payload)
-                    .eq('id', item.id)
-                    .eq('is_saved_on_instagram', false)
-                    .select('id'),
-                  signal
-                );
-                return { item, isPromoteOnly, updatedCount: updatedRows?.length ?? 0, error: updateErr };
-              }
-              const { error: updateErr } = await applyAbortSignal(
-                supabase
-                  .from('saved_reels')
-                  .update(payload)
-                  .eq('id', item.id),
-                signal
-              );
-              return { item, isPromoteOnly, updatedCount: 1, error: updateErr };
             })
           );
+          for (const { error } of results) {
+            if (error instanceof SenderDeletionBarrierError || error instanceof ArchiveImportTimeoutError) {
+              throw error;
+            }
+          }
           assertImportNotAborted(signal);
-          for (const { item, isPromoteOnly, updatedCount, error: updateErr } of results) {
-            if (updateErr) {
-              console.error(`[Repository] Failed to update archive metadata for ${item.shortcode}:`, updateErr.message);
+          for (const { item, outcome, error: updateErr } of results) {
+            if (updateErr || !outcome?.ok) {
+              if (updateErr) {
+                console.error(`[Repository] Failed to update archive metadata for ${item.shortcode}:`, updateErr.message);
+              }
               failedCount++;
               failedShortcodes.push(item.shortcode);
-            } else if (!isPromoteOnly || updatedCount > 0) {
-              if (item.promoteToSaved) promotedToSaved++;
-              if (item.saved_at) savedAtBackfilled++;
+            } else {
+              if (outcome.promoted) promotedToSaved++;
+              if (outcome.backfilled) savedAtBackfilled++;
             }
           }
         }
@@ -1530,13 +1674,6 @@ export class Repository {
         assertImportNotAborted(signal);
         const incomingSender = item.instagram_sender_id ? String(item.instagram_sender_id).trim() || null : null;
 
-        type ReconcileRow = {
-          id: string;
-          instagram_media_id: string;
-          saved_at: string | null;
-          is_saved_on_instagram: boolean;
-        };
-
         let existingRow: ReconcileRow | null = null;
 
         const { data: byMedia, error: byMediaErr } = await applyAbortSignal(
@@ -1554,7 +1691,6 @@ export class Repository {
         if (byMedia) {
           const rowSender = byMedia.instagram_sender_id ? String(byMedia.instagram_sender_id).trim() || null : null;
           if (rowSender !== incomingSender) {
-            // Incompatible owner collision on instagram_media_id: never update or miscount a foreign row
             return false;
           }
           existingRow = {
@@ -1593,116 +1729,18 @@ export class Repository {
           return false;
         }
 
-        let currentRow: ReconcileRow = existingRow;
-        let reconciliationComplete = false;
-        for (let attempt = 0; attempt < 2; attempt++) {
-          const shouldPromote = item.is_saved_on_instagram !== false && currentRow.is_saved_on_instagram === false;
-          const shouldBackfill = Boolean(
-            options?.backfillMissingSavedAt && item.saved_at && shouldBackfillSavedAt(currentRow, item.saved_at)
-          );
-          if (!shouldPromote && !shouldBackfill) {
-            reconciliationComplete = true;
-            break;
-          }
-
-          const payload: Record<string, any> = {
-            updated_at: new Date().toISOString(),
-          };
-          if (shouldPromote) {
-            payload.is_saved_on_instagram = true;
-          }
-          if (shouldBackfill && item.saved_at) {
-            payload.saved_at = item.saved_at;
-            payload.save_order_rank = item.save_order_rank;
-          }
-
-          const isPromoteOnly = shouldPromote && !shouldBackfill;
-          if (isPromoteOnly) {
-            const { data: updatedRows, error: updateErr } = await applyAbortSignal(
-              supabase
-                .from('saved_reels')
-                .update(payload)
-                .eq('id', currentRow.id)
-                .eq('is_saved_on_instagram', false)
-                .select('id'),
-              signal
-            );
-            assertImportNotAborted(signal);
-            if (updateErr) {
-              throw new Error(`Failed to promote conflicting archive reel: ${updateErr.message}`);
-            }
-            if ((updatedRows?.length ?? 0) > 0) {
-              promotedToSaved++;
-            }
-            reconciliationComplete = true;
-            break;
-          }
-
-          // Guard saved_at backfill against concurrent changes since lookup (CAS on observed saved_at)
-          let conditionalUpdate = supabase
-            .from('saved_reels')
-            .update(payload)
-            .eq('id', currentRow.id);
-          conditionalUpdate =
-            currentRow.saved_at === null
-              ? conditionalUpdate.is('saved_at', null)
-              : conditionalUpdate.eq('saved_at', currentRow.saved_at);
-
-          const { data: updatedRows, error: updateErr } = await applyAbortSignal(
-            conditionalUpdate.select('id'),
-            signal
-          );
-          assertImportNotAborted(signal);
-          if (updateErr) {
-            throw new Error(`Failed to backfill conflicting archive reel: ${updateErr.message}`);
-          }
-          if ((updatedRows?.length ?? 0) > 0) {
-            if (shouldPromote) promotedToSaved++;
-            if (shouldBackfill) savedAtBackfilled++;
-            reconciliationComplete = true;
-            break;
-          }
-
-          // Observed saved_at changed concurrently: re-read current row and re-evaluate backfill/promotion
-          const { data: refreshed, error: refreshErr } = await applyAbortSignal(
-            supabase
-              .from('saved_reels')
-              .select('id, instagram_media_id, saved_at, is_saved_on_instagram')
-              .eq('id', currentRow.id)
-              .maybeSingle(),
-            signal
-          );
-          assertImportNotAborted(signal);
-          if (refreshErr) {
-            throw new Error(`Failed to re-read conflicting archive reel: ${refreshErr.message}`);
-          }
-          if (!refreshed) {
-            return false;
-          }
-          currentRow = {
-            id: String(refreshed.id),
-            instagram_media_id: String(refreshed.instagram_media_id),
-            saved_at: refreshed.saved_at ? String(refreshed.saved_at) : null,
-            is_saved_on_instagram: refreshed.is_saved_on_instagram !== false,
-          };
+        const outcome = await applyArchiveRowUpgradeWithCas(existingRow, item);
+        if (!outcome.ok) {
+          return false;
         }
-
-        if (!reconciliationComplete) {
-          const stillNeedsPromote =
-            item.is_saved_on_instagram !== false && currentRow.is_saved_on_instagram === false;
-          const stillNeedsBackfill = Boolean(
-            options?.backfillMissingSavedAt && item.saved_at && shouldBackfillSavedAt(currentRow, item.saved_at)
-          );
-          if (stillNeedsPromote || stillNeedsBackfill) {
-            throw new Error('Concurrent modification prevented archive reconciliation backfill');
-          }
-        }
-
+        if (outcome.promoted) promotedToSaved++;
+        if (outcome.backfilled) savedAtBackfilled++;
         alreadyPresent++;
         return true;
       };
 
       const CHUNK_SIZE = 300;
+      const SKIPPED_LOOKUP_BATCH_SIZE = 50;
       for (let i = 0; i < reelsToInsert.length; i += CHUNK_SIZE) {
         assertNoActiveDeletion();
         assertImportNotAborted(signal);
@@ -1732,13 +1770,12 @@ export class Repository {
           };
         });
 
-        const { data: insertedRows, error } = await applyAbortSignal(
-          supabase
-            .from('saved_reels')
-            .upsert(chunk, { onConflict: 'instagram_media_id', ignoreDuplicates: options?.ignoreDuplicates ?? false })
-            .select('id, instagram_media_id'),
-          signal
-        );
+        // Await dispatched write to server-side completion so the sender-deletion barrier cannot
+        // release while PostgreSQL is still executing an upsert; abort checks stop subsequent chunks.
+        const { data: insertedRows, error } = await supabase
+          .from('saved_reels')
+          .upsert(chunk, { onConflict: 'instagram_media_id', ignoreDuplicates: options?.ignoreDuplicates ?? false })
+          .select('id, instagram_media_id');
         assertImportNotAborted(signal);
 
         if (error) {
@@ -1747,14 +1784,11 @@ export class Repository {
             assertNoActiveDeletion();
             assertImportNotAborted(signal);
             try {
-              const { data: insertedSingle, error: singleErr } = await applyAbortSignal(
-                supabase
-                  .from('saved_reels')
-                  .upsert(item, { onConflict: 'instagram_media_id', ignoreDuplicates: options?.ignoreDuplicates ?? false })
-                  .select('id')
-                  .maybeSingle(),
-                signal
-              );
+              const { data: insertedSingle, error: singleErr } = await supabase
+                .from('saved_reels')
+                .upsert(item, { onConflict: 'instagram_media_id', ignoreDuplicates: options?.ignoreDuplicates ?? false })
+                .select('id')
+                .maybeSingle();
               assertImportNotAborted(signal);
 
               if (!singleErr && insertedSingle) {
@@ -1787,8 +1821,81 @@ export class Repository {
           const insertedMediaIds = new Set((insertedRows || []).map((row: any) => String(row.instagram_media_id)));
           newlyImported += insertedMediaIds.size;
           if (insertedMediaIds.size < chunk.length) {
-            for (const item of chunk) {
-              if (insertedMediaIds.has(item.instagram_media_id)) continue;
+            const skippedItems = chunk.filter((item) => !insertedMediaIds.has(item.instagram_media_id));
+            const matchedByMediaId = new Map<
+              string,
+              ReconcileRow & { instagram_sender_id: string | null }
+            >();
+
+            // Batch-fetch skipped media IDs in bounded .in() sub-batches to avoid N+1 reads
+            const skippedMediaIds = Array.from(new Set(skippedItems.map((it) => it.instagram_media_id)));
+            for (let j = 0; j < skippedMediaIds.length; j += SKIPPED_LOOKUP_BATCH_SIZE) {
+              assertImportNotAborted(signal);
+              const subIds = skippedMediaIds.slice(j, j + SKIPPED_LOOKUP_BATCH_SIZE);
+              const { data: existingSkipped, error: skipLookupErr } = await applyAbortSignal(
+                supabase
+                  .from('saved_reels')
+                  .select('id, instagram_media_id, instagram_sender_id, saved_at, is_saved_on_instagram')
+                  .in('instagram_media_id', subIds),
+                signal
+              );
+              assertImportNotAborted(signal);
+              if (skipLookupErr) {
+                throw new Error(`Failed to batch-lookup skipped archive reels: ${skipLookupErr.message}`);
+              }
+              for (const row of existingSkipped || []) {
+                matchedByMediaId.set(String(row.instagram_media_id), {
+                  id: String(row.id),
+                  instagram_media_id: String(row.instagram_media_id),
+                  instagram_sender_id: row.instagram_sender_id ? String(row.instagram_sender_id).trim() || null : null,
+                  saved_at: row.saved_at ? String(row.saved_at) : null,
+                  is_saved_on_instagram: row.is_saved_on_instagram !== false,
+                });
+              }
+            }
+
+            for (const item of skippedItems) {
+              assertImportNotAborted(signal);
+              const incomingSender = item.instagram_sender_id ? String(item.instagram_sender_id).trim() || null : null;
+              const matched = matchedByMediaId.get(item.instagram_media_id);
+              if (matched) {
+                if (matched.instagram_sender_id !== incomingSender) {
+                  failedCount++;
+                  failedShortcodes.push(item.shortcode);
+                  continue;
+                }
+                const needsPromote = item.is_saved_on_instagram !== false && matched.is_saved_on_instagram === false;
+                const needsBackfill = Boolean(
+                  options?.backfillMissingSavedAt && item.saved_at && shouldBackfillSavedAt(matched, item.saved_at)
+                );
+                if (!needsPromote && !needsBackfill) {
+                  alreadyPresent++;
+                  continue;
+                }
+                try {
+                  const outcome = await applyArchiveRowUpgradeWithCas(matched, item);
+                  if (!outcome.ok) {
+                    failedCount++;
+                    failedShortcodes.push(item.shortcode);
+                  } else {
+                    if (outcome.promoted) promotedToSaved++;
+                    if (outcome.backfilled) savedAtBackfilled++;
+                    alreadyPresent++;
+                  }
+                } catch (reconcileErr: any) {
+                  if (
+                    reconcileErr instanceof SenderDeletionBarrierError ||
+                    reconcileErr instanceof ArchiveImportTimeoutError
+                  ) {
+                    throw reconcileErr;
+                  }
+                  console.error(`[Repository] Failed to upgrade skipped reel ${item.shortcode}:`, reconcileErr.message);
+                  failedCount++;
+                  failedShortcodes.push(item.shortcode);
+                }
+                continue;
+              }
+
               try {
                 const reconciled = await reconcileConflictingArchiveItem(item);
                 if (!reconciled) {
