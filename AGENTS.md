@@ -61,7 +61,10 @@ Follow GRAVITAS invariants for implementation, debugging, refactoring, review, a
 ---
 
 ### Summary of Strict Invariants:
-1. **Branching**: NEVER push or commit directly to `main` or `staging`. Every unit of work must live on a dedicated branch (`feat/*`, `fix/*`, `refactor/*`, `chore/*`, `db/*`).
+1. **Branching & Promotion Flow**:
+   - NEVER push or commit directly to `main` or `staging`. Every unit of work must live on a dedicated branch off latest `staging` (`feat/*`, `fix/*`, `refactor/*`, `chore/*`, `db/*`).
+   - **Staging-first policy**: Every fix, push, change, or feature MUST merge into `staging` via PR and be verified on the live staging deployment (`reeler-staging`) **first**.
+   - **Production promotion**: Once Meta App Review is approved, `main` serves as the live production deployment for all users while `staging` remains testing-only. Promote `staging` to `main` via a promotion PR (`staging` -> `main`) **only after** everything is verified working on `staging`. Never merge feature branches directly into `main`.
 2. **Author Identity**: Commits must always be authored by `saurabhk0205 <saurabhk0205@gmail.com>`.
 3. **Secrets**: Never commit `.env`, credentials, or access tokens.
 4. **Architecture**: Endpoints call services; services call repository (`src/db/repository.ts`). No raw database calls in endpoints.
