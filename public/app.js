@@ -1669,6 +1669,7 @@ function renderCreatorStrip() {
     if (cleanAvatar && !isPlaceholderMediaUrl(cleanAvatar)) {
       const img = document.createElement('img');
       img.src = cleanAvatar;
+      img.referrerPolicy = 'no-referrer';
       img.className = 'creator-chip-img';
       img.alt = '';
       img.setAttribute('aria-hidden', 'true');
@@ -2097,7 +2098,7 @@ function renderReels() {
 
     const imageLayerHtml = hasRealThumbnail
       ? `
-        <img class="poster-actual-img" src="${escapeHtml(cleanThumbnail)}" alt="${creatorInfo.isAttributedName ? `${badgeLabel} poster by ${safeAriaTarget}` : `${isBotSent ? 'Tracked' : 'Saved'} ${itemWord} poster`}" loading="lazy" />
+        <img class="poster-actual-img" src="${escapeHtml(cleanThumbnail)}" referrerpolicy="no-referrer" alt="${creatorInfo.isAttributedName ? `${badgeLabel} poster by ${safeAriaTarget}` : `${isBotSent ? 'Tracked' : 'Saved'} ${itemWord} poster`}" loading="lazy" />
         <div class="poster-top-scrim"></div>
         <div class="poster-bottom-scrim"></div>
       `
@@ -2598,6 +2599,7 @@ function setSlidePosterUrl(slide, reel, url, { recordRatio = true } = {}) {
   let posterImg = viewport.querySelector('.reel-poster-underlay');
   if (!posterImg) {
     posterImg = document.createElement('img');
+    posterImg.referrerPolicy = 'no-referrer';
     posterImg.className = 'reel-poster-underlay';
     posterImg.alt = '';
     posterImg.setAttribute('aria-hidden', 'true');
@@ -3750,6 +3752,7 @@ function setupEventListeners() {
       syncSourceTabsUi();
       syncKpiActiveStates();
       syncUrlState();
+      loadStats();
       fetchReels();
       const label = nextSource === 'bot'
         ? 'Showing items sent to Reeler Bot.'
@@ -3786,9 +3789,12 @@ function setupEventListeners() {
     metricFilterAll.addEventListener('click', () => {
       if (hasActiveFilters()) {
         clearAllFilters();
+        loadStats();
         announceStatus('Filters reset. Showing all tracked items.');
       } else {
         syncKpiActiveStates();
+        loadStats();
+        fetchReels();
       }
     });
   }
@@ -3800,6 +3806,7 @@ function setupEventListeners() {
       state.filters.page = 1;
       syncKpiActiveStates();
       syncUrlState();
+      loadStats();
       fetchReels();
       announceStatus(state.filters.datePreset === '7d' ? 'Filtered to items added in the last 7 days.' : 'Cleared date filter.');
     });
@@ -3812,6 +3819,7 @@ function setupEventListeners() {
       state.filters.page = 1;
       syncKpiActiveStates();
       syncUrlState();
+      loadStats();
       fetchReels();
       announceStatus(state.filters.watchStatus === 'watch_later' ? 'Filtered to Watch Later queue.' : 'Cleared Watch Later filter.');
     });
@@ -3824,6 +3832,7 @@ function setupEventListeners() {
       state.filters.page = 1;
       syncKpiActiveStates();
       syncUrlState();
+      loadStats();
       fetchReels();
       announceStatus(state.filters.watchStatus === 'watched' ? 'Filtered to Watched items.' : 'Cleared Watched filter.');
     });
@@ -4023,6 +4032,22 @@ function setupEventListeners() {
     state.filters.page = 1;
     syncKpiActiveStates();
     syncUrlState();
+    loadStats();
+    fetchReels();
+  });
+
+  // Automatically sync stats, creators, and cards when returning to this tab after DM bot actions
+  let lastAutoSyncAt = Date.now();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (isSwitchingVault) return;
+    if (vaultGateScreen && !vaultGateScreen.classList.contains('is-hidden')) return;
+    if (feedModal && feedModal.classList.contains('active')) return;
+    const now = Date.now();
+    if (now - lastAutoSyncAt < 5000) return;
+    lastAutoSyncAt = now;
+    loadStats();
+    loadCreators(state.creatorQuery);
     fetchReels();
   });
 

@@ -1249,3 +1249,49 @@ test('MetaInstagramBotService - pins watched targets and guards timezone prefere
     Repository.setSenderTimezone = origSetTz;
   }
 });
+
+test('MetadataResolver - falls back to secondary crawler User-Agent when primary UA receives login-walled HTML', async () => {
+  const { fetchReelMetadata, resetFeedMetaResolverStateForTests } = await import(
+    '../src/services/reelMetadataResolver.ts'
+  );
+  const origFetch = globalThis.fetch;
+  const origToken = process.env.META_PAGE_ACCESS_TOKEN;
+  const origProxy = process.env.METADATA_PROXY_URL;
+  resetFeedMetaResolverStateForTests();
+  delete process.env.META_PAGE_ACCESS_TOKEN;
+  delete process.env.METADATA_PROXY_URL;
+
+  const seenUAs: string[] = [];
+  try {
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      const ua = String((init?.headers as Record<string, string> | undefined)?.['User-Agent'] || '');
+      seenUAs.push(ua);
+      if (ua.startsWith('facebookexternalhit')) {
+        return new Response('<html><title>Instagram</title></html>', { status: 200 });
+      }
+      return new Response(
+        '<html><head>' +
+          '<meta property="og:url" content="https://www.instagram.com/shiadanni/reel/DFallbackUA1/" />' +
+          '<meta name="twitter:title" content="S H I A D A N N I (&#064;shiadanni) &#x2022; Instagram reel" />' +
+          '<meta property="og:image" content="https://scontent.cdninstagram.com/v/thumb.jpg" />' +
+          '</head></html>',
+        { status: 200 }
+      );
+    }) as typeof fetch;
+
+    const meta = await fetchReelMetadata('DFallbackUA1', undefined, 'reel');
+    assert.equal(meta.username, 'shiadanni');
+    assert.equal(meta.thumbnailUrl, 'https://scontent.cdninstagram.com/v/thumb.jpg');
+    assert.equal(seenUAs.length, 3, 'Should probe /reel/ and /p/ with primary UA, then fall back to secondary crawler UA');
+    assert.match(seenUAs[0], /^facebookexternalhit/);
+    assert.match(seenUAs[1], /^facebookexternalhit/);
+    assert.match(seenUAs[2], /^WhatsApp\//);
+  } finally {
+    globalThis.fetch = origFetch;
+    if (origToken === undefined) delete process.env.META_PAGE_ACCESS_TOKEN;
+    else process.env.META_PAGE_ACCESS_TOKEN = origToken;
+    if (origProxy === undefined) delete process.env.METADATA_PROXY_URL;
+    else process.env.METADATA_PROXY_URL = origProxy;
+    resetFeedMetaResolverStateForTests();
+  }
+});

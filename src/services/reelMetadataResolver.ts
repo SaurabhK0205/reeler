@@ -420,6 +420,10 @@ async function fetchImageDimensions(
  * probing the preferred URL path (`/reel/` or `/p/`) first and falling back to the alternate path on non-OK HTTP status.
  */
 const OG_META_PATTERN = /<meta\s+(?:property|name)="(?:og:url|og:image|twitter:title|og:title)"/i;
+const DIRECT_METADATA_USER_AGENTS = [
+  'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+  'WhatsApp/2.23.20.0',
+];
 
 /**
  * Reads up to `maxBytes` of UTF-8 text from a fetch Response, cancelling the underlying stream
@@ -584,17 +588,19 @@ export async function fetchReelMetadata(
   try {
     let html: string | null = null;
     let lastStatus = 0;
+    let sawLoginWallHtml = false;
 
-    for (const pathSegment of pathsToTry) {
+    const tryDirectFetch = async (pathSegment: 'reel' | 'p', userAgent: string): Promise<string | null> => {
       if (signal?.aborted) {
-        return {};
+        return null;
       }
       const url = `https://www.instagram.com/${pathSegment}/${encodeURIComponent(shortcode)}/`;
       try {
         const res = await fetch(url, {
           signal: createCombinedSignal(8000, signal),
           headers: {
-            'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+            'User-Agent': userAgent,
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
           },
         });
@@ -602,23 +608,44 @@ export async function fetchReelMetadata(
 
         if (!res.ok) {
           await res.body?.cancel().catch(() => {});
-          continue;
+          return null;
         }
 
         const candidateHtml = await readBoundedText(res);
         if (!OG_META_PATTERN.test(candidateHtml)) {
-          continue;
+          sawLoginWallHtml = true;
+          return null;
         }
-
-        html = candidateHtml;
-        break;
+        return candidateHtml;
       } catch (err: any) {
         if (signal?.aborted) {
-          return {};
+          return null;
         }
         console.warn(
           `[MetadataResolver] Direct fetch attempt for ${shortcode} (/${pathSegment}/) failed: ${err?.message || err}`
         );
+        return null;
+      }
+    };
+
+    for (const pathSegment of pathsToTry) {
+      if (signal?.aborted) {
+        return {};
+      }
+      const candidate = await tryDirectFetch(pathSegment, DIRECT_METADATA_USER_AGENTS[0]);
+      if (candidate) {
+        html = candidate;
+        break;
+      }
+    }
+
+    if (!html && sawLoginWallHtml && !signal?.aborted) {
+      for (const fallbackUserAgent of DIRECT_METADATA_USER_AGENTS.slice(1)) {
+        const candidate = await tryDirectFetch(pathsToTry[0], fallbackUserAgent);
+        if (candidate) {
+          html = candidate;
+          break;
+        }
       }
     }
 
