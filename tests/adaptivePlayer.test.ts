@@ -663,3 +663,111 @@ test('resolveFeedMediaMetadata prevents a delayed ordinary lookup from overwriti
     else process.env.METADATA_PROXY_URL = origMetaProxy;
   }
 });
+
+test('resolveFeedMediaMetadata preserves unexpired covers on kind-only refresh and lets ordinary cover cache after empty refresh', async () => {
+  const originalFetch = globalThis.fetch;
+  const origMetaProxy = process.env.METADATA_PROXY_URL;
+  delete process.env.METADATA_PROXY_URL;
+
+  try {
+    // Part A: kind-only refresh (isClips=false, thumbnailUrl=null) must preserve an unexpired cached cover
+    resetFeedMetaResolverStateForTests();
+    let mode: 'cover' | 'kind_only' = 'cover';
+    globalThis.fetch = (async () => {
+      if (mode === 'cover') {
+        return new Response(
+          '<html><head>' +
+            '<meta property="og:url" content="https://www.instagram.com/p/KindOnlyRef1/" />' +
+            '<meta property="og:image" content="https://scontent.cdninstagram.com/v/good-cover.jpg" />' +
+            '</head></html>',
+          { status: 200, headers: { 'content-type': 'text/html' } }
+        );
+      }
+      return new Response(
+        '<html><head>' +
+          '<meta property="og:url" content="https://www.instagram.com/p/KindOnlyRef1/" />' +
+          '</head></html>',
+        { status: 200, headers: { 'content-type': 'text/html' } }
+      );
+    }) as typeof fetch;
+
+    const initial = await resolveFeedMediaMetadata('KindOnlyRef1', undefined, 'p', false);
+    assert.equal(initial.thumbnailUrl, 'https://scontent.cdninstagram.com/v/good-cover.jpg');
+
+    mode = 'kind_only';
+    const kindOnlyRefresh = await resolveFeedMediaMetadata('KindOnlyRef1', undefined, 'p', true);
+    assert.equal(kindOnlyRefresh.thumbnailUrl, null, 'Explicit refresh still reports no new cover found');
+    assert.equal(kindOnlyRefresh.isClips, false);
+
+    const stillCached = await resolveFeedMediaMetadata('KindOnlyRef1', undefined, 'p', false);
+    assert.equal(
+      stillCached.thumbnailUrl,
+      'https://scontent.cdninstagram.com/v/good-cover.jpg',
+      'Kind-only refresh must preserve unexpired cached cover'
+    );
+
+    // Part B: empty refresh finishing first must not block an overlapping ordinary lookup from caching a cover
+    resetFeedMetaResolverStateForTests();
+    let seq = 0;
+    let releaseOrdinary: (() => void) | null = null;
+    let released = false;
+    const ensureReleased = () => {
+      if (!released) {
+        released = true;
+        releaseOrdinary?.();
+      }
+    };
+    let ordinaryP: Promise<Awaited<ReturnType<typeof resolveFeedMediaMetadata>>> | null = null;
+    let emptyRefreshP: Promise<Awaited<ReturnType<typeof resolveFeedMediaMetadata>>> | null = null;
+    const ordinaryStarted = new Promise<void>((resolve) => {
+      globalThis.fetch = (async () => {
+        seq++;
+        if (seq === 1) {
+          await new Promise<void>((r) => {
+            releaseOrdinary = r;
+            resolve();
+            if (released) r();
+          });
+          return new Response(
+            '<html><head>' +
+              '<meta property="og:url" content="https://www.instagram.com/p/EmptyRefRace1/" />' +
+              '<meta property="og:image" content="https://scontent.cdninstagram.com/v/recovered-cover.jpg" />' +
+              '</head></html>',
+            { status: 200, headers: { 'content-type': 'text/html' } }
+          );
+        }
+        return new Response('<html><head></head></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      }) as typeof fetch;
+    });
+
+    try {
+      ordinaryP = resolveFeedMediaMetadata('EmptyRefRace1', undefined, 'p', false);
+      await ordinaryStarted;
+
+      emptyRefreshP = resolveFeedMediaMetadata('EmptyRefRace1', undefined, 'p', true);
+      const emptyRes = await emptyRefreshP;
+      assert.equal(emptyRes.thumbnailUrl, null);
+
+      ensureReleased();
+      const ordRes = await ordinaryP;
+      assert.equal(ordRes.thumbnailUrl, 'https://scontent.cdninstagram.com/v/recovered-cover.jpg');
+
+      const seqBeforeCacheHit = seq;
+      const cachedAfter = await resolveFeedMediaMetadata('EmptyRefRace1', undefined, 'p', false);
+      assert.equal(
+        cachedAfter.thumbnailUrl,
+        'https://scontent.cdninstagram.com/v/recovered-cover.jpg',
+        'Overlapping ordinary lookup must cache its real cover even after an empty refresh'
+      );
+      assert.equal(seq, seqBeforeCacheHit, 'Cached cover must be served without another upstream fetch');
+    } finally {
+      ensureReleased();
+      await Promise.allSettled([ordinaryP, emptyRefreshP].filter(Boolean));
+    }
+  } finally {
+    resetFeedMetaResolverStateForTests();
+    globalThis.fetch = originalFetch;
+    if (origMetaProxy === undefined) delete process.env.METADATA_PROXY_URL;
+    else process.env.METADATA_PROXY_URL = origMetaProxy;
+  }
+});

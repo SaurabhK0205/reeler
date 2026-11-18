@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.ts';
 import { apiRouter } from './api/router.ts';
-import { Repository } from './db/repository.ts';
+import { ArchiveImportTimeoutError, Repository } from './db/repository.ts';
 import { ReminderWorker } from './services/reminderWorker.ts';
 import { vaultAuthMiddleware, resolveConfiguredVaultSecret } from './services/vaultAuthService.ts';
 import { createRateLimiter, getClientIp, securityHeadersMiddleware } from './middleware/security.ts';
@@ -19,6 +19,8 @@ const __dirname = path.dirname(__filename);
 export interface CreateAppOptions {
   /** Optional hook invoked after archive auth/guard succeeds and before JSON parsing (for tests). */
   onArchiveImportPreParse?: (req: express.Request) => void;
+  /** Optional execution deadline in milliseconds for archive imports (defaults to 120000ms). */
+  archiveImportExecutionTimeoutMs?: number;
 }
 
 /**
@@ -58,6 +60,10 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   const MAX_CONCURRENT_EXECUTIONS = 1;
   const MAX_QUEUED_IMPORTS = 2;
   const MAX_TRACKED_IMPORT_KEYS = 1000;
+  const ARCHIVE_IMPORT_EXECUTION_TIMEOUT_MS = Math.max(
+    50,
+    options.archiveImportExecutionTimeoutMs ?? 120_000
+  );
   const importRateLimitWindowMs = 60 * 1000;
   const importPrincipalRequests = new Map<string, { count: number; resetAt: number }>();
   const activePrincipals = new Set<string>();
@@ -145,6 +151,14 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     let principalReleased = false;
     let executionHeld = false;
     let handlerStarted = false;
+    let executionTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearExecutionTimer = () => {
+      if (executionTimer) {
+        clearTimeout(executionTimer);
+        executionTimer = null;
+      }
+    };
 
     const releaseUploadSlot = () => {
       if (!uploadReleased) {
@@ -161,6 +175,7 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     };
 
     const releaseExecutionAndPrincipal = () => {
+      clearExecutionTimer();
       releaseUploadSlot();
       if (executionHeld) {
         executionHeld = false;
@@ -176,6 +191,13 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
       acquireExecutionSlot: () => {
         executionHeld = true;
         activeExecutions++;
+        const executionAbortController = new AbortController();
+        executionTimer = setTimeout(() => {
+          executionAbortController.abort(new ArchiveImportTimeoutError());
+        }, ARCHIVE_IMPORT_EXECUTION_TIMEOUT_MS);
+        executionTimer.unref?.();
+        (req as any).archiveExecutionSignal = executionAbortController.signal;
+        (req as any).clearArchiveExecutionTimer = clearExecutionTimer;
       },
       isHandlerStarted: () => handlerStarted,
     };
@@ -249,10 +271,27 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     });
   }
 
-  // Exact POST mount: authenticate vault user BEFORE upload admission, 50MB parser, and fair execution scheduling.
+  function requireArchiveJsonContentType(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) {
+    const contentType = req.headers['content-type'];
+    if (!contentType || !req.is(['application/json', 'application/*+json'])) {
+      res.status(415).json({
+        success: false,
+        error: 'Unsupported Media Type. Archive imports require Content-Type: application/json.',
+      });
+      return;
+    }
+    next();
+  }
+
+  // Exact POST mount: authenticate vault user BEFORE media-type check, upload admission, 50MB parser, and fair execution scheduling.
   // Exact method+path binding prevents prefix-stripped subpath bypasses (e.g. /api/archive/import/health).
   const archivePreParseHandlers: express.RequestHandler[] = [
     vaultAuthMiddleware,
+    requireArchiveJsonContentType,
     archiveUploadAdmissionGuard,
   ];
   if (options.onArchiveImportPreParse) {

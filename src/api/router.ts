@@ -1,6 +1,6 @@
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
-import { Repository, SenderDeletionBarrierError } from '../db/repository.ts';
+import { ArchiveImportTimeoutError, Repository, SenderDeletionBarrierError } from '../db/repository.ts';
 import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
@@ -453,7 +453,16 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
       typeof (req as any).archiveAdmissionDeletionGeneration === 'number'
         ? (req as any).archiveAdmissionDeletionGeneration
         : undefined;
-    const result = await ArchiveImportService.importArchive(rawData, targetSenderId, admissionDeletionGeneration);
+    const executionSignal = (req as any).archiveExecutionSignal as AbortSignal | undefined;
+    const result = await ArchiveImportService.importArchive(
+      rawData,
+      targetSenderId,
+      admissionDeletionGeneration,
+      executionSignal
+    );
+    if (res.writableEnded) {
+      return;
+    }
     if (result.status === 'too_large') {
       res.status(413).json({ success: false, ...result });
       return;
@@ -469,18 +478,34 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
 
     res.status(200).json({ success: true, ...result });
   } catch (error: any) {
+    if (error instanceof ArchiveImportTimeoutError) {
+      if (!res.locals) (res as any).locals = {};
+      res.locals.skipIdempotencyCache = true;
+      if (!res.writableEnded) {
+        res.status(504).json({
+          success: false,
+          error: 'Archive import timed out before completion. Please retry.',
+        });
+      }
+      return;
+    }
     if (error instanceof SenderDeletionBarrierError) {
       if (!res.locals) (res as any).locals = {};
       res.locals.skipIdempotencyCache = true;
-      res.status(409).json({
-        success: false,
-        error: 'Account data deletion is currently in progress. Please try importing again shortly.',
-      });
+      if (!res.writableEnded) {
+        res.status(409).json({
+          success: false,
+          error: 'Account data deletion is currently in progress. Please try importing again shortly.',
+        });
+      }
       return;
     }
     console.error('[ArchiveImport] Unexpected error in /archive/import endpoint:', error);
-    res.status(500).json({ success: false, error: 'An unexpected internal error occurred during archive import.' });
+    if (!res.writableEnded) {
+      res.status(500).json({ success: false, error: 'An unexpected internal error occurred during archive import.' });
+    }
   } finally {
+    (req as any).clearArchiveExecutionTimer?.();
     (req as any).releaseImportSlot?.();
   }
 });

@@ -1032,13 +1032,17 @@ export async function resolveFeedMediaMetadata(
 
         if (!controller.signal.aborted) {
           const hasUsefulMeta = Boolean(thumbnailUrl || isClips !== null);
+          const hasCover = Boolean(thumbnailUrl);
           const existingCached = feedMetaCache.get(shortcode);
+          const hasUnexpiredCached = Boolean(existingCached && existingCached.expiresAt > Date.now());
           const hasUnexpiredUsefulCached = Boolean(
-            existingCached &&
-            existingCached.expiresAt > Date.now() &&
-            (existingCached.value.thumbnailUrl || existingCached.value.isClips !== null)
+            hasUnexpiredCached &&
+            (existingCached!.value.thumbnailUrl || existingCached!.value.isClips !== null)
           );
-          if (bypassCache && !hasUsefulMeta && hasUnexpiredUsefulCached) {
+          const hasUnexpiredCoverCached = Boolean(hasUnexpiredCached && existingCached!.value.thumbnailUrl);
+          // Preserve an unexpired cover when a refresh finds no cover (empty or classification-only),
+          // and preserve unexpired useful metadata when a refresh returns completely empty.
+          if (bypassCache && ((!hasCover && hasUnexpiredCoverCached) || (!hasUsefulMeta && hasUnexpiredUsefulCached))) {
             return result;
           }
           const latestRefreshVersion = feedMetaRefreshCommitVersions.get(shortcode) ?? 0;
@@ -1046,7 +1050,9 @@ export async function resolveFeedMediaMetadata(
             ? startRefreshVersion > latestRefreshVersion
             : startRefreshVersion === latestRefreshVersion;
           if (shouldWriteCache) {
-            if (bypassCache) {
+            // Only advance refresh commit version when a refresh finds an actual cover so an empty
+            // or coverless refresh cannot prevent an overlapping ordinary lookup from caching a cover.
+            if (bypassCache && hasCover) {
               if (
                 feedMetaRefreshCommitVersions.size >= META_CACHE_MAX_ENTRIES &&
                 !feedMetaRefreshCommitVersions.has(shortcode)

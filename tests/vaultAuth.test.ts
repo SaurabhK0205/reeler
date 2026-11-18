@@ -678,20 +678,39 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
   assert.doesNotMatch('.test { transition-timing-function: ease-in-out; }', easeInTransitionRe);
 
   /**
-   * Extracts effective CSS transition property names across all rules targeting a given selector,
-   * applying declaration precedence within each rule and expanding omitted shorthand properties to `all`.
+   * Extracts effective CSS transition property names across all rules whose selector subject
+   * matches a given class selector, applying per-rule declaration precedence and expanding
+   * omitted shorthand properties to `all`.
    */
-  const extractEffectiveTransitionProperties = (stylesheet: string, targetSelector: string): string[] => {
+  const extractEffectiveTransitionProperties = (stylesheet: string, targetClass: string): string[] => {
     const props: string[] = [];
     const cleaned = stylesheet.replace(/\/\*[\s\S]*?\*\//g, '');
     const ruleRe = /([^{}@]+)\{([^{}]+)\}/g;
-    const selectorPattern = new RegExp(
-      `(?:^|[\\s>+~])${targetSelector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[\\s>+~.:#\\[])`
-    );
+
+    const extractSubjectCompound = (selector: string): string => {
+      let depth = 0;
+      let lastCombinatorIdx = -1;
+      for (let i = 0; i < selector.length; i++) {
+        const ch = selector[i];
+        if (ch === '[' || ch === '(') depth++;
+        else if (ch === ']' || ch === ')') depth = Math.max(0, depth - 1);
+        else if (depth === 0 && (ch === ' ' || ch === '\t' || ch === '\n' || ch === '>' || ch === '+' || ch === '~')) {
+          lastCombinatorIdx = i;
+        }
+      }
+      return selector.slice(lastCombinatorIdx + 1).trim();
+    };
+
+    const subjectHasClass = (selector: string, className: string): boolean => {
+      const subject = extractSubjectCompound(selector);
+      const classes = subject.match(/\.[a-zA-Z_-][a-zA-Z0-9_-]*/g) || [];
+      return classes.includes(className);
+    };
+
     let match: RegExpExecArray | null;
     while ((match = ruleRe.exec(cleaned)) !== null) {
       const selectors = match[1].split(',').map((s) => s.trim());
-      if (!selectors.some((sel) => selectorPattern.test(sel))) continue;
+      if (!selectors.some((sel) => subjectHasClass(sel, targetClass))) continue;
       const decls = match[2].split(';');
       let ruleProps: string[] | null = null;
       let rulePropsImportant = false;
@@ -794,6 +813,22 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
     ),
     ['opacity'],
     'Opacity-only transition on .reel-media-viewport must remain permitted'
+  );
+  assert.deepEqual(
+    extractEffectiveTransitionProperties(
+      '.active.reel-media-viewport { transition: width 120ms linear; }',
+      '.reel-media-viewport'
+    ),
+    ['width'],
+    'Compound subject selector .active.reel-media-viewport must be checked'
+  );
+  assert.deepEqual(
+    extractEffectiveTransitionProperties(
+      '.reel-media-viewport .reel-poster-underlay { transition: width 120ms linear; }',
+      '.reel-media-viewport'
+    ),
+    [],
+    'Descendant selector targeting child element must not be treated as a viewport rule'
   );
   assert.match(
     css,
