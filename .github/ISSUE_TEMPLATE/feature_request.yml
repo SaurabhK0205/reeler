@@ -3,6 +3,11 @@ description: Suggest a new capability or workflow improvement for Reeler.
 title: "[Feature]: "
 labels: ["enhancement"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please do not include vault keys (`?key=...`), 6-digit login codes, `.env` files, or API tokens in public issues, and remove any credentials from examples or mockups before posting.
+
   - type: dropdown
     id: area
     attributes:
