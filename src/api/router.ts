@@ -458,6 +458,26 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
   }
   const targetSenderId = vaultUser.role === 'admin' ? undefined : vaultUser.senderId;
   (req as any).markHandlerStarted?.();
+  const executionSignal = (req as any).archiveExecutionSignal as AbortSignal | undefined;
+  const sendExecutionTimeoutResponse = () => {
+    if (!res.writableEnded) {
+      if (!res.locals) (res as any).locals = {};
+      res.locals.skipIdempotencyCache = true;
+      res.status(504).json({
+        success: false,
+        error: 'Archive import timed out before completion. Please retry.',
+      });
+    }
+  };
+  if (executionSignal) {
+    if (executionSignal.aborted) {
+      sendExecutionTimeoutResponse();
+      (req as any).clearArchiveExecutionTimer?.();
+      (req as any).releaseImportSlot?.();
+      return;
+    }
+    executionSignal.addEventListener('abort', sendExecutionTimeoutResponse, { once: true });
+  }
   try {
     const rawData = req.body;
     if (!rawData) {
@@ -469,7 +489,6 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
       typeof (req as any).archiveAdmissionDeletionGeneration === 'number'
         ? (req as any).archiveAdmissionDeletionGeneration
         : undefined;
-    const executionSignal = (req as any).archiveExecutionSignal as AbortSignal | undefined;
     const result = await ArchiveImportService.importArchive(
       rawData,
       targetSenderId,
@@ -488,21 +507,20 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
       return;
     }
     if (result.status === 'failed') {
+      if (!res.locals) (res as any).locals = {};
+      res.locals.skipIdempotencyCache = true;
       res.status(500).json({ success: false, ...result });
       return;
+    }
+    if (result.status === 'partial') {
+      if (!res.locals) (res as any).locals = {};
+      res.locals.skipIdempotencyCache = true;
     }
 
     res.status(200).json({ success: true, ...result });
   } catch (error: any) {
     if (error instanceof ArchiveImportTimeoutError) {
-      if (!res.locals) (res as any).locals = {};
-      res.locals.skipIdempotencyCache = true;
-      if (!res.writableEnded) {
-        res.status(504).json({
-          success: false,
-          error: 'Archive import timed out before completion. Please retry.',
-        });
-      }
+      sendExecutionTimeoutResponse();
       return;
     }
     if (error instanceof SenderDeletionBarrierError) {
@@ -521,6 +539,9 @@ apiRouter.post('/archive/import', async (req: Request, res: Response) => {
       res.status(500).json({ success: false, error: 'An unexpected internal error occurred during archive import.' });
     }
   } finally {
+    if (executionSignal) {
+      executionSignal.removeEventListener('abort', sendExecutionTimeoutResponse);
+    }
     (req as any).clearArchiveExecutionTimer?.();
     (req as any).releaseImportSlot?.();
   }
