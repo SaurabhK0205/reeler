@@ -3646,76 +3646,6 @@ kbd {
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  html,
-  .feed-scroll-track {
-    scroll-behavior: auto;
-  }
-  .vault-poster-card,
-  .source-tab-btn,
-  .creator-chip,
-  .card-bookmark-btn,
-  .status-pill-toggle,
-  .poster-actual-img,
-  .play-icon-box,
-  .rail-action-btn,
-  .feed-nav-arrow-btn,
-  .feed-close-btn,
-  .feed-scroll-track,
-  .feed-top-bar,
-  .nav-btn,
-  .metric-filter-btn,
-  .vault-tab-btn,
-  .table-action-icon-btn,
-  .popover-close-btn {
-    transition-property: opacity, background-color, border-color, color;
-    transition-duration: 0.12s;
-    transform: none !important;
-  }
-  .vault-poster-card:hover,
-  .vault-poster-card:active,
-  .poster-media-box:hover .poster-actual-img,
-  .poster-media-box:focus-within .poster-actual-img,
-  .poster-play-trigger:hover .play-icon-box,
-  .poster-play-trigger:focus-visible .play-icon-box,
-  .rail-action-btn:hover,
-  .rail-action-btn:active,
-  .feed-nav-arrow-btn:hover,
-  .feed-nav-arrow-btn:active,
-  .feed-close-btn:hover,
-  .feed-close-btn:active,
-  .source-tab-btn:active,
-  .creator-chip:active,
-  .card-bookmark-btn:active,
-  .status-pill-toggle:active,
-  .nav-btn:active,
-  .metric-filter-btn:active,
-  .vault-tab-btn:active,
-  .table-action-icon-btn:active,
-  .popover-close-btn:active {
-    transform: none !important;
-  }
-  .reel-media-viewport,
-  .reel-iframe-container iframe,
-  .reel-poster-underlay,
-  .reel-probe-indicator,
-  .feed-focus-player-btn,
-  .reels-feed-modal,
-  .vault-toast {
-    transition: opacity 0.12s linear;
-  }
-  .reel-probe-spinner,
-  .stats-bar.is-initial-loading .metric-num::after,
-  .skeleton-poster,
-  .skeleton-line,
-  .skeleton-avatar,
-  .skeleton-bar,
-  .skeleton-btn,
-  .vault-gate-card {
-    animation: none;
-  }
-}
-
 /* ==============================================================================
    ZERO-LOGIN VAULT AUTH GATE (Linear Obsidian Private Vault Screen)
    ============================================================================== */
@@ -4032,5 +3962,76 @@ kbd {
   }
   .vault-gate-footer-links {
     gap: 8px 14px;
+  }
+}
+
+/* Keep reduced-motion overrides last so equal-specificity rules always win the CSS cascade. */
+@media (prefers-reduced-motion: reduce) {
+  html,
+  .feed-scroll-track {
+    scroll-behavior: auto;
+  }
+  .vault-poster-card,
+  .source-tab-btn,
+  .creator-chip,
+  .card-bookmark-btn,
+  .status-pill-toggle,
+  .poster-actual-img,
+  .play-icon-box,
+  .rail-action-btn,
+  .feed-nav-arrow-btn,
+  .feed-close-btn,
+  .feed-scroll-track,
+  .feed-top-bar,
+  .nav-btn,
+  .metric-filter-btn,
+  .vault-tab-btn,
+  .table-action-icon-btn,
+  .popover-close-btn {
+    transition-property: opacity, background-color, border-color, color;
+    transition-duration: 0.12s;
+    transform: none !important;
+  }
+  .vault-poster-card:hover,
+  .vault-poster-card:active,
+  .poster-media-box:hover .poster-actual-img,
+  .poster-media-box:focus-within .poster-actual-img,
+  .poster-play-trigger:hover .play-icon-box,
+  .poster-play-trigger:focus-visible .play-icon-box,
+  .rail-action-btn:hover,
+  .rail-action-btn:active,
+  .feed-nav-arrow-btn:hover,
+  .feed-nav-arrow-btn:active,
+  .feed-close-btn:hover,
+  .feed-close-btn:active,
+  .source-tab-btn:active,
+  .creator-chip:active,
+  .card-bookmark-btn:active,
+  .status-pill-toggle:active,
+  .nav-btn:active,
+  .metric-filter-btn:active,
+  .vault-tab-btn:active,
+  .table-action-icon-btn:active,
+  .popover-close-btn:active {
+    transform: none !important;
+  }
+  .reel-media-viewport,
+  .reel-iframe-container iframe,
+  .reel-poster-underlay,
+  .reel-probe-indicator,
+  .feed-focus-player-btn,
+  .reels-feed-modal,
+  .vault-toast {
+    transition: opacity 0.12s linear;
+  }
+  .reel-probe-spinner,
+  .stats-bar.is-initial-loading .metric-num::after,
+  .skeleton-poster,
+  .skeleton-line,
+  .skeleton-avatar,
+  .skeleton-bar,
+  .skeleton-btn,
+  .vault-gate-card {
+    animation: none;
   }
 }

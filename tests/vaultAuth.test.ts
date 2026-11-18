@@ -603,7 +603,33 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
   assert.ok(css.includes('contain: layout paint;'), 'Poster cards must apply layout/paint containment');
   assert.ok(css.includes('transform: translateX(1px);'), 'Play triangle icons must be optically centered');
   assert.ok(css.includes('.metric-filter-btn:active'), 'Stat filter cards must include tactile :active feedback and reduced-motion override');
-  assert.ok(css.includes('.vault-gate-card {\n    animation: none;'), 'Vault gate entrance animation must be disabled under prefers-reduced-motion');
+
+  // Cascade-aware reduced-motion check: the @media (prefers-reduced-motion: reduce) rule disabling
+  // .vault-gate-card animation and .vault-tab-btn transforms/transitions must appear AFTER the base
+  // declarations so equal-specificity rules cannot override reduced motion.
+  const gateAnimMatches = [...css.matchAll(/\.vault-gate-card\s*\{[^}]*animation\s*:\s*vaultGateEnter[^}]*\}/g)];
+  assert.equal(gateAnimMatches.length, 1, 'Expected exactly one base .vault-gate-card animation declaration');
+  const lastGateAnimEnd = (gateAnimMatches[0].index ?? 0) + gateAnimMatches[0][0].length;
+
+  const tabBaseMatches = [...css.matchAll(/\.vault-tab-btn\s*\{[^}]*transition\s*:[^}]*\}/g)];
+  assert.ok(tabBaseMatches.length >= 1, 'Expected base .vault-tab-btn transition declaration');
+  const lastTabBaseEnd = Math.max(...tabBaseMatches.map((m) => (m.index ?? 0) + m[0].length));
+
+  const reducedMotionIndex = css.lastIndexOf('@media (prefers-reduced-motion: reduce)');
+  assert.ok(reducedMotionIndex > lastGateAnimEnd, '@media (prefers-reduced-motion: reduce) must appear after .vault-gate-card animation declaration');
+  assert.ok(reducedMotionIndex > lastTabBaseEnd, '@media (prefers-reduced-motion: reduce) must appear after .vault-tab-btn transition declaration');
+
+  const reducedMotionBlock = css.slice(reducedMotionIndex);
+  assert.match(
+    reducedMotionBlock,
+    /\.vault-gate-card\s*\{[^}]*animation\s*:\s*none\s*;/,
+    'Reduced-motion block must disable .vault-gate-card animation after its base rule'
+  );
+  assert.match(
+    reducedMotionBlock,
+    /\.vault-tab-btn[\s\S]*?transition-property\s*:\s*opacity,\s*background-color,\s*border-color,\s*color\s*;/,
+    'Reduced-motion block must override .vault-tab-btn transition-property after its base rule'
+  );
 
   // 4. HTML cache-busting query versions stay aligned
   assert.ok(html.includes('style.css?v=4.5'), 'index.html must reference style.css?v=4.5');
