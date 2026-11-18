@@ -493,6 +493,31 @@ test('Security - Supabase migration 015 locks down over-permissive RLS policies 
   assert.ok(sql.includes('REVOKE ALL ON public.creators FROM anon, authenticated;'));
   assert.ok(sql.includes('REVOKE ALL ON public.saved_reels FROM anon, authenticated;'));
   assert.ok(sql.includes('REVOKE ALL ON FUNCTION public.search_saved_reels(TEXT) FROM PUBLIC, anon, authenticated;'));
+
+  const { loadConfig } = await import('../src/config.ts');
+  const origUrl = process.env.SUPABASE_URL;
+  const origServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const origAnonKey = process.env.SUPABASE_ANON_KEY;
+  try {
+    process.env.SUPABASE_URL = 'https://example.supabase.co';
+    delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    process.env.SUPABASE_ANON_KEY = 'anon-only-key';
+    const anonOnlyCfg = loadConfig();
+    assert.equal(anonOnlyCfg.supabase.isConfigured, false, 'loadConfig must not accept SUPABASE_ANON_KEY alone');
+    assert.equal(anonOnlyCfg.supabase.key, undefined);
+
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-role-secret';
+    const serviceCfg = loadConfig();
+    assert.equal(serviceCfg.supabase.isConfigured, true);
+    assert.equal(serviceCfg.supabase.key, 'service-role-secret');
+  } finally {
+    if (origUrl === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = origUrl;
+    if (origServiceKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = origServiceKey;
+    if (origAnonKey === undefined) delete process.env.SUPABASE_ANON_KEY;
+    else process.env.SUPABASE_ANON_KEY = origAnonKey;
+  }
 });
 
 test('Security - ArchiveImportService rejects oversized item arrays (> 50,000 items) before DB processing', async () => {

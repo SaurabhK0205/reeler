@@ -19,6 +19,13 @@ const app = express();
 app.disable('x-powered-by');
 
 const config = loadConfig();
+if (process.env.SUPABASE_URL?.trim() && !process.env.SUPABASE_SERVICE_ROLE_KEY?.trim()) {
+  console.error(
+    '[Startup] FATAL: SUPABASE_URL is set without SUPABASE_SERVICE_ROLE_KEY. ' +
+      'Migration 015 revokes anon/authenticated access on creators and saved_reels; SUPABASE_SERVICE_ROLE_KEY is required.'
+  );
+  process.exit(1);
+}
 const reminderWorker = new ReminderWorker();
 
 // Reverse proxy trust: configurable via TRUST_PROXY env var (e.g. '1', 'loopback', 'true', or 'false' for direct exposure)
@@ -201,10 +208,9 @@ const server = app.listen(PORT, () => {
   if (
     process.env.NODE_ENV === 'production' &&
     !process.env.VAULT_SECRET?.trim() &&
-    !process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() &&
-    !process.env.SUPABASE_ANON_KEY?.trim()
+    !process.env.SUPABASE_SERVICE_ROLE_KEY?.trim()
   ) {
-    console.warn('[Security] WARNING: Running in production without VAULT_SECRET or Supabase key configured!');
+    console.warn('[Security] WARNING: Running in production without VAULT_SECRET or SUPABASE_SERVICE_ROLE_KEY configured!');
   }
   console.log('================================================================\n');
 

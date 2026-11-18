@@ -282,8 +282,7 @@ declare global {
  * Resolves the server secret used to sign and verify zero-login vault tokens.
  */
 export function getVaultSecret(): string {
-  const config = loadConfig();
-  const configuredSecret = process.env.VAULT_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+  const configuredSecret = process.env.VAULT_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (configuredSecret && configuredSecret.trim()) {
     return configuredSecret.trim();
   }
