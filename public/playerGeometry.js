@@ -149,7 +149,8 @@ function () {
       const isFourFiveEnvelope = embedRatio >= 0.76 && embedRatio <= 0.84;
       if (isFourFiveEnvelope && isClips !== false) {
         if (validThumb !== null) {
-          if (validThumb < 0.70) {
+          const isNativeFourFive = validThumb >= 0.74 && validThumb <= 0.86;
+          if (validThumb < 0.70 || (isClips === true && !isNativeFourFive && validThumb <= 1.08)) {
             return {
               isPillarboxedReel: true,
               effectiveEmbedRatio: embedRatio,
@@ -179,6 +180,14 @@ function () {
 
     // Pre-probe / fallback classification
     if (validThumb !== null) {
+      const isNativeFourFive = validThumb >= 0.74 && validThumb <= 0.86;
+      if (isClips === true && !isNativeFourFive) {
+        return {
+          isPillarboxedReel: true,
+          effectiveEmbedRatio: 0.80,
+          displayRatio: validThumb < 0.70 && validThumb >= 0.50 ? validThumb : 9 / 16,
+        };
+      }
       if (isClips !== false && validThumb < 0.70) {
         return {
           isPillarboxedReel: true,
@@ -298,8 +307,17 @@ function () {
     const bottomSafetyPx = iframeW > 550 ? 4 : 3;
     const viewportHeightPx = Math.max(120, Math.min(viewH, expectedMediaH) - bottomSafetyPx);
     const iframeLeft = isPillarboxedReel ? Math.round((viewW - iframeW) / 2) : -1;
-    const iframeTop = -HEADER_CLIP_PX;
-    const iframeH = Math.max(900, expectedMediaH + 280);
+
+    let iframeTop = -HEADER_CLIP_PX;
+    if (!isPillarboxedReel && effectiveEmbedRatio > 1.05) {
+      // Instagram EmbedFrame has 4:3 envelope (padding-bottom: 75%)
+      const containerH = (iframeW - 2) * 0.75;
+      const mediaH = expectedMediaH;
+      const letterboxPad = Math.max(0, Math.round((containerH - mediaH) / 2));
+      iframeTop = -(HEADER_CLIP_PX + letterboxPad);
+    }
+
+    const iframeH = Math.max(900, expectedMediaH + Math.abs(iframeTop) + 280);
 
     return {
       isPillarboxedReel,
