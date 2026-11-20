@@ -3895,12 +3895,14 @@ function mountFeedIframe(slide, reel) {
 
     if (phase === 'aborted') {
       phase = h1 ? 'w2' : 'w1';
+      iframe.style.width = `${phase === 'w2' ? ReelerGeometry.PROBE_WIDTH_2 : ReelerGeometry.PROBE_WIDTH_1}px`;
       iframe.dataset.probing = '1';
       if (safetyTimer) clearTimeout(safetyTimer);
       safetyTimer = setTimeout(() => {
         phase = 'aborted';
         finalizeAndReveal(null, false, 0, false);
       }, 3500);
+      return;
     }
 
     if (phase === 'w1') {
