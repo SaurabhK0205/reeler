@@ -3886,8 +3886,6 @@ function mountFeedIframe(slide, reel) {
       fallbackBox.hidden = true;
       iframe.hidden = false;
       settled = false;
-      finalizeAndReveal(cached?.embedRatio ?? null, false, 40, false);
-      return;
     }
 
     if (phase === 'cached') {
@@ -3896,8 +3894,13 @@ function mountFeedIframe(slide, reel) {
     }
 
     if (phase === 'aborted') {
-      finalizeAndReveal(cached?.embedRatio ?? null, false, 40, false);
-      return;
+      phase = h1 ? 'w2' : 'w1';
+      iframe.dataset.probing = '1';
+      if (safetyTimer) clearTimeout(safetyTimer);
+      safetyTimer = setTimeout(() => {
+        phase = 'aborted';
+        finalizeAndReveal(null, false, 0, false);
+      }, 3500);
     }
 
     if (phase === 'w1') {
