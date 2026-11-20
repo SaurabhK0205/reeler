@@ -888,4 +888,16 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
   assert.ok(js.includes("e.key === 'Escape' && searchInput.value"), 'app.js must clear search on Escape key');
   assert.ok(js.includes("e.key === 'Escape' && creatorFilterInput.value"), 'app.js must clear creator filter on Escape key');
   assert.ok(js.includes('state.filters.creatorId === id && id'), 'app.js must support 1-tap creator filter toggle-off');
+
+  // 10. Continuous infinite scrolling and feed pagination invariants
+  assert.ok(html.includes('id="catalog-sentinel"'), 'index.html must include catalog-sentinel for continuous scrolling');
+  assert.ok(html.includes('id="catalog-scroll-spinner"'), 'index.html must include catalog-scroll-spinner');
+  assert.ok(css.includes('.catalog-sentinel'), 'style.css must style .catalog-sentinel');
+  assert.ok(css.includes('.catalog-scroll-spinner'), 'style.css must style .catalog-scroll-spinner');
+  assert.ok(js.includes('function createFeedSlide('), 'app.js must extract createFeedSlide for modular slide rendering');
+  assert.ok(js.includes('function appendFeedSlides('), 'app.js must implement appendFeedSlides to append slides without disrupting playback');
+  assert.ok(js.includes('function loadMoreFeedReels('), 'app.js must implement loadMoreFeedReels for vertical feed pagination');
+  assert.ok(js.includes('function loadMoreCatalogReels('), 'app.js must implement loadMoreCatalogReels for catalog continuous scroll');
+  assert.ok(js.includes('function setupCatalogInfiniteObserver('), 'app.js must wire setupCatalogInfiniteObserver on catalog-sentinel');
+  assert.ok(js.includes('index >= state.reels.length - 3 && state.reels.length < state.total'), 'app.js must prefetch next feed page before reaching the end');
 });
