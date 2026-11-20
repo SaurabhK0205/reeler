@@ -584,10 +584,10 @@ export class MetaInstagramBotService {
               : null;
           break;
         }
-        if (typeof att?.payload?.title === 'string' && /https?:\/\/(?:www\.)?instagram\.com\/(?:reel|p|tv)\//i.test(att.payload.title)) {
-          const match = att.payload.title.match(/https?:\/\/(?:www\.)?instagram\.com\/(?:reel|p|tv)\/[a-zA-Z0-9_-]+/i);
-          if (match) {
-            reelUrl = match[0];
+        if (typeof att?.payload?.title === 'string' && att.payload.title.trim()) {
+          const titleMatch = extractInstagramShortcodeAndPath(att.payload.title);
+          if (titleMatch) {
+            reelUrl = titleMatch.matchedText;
             attachmentType = typeof att.type === 'string' ? att.type : null;
             attachmentTitle = att.payload.title.trim();
             break;

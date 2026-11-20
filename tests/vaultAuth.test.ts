@@ -656,7 +656,7 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
   );
   assert.match(
     reducedMotionBlock,
-    /\.vault-tab-btn[\s\S]*?transition-property\s*:\s*opacity,\s*background-color,\s*border-color,\s*color\s*;/,
+    /\.vault-tab-btn[\s\S]*?transition-property\s*:\s*opacity\s*;/,
     'Reduced-motion block must override .vault-tab-btn transition-property after its base rule'
   );
 
