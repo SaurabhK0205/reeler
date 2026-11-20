@@ -2251,6 +2251,15 @@ test('Security - getClientIp normalizes IPv4-mapped IPv6 and falls back safely',
   // Fallback to socket remoteAddress
   assert.equal(getClientIp({ socket: { remoteAddress: '::ffff:203.0.113.5' } } as any), '203.0.113.5');
 
+  // Hexadecimal IPv4-mapped IPv6 (e.g. ::ffff:c000:201 -> 192.0.2.1, ::ffff:7f00:1 -> 127.0.0.1)
+  assert.equal(getClientIp({ ip: '::ffff:c000:201' } as any), '192.0.2.1');
+  assert.equal(getClientIp({ ip: '::ffff:7f00:1' } as any), '127.0.0.1');
+  assert.equal(getClientIp({ ip: '::FFFF:c000:0201' } as any), '192.0.2.1');
+
+  // Invalid mapped addresses avoid being treated as normalized IPv4
+  assert.equal(getClientIp({ ip: '::ffff:invalid:extra:parts' } as any), '::ffff:invalid:extra:parts');
+  assert.equal(getClientIp({ ip: '::ffff:999.999.999.999' } as any), '::ffff:999.999.999.999');
+
   // Unknown fallback
   assert.equal(getClientIp({} as any), 'unknown');
 });
@@ -2367,4 +2376,25 @@ test('MetaInstagramBotService - resilient webhook handling for passive events, p
     'messaging'
   );
   assert.ok(processedText.startsWith('https://www.instagram.com/reel/Ctitle456'));
+
+  // 4b. Attachment with title containing /creator/reel/ and /reels/ URLs
+  processedText = '';
+  await (testService as any).dispatchWebhookMessage(
+    'sender_att_title_creator',
+    'mid_title_creator',
+    '',
+    [{ type: 'share', payload: { title: 'Look at this https://www.instagram.com/creator/reel/Ctitle456/' } }],
+    'messaging'
+  );
+  assert.ok(processedText.includes('https://www.instagram.com/creator/reel/Ctitle456/'));
+
+  processedText = '';
+  await (testService as any).dispatchWebhookMessage(
+    'sender_att_title_reels',
+    'mid_title_reels',
+    '',
+    [{ type: 'share', payload: { title: 'Check https://www.instagram.com/reels/Creels789/' } }],
+    'messaging'
+  );
+  assert.ok(processedText.includes('https://www.instagram.com/reels/Creels789/'));
 });
