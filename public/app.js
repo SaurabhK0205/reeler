@@ -3902,7 +3902,6 @@ function mountFeedIframe(slide, reel) {
         phase = 'aborted';
         finalizeAndReveal(null, false, 0, false);
       }, 3500);
-      return;
     }
 
     if (phase === 'w1') {
