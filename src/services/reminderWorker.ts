@@ -256,12 +256,12 @@ export class ReminderWorker {
     if (msg.text) {
       const { isCommand, markAll } = parseWatchedStopCommand(msg.text);
       if (isCommand) {
-        const { updatedReels, remainingCount } = await Repository.markWatchedForInstagramSender(
+        const { updatedReels, remainingCount, remainingReels } = await Repository.markWatchedForInstagramSender(
           this.adminUserId || '',
           { markAll, includeUnattributedFallback: true }
         );
         if (this.adminUserId) {
-          const reply = formatWatchedConfirmationMessage(updatedReels, remainingCount, markAll);
+          const reply = formatWatchedConfirmationMessage(updatedReels, remainingCount, markAll, remainingReels);
           await this.actionClient.sendDirectMessage(this.adminUserId, reply);
         }
         return;
