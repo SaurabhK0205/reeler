@@ -3716,8 +3716,10 @@ function mountFeedIframe(slide, reel) {
   if (viewport) viewport.scrollTop = 0;
   iframeBox.scrollTop = 0;
 
+  const originParam = encodeURIComponent(window.location.origin || '');
+  const pathParam = encodeURIComponent((window.location.pathname || '/').substring(0, 100));
   const iframe = document.createElement('iframe');
-  iframe.src = `https://www.instagram.com/p/${encodeURIComponent(shortcode)}/embed/`;
+  iframe.src = `https://www.instagram.com/p/${encodeURIComponent(shortcode)}/embed/?cr=1&rd=${originParam}&rp=${pathParam}`;
   iframe.className = 'reel-player-iframe';
   iframe.tabIndex = -1;
   iframe.setAttribute('allowfullscreen', 'true');
@@ -3729,6 +3731,9 @@ function mountFeedIframe(slide, reel) {
     'title',
     frameCreator.isAttributedName ? `Instagram post by ${frameCreator.accessibleName}` : 'Embedded Instagram post'
   );
+  iframe.addEventListener('error', () => {
+    finalizeAndReveal(null, false, 0, true);
+  }, { once: true });
 
   const abortController = new AbortController();
   let metaPromise = null;
@@ -3870,22 +3875,17 @@ function mountFeedIframe(slide, reel) {
     const msg = ReelerGeometry.parseEmbedMessage(event.data);
     if (!msg) return;
 
+    // Any valid postMessage from Instagram confirms the frame is mounted
+    mounted = true;
+
     if (phase === 'cached') {
-      if (msg.type === 'MOUNTED') {
-        mounted = true;
-        finalizeAndReveal(cached.embedRatio, false, 80, false);
-      }
+      finalizeAndReveal(cached.embedRatio, false, 40, false);
       return;
     }
 
     if (phase === 'w1') {
-      if (msg.type === 'MOUNTED') {
-        mounted = true;
-      }
-      if (msg.type === 'MEASURE' && msg.height && msg.height > 150) {
+      if (msg.height && msg.height > 150) {
         h1 = msg.height;
-      }
-      if (mounted && h1 !== null) {
         phase = 'w2';
         iframe.style.width = `${ReelerGeometry.PROBE_WIDTH_2}px`;
         if (safetyTimer) {
@@ -3893,7 +3893,7 @@ function mountFeedIframe(slide, reel) {
           safetyTimer = setTimeout(() => {
             phase = 'aborted';
             finalizeAndReveal(null, false, 0, false);
-          }, 2500);
+          }, 3500);
         }
       }
       return;
@@ -3922,7 +3922,7 @@ function mountFeedIframe(slide, reel) {
         ]);
       }
 
-      finalizeAndReveal(measuredRatio, true, 180, false);
+      finalizeAndReveal(measuredRatio, true, 80, false);
     }
   };
 
@@ -3968,7 +3968,7 @@ function mountFeedIframe(slide, reel) {
     iframeBox.appendChild(iframe);
 
     safetyTimer = setTimeout(() => {
-      finalizeAndReveal(cached.embedRatio, false, 0, !mounted);
+      finalizeAndReveal(cached.embedRatio, false, 0, false);
     }, 2500);
   } else {
     iframe.dataset.probing = '1';
@@ -3980,7 +3980,7 @@ function mountFeedIframe(slide, reel) {
 
     safetyTimer = setTimeout(() => {
       phase = 'aborted';
-      finalizeAndReveal(null, false, 0, !mounted);
+      finalizeAndReveal(null, false, 0, false);
     }, 6500);
   }
 }
