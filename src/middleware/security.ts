@@ -26,10 +26,35 @@ export function setResponseHeader(res: Response, name: string, value: string): v
 
 /**
  * Resolves the client IP address safely using Express's trust-proxy aware `req.ip`.
+ * Normalizes IPv4-mapped IPv6 addresses (dotted-decimal `::ffff:a.b.c.d` or hexadecimal
+ * `::ffff:HHHH:HHHH` -> `a.b.c.d`) so IP rotation and rate-limiting buckets do not bifurcate clients.
  */
 export function getClientIp(req: Request): string {
   const raw = req.ip || req.socket?.remoteAddress || 'unknown';
-  return String(raw).trim() || 'unknown';
+  const ip = String(raw).trim();
+  if (ip.toLowerCase().startsWith('::ffff:')) {
+    const remainder = ip.slice(7).trim();
+    if (remainder.includes('.')) {
+      const octets = remainder.split('.');
+      if (
+        octets.length === 4 &&
+        octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) >= 0 && Number(o) <= 255)
+      ) {
+        return octets.map(Number).join('.');
+      }
+    } else if (remainder.includes(':')) {
+      const hexParts = remainder.split(':');
+      if (
+        hexParts.length === 2 &&
+        hexParts.every((p) => /^[0-9a-fA-F]{1,4}$/.test(p))
+      ) {
+        const h1 = parseInt(hexParts[0], 16);
+        const h2 = parseInt(hexParts[1], 16);
+        return `${(h1 >> 8) & 0xff}.${h1 & 0xff}.${(h2 >> 8) & 0xff}.${h2 & 0xff}`;
+      }
+    }
+  }
+  return ip || 'unknown';
 }
 
 export interface RateLimiterOptions {

@@ -570,14 +570,28 @@ export class MetaInstagramBotService {
     let attachmentTitle: string | null = null;
     if (Array.isArray(attachments)) {
       for (const att of attachments) {
-        if (att?.payload?.url) {
-          reelUrl = att.payload.url;
+        const urlCandidate =
+          (typeof att?.payload?.url === 'string' && att.payload.url.trim()) ||
+          (typeof att?.payload?.target?.url === 'string' && att.payload.target.url.trim()) ||
+          (typeof att?.payload?.reel_url === 'string' && att.payload.reel_url.trim()) ||
+          null;
+        if (urlCandidate) {
+          reelUrl = urlCandidate;
           attachmentType = typeof att.type === 'string' ? att.type : null;
           attachmentTitle =
-            typeof att.payload.title === 'string' && att.payload.title.trim()
+            typeof att.payload?.title === 'string' && att.payload.title.trim()
               ? att.payload.title.trim()
               : null;
           break;
+        }
+        if (typeof att?.payload?.title === 'string' && att.payload.title.trim()) {
+          const titleMatch = extractInstagramShortcodeAndPath(att.payload.title);
+          if (titleMatch) {
+            reelUrl = titleMatch.matchedText;
+            attachmentType = typeof att.type === 'string' ? att.type : null;
+            attachmentTitle = att.payload.title.trim();
+            break;
+          }
         }
       }
     }
@@ -695,10 +709,19 @@ export class MetaInstagramBotService {
         for (const event of messaging) {
           const senderId = event.sender?.id;
           if (!senderId || event.message?.is_echo) continue;
+          // Silently ignore passive read/delivery receipts and emoji reactions without actionable messages or postbacks
+          if (!event.message && !event.postback) continue;
+          const text =
+            event.message?.text ||
+            event.message?.quick_reply?.payload ||
+            event.postback?.payload ||
+            event.postback?.title ||
+            '';
+          const mid = event.message?.mid ?? event.postback?.mid;
           await this.dispatchWebhookMessage(
             senderId,
-            event.message?.mid,
-            event.message?.text || '',
+            mid,
+            text,
             event.message?.attachments,
             'messaging'
           );
@@ -707,14 +730,22 @@ export class MetaInstagramBotService {
         // B. Changes events (some webhook subscriptions dispatch via changes)
         const changes = entry.changes || [];
         for (const change of changes) {
-          if (change.field === 'messages' && change.value) {
+          if ((change.field === 'messages' || change.field === 'messaging_postbacks') && change.value) {
             const val = change.value;
             const senderId = val.sender?.id;
             if (!senderId || val.message?.is_echo) continue;
+            if (!val.message && !val.postback) continue;
+            const text =
+              val.message?.text ||
+              val.message?.quick_reply?.payload ||
+              val.postback?.payload ||
+              val.postback?.title ||
+              '';
+            const mid = val.message?.mid ?? val.postback?.mid;
             await this.dispatchWebhookMessage(
               senderId,
-              val.message?.mid,
-              val.message?.text || '',
+              mid,
+              text,
               val.message?.attachments,
               'change'
             );

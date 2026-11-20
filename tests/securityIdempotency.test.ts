@@ -4,6 +4,7 @@ import http from 'node:http';
 import express from 'express';
 import {
   createRateLimiter,
+  getClientIp,
   safeStringEqual,
   securityHeadersMiddleware,
 } from '../src/middleware/security.ts';
@@ -2235,4 +2236,165 @@ test('Security - apiRouter returns 404 JSON for unrecognized API endpoints and 4
     if (origSecret === undefined) delete process.env.VAULT_SECRET;
     else process.env.VAULT_SECRET = origSecret;
   }
+});
+
+test('Security - getClientIp normalizes IPv4-mapped IPv6 and falls back safely', () => {
+  // Standard IPv4
+  assert.equal(getClientIp({ ip: '198.51.100.1' } as any), '198.51.100.1');
+
+  // IPv4-mapped IPv6
+  assert.equal(getClientIp({ ip: '::ffff:198.51.100.1' } as any), '198.51.100.1');
+
+  // Whitespace-padded IPv4-mapped IPv6
+  assert.equal(getClientIp({ ip: '  ::ffff:198.51.100.1  ' } as any), '198.51.100.1');
+
+  // Fallback to socket remoteAddress
+  assert.equal(getClientIp({ socket: { remoteAddress: '::ffff:203.0.113.5' } } as any), '203.0.113.5');
+
+  // Hexadecimal IPv4-mapped IPv6 (e.g. ::ffff:c000:201 -> 192.0.2.1, ::ffff:7f00:1 -> 127.0.0.1)
+  assert.equal(getClientIp({ ip: '::ffff:c000:201' } as any), '192.0.2.1');
+  assert.equal(getClientIp({ ip: '::ffff:7f00:1' } as any), '127.0.0.1');
+  assert.equal(getClientIp({ ip: '::FFFF:c000:0201' } as any), '192.0.2.1');
+
+  // Invalid mapped addresses avoid being treated as normalized IPv4
+  assert.equal(getClientIp({ ip: '::ffff:invalid:extra:parts' } as any), '::ffff:invalid:extra:parts');
+  assert.equal(getClientIp({ ip: '::ffff:999.999.999.999' } as any), '::ffff:999.999.999.999');
+
+  // Unknown fallback
+  assert.equal(getClientIp({} as any), 'unknown');
+});
+
+test('MetaInstagramBotService - resilient webhook handling for passive events, postbacks, and target attachments', async () => {
+  const dispatched: Array<{ senderId: string; rawMid: unknown; text: string }> = [];
+
+  const service = new MetaInstagramBotService({} as any, {
+    PAGE_ACCESS_TOKEN: 'mock_token',
+    INSTAGRAM_ACCOUNT_ID: 'mock_page_id',
+    APP_SECRET: 'mock_secret',
+  });
+
+  // Spy on dispatchWebhookMessage private method
+  (service as any).dispatchWebhookMessage = async (
+    senderId: string,
+    rawMid: unknown,
+    text: string,
+    attachments: any[] | undefined
+  ) => {
+    dispatched.push({ senderId, rawMid, text });
+  };
+
+  // 1. Passive read, delivery, and reaction events are ignored silently
+  await service.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          { sender: { id: 'sender_passive' }, read: { watermark: 12345 } },
+          { sender: { id: 'sender_passive' }, delivery: { mids: ['mid_1'] } },
+          { sender: { id: 'sender_passive' }, reaction: { reaction: 'love', emoji: '❤️' } },
+        ],
+      },
+    ],
+  });
+  assert.equal(dispatched.length, 0, 'Passive events must not trigger dispatch');
+
+  // 2. Postback event is dispatched with postback payload and preserves postback mid
+  await service.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: 'sender_postback' },
+            postback: { mid: 'mid.postback_123', payload: 'help', title: 'Help Menu' },
+          },
+        ],
+      },
+    ],
+  });
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].senderId, 'sender_postback');
+  assert.equal(dispatched[0].rawMid, 'mid.postback_123');
+  assert.equal(dispatched[0].text, 'help');
+  dispatched.length = 0;
+
+  // 2b. Changes subscription with messaging_postbacks field dispatches correctly
+  await service.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        changes: [
+          {
+            field: 'messaging_postbacks',
+            value: {
+              sender: { id: 'sender_change_postback' },
+              postback: { mid: 'mid.change_postback_456', payload: 'watched' },
+            },
+          },
+        ],
+      },
+    ],
+  });
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].senderId, 'sender_change_postback');
+  assert.equal(dispatched[0].rawMid, 'mid.change_postback_456');
+  assert.equal(dispatched[0].text, 'watched');
+  dispatched.length = 0;
+
+  // 3. Attachment with target.url is parsed
+  const testService = new MetaInstagramBotService({} as any, {
+    PAGE_ACCESS_TOKEN: 'mock_token',
+    INSTAGRAM_ACCOUNT_ID: 'mock_page_id',
+    APP_SECRET: 'mock_secret',
+  });
+
+  let processedText = '';
+  (testService as any).processIncomingText = async (
+    senderId: string,
+    text: string
+  ) => {
+    processedText = text;
+    return { stateMutated: false, anyDeliveryFailed: false };
+  };
+
+  await (testService as any).dispatchWebhookMessage(
+    'sender_att_target',
+    'mid_target_1',
+    '',
+    [{ type: 'share', payload: { target: { url: 'https://www.instagram.com/reel/Ctarget123/' } } }],
+    'messaging'
+  );
+  assert.equal(processedText, 'https://www.instagram.com/reel/Ctarget123/');
+
+  // 4. Attachment with title containing reel URL
+  processedText = '';
+  await (testService as any).dispatchWebhookMessage(
+    'sender_att_title',
+    'mid_title_1',
+    '',
+    [{ type: 'share', payload: { title: 'Shared: https://www.instagram.com/reel/Ctitle456/?utm_source=ig_web' } }],
+    'messaging'
+  );
+  assert.ok(processedText.startsWith('https://www.instagram.com/reel/Ctitle456'));
+
+  // 4b. Attachment with title containing /creator/reel/ and /reels/ URLs
+  processedText = '';
+  await (testService as any).dispatchWebhookMessage(
+    'sender_att_title_creator',
+    'mid_title_creator',
+    '',
+    [{ type: 'share', payload: { title: 'Look at this https://www.instagram.com/creator/reel/Ctitle456/' } }],
+    'messaging'
+  );
+  assert.ok(processedText.includes('https://www.instagram.com/creator/reel/Ctitle456/'));
+
+  processedText = '';
+  await (testService as any).dispatchWebhookMessage(
+    'sender_att_title_reels',
+    'mid_title_reels',
+    '',
+    [{ type: 'share', payload: { title: 'Check https://www.instagram.com/reels/Creels789/' } }],
+    'messaging'
+  );
+  assert.ok(processedText.includes('https://www.instagram.com/reels/Creels789/'));
 });
