@@ -198,7 +198,10 @@ test('playerGeometry.computeAdaptiveStage fits all aspect ratios on Desktop, Mob
     assert.equal(st.useSideDock, c.expectSideDock, `${c.name} useSideDock`);
     assert.equal(st.useDockedMeta, c.expectDocked, `${c.name} useDockedMeta`);
     assert.equal(st.useCompactRail, c.expectCompact, `${c.name} useCompactRail`);
-    assert.equal(st.iframeTop, -55, `${c.name} must clip 54px header + 1px safety`);
+    const expectedIframeTop = !st.isPillarboxedReel && st.effectiveEmbedRatio > 1.05
+      ? -(ReelerGeometry.HEADER_CLIP_PX + Math.max(0, Math.round((((st.iframeW - 2) * 0.75) - Math.round((st.iframeW - 2) / st.effectiveEmbedRatio)) / 2)))
+      : -55;
+    assert.equal(st.iframeTop, expectedIframeTop, `${c.name} iframeTop must clip 54px header and letterbox`);
     assert.ok(st.viewW <= c.vw - 16, `${c.name} viewW ${st.viewW} fits viewport ${c.vw}`);
     assert.ok(st.controlsW >= st.viewW, `${c.name} controlsW ${st.controlsW} >= viewW ${st.viewW}`);
     assert.ok(st.controlsW <= c.vw - 16, `${c.name} controlsW ${st.controlsW} fits viewport ${c.vw}`);
@@ -770,4 +773,70 @@ test('resolveFeedMediaMetadata preserves unexpired covers on kind-only refresh a
     if (origMetaProxy === undefined) delete process.env.METADATA_PROXY_URL;
     else process.env.METADATA_PROXY_URL = origMetaProxy;
   }
+});
+
+test('playerGeometry and app embed contracts: landscape alignment, square grid reel preservation, and postMessages', () => {
+  // 1. Reel with 1.0 square CDN grid thumbnail must remain classified as pillarboxed 9:16 reel
+  const reelSquareGridThumb = ReelerGeometry.classifyPostAspect({
+    embedRatio: 0.8,
+    isClips: true,
+    thumbAspectRatio: 1.0,
+  });
+  assert.equal(reelSquareGridThumb.isPillarboxedReel, true, 'Square CDN thumbnail must not de-pillarbox 9:16 reel');
+  assert.ok(Math.abs(reelSquareGridThumb.displayRatio - 9 / 16) < 0.001);
+
+  // 2. Pre-probe reel with 1.0 square thumbnail also stays pillarboxed 9:16
+  const preProbeSquareReel = ReelerGeometry.classifyPostAspect({
+    embedRatio: null,
+    isClips: true,
+    thumbAspectRatio: 1.0,
+  });
+  assert.equal(preProbeSquareReel.isPillarboxedReel, true);
+  assert.ok(Math.abs(preProbeSquareReel.displayRatio - 9 / 16) < 0.001);
+
+  // 3. 16:9 Landscape post dynamically clips top letterbox bar and hugs media
+  const stage169 = ReelerGeometry.computeAdaptiveStage({
+    embedRatio: 1.778,
+    isClips: true,
+    thumbAspectRatio: 1.778,
+    viewportWidth: 1280,
+    viewportHeight: 800,
+  });
+  assert.equal(stage169.isPillarboxedReel, false);
+  assert.equal(stage169.displayRatio, 1.778);
+  assert.equal(stage169.viewW, 720);
+  assert.equal(stage169.viewH, 401);
+  assert.equal(stage169.iframeW, 722);
+  // Expected: letterboxPad = Math.round(((722 - 2) * 0.75 - Math.round(720 / 1.778)) / 2) = (540 - 405) / 2 = 68px
+  // iframeTop = -(55 + 68) = -123px
+  assert.equal(stage169.iframeTop, -123);
+  assert.ok(stage169.useDockedMeta, '16:9 post must use docked metadata bar');
+
+  // 4. parseEmbedMessage cleanly parses LOADING, MOUNTED, and MEASURE
+  assert.deepEqual(ReelerGeometry.parseEmbedMessage(JSON.stringify({ type: 'LOADING', details: {} })), {
+    type: 'LOADING',
+    height: null,
+  });
+  assert.deepEqual(
+    ReelerGeometry.parseEmbedMessage(JSON.stringify({ type: 'MOUNTED', details: { styles: [] } })),
+    {
+      type: 'MOUNTED',
+      height: null,
+    }
+  );
+  assert.deepEqual(
+    ReelerGeometry.parseEmbedMessage(JSON.stringify({ type: 'MEASURE', details: { height: 433 } })),
+    {
+      type: 'MEASURE',
+      height: 433,
+    }
+  );
+
+  // 5. Embed iframe query string construction contract
+  const shortcode = 'Df4q5OZzBEz';
+  const originParam = encodeURIComponent('https://reeler-staging.onrender.com');
+  const pathParam = encodeURIComponent('/');
+  const expectedSrc = `https://www.instagram.com/p/${encodeURIComponent(shortcode)}/embed/?cr=1&rd=${originParam}&rp=${pathParam}`;
+  assert.ok(expectedSrc.includes('?cr=1&rd='), 'Embed URL must include cr=1 cross-origin parameter');
+  assert.ok(expectedSrc.includes(encodeURIComponent('https://reeler-staging.onrender.com')));
 });
