@@ -3886,8 +3886,6 @@ function mountFeedIframe(slide, reel) {
       fallbackBox.hidden = true;
       iframe.hidden = false;
       settled = false;
-      finalizeAndReveal(cached?.embedRatio ?? null, false, 40, false);
-      return;
     }
 
     if (phase === 'cached') {
@@ -3896,8 +3894,24 @@ function mountFeedIframe(slide, reel) {
     }
 
     if (phase === 'aborted') {
-      finalizeAndReveal(cached?.embedRatio ?? null, false, 40, false);
-      return;
+      const currentW = Math.round(parseFloat(iframe.style.width) || iframe.offsetWidth || 0);
+      iframe.dataset.probing = '1';
+      if (safetyTimer) clearTimeout(safetyTimer);
+      safetyTimer = setTimeout(() => {
+        phase = 'aborted';
+        finalizeAndReveal(null, false, 0, false);
+      }, 3500);
+
+      if (h1 && currentW === ReelerGeometry.PROBE_WIDTH_2) {
+        phase = 'w2';
+      } else if (!h1 && currentW === ReelerGeometry.PROBE_WIDTH_1) {
+        phase = 'w1';
+      } else {
+        h1 = null;
+        phase = 'w1';
+        iframe.style.width = `${ReelerGeometry.PROBE_WIDTH_1}px`;
+        return;
+      }
     }
 
     if (phase === 'w1') {
