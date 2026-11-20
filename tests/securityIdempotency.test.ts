@@ -2212,6 +2212,20 @@ test('Security - apiRouter returns 404 JSON for unrecognized API endpoints and 4
         headers: { 'X-Vault-Key': adminKey },
       });
       assert.equal(validExpandedRes.status, 200);
+
+      // Expanded year 0 leap day (+000000-02-29) is valid proleptic Gregorian leap day
+      const validYear0LeapRes = await fetch(`${baseUrl}/api/reels?startDate=%2B000000-02-29T00:00:00.000Z`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(validYear0LeapRes.status, 200);
+
+      // Expanded year 0 impossible day (+000000-02-30) returns 400 Bad Request
+      const invalidYear0Res = await fetch(`${baseUrl}/api/reels?startDate=%2B000000-02-30T00:00:00.000Z`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(invalidYear0Res.status, 400);
+      const invalidYear0Body = (await invalidYear0Res.json()) as { error?: string };
+      assert.equal(invalidYear0Body.error, 'INVALID_DATE_FORMAT');
     });
   } finally {
     resetApiRateLimitersForTesting();

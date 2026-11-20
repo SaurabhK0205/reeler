@@ -442,8 +442,15 @@ export function parseDurationOrDateInput(input: unknown): Date | null {
 
   if (month < 1 || month > 12 || day < 1 || day > 31) return null;
 
-  // Determine exact maximum valid days for the given month and year (1-indexed month, day 0 is last day of month)
-  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  // Determine exact maximum valid days for the given month and year using proleptic Gregorian rules
+  // (avoiding Date.UTC's legacy 0-99 year remapping to 1900-1999)
+  let daysInMonth = 31;
+  if (month === 2) {
+    const isLeap = (year % 4 === 0 && year % 100 !== 0) || (year % 400 === 0);
+    daysInMonth = isLeap ? 29 : 28;
+  } else if (month === 4 || month === 6 || month === 9 || month === 11) {
+    daysInMonth = 30;
+  }
   if (day > daysInMonth) return null;
 
   if (isoMatch[5] !== undefined) {
