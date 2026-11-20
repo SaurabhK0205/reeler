@@ -181,7 +181,7 @@ function () {
     // Pre-probe / fallback classification
     if (validThumb !== null) {
       const isNativeFourFive = validThumb >= 0.74 && validThumb <= 0.86;
-      if (validThumb < 0.70 || (isClips === true && !isNativeFourFive && validThumb <= 1.08)) {
+      if ((validThumb < 0.70 && isClips !== false) || (isClips === true && !isNativeFourFive && validThumb <= 1.08)) {
         return {
           isPillarboxedReel: true,
           effectiveEmbedRatio: 0.80,

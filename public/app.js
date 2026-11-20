@@ -3731,9 +3731,6 @@ function mountFeedIframe(slide, reel) {
     'title',
     frameCreator.isAttributedName ? `Instagram post by ${frameCreator.accessibleName}` : 'Embedded Instagram post'
   );
-  iframe.addEventListener('load', () => {
-    mounted = true;
-  });
   iframe.addEventListener('error', () => {
     finalizeAndReveal(null, false, 0, true);
   }, { once: true });
@@ -3807,20 +3804,36 @@ function mountFeedIframe(slide, reel) {
    */
   const finalizeAndReveal = (embedRatio, persist, settleDelayMs = 0, showFallback = false) => {
     if (settled || abortController.signal.aborted) return;
-    settled = true;
     delete iframe.dataset.probing;
     clearProbeUi();
 
     if (showFallback && !mounted && fallbackBox) {
-      cleanupListeners();
+      if (safetyTimer) {
+        clearTimeout(safetyTimer);
+        safetyTimer = null;
+      }
       if (focusPlayerBtn) {
         focusPlayerBtn.hidden = true;
         focusPlayerBtn.disabled = true;
       }
       iframe.hidden = true;
       fallbackBox.hidden = false;
+
+      // Late recovery: if a slow frame completes load or emits a message late, replace fallback and reveal
+      const onLateRecover = () => {
+        if (abortController.signal.aborted) return;
+        mounted = true;
+        fallbackBox.hidden = true;
+        iframe.hidden = false;
+        settled = false;
+        finalizeAndReveal(cached?.embedRatio ?? null, false, 40, false);
+      };
+
+      iframe.addEventListener('load', onLateRecover, { once: true });
       return;
     }
+
+    settled = true;
 
     if (persist && typeof embedRatio === 'number') {
       persistAspectCacheEntry(shortcode, {
@@ -3880,6 +3893,12 @@ function mountFeedIframe(slide, reel) {
 
     // Any valid postMessage from Instagram confirms the frame is mounted
     mounted = true;
+
+    if (fallbackBox && !fallbackBox.hidden) {
+      fallbackBox.hidden = true;
+      iframe.hidden = false;
+      settled = false;
+    }
 
     if (phase === 'cached') {
       finalizeAndReveal(cached.embedRatio, false, 40, false);
