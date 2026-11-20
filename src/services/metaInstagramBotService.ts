@@ -717,9 +717,10 @@ export class MetaInstagramBotService {
             event.postback?.payload ||
             event.postback?.title ||
             '';
+          const mid = event.message?.mid ?? event.postback?.mid;
           await this.dispatchWebhookMessage(
             senderId,
-            event.message?.mid,
+            mid,
             text,
             event.message?.attachments,
             'messaging'
@@ -729,7 +730,7 @@ export class MetaInstagramBotService {
         // B. Changes events (some webhook subscriptions dispatch via changes)
         const changes = entry.changes || [];
         for (const change of changes) {
-          if (change.field === 'messages' && change.value) {
+          if ((change.field === 'messages' || change.field === 'messaging_postbacks') && change.value) {
             const val = change.value;
             const senderId = val.sender?.id;
             if (!senderId || val.message?.is_echo) continue;
@@ -740,9 +741,10 @@ export class MetaInstagramBotService {
               val.postback?.payload ||
               val.postback?.title ||
               '';
+            const mid = val.message?.mid ?? val.postback?.mid;
             await this.dispatchWebhookMessage(
               senderId,
-              val.message?.mid,
+              mid,
               text,
               val.message?.attachments,
               'change'

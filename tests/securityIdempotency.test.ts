@@ -2256,7 +2256,7 @@ test('Security - getClientIp normalizes IPv4-mapped IPv6 and falls back safely',
 });
 
 test('MetaInstagramBotService - resilient webhook handling for passive events, postbacks, and target attachments', async () => {
-  const dispatched: Array<{ senderId: string; text: string }> = [];
+  const dispatched: Array<{ senderId: string; rawMid: unknown; text: string }> = [];
 
   const service = new MetaInstagramBotService({} as any, {
     PAGE_ACCESS_TOKEN: 'mock_token',
@@ -2271,7 +2271,7 @@ test('MetaInstagramBotService - resilient webhook handling for passive events, p
     text: string,
     attachments: any[] | undefined
   ) => {
-    dispatched.push({ senderId, text });
+    dispatched.push({ senderId, rawMid, text });
   };
 
   // 1. Passive read, delivery, and reaction events are ignored silently
@@ -2289,7 +2289,7 @@ test('MetaInstagramBotService - resilient webhook handling for passive events, p
   });
   assert.equal(dispatched.length, 0, 'Passive events must not trigger dispatch');
 
-  // 2. Postback event is dispatched with postback payload
+  // 2. Postback event is dispatched with postback payload and preserves postback mid
   await service.handleWebhookPayload({
     object: 'instagram',
     entry: [
@@ -2297,7 +2297,7 @@ test('MetaInstagramBotService - resilient webhook handling for passive events, p
         messaging: [
           {
             sender: { id: 'sender_postback' },
-            postback: { payload: 'help', title: 'Help Menu' },
+            postback: { mid: 'mid.postback_123', payload: 'help', title: 'Help Menu' },
           },
         ],
       },
@@ -2305,7 +2305,31 @@ test('MetaInstagramBotService - resilient webhook handling for passive events, p
   });
   assert.equal(dispatched.length, 1);
   assert.equal(dispatched[0].senderId, 'sender_postback');
+  assert.equal(dispatched[0].rawMid, 'mid.postback_123');
   assert.equal(dispatched[0].text, 'help');
+  dispatched.length = 0;
+
+  // 2b. Changes subscription with messaging_postbacks field dispatches correctly
+  await service.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        changes: [
+          {
+            field: 'messaging_postbacks',
+            value: {
+              sender: { id: 'sender_change_postback' },
+              postback: { mid: 'mid.change_postback_456', payload: 'watched' },
+            },
+          },
+        ],
+      },
+    ],
+  });
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].senderId, 'sender_change_postback');
+  assert.equal(dispatched[0].rawMid, 'mid.change_postback_456');
+  assert.equal(dispatched[0].text, 'watched');
   dispatched.length = 0;
 
   // 3. Attachment with target.url is parsed
