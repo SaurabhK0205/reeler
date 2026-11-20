@@ -3731,6 +3731,10 @@ function mountFeedIframe(slide, reel) {
     'title',
     frameCreator.isAttributedName ? `Instagram post by ${frameCreator.accessibleName}` : 'Embedded Instagram post'
   );
+  let iframeLoaded = false;
+  iframe.addEventListener('load', () => {
+    iframeLoaded = true;
+  });
   iframe.addEventListener('error', () => {
     finalizeAndReveal(null, false, 0, true);
   }, { once: true });
@@ -3822,7 +3826,7 @@ function mountFeedIframe(slide, reel) {
       // Late recovery: if a slow frame completes load or emits a message late, replace fallback and reveal
       const onLateRecover = () => {
         if (abortController.signal.aborted) return;
-        mounted = true;
+        iframeLoaded = true;
         fallbackBox.hidden = true;
         iframe.hidden = false;
         settled = false;
@@ -3902,6 +3906,11 @@ function mountFeedIframe(slide, reel) {
 
     if (phase === 'cached') {
       finalizeAndReveal(cached.embedRatio, false, 40, false);
+      return;
+    }
+
+    if (phase === 'aborted') {
+      finalizeAndReveal(cached?.embedRatio ?? null, false, 40, false);
       return;
     }
 
@@ -3990,7 +3999,7 @@ function mountFeedIframe(slide, reel) {
     iframeBox.appendChild(iframe);
 
     safetyTimer = setTimeout(() => {
-      finalizeAndReveal(cached.embedRatio, false, 0, !mounted);
+      finalizeAndReveal(cached.embedRatio, false, 0, !mounted && !iframeLoaded);
     }, 2500);
   } else {
     iframe.dataset.probing = '1';
@@ -4002,7 +4011,7 @@ function mountFeedIframe(slide, reel) {
 
     safetyTimer = setTimeout(() => {
       phase = 'aborted';
-      finalizeAndReveal(null, false, 0, !mounted);
+      finalizeAndReveal(null, false, 0, !mounted && !iframeLoaded);
     }, 6500);
   }
 }
