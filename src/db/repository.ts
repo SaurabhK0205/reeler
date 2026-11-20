@@ -2538,6 +2538,10 @@ export class Repository {
     const isScoped = Boolean(trimmedSender && trimmedSender !== 'admin');
     if (!cleanUsername) return { creator: null, reels: [], totalReelsCount: 0, totalPostsCount: 0 };
 
+    const { handle: sanitizedHandle, text: sanitizedText } = sanitizePostgrestSearchTerm(cleanUsername);
+    const safeTerm = sanitizedHandle || sanitizedText;
+    if (!safeTerm) return { creator: null, reels: [], totalReelsCount: 0, totalPostsCount: 0 };
+
     const sortCreatorItems = (items: SavedReel[]): SavedReel[] =>
       [...items].sort((a, b) => {
         const effectiveSavedDiff =
@@ -2594,18 +2598,19 @@ export class Repository {
     }
 
     const supabase = getSupabase();
-    // 1. Try exact match first across all creator records with this username
+    // 1. Try exact match first across all creator records with this username (bounded to 20 rows)
     let { data: creators } = await supabase
       .from('creators')
       .select('*')
-      .ilike('username', cleanUsername);
+      .ilike('username', safeTerm)
+      .limit(20);
 
-    // 2. If no exact match, try partial match on username or display_name
+    // 2. If no exact match, try sanitized partial match on username or display_name
     if (!creators || creators.length === 0) {
       const { data: partialCreators } = await supabase
         .from('creators')
         .select('*')
-        .or(`username.ilike.%${cleanUsername}%,display_name.ilike.%${cleanUsername}%`)
+        .or(`username.ilike.%${safeTerm}%,display_name.ilike.%${safeTerm}%`)
         .limit(10);
       creators = partialCreators || [];
     }
@@ -3028,7 +3033,11 @@ export class Repository {
     return data as SavedReel[];
   }
 
-  static async activateDefaultReminder(id: string, defaultHours: number = 10): Promise<{ reel: SavedReel; targetTime: Date }> {
+  static async activateDefaultReminder(
+    id: string,
+    expectedDeadline: string,
+    defaultHours: number = 10
+  ): Promise<{ reel: SavedReel | null; targetTime: Date }> {
     const now = new Date();
     const targetTime = new Date(now.getTime() + defaultHours * 3600 * 1000);
     const targetIso = targetTime.toISOString();
@@ -3036,6 +3045,9 @@ export class Repository {
     if (!isSupabaseConfigured()) {
       const reel = memoryStore.reels.get(id);
       if (reel) {
+        if (reel.awaiting_reminder_choice_until !== expectedDeadline) {
+          return { reel: null, targetTime };
+        }
         reel.awaiting_reminder_choice_until = null;
         reel.reminder_interval_hours = defaultHours;
         reel.reminder_interval_seconds = defaultHours * 3600;
@@ -3043,7 +3055,7 @@ export class Repository {
         reel.updated_at = now.toISOString();
         return { reel: { ...reel, creator: memoryStore.creators.get(reel.creator_id) }, targetTime };
       }
-      throw new Error('Reel not found in memory store');
+      return { reel: null, targetTime };
     }
 
     const supabase = getSupabase();
@@ -3057,11 +3069,15 @@ export class Repository {
         updated_at: now.toISOString(),
       })
       .eq('id', id)
+      .eq('awaiting_reminder_choice_until', expectedDeadline)
       .select('*, creator:creators(*)')
-      .single();
+      .maybeSingle();
 
-    if (error || !data) {
-      throw new Error(`Failed to activate default reminder: ${error?.message}`);
+    if (error) {
+      throw new Error(`Failed to activate default reminder: ${error.message}`);
+    }
+    if (!data) {
+      return { reel: null, targetTime };
     }
 
     return { reel: data as SavedReel, targetTime };
