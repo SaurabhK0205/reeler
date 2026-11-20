@@ -167,6 +167,7 @@ export function securityHeadersMiddleware(req: Request, res: Response, next: Nex
   setResponseHeader(res, 'Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
   setResponseHeader(res, 'X-DNS-Prefetch-Control', 'off');
   setResponseHeader(res, 'Cross-Origin-Opener-Policy', 'same-origin');
+  setResponseHeader(res, 'Cross-Origin-Resource-Policy', 'same-origin');
   setResponseHeader(res, 'Content-Security-Policy', CONTENT_SECURITY_POLICY);
 
   const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();

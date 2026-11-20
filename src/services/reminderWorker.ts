@@ -26,6 +26,7 @@ export class ReminderWorker {
   private adminThreadId: string | null = null;
   private adminUserId: string | null = null;
   private isDispatching = false;
+  private isCheckingChoices = false;
   private failedReelSuppression = new Map<string, number>();
 
   private markItemProcessed(itemId: string) {
@@ -377,26 +378,41 @@ export class ReminderWorker {
    * and notifies the user with the exact trigger time!
    */
   async checkAwaitingChoices() {
-    const expiredReels = await Repository.getReelsAwaitingChoiceDue();
-    if (expiredReels.length === 0) return;
+    if (this.isCheckingChoices) {
+      console.log('[ReminderWorker] Choice check already in progress, skipping tick.');
+      return;
+    }
+    this.isCheckingChoices = true;
 
-    const config = loadConfig();
-    const defaultHours = config.reminders.defaultIntervalHours || 10;
+    try {
+      const expiredReels = await Repository.getReelsAwaitingChoiceDue();
+      if (expiredReels.length === 0) return;
 
-    for (const reel of expiredReels) {
-      const { targetTime } = await Repository.activateDefaultReminder(reel.id, defaultHours);
-      const senderTz = reel.instagram_sender_id
-        ? await Repository.getSenderTimezone(reel.instagram_sender_id)
-        : undefined;
-      const targetStr = formatTargetTime(targetTime, new Date(), senderTz);
+      const config = loadConfig();
+      const defaultHours = config.reminders.defaultIntervalHours || 10;
 
-      const defaultNotice = formatDefaultReminderNotice(reel, defaultHours, targetStr);
+      for (const reel of expiredReels) {
+        const { reel: activatedReel, targetTime } = await Repository.activateDefaultReminder(reel.id, defaultHours);
+        if (!activatedReel) {
+          // CAS race lost: another tick or worker already activated this reel's reminder
+          continue;
+        }
 
-      console.log(`[ReminderWorker] ⏰ 10-minute wait expired for reel ${reel.shortcode}. Set default ${defaultHours}h reminder (${targetStr}).`);
+        const senderTz = activatedReel.instagram_sender_id
+          ? await Repository.getSenderTimezone(activatedReel.instagram_sender_id)
+          : undefined;
+        const targetStr = formatTargetTime(targetTime, new Date(), senderTz);
 
-      if (reel.instagram_sender_id && this.metaBot.isConfigured) {
-        await this.metaBot.sendDirectMessage(reel.instagram_sender_id, defaultNotice);
+        const defaultNotice = formatDefaultReminderNotice(activatedReel, defaultHours, targetStr);
+
+        console.log(`[ReminderWorker] ⏰ 10-minute wait expired for reel ${activatedReel.shortcode}. Set default ${defaultHours}h reminder (${targetStr}).`);
+
+        if (activatedReel.instagram_sender_id && this.metaBot.isConfigured) {
+          await this.metaBot.sendDirectMessage(activatedReel.instagram_sender_id, defaultNotice);
+        }
       }
+    } finally {
+      this.isCheckingChoices = false;
     }
   }
 }

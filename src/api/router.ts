@@ -311,12 +311,24 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
       ? req.query.creatorId.trim().slice(0, 128)
       : undefined;
 
+    const rawStartDate = typeof req.query.startDate === 'string' ? req.query.startDate.trim().slice(0, 40) : undefined;
+    const rawEndDate = typeof req.query.endDate === 'string' ? req.query.endDate.trim().slice(0, 40) : undefined;
+
+    if (rawStartDate && Number.isNaN(Date.parse(rawStartDate))) {
+      res.status(400).json({ error: 'INVALID_DATE_FORMAT', message: 'startDate must be a valid date or timestamp.' });
+      return;
+    }
+    if (rawEndDate && Number.isNaN(Date.parse(rawEndDate))) {
+      res.status(400).json({ error: 'INVALID_DATE_FORMAT', message: 'endDate must be a valid date or timestamp.' });
+      return;
+    }
+
     const filters: ReelQueryFilters = {
       creatorId: safeCreatorId,
       instagramSenderId: senderId,
       datePreset: (req.query.datePreset as DateFilterPreset) || 'all',
-      startDate: typeof req.query.startDate === 'string' ? req.query.startDate.slice(0, 40) : undefined,
-      endDate: typeof req.query.endDate === 'string' ? req.query.endDate.slice(0, 40) : undefined,
+      startDate: rawStartDate,
+      endDate: rawEndDate,
       watchStatus: (req.query.watchStatus as WatchStatus | 'all') || 'all',
       mediaType: (rawMediaType as SavedMediaType | 'all') || 'all',
       source: (rawSource as SavedCollectionSource | 'all') || 'all',
@@ -603,6 +615,18 @@ apiRouter.patch('/user/timezone', async (req: Request, res: Response, next: Next
     success: true,
     timezone: resolved,
     summary: getTimeZoneSummary(resolved),
+  });
+});
+
+/**
+ * Catch-all 404 handler for unrecognized /api routes.
+ * Prevents unknown API calls from falling through to the single-page application index.html shell.
+ */
+apiRouter.all('*', (req: Request, res: Response) => {
+  setResponseHeader(res, 'Cache-Control', 'no-store');
+  res.status(404).json({
+    error: 'NOT_FOUND',
+    message: `API endpoint ${req.method} ${req.path} not found.`,
   });
 });
 

@@ -87,6 +87,7 @@ test('Security - securityHeadersMiddleware sets CSP, nosniff, frame deny, and HS
     assert.equal(res.headers.get('x-frame-options'), 'DENY');
     assert.equal(res.headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
     assert.equal(res.headers.get('cross-origin-opener-policy'), 'same-origin');
+    assert.equal(res.headers.get('cross-origin-resource-policy'), 'same-origin');
     assert.match(res.headers.get('content-security-policy') || '', /script-src 'self'/);
     assert.match(res.headers.get('content-security-policy') || '', /frame-ancestors 'none'/);
     assert.match(res.headers.get('strict-transport-security') || '', /max-age=31536000/);
@@ -2064,5 +2065,104 @@ test('Archive Import - rejects non-JSON media types with 415, enforces bounded e
     else process.env.SUPABASE_URL = origSupabaseUrl;
     if (origSupabaseKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
     else process.env.SUPABASE_SERVICE_ROLE_KEY = origSupabaseKey;
+  }
+});
+
+test('Security - Repository.getReelsByCreatorUsername safely handles PostgREST control and injection characters', async () => {
+  Repository.resetMemoryStoreForTests();
+  try {
+    // Malformed strings with commas, parens, quotes, wildcards must not throw or produce invalid search clauses
+    const result1 = await Repository.getReelsByCreatorUsername('injection,id.eq.bar()');
+    assert.equal(result1.creator, null);
+    assert.deepEqual(result1.reels, []);
+
+    const result2 = await Repository.getReelsByCreatorUsername('@test%_wildcard*');
+    assert.equal(result2.creator, null);
+    assert.deepEqual(result2.reels, []);
+
+    const resultEmpty = await Repository.getReelsByCreatorUsername('   ,,,()""  ');
+    assert.equal(resultEmpty.creator, null);
+    assert.deepEqual(resultEmpty.reels, []);
+  } finally {
+    Repository.resetMemoryStoreForTests();
+  }
+});
+
+test('Security - Repository.activateDefaultReminder enforces atomic CAS on awaiting_reminder_choice_until', async () => {
+  Repository.resetMemoryStoreForTests();
+  try {
+    const creator = await Repository.upsertCreator({ username: 'cas_creator' });
+    const reel = await Repository.upsertSavedReel({
+      shortcode: 'CasReelShortcode1',
+      reel_url: 'https://www.instagram.com/reel/CasReelShortcode1/',
+      creator_id: creator.id,
+      media_type: 'reel',
+      watch_status: 'watch_later',
+      awaiting_reminder_choice_until: new Date(Date.now() - 60_000).toISOString(),
+    });
+
+    // First activation succeeds and returns reel with cleared awaiting choice
+    const firstActivation = await Repository.activateDefaultReminder(reel.id, 10);
+    assert.ok(firstActivation.reel !== null);
+    assert.equal(firstActivation.reel?.awaiting_reminder_choice_until, null);
+    assert.equal(firstActivation.reel?.reminder_interval_hours, 10);
+
+    // Second activation on already-cleared reel returns null reel (CAS lost, prevents duplicate DMs)
+    const secondActivation = await Repository.activateDefaultReminder(reel.id, 10);
+    assert.equal(secondActivation.reel, null);
+  } finally {
+    Repository.resetMemoryStoreForTests();
+  }
+});
+
+test('Security - apiRouter returns 404 JSON for unrecognized API endpoints and 400 for malformed date filters', async () => {
+  const origEnv = process.env.NODE_ENV;
+  const origSecret = process.env.VAULT_SECRET;
+  process.env.NODE_ENV = 'production';
+  process.env.VAULT_SECRET = 'test-secret-vault-key-404-check';
+
+  const app = createApp();
+  const adminKey = getAdminVaultKey();
+
+  try {
+    await withServer(app, async (baseUrl) => {
+      // 1. Unrecognized API route returns 404 JSON instead of falling through to SPA index.html
+      const unknownApiRes = await fetch(`${baseUrl}/api/nonexistent/subpath`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(unknownApiRes.status, 404);
+      assert.equal(unknownApiRes.headers.get('content-type')?.includes('application/json'), true);
+      const unknownBody = (await unknownApiRes.json()) as { error?: string };
+      assert.equal(unknownBody.error, 'NOT_FOUND');
+
+      // 2. GET /api/reels with invalid startDate returns 400 Bad Request
+      const invalidStartRes = await fetch(`${baseUrl}/api/reels?startDate=not-a-valid-date`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(invalidStartRes.status, 400);
+      const invalidStartBody = (await invalidStartRes.json()) as { error?: string };
+      assert.equal(invalidStartBody.error, 'INVALID_DATE_FORMAT');
+
+      // 3. GET /api/reels with invalid endDate returns 400 Bad Request
+      const invalidEndRes = await fetch(`${baseUrl}/api/reels?endDate=invalid-end-date`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(invalidEndRes.status, 400);
+      const invalidEndBody = (await invalidEndRes.json()) as { error?: string };
+      assert.equal(invalidEndBody.error, 'INVALID_DATE_FORMAT');
+
+      // 4. Valid ISO date parameters proceed normally
+      const validDateRes = await fetch(`${baseUrl}/api/reels?startDate=2026-01-01T00:00:00.000Z`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(validDateRes.status, 200);
+    });
+  } finally {
+    resetApiRateLimitersForTesting();
+    clearIdempotencyStoreForTesting();
+    if (origEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = origEnv;
+    if (origSecret === undefined) delete process.env.VAULT_SECRET;
+    else process.env.VAULT_SECRET = origSecret;
   }
 });
