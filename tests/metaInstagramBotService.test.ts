@@ -239,6 +239,28 @@ test('reelMessages - confirmation messages never expose shortcodes & split UTF-1
   assert.ok(singleWithRemaining.includes('2 other Watch Later reminders active'));
   assert.ok(singleWithRemaining.includes('stop all'));
 
+  const singleWithDetailedRemaining = formatWatchedConfirmationMessage(
+    [reelMock],
+    1,
+    false,
+    [
+      {
+        ...reelMock,
+        id: 'r_other',
+        shortcode: 'OtherCode123',
+        creator: {
+          id: 'c_other',
+          username: 'cool_creator',
+          display_name: 'Cool Creator',
+          created_at: '2026-11-10T00:00:00Z',
+          updated_at: '2026-11-10T00:00:00Z',
+        },
+      },
+    ]
+  );
+  assert.ok(singleWithDetailedRemaining.includes('1 other Watch Later reminder active: @cool_creator'));
+  assert.ok(!singleWithDetailedRemaining.includes('OtherCode123'), 'Must not leak remaining shortcode');
+
   const unattributedNoCaption = formatWatchedConfirmationMessage(
     [
       {

@@ -30,14 +30,94 @@ function saveViewMode(mode) {
 }
 
 const VAULT_KEY_STORAGE = 'reeler_vault_key';
+const VAULT_LAST_ACTIVE_STORAGE = 'reeler_vault_last_active';
+const VAULT_INACTIVITY_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour inactivity threshold
+
+let lastActivityRecordTime = 0;
+
+/**
+ * Records user interaction timestamp to enforce 1-hour inactivity auto-logout.
+ * Throttled to at most once every 10 seconds to avoid unnecessary localStorage writes.
+ */
+function recordVaultActivity(force = false) {
+  const now = Date.now();
+  if (!force && now - lastActivityRecordTime < 10000) {
+    return;
+  }
+  if (checkVaultInactivity(false)) {
+    return;
+  }
+  lastActivityRecordTime = now;
+  try {
+    if (localStorage.getItem(VAULT_KEY_STORAGE)) {
+      localStorage.setItem(VAULT_LAST_ACTIVE_STORAGE, String(now));
+    }
+  } catch (_) {
+    /* non-fatal */
+  }
+}
+
+/**
+ * Checks whether the current vault session has exceeded the 1-hour inactivity limit.
+ * If expired, immediately purges stored keys, resets state, and shows the gate screen.
+ * @param {boolean} [quiet=false]
+ * @returns {boolean} True if session was expired and logged out.
+ */
+function checkVaultInactivity(quiet = false) {
+  try {
+    const key = localStorage.getItem(VAULT_KEY_STORAGE);
+    if (!key) {
+      if (vaultGateScreen && vaultGateScreen.classList.contains('is-hidden')) {
+        if (typeof closeReelsFeed === 'function') closeReelsFeed();
+        if (typeof resetVaultSessionState === 'function') resetVaultSessionState();
+        if (typeof showVaultGateScreen === 'function') showVaultGateScreen(undefined, { preserveWorkspace: false });
+      }
+      return false;
+    }
+
+    const rawLastActive = localStorage.getItem(VAULT_LAST_ACTIVE_STORAGE);
+    if (!rawLastActive) {
+      localStorage.setItem(VAULT_LAST_ACTIVE_STORAGE, String(Date.now()));
+      return false;
+    }
+
+    const lastActive = Number(rawLastActive);
+    if (Number.isFinite(lastActive) && Date.now() - lastActive > VAULT_INACTIVITY_TIMEOUT_MS) {
+      confirmSignOutVault({
+        reason: 'inactivity',
+        message: 'Your session expired due to 1 hour of inactivity for your privacy. Please sign back in.',
+        quiet,
+      });
+      return true;
+    }
+  } catch (_) {
+    /* non-fatal */
+  }
+  return false;
+}
 
 /**
  * Reads the stored private vault access key from localStorage.
+ * Enforces the 1-hour inactivity check so expired keys are rejected immediately.
  * @returns {string}
  */
 function getVaultAccessKey() {
   try {
-    return localStorage.getItem(VAULT_KEY_STORAGE) || '';
+    const key = localStorage.getItem(VAULT_KEY_STORAGE) || '';
+    if (!key) return '';
+    const rawLastActive = localStorage.getItem(VAULT_LAST_ACTIVE_STORAGE);
+    if (rawLastActive) {
+      const lastActive = Number(rawLastActive);
+      if (Number.isFinite(lastActive) && Date.now() - lastActive > VAULT_INACTIVITY_TIMEOUT_MS) {
+        confirmSignOutVault({
+          reason: 'inactivity',
+          message: 'Your session expired due to 1 hour of inactivity for your privacy. Please sign back in.',
+          quiet: false,
+        });
+        return '';
+      }
+    }
+    return key;
   } catch (_) {
     return '';
   }
@@ -45,15 +125,18 @@ function getVaultAccessKey() {
 
 /**
  * Stores or clears the private vault access key.
+ * Synchronizes the last active timestamp when a valid key is set.
  * @param {string | null | undefined} key
  */
 function setVaultAccessKey(key) {
   try {
     if (key && key.trim()) {
       localStorage.setItem(VAULT_KEY_STORAGE, key.trim());
+      localStorage.setItem(VAULT_LAST_ACTIVE_STORAGE, String(Date.now()));
       syncBrowserTimezone();
     } else {
       localStorage.removeItem(VAULT_KEY_STORAGE);
+      localStorage.removeItem(VAULT_LAST_ACTIVE_STORAGE);
     }
   } catch (_) {
     /* non-fatal */
@@ -122,6 +205,7 @@ function vaultFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
   if (key) {
     headers.set('X-Vault-Key', key);
+    recordVaultActivity(false);
   }
   const method = String(options.method || 'GET').toUpperCase();
   if ((method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') && !headers.has('Idempotency-Key')) {
@@ -696,6 +780,10 @@ function cancelSwitchVault() {
  * Explicitly signs out of the current device, clears the stored vault key, and resets vault state.
  */
 function confirmSignOutVault() {
+  const options = arguments[0] || {};
+  if (typeof closeReelsFeed === 'function') {
+    closeReelsFeed();
+  }
   invalidatePendingVaultAuth();
   clearPendingOtpAttempt();
   vaultSessionGeneration++;
@@ -707,8 +795,12 @@ function confirmSignOutVault() {
   if (vaultKeyInput) vaultKeyInput.value = '';
   showVaultGateScreen(undefined, { preserveWorkspace: false });
   switchVaultGateTab('otp');
+  const message = options.message || 'Signed out of this device. Enter a fresh 6-digit code or vault key to sign back in.';
   if (typeof announceStatus === 'function') {
-    announceStatus('Signed out of this device. Enter a fresh 6-digit code or vault key to sign back in.');
+    announceStatus(message);
+  }
+  if (options.reason === 'inactivity' && !options.quiet) {
+    showToast(message, 'info');
   }
 }
 
@@ -1376,6 +1468,7 @@ function renderInitialSkeletons() {
  * Initializes the vault application, restores URL state, binds events, and loads data in parallel.
  */
 async function init() {
+  checkVaultInactivity(true);
   const { hasUrlView } = restoreFiltersFromUrl();
   applyViewMode(state.viewMode, false, !hasUrlView);
   renderActiveFilterChips();
@@ -1759,8 +1852,9 @@ function renderCreatorStrip() {
  * @param {string} id
  */
 function selectCreator(id) {
-  state.filters.creatorId = id;
-  state.selectedCreator = id ? findCreatorById(id) : null;
+  const nextId = (state.filters.creatorId === id && id) ? '' : id;
+  state.filters.creatorId = nextId;
+  state.selectedCreator = nextId ? findCreatorById(nextId) : null;
   state.filters.page = 1;
   syncKpiActiveStates();
   syncUrlState();
@@ -2048,15 +2142,72 @@ function renderReels() {
       emptyActionHtml = '<button type="button" class="nav-btn nav-btn-primary" data-action="empty-import">Import saved_posts.json</button>';
     }
 
-    const emptyHtml = `
-      <div class="vault-empty-state">
-        <div class="empty-title-text">${emptyTitle}</div>
-        <div class="empty-desc-text">${emptyDesc}</div>
-        <div class="state-actions-row">
-          ${emptyActionHtml}
+    let emptyHtml;
+    if (isVaultEmpty) {
+      emptyHtml = `
+        <div class="vault-empty-state ftue-onboarding-card">
+          <div class="ftue-hero-badge">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect>
+              <path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path>
+              <line x1="17.5" y1="6.5" x2="17.51" y2="6.5"></line>
+            </svg>
+            <span>Welcome to Reeler</span>
+          </div>
+          <div class="empty-title-text ftue-title">Your Private Vault is Ready</div>
+          <div class="empty-desc-text ftue-desc">
+            You scroll through hundreds of reels every day. Save the ones that actually inspire or teach you, organized automatically with creator tags, captions, and reminders.
+          </div>
+          <div class="ftue-steps-grid">
+            <div class="ftue-step-card">
+              <div class="ftue-step-num">1</div>
+              <div class="ftue-step-content">
+                <div class="ftue-step-title">Share Any Reel</div>
+                <div class="ftue-step-text">Tap Share on any Instagram Reel or Post you want to remember.</div>
+              </div>
+            </div>
+            <div class="ftue-step-card">
+              <div class="ftue-step-num">2</div>
+              <div class="ftue-step-content">
+                <div class="ftue-step-title">DM @er_reel_er</div>
+                <div class="ftue-step-text">Send the link directly to our bot in your Instagram DMs.</div>
+              </div>
+            </div>
+            <div class="ftue-step-card">
+              <div class="ftue-step-num">3</div>
+              <div class="ftue-step-content">
+                <div class="ftue-step-title">Indexed Instantly</div>
+                <div class="ftue-step-text">Your reel appears here with instant search, creator tags, and reminders.</div>
+              </div>
+            </div>
+          </div>
+          <div class="state-actions-row ftue-actions-row">
+            <a href="https://ig.me/m/er_reel_er" target="_blank" rel="noopener noreferrer" class="nav-btn nav-btn-primary ftue-btn">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+              Message @er_reel_er
+            </a>
+            <button type="button" class="nav-btn nav-btn-secondary ftue-btn" data-action="empty-import">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+              Import saved_posts.json
+            </button>
+            <button type="button" class="nav-btn nav-btn-ghost ftue-btn" data-action="copy-bot-handle">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+              Copy Bot Handle
+            </button>
+          </div>
         </div>
-      </div>
-    `;
+      `;
+    } else {
+      emptyHtml = `
+        <div class="vault-empty-state">
+          <div class="empty-title-text">${emptyTitle}</div>
+          <div class="empty-desc-text">${emptyDesc}</div>
+          <div class="state-actions-row">
+            ${emptyActionHtml}
+          </div>
+        </div>
+      `;
+    }
     reelsGrid.innerHTML = emptyHtml;
     if (reelsTable) reelsTable.hidden = true;
     if (reelsTableContainer) reelsTableContainer.classList.add('is-empty-state');
@@ -2070,6 +2221,20 @@ function renderReels() {
     });
     vaultContainerEl?.querySelectorAll('[data-action="empty-import"]').forEach((btn) => {
       btn.addEventListener('click', () => importBtn.click());
+    });
+    vaultContainerEl?.querySelectorAll('[data-action="copy-bot-handle"]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        try {
+          if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText('@er_reel_er');
+            showToast('Copied @er_reel_er to clipboard!', 'success');
+          } else {
+            showToast('Instagram handle: @er_reel_er', 'info');
+          }
+        } catch (_) {
+          showToast('Instagram handle: @er_reel_er', 'info');
+        }
+      });
     });
     return;
   }
@@ -4508,6 +4673,24 @@ function handleModalKeydown(e) {
  * Binds UI controls, URL sync, search debounce, key listeners, shortcuts popover, and archive import handlers.
  */
 function setupEventListeners() {
+  // 1-hour privacy auto-logout tracking across interactions, visibility changes, and window focus
+  ['pointerdown', 'keydown', 'scroll', 'touchstart'].forEach((evt) => {
+    window.addEventListener(evt, () => recordVaultActivity(false), { passive: true });
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      checkVaultInactivity(false);
+    }
+  });
+
+  window.addEventListener('focus', () => {
+    checkVaultInactivity(false);
+  });
+
+  setInterval(() => {
+    checkVaultInactivity(false);
+  }, 30000);
   viewModeGridBtn.addEventListener('click', () => applyViewMode('grid'));
   viewModeListBtn.addEventListener('click', () => applyViewMode('list'));
 
@@ -4705,17 +4888,28 @@ function setupEventListeners() {
     }
   });
 
+  searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && searchInput.value) {
+      e.preventDefault();
+      clearSearchBtn.click();
+    }
+  });
+
   searchInput.addEventListener('input', (e) => {
     clearTimeout(searchTimeout);
     const val = e.target.value;
     clearSearchBtn.hidden = !val;
+    const trimmed = val.trim();
+    if (trimmed) {
+      resultsCount.textContent = `Searching "${trimmed}"...`;
+    }
     searchTimeout = setTimeout(() => {
       state.filters.search = val;
       state.filters.page = 1;
       syncKpiActiveStates();
       syncUrlState();
       fetchReels();
-    }, 220);
+    }, 180);
   });
 
   clearSearchBtn.addEventListener('click', () => {
@@ -4733,6 +4927,13 @@ function setupEventListeners() {
   });
 
   if (creatorFilterInput) {
+    creatorFilterInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && creatorFilterInput.value) {
+        e.preventDefault();
+        clearCreatorFilterBtn?.click();
+      }
+    });
+
     creatorFilterInput.addEventListener('input', (e) => {
       const val = e.target.value || '';
       state.creatorQuery = val;

@@ -1,0 +1,30 @@
+{
+  "name": "Reeler — Reels & Posts Vault",
+  "short_name": "Reeler",
+  "description": "Track, remind, and organize your saved Instagram Reels and Posts in a private vault.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#010102",
+  "theme_color": "#070709",
+  "icons": [
+    {
+      "src": "/icons/meta-app-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/meta-app-icon-1024.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

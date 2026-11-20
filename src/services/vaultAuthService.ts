@@ -413,20 +413,35 @@ export function getAdminVaultKey(): string {
 }
 
 /**
- * Generates a URL-safe, tamper-proof vault access key for a specific Instagram sender ID.
+ * Maximum server-side lifetime for a timestamped user vault token (14 days hard ceiling).
  */
-export function generateUserVaultKey(senderId: string): string {
+export const MAX_USER_TOKEN_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+
+/**
+ * Generates a URL-safe, tamper-proof vault access key for a specific Instagram sender ID.
+ * When `issuedAt` is provided, binds the issuance epoch to enforce maximum token age.
+ */
+export function generateUserVaultKey(senderId: string, issuedAt?: number): string {
   const trimmed = String(senderId || '').trim();
   if (!trimmed) {
     throw new Error('Cannot generate vault key for empty senderId');
   }
   const secret = getVaultSecret();
+  if (typeof issuedAt === 'number' && Number.isFinite(issuedAt) && issuedAt > 0) {
+    const signature = crypto
+      .createHmac('sha256', secret)
+      .update(`user:${trimmed}:${issuedAt}`)
+      .digest('hex')
+      .slice(0, 24);
+    return Buffer.from(`user.${trimmed}.${issuedAt}.${signature}`).toString('base64url');
+  }
   const signature = crypto.createHmac('sha256', secret).update(`user:${trimmed}`).digest('hex').slice(0, 24);
   return Buffer.from(`user.${trimmed}.${signature}`).toString('base64url');
 }
 
 /**
  * Verifies an incoming vault key and unpacks the role and Instagram sender ID.
+ * Enforces signature validity and expiration for timestamped tokens.
  */
 export function verifyVaultKey(key: string): { valid: boolean; session?: VaultUserSession } {
   if (!key || typeof key !== 'string') {
@@ -443,7 +458,7 @@ export function verifyVaultKey(key: string): { valid: boolean; session?: VaultUs
     };
   }
 
-  // 2. Decode user token
+  // 2. Decode user or admin token
   try {
     const raw = Buffer.from(trimmedKey, 'base64url').toString('utf-8');
     const parts = raw.split('.');
@@ -461,6 +476,32 @@ export function verifyVaultKey(key: string): { valid: boolean; session?: VaultUs
       return { valid: false };
     }
 
+    // 2b. Timestamped user token: user.<senderId>.<issuedAt>.<signature>
+    if (parts.length === 4 && parts[0] === 'user') {
+      const [, senderId, rawIssuedAt, signature] = parts;
+      const issuedAt = Number(rawIssuedAt);
+      if (!senderId || !Number.isFinite(issuedAt) || issuedAt <= 0) return { valid: false };
+      const now = Date.now();
+      // Reject tokens issued in the future (allowing 60s clock skew) or older than MAX_USER_TOKEN_AGE_MS
+      if (issuedAt > now + 60_000 || now - issuedAt > MAX_USER_TOKEN_AGE_MS) {
+        return { valid: false };
+      }
+      const secret = getVaultSecret();
+      const expectedSig = crypto
+        .createHmac('sha256', secret)
+        .update(`user:${senderId}:${rawIssuedAt}`)
+        .digest('hex')
+        .slice(0, 24);
+      if (safeStringEqual(signature, expectedSig)) {
+        return {
+          valid: true,
+          session: { role: 'user', senderId },
+        };
+      }
+      return { valid: false };
+    }
+
+    // 2c. Legacy non-timestamped user token: user.<senderId>.<signature>
     if (parts.length === 3 && parts[0] === 'user') {
       const [, senderId, signature] = parts;
       if (!senderId) return { valid: false };

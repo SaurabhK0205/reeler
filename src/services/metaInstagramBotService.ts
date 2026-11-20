@@ -949,12 +949,12 @@ export class MetaInstagramBotService {
         }
         targetReelIds = delivery.retryState.pinnedWatchedTargetIds;
       }
-      const { updatedReels, remainingCount } = await Repository.markWatchedForInstagramSender(senderId, {
+      const { updatedReels, remainingCount, remainingReels } = await Repository.markWatchedForInstagramSender(senderId, {
         markAll,
         ...(targetReelIds !== undefined ? { targetReelIds } : {}),
       });
       if (delivery) delivery.stateMutated = true;
-      const reply = formatWatchedConfirmationMessage(updatedReels, remainingCount, markAll);
+      const reply = formatWatchedConfirmationMessage(updatedReels, remainingCount, markAll, remainingReels);
       await this.deliverReply(senderId, reply, delivery);
       return;
     }

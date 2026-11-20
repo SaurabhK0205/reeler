@@ -4,9 +4,16 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#070709">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Reeler">
+  <meta name="application-name" content="Reeler">
   <title>Reeler | Reels &amp; Posts Vault</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="apple-touch-icon" href="/icons/meta-app-icon-512.png">
+  <link rel="manifest" href="/manifest.json">
   <link rel="stylesheet" href="style.css?v=4.8">
 </head>
 <body>
@@ -176,7 +183,7 @@
             <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
           </svg>
           <input type="text" id="search-input" placeholder="Search captions or @creators" autocomplete="off">
-          <button type="button" id="clear-search" class="clear-search-btn" aria-label="Clear search" hidden>
+          <button type="button" id="clear-search" class="clear-search-btn" aria-label="Clear search" title="Clear search (Esc)" hidden>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <line x1="18" y1="6" x2="6" y2="18"></line>
               <line x1="6" y1="6" x2="18" y2="18"></line>
@@ -264,7 +271,7 @@
             <div class="creator-search-field">
               <label for="creator-filter-input" class="sr-only">Filter creator chips by handle</label>
               <input type="search" id="creator-filter-input" class="creator-filter-input" placeholder="Find creator (@handle)..." autocomplete="off">
-              <button type="button" id="clear-creator-filter" class="clear-search-btn clear-creator-btn" aria-label="Clear creator search" hidden>
+              <button type="button" id="clear-creator-filter" class="clear-search-btn clear-creator-btn" aria-label="Clear creator search" title="Clear creator search (Esc)" hidden>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <line x1="18" y1="6" x2="6" y2="18"></line>
                   <line x1="6" y1="6" x2="18" y2="18"></line>
