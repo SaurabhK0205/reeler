@@ -429,6 +429,7 @@ const state = {
     page: 1,
     limit: 24,
   },
+  initialPageOffset: 0,
   creatorQuery: '',
   viewMode: readViewMode(),
   total: 0,
@@ -447,6 +448,10 @@ const state = {
   metaCache: new Map(),
   aspectCache: loadAspectCache(),
 };
+
+let isFeedLoadingMore = false;
+let isCatalogLoadingMore = false;
+let catalogIntersectionObserver = null;
 
 // DOM References
 const topNavEl = document.querySelector('.top-nav');
@@ -698,6 +703,7 @@ function resetVaultSessionState() {
     statsFetchController = null;
   }
   if (typeof state !== 'undefined' && state) {
+    state.initialPageOffset = 0;
     state.reels = [];
     state.total = 0;
     state.stats = null;
@@ -712,6 +718,10 @@ function resetVaultSessionState() {
       state.filters.page = 1;
     }
   }
+  isFeedLoadingMore = false;
+  isCatalogLoadingMore = false;
+  const catalogSpinner = document.getElementById('catalog-scroll-spinner');
+  if (catalogSpinner) catalogSpinner.hidden = true;
   if (creatorFilterInput) creatorFilterInput.value = '';
   if (typeof syncUrlState === 'function') {
     syncUrlState();
@@ -1864,27 +1874,32 @@ function selectCreator(id) {
 
 /**
  * Queries reels matching active filters, pagination, and search terms with abort safety and inline error recovery.
- * @param {{ silent?: boolean; pageOverride?: number }} [options]
+ * @param {{ silent?: boolean; pageOverride?: number; append?: boolean }} [options]
  */
 async function fetchReels(options = {}) {
   const silent = Boolean(options.silent);
-  if (silent && fetchReelsAbortController?.isExplicit) {
+  const isAppend = Boolean(options.append);
+  if (silent && !isAppend && fetchReelsAbortController?.isExplicit) {
     return;
   }
   const pageToFetch = Number.isInteger(options.pageOverride) && options.pageOverride >= 1
     ? options.pageOverride
     : state.filters.page;
 
-  if (fetchReelsAbortController) {
+  if (!isAppend && fetchReelsAbortController) {
     fetchReelsAbortController.abort();
   }
   const controller = new AbortController();
-  controller.isExplicit = !silent;
-  fetchReelsAbortController = controller;
+  controller.isExplicit = !silent && !isAppend;
+  if (!isAppend) {
+    fetchReelsAbortController = controller;
+  }
   const { signal } = controller;
 
-  renderActiveFilterChips();
-  if (!silent) {
+  if (!isAppend) {
+    renderActiveFilterChips();
+  }
+  if (!silent && !isAppend) {
     const queryLabels = getMediaUnitLabels(state.filters.mediaType, state.filters.source);
     resultsCount.textContent = `Querying ${queryLabels.scopedPlural}...`;
   }
@@ -1923,28 +1938,46 @@ async function fetchReels(options = {}) {
 
     const data = await res.json();
     if (signal.aborted) return;
-    if (silent && feedModal?.classList.contains('active')) return;
+    if (silent && !isAppend && feedModal?.classList.contains('active')) return;
 
     const nextReels = data.reels || [];
     const nextTotal = data.total || 0;
     const maxPage = Math.max(1, Math.ceil(nextTotal / state.filters.limit) || 1);
-    if (nextReels.length === 0 && pageToFetch > maxPage) {
+    if (!isAppend && nextReels.length === 0 && pageToFetch > maxPage) {
       if (fetchReelsAbortController === controller) {
         fetchReelsAbortController = null;
       }
       return fetchReels({ silent, pageOverride: maxPage });
     }
 
-    if (pageToFetch !== state.filters.page) {
-      state.filters.page = pageToFetch;
-      syncUrlState();
-    }
-    state.reels = nextReels;
     state.total = nextTotal;
     hasInitialReelsSettled = true;
 
-    renderReels();
-    updatePagination(data.page, data.limit, data.total);
+    if (isAppend) {
+      const existingIds = new Set(state.reels.map((r) => r.id));
+      const newItems = nextReels.filter((r) => !existingIds.has(r.id));
+      if (newItems.length > 0) {
+        state.reels.push(...newItems);
+        renderReels({ append: true, newReels: newItems });
+        if (feedModal?.classList.contains('active')) {
+          appendFeedSlides(newItems);
+        }
+      }
+      const highestPage = Math.max(state.filters.page, pageToFetch);
+      updatePagination(highestPage, state.filters.limit, state.total);
+    } else {
+      state.initialPageOffset = (pageToFetch - 1) * state.filters.limit;
+      if (pageToFetch !== state.filters.page) {
+        state.filters.page = pageToFetch;
+        syncUrlState();
+      }
+      state.reels = nextReels;
+      renderReels();
+      updatePagination(data.page, data.limit, data.total);
+      if (feedModal?.classList.contains('active')) {
+        renderFeedSlides();
+      }
+    }
   } catch (e) {
     if (e?.name === 'AbortError') return;
     console.error('Failed to fetch reels:', e);
@@ -2104,15 +2137,385 @@ function getStatusPillAriaLabel(status, targetLabel) {
 }
 
 /**
- * Renders reel poster cards in grid view and table rows in list view with accessible, non-nested controls.
+ * Builds an accessible grid poster card with tactile play, creator filter, bookmark, and watched toggles.
+ * @param {object} reel
+ * @param {string} rankNum
+ * @returns {HTMLElement}
  */
-function renderReels() {
+function createGridCard(reel, rankNum) {
+  const effectiveStatus = pendingStatusValues.has(reel.id) ? pendingStatusValues.get(reel.id) : reel.watch_status;
+  const isPending = pendingStatusIds.has(reel.id);
+  const isBotSent = reel.is_saved_on_instagram === false;
+  const itemType = getSavedMediaType(reel);
+  const isPost = itemType === 'post';
+  const badgeLabel = isPost ? 'Post' : 'Reel';
+  const badgeClass = isPost ? 'media-type-post' : 'media-type-reel';
+  const itemWord = isPost ? 'post' : 'reel';
+  const sourcePillHtml = isBotSent ? '<span class="card-source-pill is-bot">Bot</span>' : '';
+  const creatorInfo = getCreatorDisplayInfo(reel.creator);
+  const safeCreator = escapeHtml(creatorInfo.displayText);
+  const ariaTarget = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `this ${itemWord}`;
+  const safeAriaTarget = escapeHtml(ariaTarget);
+  const creatorFilterSubject = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `unattributed ${itemWord}s`;
+  const { initial } = creatorInfo;
+  const dateInfo = getReelDisplayDate(reel);
+  const dateFormatted = formatShortDate(dateInfo.iso);
+  const isWatchLater = effectiveStatus === 'watch_later';
+  const isWatched = effectiveStatus === 'watched';
+  const pillTitle = escapeHtml(getStatusPillTitle(effectiveStatus));
+  const pillAria = escapeHtml(getStatusPillAriaLabel(effectiveStatus, ariaTarget));
+  const cardLaterTitle = escapeHtml(getLaterButtonTitle(effectiveStatus, 'card'));
+  const cardLaterAria = escapeHtml(getLaterButtonAriaLabel(effectiveStatus, ariaTarget, 'card'));
+  const cleanCaption = stripPrivateUseChars(reel.caption).trim();
+  const rawCaption = cleanCaption || 'No caption provided';
+  const safeCaption = escapeHtml(rawCaption);
+  const rawCleanThumbnail = sanitizeMediaUrl(reel.thumbnail_url);
+  const replacedStoredThumb = rawCleanThumbnail ? sanitizeMediaUrl(gridThumbReplacedUrls.get(rawCleanThumbnail)) : null;
+  const cachedMetaThumb = reel.shortcode ? sanitizeMediaUrl(state.metaCache.get(reel.shortcode)?.thumbnailUrl) : null;
+  const cleanThumbnail = (replacedStoredThumb && !isPlaceholderMediaUrl(replacedStoredThumb))
+    ? replacedStoredThumb
+    : ((rawCleanThumbnail && !isPlaceholderMediaUrl(rawCleanThumbnail))
+      ? rawCleanThumbnail
+      : ((cachedMetaThumb && !isPlaceholderMediaUrl(cachedMetaThumb)) ? cachedMetaThumb : null));
+  const hasRealThumbnail = Boolean(cleanThumbnail);
+  const thumbMeta = ReelerGeometry.parseThumbMeta(cleanThumbnail);
+  const posterAltText = creatorInfo.isAttributedName
+    ? `${badgeLabel} poster by ${ariaTarget}`
+    : `${isBotSent ? 'Tracked' : 'Saved'} ${itemWord} poster`;
+  const posterKindLabel = thumbMeta.mediaKind === 'CAROUSEL_ITEM'
+    ? 'Carousel'
+    : ((isPost || thumbMeta.isClips === false)
+      ? (isBotSent ? 'Bot Post' : 'Saved Post')
+      : (isBotSent ? 'Bot Reel' : 'Saved Reel'));
+  const touchCueLabel = (isPost || thumbMeta.isClips === false) ? 'Open' : 'Watch';
+  const creatorId = reel.creator?.id ? String(reel.creator.id) : '';
+  const isCreatorFiltered = Boolean(creatorId && state.filters.creatorId === creatorId);
+  const creatorFilterTitle = escapeHtml(
+    creatorId
+      ? (isCreatorFiltered ? `Showing ${creatorFilterSubject} (click to clear filter)` : `Filter vault by ${creatorFilterSubject}`)
+      : `Unattributed ${itemWord} (creator filter unavailable)`
+  );
+  const creatorFilterAria = escapeHtml(
+    isCreatorFiltered ? `Clear creator filter ${creatorFilterSubject}` : `Filter items by ${creatorFilterSubject}`
+  );
+
+  const card = document.createElement('article');
+  card.className = `vault-poster-card ${hasRealThumbnail ? 'has-thumbnail' : 'is-monogram'}`;
+  card.setAttribute('data-id', reel.id);
+  card.setAttribute('data-media-type', itemType);
+  card.setAttribute('data-source', isBotSent ? 'bot' : 'instagram');
+
+  const hasDateLabel = Boolean(dateFormatted && dateFormatted !== 'Unknown');
+  const monogramTitleHtml = creatorInfo.isAttributedName
+    ? `<div class="art-creator-handle">${safeCreator}</div>`
+    : (cleanCaption
+      ? `<div class="art-caption-preview">${escapeHtml(cleanCaption)}</div>`
+      : (hasDateLabel
+        ? `<div class="art-creator-handle">${escapeHtml(`${dateInfo.labelPrefix} ${dateFormatted}`)}</div>`
+        : ''));
+
+  const monogramArtHtml = `
+    <div class="monochrome-poster-art"${hasRealThumbnail ? ' aria-hidden="true"' : ''}>
+      <div class="art-center-block">
+        <div class="art-monogram-circle" aria-hidden="true">${initial}</div>
+        ${monogramTitleHtml}
+        <div class="art-poster-kind">${posterKindLabel}</div>
+      </div>
+      <div class="poster-bottom-scrim"></div>
+    </div>
+  `;
+
+  const imageLayerHtml = hasRealThumbnail
+    ? `
+      <img class="poster-actual-img" src="${escapeHtml(cleanThumbnail)}" referrerpolicy="no-referrer" alt="${escapeHtml(posterAltText)}" loading="lazy" />
+      <div class="poster-top-scrim"></div>
+      <div class="poster-bottom-scrim"></div>
+    `
+    : '';
+
+  card.innerHTML = `
+    <div class="poster-media-box">
+      ${monogramArtHtml}
+      ${imageLayerHtml}
+      <button type="button" class="poster-play-trigger" aria-label="Open ${itemWord} #${rankNum}${creatorInfo.isAttributedName ? ` by ${safeAriaTarget}` : ''} in fullscreen feed">
+        <span class="play-hover-trigger" aria-hidden="true">
+          <span class="play-icon-box">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+          </span>
+        </span>
+        <span class="poster-cue-monogram" aria-hidden="true">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <polygon points="6 4 20 12 6 20 6 4"></polygon>
+          </svg>
+        </span>
+        <span class="poster-cue-thumb" aria-hidden="true">${touchCueLabel}</span>
+      </button>
+      <div class="card-header-overlay">
+        <div class="card-header-badges">
+          <span class="rank-tag" aria-hidden="true">#${rankNum}</span>
+          <span class="media-type-badge ${badgeClass}">${badgeLabel}</span>
+        </div>
+        <button type="button" class="card-bookmark-btn ${isWatchLater ? 'active' : ''}" title="${cardLaterTitle}" aria-label="${cardLaterAria}" aria-pressed="${isWatchLater}"${isPending ? ' disabled aria-busy="true"' : ''}>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div class="card-details-box">
+      <div class="card-creator-row">
+        <button type="button" class="card-creator-filter-btn ${isCreatorFiltered ? 'is-active' : ''}" data-action="filter-creator" title="${creatorFilterTitle}" aria-label="${creatorFilterAria}" aria-pressed="${isCreatorFiltered}"${creatorId ? '' : ' disabled'}><span class="handle-text">${safeCreator}</span></button>
+      </div>
+      <div class="card-caption-line">${safeCaption}</div>
+      <div class="card-footer-meta">
+        <div class="card-meta-left">
+          <span class="card-date-label">${dateInfo.labelPrefix} ${dateFormatted}</span>
+          ${sourcePillHtml}
+          <span class="card-later-badge"${isWatchLater ? '' : ' hidden'}>Later</span>
+        </div>
+        <button type="button" class="status-pill-toggle ${isWatched ? 'status-pill-watched' : 'status-pill-unwatched'}" data-id="${reel.id}" title="${pillTitle}" aria-label="${pillAria}" aria-pressed="${isWatched}"${isPending ? ' disabled aria-busy="true"' : ''}>
+          ${renderStatusPillContent(effectiveStatus)}
+        </button>
+      </div>
+    </div>
+  `;
+
+  const posterPlayTrigger = card.querySelector('.poster-play-trigger');
+  posterPlayTrigger.addEventListener('click', () => {
+    openReelsFeed(reel, posterPlayTrigger);
+  });
+
+  const cardCreatorFilterBtn = card.querySelector('[data-action="filter-creator"]');
+  if (cardCreatorFilterBtn && creatorId) {
+    cardCreatorFilterBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const nextId = state.filters.creatorId === creatorId ? '' : creatorId;
+      if (nextId && reel.creator) {
+        state.selectedCreator = reel.creator;
+      }
+      selectCreator(nextId);
+      announceStatus(nextId ? `Filtered items by ${creatorFilterSubject}.` : 'Cleared creator filter.');
+    });
+  }
+
+  const cardBookmark = card.querySelector('.card-bookmark-btn');
+  cardBookmark.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const latestStatus = state.reels.find((r) => r.id === reel.id)?.watch_status || reel.watch_status;
+    const nextStatus = latestStatus === 'watch_later' ? 'unwatched' : 'watch_later';
+    updateReelStatus(reel.id, nextStatus);
+  });
+
+  const cardStatusBtn = card.querySelector('.status-pill-toggle');
+  cardStatusBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const latestStatus = state.reels.find((r) => r.id === reel.id)?.watch_status || reel.watch_status;
+    toggleWatchedStatus(reel.id, latestStatus);
+  });
+
+  const cardImg = card.querySelector('.poster-actual-img');
+  if (cardImg) {
+    cardImg.addEventListener('error', () => {
+      cardImg.hidden = true;
+      card.classList.remove('has-thumbnail');
+      card.classList.add('is-monogram');
+      card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
+      if (!card.isConnected) return;
+      const sc = reel.shortcode ? String(reel.shortcode).trim() : '';
+      if (sc && !hasRefreshedGridThumb(sc, cleanThumbnail) && !isGridThumbUnavailable(sc)) {
+        if (gridThumbPendingRefresh.has(sc)) {
+          addGridThumbRefreshWaiter(sc, {
+            card,
+            reel,
+            shortcode: sc,
+            altText: posterAltText,
+            isPost,
+            bypassCache: false,
+            suppressRefreshRetry: true,
+            failedUrl: cleanThumbnail,
+            failedStoredUrl: rawCleanThumbnail || cleanThumbnail,
+          });
+        } else {
+          gridThumbPendingRefresh.add(sc);
+          const cachedMeta = state.metaCache.get(sc);
+          if (cachedMeta && sanitizeMediaUrl(cachedMeta.thumbnailUrl) === cleanThumbnail) {
+            state.metaCache.delete(sc);
+          }
+          if (rawCleanThumbnail && gridThumbReplacedUrls.get(rawCleanThumbnail) === cleanThumbnail) {
+            gridThumbReplacedUrls.delete(rawCleanThumbnail);
+          }
+          registerGridCardForThumbnailHydration(card, reel, posterAltText, isPost, {
+            bypassCache: true,
+            failedUrl: cleanThumbnail,
+            failedStoredUrl: rawCleanThumbnail || cleanThumbnail,
+          });
+        }
+      }
+    }, { once: true });
+
+    const handleCardImgLoaded = () => {
+      cardImg.classList.add('is-loaded');
+      if (reel.shortcode && cardImg.naturalWidth > 0 && cardImg.naturalHeight > 0) {
+        state.thumbRatioCache.set(reel.shortcode, cardImg.naturalWidth / cardImg.naturalHeight);
+      }
+    };
+
+    if (cardImg.complete && cardImg.naturalWidth > 0) {
+      handleCardImgLoaded();
+    } else {
+      cardImg.addEventListener('load', handleCardImgLoaded, { once: true });
+    }
+  } else if (reel.shortcode) {
+    registerGridCardForThumbnailHydration(card, reel, posterAltText, isPost);
+  }
+
+  return card;
+}
+
+/**
+ * Builds an accessible list view table row with action buttons and creator filters.
+ * @param {object} reel
+ * @param {string} rankNum
+ * @returns {HTMLTableRowElement}
+ */
+function createTableRow(reel, rankNum) {
+  const effectiveStatus = pendingStatusValues.has(reel.id) ? pendingStatusValues.get(reel.id) : reel.watch_status;
+  const isPending = pendingStatusIds.has(reel.id);
+  const isBotSent = reel.is_saved_on_instagram === false;
+  const itemType = getSavedMediaType(reel);
+  const isPost = itemType === 'post';
+  const badgeLabel = isPost ? 'Post' : 'Reel';
+  const badgeClass = isPost ? 'media-type-post' : 'media-type-reel';
+  const itemWord = isPost ? 'post' : 'reel';
+  const sourcePillHtml = isBotSent ? '<span class="card-source-pill is-bot">Bot</span>' : '';
+  const creatorInfo = getCreatorDisplayInfo(reel.creator);
+  const safeCreator = escapeHtml(creatorInfo.displayText);
+  const ariaTarget = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `this ${itemWord}`;
+  const safeAriaTarget = escapeHtml(ariaTarget);
+  const creatorFilterSubject = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `unattributed ${itemWord}s`;
+  const safeReelUrl = escapeHtml(sanitizeExternalHref(reel.reel_url, 'https://www.instagram.com/'));
+  const { initial } = creatorInfo;
+  const dateInfo = getReelDisplayDate(reel);
+  const dateFormatted = formatShortDate(dateInfo.iso);
+  const isWatchLater = effectiveStatus === 'watch_later';
+  const isWatched = effectiveStatus === 'watched';
+  const pillTitle = escapeHtml(getStatusPillTitle(effectiveStatus));
+  const pillAria = escapeHtml(getStatusPillAriaLabel(effectiveStatus, ariaTarget));
+  const listLaterTitle = escapeHtml(getLaterButtonTitle(effectiveStatus, 'list'));
+  const listLaterAria = escapeHtml(getLaterButtonAriaLabel(effectiveStatus, ariaTarget, 'list'));
+  const cleanCaption = stripPrivateUseChars(reel.caption).trim();
+  const rawCaption = cleanCaption || 'No caption provided';
+  const safeCaption = escapeHtml(rawCaption);
+  const creatorId = reel.creator?.id ? String(reel.creator.id) : '';
+  const isCreatorFiltered = Boolean(creatorId && state.filters.creatorId === creatorId);
+  const creatorFilterTitle = escapeHtml(
+    creatorId
+      ? (isCreatorFiltered ? `Showing ${creatorFilterSubject} (click to clear filter)` : `Filter vault by ${creatorFilterSubject}`)
+      : `Unattributed ${itemWord} (creator filter unavailable)`
+  );
+  const creatorFilterAria = escapeHtml(
+    isCreatorFiltered ? `Clear creator filter ${creatorFilterSubject}` : `Filter items by ${creatorFilterSubject}`
+  );
+
+  const row = document.createElement('tr');
+  row.className = 'table-row';
+  row.setAttribute('data-id', reel.id);
+  row.setAttribute('data-media-type', itemType);
+  row.setAttribute('data-source', isBotSent ? 'bot' : 'instagram');
+  const tableDateLabel = dateInfo.labelPrefix === 'Published'
+    ? `Pub ${dateFormatted}`
+    : `${dateInfo.labelPrefix} ${dateFormatted}`;
+
+  row.innerHTML = `
+    <td class="table-rank"><div class="table-rank-wrap"><span>#${rankNum}</span><span class="media-type-badge ${badgeClass}">${badgeLabel}</span></div></td>
+    <td class="table-creator-td">
+      <div class="table-creator-cell">
+        <div class="table-creator-avatar" aria-hidden="true">${initial}</div>
+        <button type="button" class="table-creator-filter-btn ${isCreatorFiltered ? 'is-active' : ''}" data-action="filter-creator" title="${creatorFilterTitle}" aria-label="${creatorFilterAria}" aria-pressed="${isCreatorFiltered}"${creatorId ? '' : ' disabled'}><span class="handle-text">${safeCreator}</span></button>
+      </div>
+    </td>
+    <td class="table-caption-cell"><div class="table-caption-clamp" title="${safeCaption}">${safeCaption}</div></td>
+    <td class="table-date-cell"><div class="table-date-wrap"><span class="table-date-text">${escapeHtml(tableDateLabel)}</span>${sourcePillHtml}</div></td>
+    <td class="table-status-td">
+      <div class="table-status-group">
+        <span class="table-later-badge"${isWatchLater ? '' : ' hidden'}>Later</span>
+        <button type="button" class="status-pill-toggle ${isWatched ? 'status-pill-watched' : 'status-pill-unwatched'}" data-id="${reel.id}" title="${pillTitle}" aria-label="${pillAria}" aria-pressed="${isWatched}"${isPending ? ' disabled aria-busy="true"' : ''}>
+          ${renderStatusPillContent(effectiveStatus)}
+        </button>
+      </div>
+    </td>
+    <td class="table-actions-td">
+      <div class="table-actions-cell">
+        <button type="button" class="table-action-icon-btn btn-table-play" title="Open ${badgeLabel} in Feed" aria-label="Open ${itemWord}${creatorInfo.isAttributedName ? ` by ${safeAriaTarget}` : ''} in feed">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+        </button>
+        <button type="button" class="table-action-icon-btn btn-table-bookmark ${isWatchLater ? 'active' : ''}" title="${listLaterTitle}" aria-label="${listLaterAria}" aria-pressed="${isWatchLater}"${isPending ? ' disabled aria-busy="true"' : ''}>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+        </button>
+        <a class="table-action-icon-btn" href="${safeReelUrl}" target="_blank" rel="noopener noreferrer" title="Open ${badgeLabel} on Instagram" aria-label="Open ${itemWord}${creatorInfo.isAttributedName ? ` by ${safeAriaTarget}` : ''} on Instagram">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+        </a>
+      </div>
+    </td>
+  `;
+
+  row.addEventListener('click', (e) => {
+    if (e.target.closest('a') || e.target.closest('button')) return;
+    openReelsFeed(reel, row.querySelector('.btn-table-play'));
+  });
+
+  const rowCreatorFilterBtn = row.querySelector('[data-action="filter-creator"]');
+  if (rowCreatorFilterBtn && creatorId) {
+    rowCreatorFilterBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const nextId = state.filters.creatorId === creatorId ? '' : creatorId;
+      if (nextId && reel.creator) {
+        state.selectedCreator = reel.creator;
+      }
+      selectCreator(nextId);
+      announceStatus(nextId ? `Filtered items by ${creatorFilterSubject}.` : 'Cleared creator filter.');
+    });
+  }
+
+  const tablePlayBtn = row.querySelector('.btn-table-play');
+  tablePlayBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openReelsFeed(reel, tablePlayBtn);
+  });
+
+  row.querySelector('.btn-table-bookmark').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const latestStatus = state.reels.find((r) => r.id === reel.id)?.watch_status || reel.watch_status;
+    const nextStatus = latestStatus === 'watch_later' ? 'unwatched' : 'watch_later';
+    updateReelStatus(reel.id, nextStatus);
+  });
+
+  row.querySelector('.status-pill-toggle').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const latestStatus = state.reels.find((r) => r.id === reel.id)?.watch_status || reel.watch_status;
+    toggleWatchedStatus(reel.id, latestStatus);
+  });
+
+  return row;
+}
+
+/**
+ * Renders reel poster cards in grid view and table rows in list view with accessible, non-nested controls.
+ * @param {{ append?: boolean; newReels?: Array<object> }} [options]
+ */
+function renderReels(options = {}) {
   hasInitialReelsSettled = true;
-  resetGridThumbnailHydration();
-  renderActiveFilterChips();
-  reelsGrid.innerHTML = '';
-  reelsTableBody.innerHTML = '';
+  const isAppend = Boolean(options.append && Array.isArray(options.newReels));
   const typeLabels = getMediaUnitLabels(state.filters.mediaType, state.filters.source);
+
+  if (!isAppend) {
+    resetGridThumbnailHydration();
+    renderActiveFilterChips();
+    reelsGrid.innerHTML = '';
+    reelsTableBody.innerHTML = '';
+  }
 
   if (state.reels.length === 0) {
     resultsCount.textContent = `0 ${typeLabels.scopedPlural} match your view`;
@@ -2247,331 +2650,20 @@ function renderReels() {
     reelsTableState.innerHTML = '';
   }
 
-  const rangeStart = (state.filters.page - 1) * state.filters.limit + 1;
-  const rangeEnd = Math.min(state.filters.page * state.filters.limit, state.total);
+  const baseOffset = state.initialPageOffset || 0;
+  const rangeStart = baseOffset + 1;
+  const rangeEnd = Math.min(baseOffset + state.reels.length, state.total);
   resultsCount.textContent = `Showing ${rangeStart.toLocaleString()}–${rangeEnd.toLocaleString()} of ${state.total.toLocaleString()} ${typeLabels.scopedUnit(state.total)}`;
 
-  for (let idx = 0; idx < state.reels.length; idx++) {
-    const reel = state.reels[idx];
-    const effectiveStatus = pendingStatusValues.has(reel.id) ? pendingStatusValues.get(reel.id) : reel.watch_status;
-    const isPending = pendingStatusIds.has(reel.id);
-    const isBotSent = reel.is_saved_on_instagram === false;
-    const itemType = getSavedMediaType(reel);
-    const isPost = itemType === 'post';
-    const badgeLabel = isPost ? 'Post' : 'Reel';
-    const badgeClass = isPost ? 'media-type-post' : 'media-type-reel';
-    const itemWord = isPost ? 'post' : 'reel';
-    const sourcePillHtml = isBotSent ? '<span class="card-source-pill is-bot">Bot</span>' : '';
-    const creatorInfo = getCreatorDisplayInfo(reel.creator);
-    const safeCreator = escapeHtml(creatorInfo.displayText);
-    const ariaTarget = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `this ${itemWord}`;
-    const safeAriaTarget = escapeHtml(ariaTarget);
-    const creatorFilterSubject = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `unattributed ${itemWord}s`;
-    const safeReelUrl = escapeHtml(sanitizeExternalHref(reel.reel_url, 'https://www.instagram.com/'));
-    const { initial } = creatorInfo;
-    const dateInfo = getReelDisplayDate(reel);
-    const dateFormatted = formatShortDate(dateInfo.iso);
-    const isWatchLater = effectiveStatus === 'watch_later';
-    const isWatched = effectiveStatus === 'watched';
-    const pillTitle = escapeHtml(getStatusPillTitle(effectiveStatus));
-    const pillAria = escapeHtml(getStatusPillAriaLabel(effectiveStatus, ariaTarget));
-    const cardLaterTitle = escapeHtml(getLaterButtonTitle(effectiveStatus, 'card'));
-    const cardLaterAria = escapeHtml(getLaterButtonAriaLabel(effectiveStatus, ariaTarget, 'card'));
-    const listLaterTitle = escapeHtml(getLaterButtonTitle(effectiveStatus, 'list'));
-    const listLaterAria = escapeHtml(getLaterButtonAriaLabel(effectiveStatus, ariaTarget, 'list'));
-    const cleanCaption = stripPrivateUseChars(reel.caption).trim();
-    const rawCaption = cleanCaption || 'No caption provided';
-    const safeCaption = escapeHtml(rawCaption);
-    const rankNum = (rangeStart + idx).toLocaleString();
-    const rawCleanThumbnail = sanitizeMediaUrl(reel.thumbnail_url);
-    const replacedStoredThumb = rawCleanThumbnail ? sanitizeMediaUrl(gridThumbReplacedUrls.get(rawCleanThumbnail)) : null;
-    const cachedMetaThumb = reel.shortcode ? sanitizeMediaUrl(state.metaCache.get(reel.shortcode)?.thumbnailUrl) : null;
-    const cleanThumbnail = (replacedStoredThumb && !isPlaceholderMediaUrl(replacedStoredThumb))
-      ? replacedStoredThumb
-      : ((rawCleanThumbnail && !isPlaceholderMediaUrl(rawCleanThumbnail))
-        ? rawCleanThumbnail
-        : ((cachedMetaThumb && !isPlaceholderMediaUrl(cachedMetaThumb)) ? cachedMetaThumb : null));
-    const hasRealThumbnail = Boolean(cleanThumbnail);
-    const thumbMeta = ReelerGeometry.parseThumbMeta(cleanThumbnail);
-    const posterAltText = creatorInfo.isAttributedName
-      ? `${badgeLabel} poster by ${ariaTarget}`
-      : `${isBotSent ? 'Tracked' : 'Saved'} ${itemWord} poster`;
-    const posterKindLabel = thumbMeta.mediaKind === 'CAROUSEL_ITEM'
-      ? 'Carousel'
-      : ((isPost || thumbMeta.isClips === false)
-        ? (isBotSent ? 'Bot Post' : 'Saved Post')
-        : (isBotSent ? 'Bot Reel' : 'Saved Reel'));
-    const touchCueLabel = (isPost || thumbMeta.isClips === false) ? 'Open' : 'Watch';
-    const creatorId = reel.creator?.id ? String(reel.creator.id) : '';
-    const isCreatorFiltered = Boolean(creatorId && state.filters.creatorId === creatorId);
-    const creatorFilterTitle = escapeHtml(
-      creatorId
-        ? (isCreatorFiltered ? `Showing ${creatorFilterSubject} (click to clear filter)` : `Filter vault by ${creatorFilterSubject}`)
-        : `Unattributed ${itemWord} (creator filter unavailable)`
-    );
-    const creatorFilterAria = escapeHtml(
-      isCreatorFiltered ? `Clear creator filter ${creatorFilterSubject}` : `Filter items by ${creatorFilterSubject}`
-    );
+  const itemsToRender = isAppend ? options.newReels : state.reels;
+  const startIndex = isAppend ? (state.reels.length - options.newReels.length) : 0;
 
-    // 1. Grid Poster Card (<article> + separate sibling play trigger, bookmark, creator filter handle, Later badge, and 1-click Watched toggle)
-    const card = document.createElement('article');
-    card.className = `vault-poster-card ${hasRealThumbnail ? 'has-thumbnail' : 'is-monogram'}`;
-    card.setAttribute('data-id', reel.id);
-    card.setAttribute('data-media-type', itemType);
-    card.setAttribute('data-source', isBotSent ? 'bot' : 'instagram');
-
-    const hasDateLabel = Boolean(dateFormatted && dateFormatted !== 'Unknown');
-    const monogramTitleHtml = creatorInfo.isAttributedName
-      ? `<div class="art-creator-handle">${safeCreator}</div>`
-      : (cleanCaption
-        ? `<div class="art-caption-preview">${escapeHtml(cleanCaption)}</div>`
-        : (hasDateLabel
-          ? `<div class="art-creator-handle">${escapeHtml(`${dateInfo.labelPrefix} ${dateFormatted}`)}</div>`
-          : ''));
-
-    const monogramArtHtml = `
-      <div class="monochrome-poster-art"${hasRealThumbnail ? ' aria-hidden="true"' : ''}>
-        <div class="art-center-block">
-          <div class="art-monogram-circle" aria-hidden="true">${initial}</div>
-          ${monogramTitleHtml}
-          <div class="art-poster-kind">${posterKindLabel}</div>
-        </div>
-        <div class="poster-bottom-scrim"></div>
-      </div>
-    `;
-
-    const imageLayerHtml = hasRealThumbnail
-      ? `
-        <img class="poster-actual-img" src="${escapeHtml(cleanThumbnail)}" referrerpolicy="no-referrer" alt="${escapeHtml(posterAltText)}" loading="lazy" />
-        <div class="poster-top-scrim"></div>
-        <div class="poster-bottom-scrim"></div>
-      `
-      : '';
-
-    card.innerHTML = `
-      <div class="poster-media-box">
-        ${monogramArtHtml}
-        ${imageLayerHtml}
-        <button type="button" class="poster-play-trigger" aria-label="Open ${itemWord} #${rankNum}${creatorInfo.isAttributedName ? ` by ${safeAriaTarget}` : ''} in fullscreen feed">
-          <span class="play-hover-trigger" aria-hidden="true">
-            <span class="play-icon-box">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                <polygon points="5 3 19 12 5 21 5 3"></polygon>
-              </svg>
-            </span>
-          </span>
-          <span class="poster-cue-monogram" aria-hidden="true">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-              <polygon points="6 4 20 12 6 20 6 4"></polygon>
-            </svg>
-          </span>
-          <span class="poster-cue-thumb" aria-hidden="true">${touchCueLabel}</span>
-        </button>
-        <div class="card-header-overlay">
-          <div class="card-header-badges">
-            <span class="rank-tag" aria-hidden="true">#${rankNum}</span>
-            <span class="media-type-badge ${badgeClass}">${badgeLabel}</span>
-          </div>
-          <button type="button" class="card-bookmark-btn ${isWatchLater ? 'active' : ''}" title="${cardLaterTitle}" aria-label="${cardLaterAria}" aria-pressed="${isWatchLater}"${isPending ? ' disabled aria-busy="true"' : ''}>
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path>
-            </svg>
-          </button>
-        </div>
-      </div>
-      <div class="card-details-box">
-        <div class="card-creator-row">
-          <button type="button" class="card-creator-filter-btn ${isCreatorFiltered ? 'is-active' : ''}" data-action="filter-creator" title="${creatorFilterTitle}" aria-label="${creatorFilterAria}" aria-pressed="${isCreatorFiltered}"${creatorId ? '' : ' disabled'}><span class="handle-text">${safeCreator}</span></button>
-        </div>
-        <div class="card-caption-line">${safeCaption}</div>
-        <div class="card-footer-meta">
-          <div class="card-meta-left">
-            <span class="card-date-label">${dateInfo.labelPrefix} ${dateFormatted}</span>
-            ${sourcePillHtml}
-            <span class="card-later-badge"${isWatchLater ? '' : ' hidden'}>Later</span>
-          </div>
-          <button type="button" class="status-pill-toggle ${isWatched ? 'status-pill-watched' : 'status-pill-unwatched'}" data-id="${reel.id}" title="${pillTitle}" aria-label="${pillAria}" aria-pressed="${isWatched}"${isPending ? ' disabled aria-busy="true"' : ''}>
-            ${renderStatusPillContent(effectiveStatus)}
-          </button>
-        </div>
-      </div>
-    `;
-
-    const posterPlayTrigger = card.querySelector('.poster-play-trigger');
-    posterPlayTrigger.addEventListener('click', () => {
-      openReelsFeed(reel, posterPlayTrigger);
-    });
-
-    const cardCreatorFilterBtn = card.querySelector('[data-action="filter-creator"]');
-    if (cardCreatorFilterBtn && creatorId) {
-      cardCreatorFilterBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        const nextId = state.filters.creatorId === creatorId ? '' : creatorId;
-        if (nextId && reel.creator) {
-          state.selectedCreator = reel.creator;
-        }
-        selectCreator(nextId);
-        announceStatus(nextId ? `Filtered items by ${creatorFilterSubject}.` : 'Cleared creator filter.');
-      });
-    }
-
-    const cardBookmark = card.querySelector('.card-bookmark-btn');
-    cardBookmark.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const latestStatus = state.reels.find((r) => r.id === reel.id)?.watch_status || reel.watch_status;
-      const nextStatus = latestStatus === 'watch_later' ? 'unwatched' : 'watch_later';
-      updateReelStatus(reel.id, nextStatus);
-    });
-
-    const cardStatusBtn = card.querySelector('.status-pill-toggle');
-    cardStatusBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const latestStatus = state.reels.find((r) => r.id === reel.id)?.watch_status || reel.watch_status;
-      toggleWatchedStatus(reel.id, latestStatus);
-    });
-
-    const cardImg = card.querySelector('.poster-actual-img');
-    if (cardImg) {
-      cardImg.addEventListener('error', () => {
-        cardImg.hidden = true;
-        card.classList.remove('has-thumbnail');
-        card.classList.add('is-monogram');
-        card.querySelector('.monochrome-poster-art')?.removeAttribute('aria-hidden');
-        if (!card.isConnected) return;
-        // One-shot refresh when a previously cached or DB-stored Instagram CDN URL expires
-        const sc = reel.shortcode ? String(reel.shortcode).trim() : '';
-        if (sc && !hasRefreshedGridThumb(sc, cleanThumbnail) && !isGridThumbUnavailable(sc)) {
-          if (gridThumbPendingRefresh.has(sc)) {
-            addGridThumbRefreshWaiter(sc, {
-              card,
-              reel,
-              shortcode: sc,
-              altText: posterAltText,
-              isPost,
-              bypassCache: false,
-              suppressRefreshRetry: true,
-              failedUrl: cleanThumbnail,
-              failedStoredUrl: rawCleanThumbnail || cleanThumbnail,
-            });
-          } else {
-            gridThumbPendingRefresh.add(sc);
-            const cachedMeta = state.metaCache.get(sc);
-            if (cachedMeta && sanitizeMediaUrl(cachedMeta.thumbnailUrl) === cleanThumbnail) {
-              state.metaCache.delete(sc);
-            }
-            if (rawCleanThumbnail && gridThumbReplacedUrls.get(rawCleanThumbnail) === cleanThumbnail) {
-              gridThumbReplacedUrls.delete(rawCleanThumbnail);
-            }
-            registerGridCardForThumbnailHydration(card, reel, posterAltText, isPost, {
-              bypassCache: true,
-              failedUrl: cleanThumbnail,
-              failedStoredUrl: rawCleanThumbnail || cleanThumbnail,
-            });
-          }
-        }
-      }, { once: true });
-
-      /**
-       * Records natural thumbnail aspect ratio once loaded and triggers smooth cross-fade.
-       */
-      const handleCardImgLoaded = () => {
-        cardImg.classList.add('is-loaded');
-        if (reel.shortcode && cardImg.naturalWidth > 0 && cardImg.naturalHeight > 0) {
-          state.thumbRatioCache.set(reel.shortcode, cardImg.naturalWidth / cardImg.naturalHeight);
-        }
-      };
-
-      if (cardImg.complete && cardImg.naturalWidth > 0) {
-        handleCardImgLoaded();
-      } else {
-        cardImg.addEventListener('load', handleCardImgLoaded, { once: true });
-      }
-    } else if (reel.shortcode) {
-      registerGridCardForThumbnailHydration(card, reel, posterAltText, isPost);
-    }
-
+  for (let idx = 0; idx < itemsToRender.length; idx++) {
+    const reel = itemsToRender[idx];
+    const rankNum = (baseOffset + startIndex + idx + 1).toLocaleString();
+    const card = createGridCard(reel, rankNum);
+    const row = createTableRow(reel, rankNum);
     reelsGrid.appendChild(card);
-
-    // 2. Responsive Table Row (List View)
-    const row = document.createElement('tr');
-    row.className = 'table-row';
-    row.setAttribute('data-id', reel.id);
-    row.setAttribute('data-media-type', itemType);
-    row.setAttribute('data-source', isBotSent ? 'bot' : 'instagram');
-    const tableDateLabel = dateInfo.labelPrefix === 'Published'
-      ? `Pub ${dateFormatted}`
-      : `${dateInfo.labelPrefix} ${dateFormatted}`;
-
-    row.innerHTML = `
-      <td class="table-rank"><div class="table-rank-wrap"><span>#${rankNum}</span><span class="media-type-badge ${badgeClass}">${badgeLabel}</span></div></td>
-      <td class="table-creator-td">
-        <div class="table-creator-cell">
-          <div class="table-creator-avatar" aria-hidden="true">${initial}</div>
-          <button type="button" class="table-creator-filter-btn ${isCreatorFiltered ? 'is-active' : ''}" data-action="filter-creator" title="${creatorFilterTitle}" aria-label="${creatorFilterAria}" aria-pressed="${isCreatorFiltered}"${creatorId ? '' : ' disabled'}><span class="handle-text">${safeCreator}</span></button>
-        </div>
-      </td>
-      <td class="table-caption-cell"><div class="table-caption-clamp" title="${safeCaption}">${safeCaption}</div></td>
-      <td class="table-date-cell"><div class="table-date-wrap"><span class="table-date-text">${escapeHtml(tableDateLabel)}</span>${sourcePillHtml}</div></td>
-      <td class="table-status-td">
-        <div class="table-status-group">
-          <span class="table-later-badge"${isWatchLater ? '' : ' hidden'}>Later</span>
-          <button type="button" class="status-pill-toggle ${isWatched ? 'status-pill-watched' : 'status-pill-unwatched'}" data-id="${reel.id}" title="${pillTitle}" aria-label="${pillAria}" aria-pressed="${isWatched}"${isPending ? ' disabled aria-busy="true"' : ''}>
-            ${renderStatusPillContent(effectiveStatus)}
-          </button>
-        </div>
-      </td>
-      <td class="table-actions-td">
-        <div class="table-actions-cell">
-          <button type="button" class="table-action-icon-btn btn-table-play" title="Open ${badgeLabel} in Feed" aria-label="Open ${itemWord}${creatorInfo.isAttributedName ? ` by ${safeAriaTarget}` : ''} in feed">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
-          </button>
-          <button type="button" class="table-action-icon-btn btn-table-bookmark ${isWatchLater ? 'active' : ''}" title="${listLaterTitle}" aria-label="${listLaterAria}" aria-pressed="${isWatchLater}"${isPending ? ' disabled aria-busy="true"' : ''}>
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
-          </button>
-          <a class="table-action-icon-btn" href="${safeReelUrl}" target="_blank" rel="noopener noreferrer" title="Open ${badgeLabel} on Instagram" aria-label="Open ${itemWord}${creatorInfo.isAttributedName ? ` by ${safeAriaTarget}` : ''} on Instagram">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
-          </a>
-        </div>
-      </td>
-    `;
-
-    row.addEventListener('click', (e) => {
-      if (e.target.closest('a') || e.target.closest('button')) return;
-      openReelsFeed(reel, row.querySelector('.btn-table-play'));
-    });
-
-    const rowCreatorFilterBtn = row.querySelector('[data-action="filter-creator"]');
-    if (rowCreatorFilterBtn && creatorId) {
-      rowCreatorFilterBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        const nextId = state.filters.creatorId === creatorId ? '' : creatorId;
-        if (nextId && reel.creator) {
-          state.selectedCreator = reel.creator;
-        }
-        selectCreator(nextId);
-        announceStatus(nextId ? `Filtered items by ${creatorFilterSubject}.` : 'Cleared creator filter.');
-      });
-    }
-
-    const tablePlayBtn = row.querySelector('.btn-table-play');
-    tablePlayBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      openReelsFeed(reel, tablePlayBtn);
-    });
-
-    row.querySelector('.btn-table-bookmark').addEventListener('click', (e) => {
-      e.stopPropagation();
-      const latestStatus = state.reels.find((r) => r.id === reel.id)?.watch_status || reel.watch_status;
-      const nextStatus = latestStatus === 'watch_later' ? 'unwatched' : 'watch_later';
-      updateReelStatus(reel.id, nextStatus);
-    });
-
-    row.querySelector('.status-pill-toggle').addEventListener('click', (e) => {
-      e.stopPropagation();
-      const latestStatus = state.reels.find((r) => r.id === reel.id)?.watch_status || reel.watch_status;
-      toggleWatchedStatus(reel.id, latestStatus);
-    });
-
     reelsTableBody.appendChild(row);
   }
 
@@ -3913,6 +4005,187 @@ function syncActiveSlideInert(activeIndex) {
 }
 
 /**
+ * Builds an accessible 100dvh reel slide with adaptive framing and action rail.
+ * @param {object} reel
+ * @param {number} index
+ * @returns {HTMLElement}
+ */
+function createFeedSlide(reel, index) {
+  const effectiveStatus = pendingStatusValues.has(reel.id) ? pendingStatusValues.get(reel.id) : reel.watch_status;
+  const isPending = pendingStatusIds.has(reel.id);
+  const isBotSent = reel.is_saved_on_instagram === false;
+  const isPost = getSavedMediaType(reel) === 'post';
+  const itemWord = isPost ? 'post' : 'reel';
+  const itemBadgeTitle = isPost ? 'Post' : 'Reel';
+  const feedMonogramFallback = isBotSent
+    ? (isPost ? 'Bot Post' : 'Bot Reel')
+    : (isPost ? 'Saved Post' : 'Saved Reel');
+  const feedSourcePill = isBotSent ? '<span class="feed-source-pill is-bot">Sent to Bot</span>' : '';
+  const creatorInfo = getCreatorDisplayInfo(reel.creator);
+  const ariaTarget = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `this ${itemWord}`;
+  const safeCreator = escapeHtml(creatorInfo.displayText);
+  const safeReelUrl = escapeHtml(sanitizeExternalHref(reel.reel_url, 'https://www.instagram.com/'));
+  const safeCreatorHref = escapeHtml(getSafeCreatorProfileHref(reel.creator, reel.reel_url));
+  const creatorLinkTitle = escapeHtml(
+    creatorInfo.hasPublicHandle
+      ? `Open ${creatorInfo.displayText}'s profile on Instagram`
+      : (creatorInfo.isAttributedName
+        ? `Open ${creatorInfo.displayText}'s ${itemWord} on Instagram`
+        : `Open ${itemWord} on Instagram`)
+  );
+  const { initial } = creatorInfo;
+  const isWatchLater = effectiveStatus === 'watch_later';
+  const isWatched = effectiveStatus === 'watched';
+  const cleanThumbnail = sanitizeMediaUrl(reel.thumbnail_url);
+  const hasRealThumbnail = Boolean(cleanThumbnail && !isPlaceholderMediaUrl(cleanThumbnail));
+  const dateInfo = getReelDisplayDate(reel);
+  const dateFormatted = formatShortDate(dateInfo.iso);
+  const cleanSlideCaption = stripPrivateUseChars(reel.caption).trim();
+  const captionText = cleanSlideCaption || `No caption available for this ${itemWord}.`;
+
+  const slide = document.createElement('div');
+  slide.className = 'feed-reel-slide';
+  slide.setAttribute('data-reel-id', reel.id);
+  slide.setAttribute('data-index', String(index));
+  slide.inert = index !== state.currentFeedIndex;
+
+  slide.innerHTML = `
+    <div class="reel-stage-wrapper">
+      <div class="reel-media-slot">
+        <div class="reel-media-viewport">
+          <div class="reel-monogram-underlay" aria-hidden="true">
+            <div class="feed-monogram-circle">${initial}</div>
+            <div class="feed-monogram-handle">${creatorInfo.isAttributedName ? safeCreator : feedMonogramFallback}</div>
+          </div>
+          <div class="reel-probe-indicator" aria-hidden="true">
+            <span class="reel-probe-spinner"></span>
+            <span>Preparing player...</span>
+          </div>
+          <div class="reel-embed-fallback" hidden>
+            <p class="reel-fallback-msg">Instagram embed did not load in this frame.</p>
+            <div class="reel-embed-fallback-actions">
+              <button type="button" class="nav-btn nav-btn-secondary" data-action="retry-embed">Retry Embed</button>
+              <a href="${safeReelUrl}" target="_blank" rel="noopener noreferrer" class="nav-btn nav-btn-primary">Open on Instagram</a>
+            </div>
+          </div>
+          <button type="button" class="feed-focus-player-btn" data-action="focus-embed-player" disabled>${isPost ? 'Focus Instagram post embed' : 'Focus video player'}</button>
+          <!-- Boundary-Masked Clean Iframe Container (Zero white Instagram chrome) -->
+          <div class="reel-iframe-container" id="feed-iframe-box-${reel.id}"></div>
+        </div>
+
+        <!-- Adaptive Action Rail (Right Side on Desktop / Horizontal Strip on Compact) -->
+        <div class="reel-actions-rail">
+          <div class="rail-action-item">
+            <button type="button" class="rail-action-btn ${isWatched ? 'active-watched' : ''}" data-action="feed-toggle-watched" title="${escapeHtml(getStatusPillTitle(effectiveStatus))} (w)" aria-label="${escapeHtml(getStatusPillTitle(effectiveStatus))}" aria-pressed="${isWatched}"${isPending ? ' disabled aria-busy="true"' : ''}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>
+            </button>
+            <span class="rail-action-sublabel">Watched</span>
+          </div>
+
+          <div class="rail-action-item">
+            <button type="button" class="rail-action-btn ${isWatchLater ? 'active-later' : ''}" data-action="feed-toggle-later" title="${escapeHtml(getLaterButtonTitle(effectiveStatus, 'feed'))}" aria-label="${escapeHtml(getLaterButtonAriaLabel(effectiveStatus, ariaTarget, 'feed'))}" aria-pressed="${isWatchLater}"${isPending ? ' disabled aria-busy="true"' : ''}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+            </button>
+            <span class="rail-action-sublabel">Later</span>
+          </div>
+
+          <div class="rail-action-item">
+            <button type="button" class="rail-action-btn" data-action="feed-copy-link" title="Copy ${itemBadgeTitle} Link (c)" aria-label="Copy ${itemBadgeTitle} Link">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+            <span class="rail-action-sublabel copy-label">Copy</span>
+          </div>
+
+          <div class="rail-action-item">
+            <a href="${safeReelUrl}" target="_blank" rel="noopener noreferrer" class="rail-action-btn" title="Open on Instagram" aria-label="Open in Instagram">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+            </a>
+            <span class="rail-action-sublabel">Open</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Overlay / Docked Details -->
+      <div class="reel-overlay-content">
+        <div class="reel-overlay-creator">
+          <div class="reel-creator-avatar" aria-hidden="true">${initial}</div>
+          <div class="reel-creator-meta">
+            <a href="${safeCreatorHref}" target="_blank" rel="noopener noreferrer" class="reel-creator-handle" title="${creatorLinkTitle}"><span class="handle-text">${safeCreator}</span></a>
+            <span class="reel-saved-badge">${dateInfo.labelPrefix} ${dateFormatted}${feedSourcePill}</span>
+          </div>
+        </div>
+        <div class="reel-caption-wrap" id="caption-wrap-${reel.id}">
+          <p class="reel-caption-text">${escapeHtml(captionText)}</p>
+          ${captionText.length > 90 ? '<button type="button" class="reel-caption-toggle" data-action="toggle-caption" aria-label="Expand caption" aria-expanded="false">more</button>' : ''}
+        </div>
+      </div>
+    </div>
+  `;
+
+  if (hasRealThumbnail) {
+    setSlidePosterUrl(slide, reel, cleanThumbnail, { recordRatio: true });
+  }
+
+  applySlideStage(slide, reel);
+
+  slide.addEventListener('click', async (e) => {
+    const toggleCaptionBtn = e.target.closest('[data-action="toggle-caption"]');
+    if (toggleCaptionBtn) {
+      const wrap = slide.querySelector('.reel-caption-wrap');
+      const isExp = wrap.classList.toggle('expanded');
+      toggleCaptionBtn.textContent = isExp ? 'less' : 'more';
+      toggleCaptionBtn.setAttribute('aria-label', isExp ? 'Collapse caption' : 'Expand caption');
+      toggleCaptionBtn.setAttribute('aria-expanded', String(isExp));
+      return;
+    }
+
+    const watchedBtn = e.target.closest('[data-action="feed-toggle-watched"]');
+    if (watchedBtn) {
+      const latestStatus = state.reels.find((r) => r.id === reel.id)?.watch_status || reel.watch_status;
+      const newStatus = latestStatus === 'watched' ? 'unwatched' : 'watched';
+      await updateReelStatus(reel.id, newStatus);
+      return;
+    }
+
+    const laterBtn = e.target.closest('[data-action="feed-toggle-later"]');
+    if (laterBtn) {
+      const latestStatus = state.reels.find((r) => r.id === reel.id)?.watch_status || reel.watch_status;
+      const newStatus = latestStatus === 'watch_later' ? 'unwatched' : 'watch_later';
+      await updateReelStatus(reel.id, newStatus);
+      return;
+    }
+
+    const copyBtn = e.target.closest('[data-action="feed-copy-link"]');
+    if (copyBtn) {
+      await copySlideLink(slide, reel);
+      return;
+    }
+
+    const retryEmbedBtn = e.target.closest('[data-action="retry-embed"]');
+    if (retryEmbedBtn) {
+      const fallback = slide.querySelector('.reel-embed-fallback');
+      if (fallback) fallback.hidden = true;
+      const box = slide.querySelector('.reel-iframe-container');
+      unmountSlideIframe(box);
+      mountFeedIframe(slide, reel);
+      return;
+    }
+
+    const focusPlayerBtn = e.target.closest('[data-action="focus-embed-player"]');
+    if (focusPlayerBtn) {
+      const iframe = slide.querySelector('.reel-player-iframe.is-ready');
+      if (iframe) {
+        iframe.tabIndex = 0;
+        iframe.focus({ preventScroll: true });
+        announceStatus('Focused embedded Instagram player.');
+      }
+    }
+  });
+
+  return slide;
+}
+
+/**
  * Constructs 100dvh reel slides for the vertical snap feed with adaptive framing.
  */
 function renderFeedSlides() {
@@ -3921,181 +4194,31 @@ function renderFeedSlides() {
   feedScrollTrack.innerHTML = '';
 
   state.reels.forEach((reel, index) => {
-    const effectiveStatus = pendingStatusValues.has(reel.id) ? pendingStatusValues.get(reel.id) : reel.watch_status;
-    const isPending = pendingStatusIds.has(reel.id);
-    const isBotSent = reel.is_saved_on_instagram === false;
-    const isPost = getSavedMediaType(reel) === 'post';
-    const itemWord = isPost ? 'post' : 'reel';
-    const itemBadgeTitle = isPost ? 'Post' : 'Reel';
-    const feedMonogramFallback = isBotSent
-      ? (isPost ? 'Bot Post' : 'Bot Reel')
-      : (isPost ? 'Saved Post' : 'Saved Reel');
-    const feedSourcePill = isBotSent ? '<span class="feed-source-pill is-bot">Sent to Bot</span>' : '';
-    const creatorInfo = getCreatorDisplayInfo(reel.creator);
-    const ariaTarget = creatorInfo.isAttributedName ? creatorInfo.accessibleName : `this ${itemWord}`;
-    const safeCreator = escapeHtml(creatorInfo.displayText);
-    const safeReelUrl = escapeHtml(sanitizeExternalHref(reel.reel_url, 'https://www.instagram.com/'));
-    const safeCreatorHref = escapeHtml(getSafeCreatorProfileHref(reel.creator, reel.reel_url));
-    const creatorLinkTitle = escapeHtml(
-      creatorInfo.hasPublicHandle
-        ? `Open ${creatorInfo.displayText}'s profile on Instagram`
-        : (creatorInfo.isAttributedName
-          ? `Open ${creatorInfo.displayText}'s ${itemWord} on Instagram`
-          : `Open ${itemWord} on Instagram`)
-    );
-    const { initial } = creatorInfo;
-    const isWatchLater = effectiveStatus === 'watch_later';
-    const isWatched = effectiveStatus === 'watched';
-    const cleanThumbnail = sanitizeMediaUrl(reel.thumbnail_url);
-    const hasRealThumbnail = Boolean(cleanThumbnail && !isPlaceholderMediaUrl(cleanThumbnail));
-    const dateInfo = getReelDisplayDate(reel);
-    const dateFormatted = formatShortDate(dateInfo.iso);
-    const cleanSlideCaption = stripPrivateUseChars(reel.caption).trim();
-    const captionText = cleanSlideCaption || `No caption available for this ${itemWord}.`;
-
-    const slide = document.createElement('div');
-    slide.className = 'feed-reel-slide';
-    slide.setAttribute('data-reel-id', reel.id);
-    slide.setAttribute('data-index', String(index));
-    slide.inert = index !== state.currentFeedIndex;
-
-    slide.innerHTML = `
-      <div class="reel-stage-wrapper">
-        <div class="reel-media-slot">
-          <div class="reel-media-viewport">
-            <div class="reel-monogram-underlay" aria-hidden="true">
-              <div class="feed-monogram-circle">${initial}</div>
-              <div class="feed-monogram-handle">${creatorInfo.isAttributedName ? safeCreator : feedMonogramFallback}</div>
-            </div>
-            <div class="reel-probe-indicator" aria-hidden="true">
-              <span class="reel-probe-spinner"></span>
-              <span>Preparing player...</span>
-            </div>
-            <div class="reel-embed-fallback" hidden>
-              <p class="reel-fallback-msg">Instagram embed did not load in this frame.</p>
-              <div class="reel-embed-fallback-actions">
-                <button type="button" class="nav-btn nav-btn-secondary" data-action="retry-embed">Retry Embed</button>
-                <a href="${safeReelUrl}" target="_blank" rel="noopener noreferrer" class="nav-btn nav-btn-primary">Open on Instagram</a>
-              </div>
-            </div>
-            <button type="button" class="feed-focus-player-btn" data-action="focus-embed-player" disabled>${isPost ? 'Focus Instagram post embed' : 'Focus video player'}</button>
-            <!-- Boundary-Masked Clean Iframe Container (Zero white Instagram chrome) -->
-            <div class="reel-iframe-container" id="feed-iframe-box-${reel.id}"></div>
-          </div>
-
-          <!-- Adaptive Action Rail (Right Side on Desktop / Horizontal Strip on Compact) -->
-          <div class="reel-actions-rail">
-            <div class="rail-action-item">
-              <button type="button" class="rail-action-btn ${isWatched ? 'active-watched' : ''}" data-action="feed-toggle-watched" title="${escapeHtml(getStatusPillTitle(effectiveStatus))} (w)" aria-label="${escapeHtml(getStatusPillTitle(effectiveStatus))}" aria-pressed="${isWatched}"${isPending ? ' disabled aria-busy="true"' : ''}>
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>
-              </button>
-              <span class="rail-action-sublabel">Watched</span>
-            </div>
-
-            <div class="rail-action-item">
-              <button type="button" class="rail-action-btn ${isWatchLater ? 'active-later' : ''}" data-action="feed-toggle-later" title="${escapeHtml(getLaterButtonTitle(effectiveStatus, 'feed'))}" aria-label="${escapeHtml(getLaterButtonAriaLabel(effectiveStatus, ariaTarget, 'feed'))}" aria-pressed="${isWatchLater}"${isPending ? ' disabled aria-busy="true"' : ''}>
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="${isWatchLater ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
-              </button>
-              <span class="rail-action-sublabel">Later</span>
-            </div>
-
-            <div class="rail-action-item">
-              <button type="button" class="rail-action-btn" data-action="feed-copy-link" title="Copy ${itemBadgeTitle} Link (c)" aria-label="Copy ${itemBadgeTitle} Link">
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-              </button>
-              <span class="rail-action-sublabel copy-label">Copy</span>
-            </div>
-
-            <div class="rail-action-item">
-              <a href="${safeReelUrl}" target="_blank" rel="noopener noreferrer" class="rail-action-btn" title="Open on Instagram" aria-label="Open in Instagram">
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
-              </a>
-              <span class="rail-action-sublabel">Open</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- Overlay / Docked Details -->
-        <div class="reel-overlay-content">
-          <div class="reel-overlay-creator">
-            <div class="reel-creator-avatar" aria-hidden="true">${initial}</div>
-            <div class="reel-creator-meta">
-              <a href="${safeCreatorHref}" target="_blank" rel="noopener noreferrer" class="reel-creator-handle" title="${creatorLinkTitle}"><span class="handle-text">${safeCreator}</span></a>
-              <span class="reel-saved-badge">${dateInfo.labelPrefix} ${dateFormatted}${feedSourcePill}</span>
-            </div>
-          </div>
-          <div class="reel-caption-wrap" id="caption-wrap-${reel.id}">
-            <p class="reel-caption-text">${escapeHtml(captionText)}</p>
-            ${captionText.length > 90 ? '<button type="button" class="reel-caption-toggle" data-action="toggle-caption" aria-label="Expand caption" aria-expanded="false">more</button>' : ''}
-          </div>
-        </div>
-      </div>
-    `;
-
-    if (hasRealThumbnail) {
-      setSlidePosterUrl(slide, reel, cleanThumbnail, { recordRatio: true });
-    }
-
-    applySlideStage(slide, reel);
-
-    slide.addEventListener('click', async (e) => {
-      const toggleCaptionBtn = e.target.closest('[data-action="toggle-caption"]');
-      if (toggleCaptionBtn) {
-        const wrap = slide.querySelector('.reel-caption-wrap');
-        const isExp = wrap.classList.toggle('expanded');
-        toggleCaptionBtn.textContent = isExp ? 'less' : 'more';
-        toggleCaptionBtn.setAttribute('aria-label', isExp ? 'Collapse caption' : 'Expand caption');
-        toggleCaptionBtn.setAttribute('aria-expanded', String(isExp));
-        return;
-      }
-
-      const watchedBtn = e.target.closest('[data-action="feed-toggle-watched"]');
-      if (watchedBtn) {
-        const latestStatus = state.reels.find((r) => r.id === reel.id)?.watch_status || reel.watch_status;
-        const newStatus = latestStatus === 'watched' ? 'unwatched' : 'watched';
-        await updateReelStatus(reel.id, newStatus);
-        return;
-      }
-
-      const laterBtn = e.target.closest('[data-action="feed-toggle-later"]');
-      if (laterBtn) {
-        const latestStatus = state.reels.find((r) => r.id === reel.id)?.watch_status || reel.watch_status;
-        const newStatus = latestStatus === 'watch_later' ? 'unwatched' : 'watch_later';
-        await updateReelStatus(reel.id, newStatus);
-        return;
-      }
-
-      const copyBtn = e.target.closest('[data-action="feed-copy-link"]');
-      if (copyBtn) {
-        await copySlideLink(slide, reel);
-        return;
-      }
-
-      const retryEmbedBtn = e.target.closest('[data-action="retry-embed"]');
-      if (retryEmbedBtn) {
-        const fallback = slide.querySelector('.reel-embed-fallback');
-        if (fallback) fallback.hidden = true;
-        const box = slide.querySelector('.reel-iframe-container');
-        unmountSlideIframe(box);
-        mountFeedIframe(slide, reel);
-        return;
-      }
-
-      const focusPlayerBtn = e.target.closest('[data-action="focus-embed-player"]');
-      if (focusPlayerBtn) {
-        const iframe = slide.querySelector('.reel-player-iframe.is-ready');
-        if (iframe) {
-          iframe.tabIndex = 0;
-          iframe.focus({ preventScroll: true });
-          announceStatus('Focused embedded Instagram player.');
-        }
-      }
-    });
-
+    const slide = createFeedSlide(reel, index);
     feedScrollTrack.appendChild(slide);
   });
 
   setupFeedIntersectionObserver();
+}
+
+/**
+ * Dynamically appends newly fetched reels as slides onto the active feed track and registers them with the observer.
+ * @param {Array<object>} newReels
+ */
+function appendFeedSlides(newReels) {
+  if (!Array.isArray(newReels) || newReels.length === 0) return;
+  const startIndex = feedScrollTrack.querySelectorAll('.feed-reel-slide').length;
+  newReels.forEach((reel, i) => {
+    const slideIndex = startIndex + i;
+    const slide = createFeedSlide(reel, slideIndex);
+    feedScrollTrack.appendChild(slide);
+    if (feedIntersectionObserver) {
+      feedIntersectionObserver.observe(slide);
+    }
+  });
+  updateFeedNavArrows(state.currentFeedIndex);
+  const currentReel = state.reels[state.currentFeedIndex];
+  feedCounterKicker.textContent = formatFeedCounterKicker(currentReel, state.currentFeedIndex, state.total || state.reels.length);
 }
 
 /**
@@ -4128,7 +4251,8 @@ async function copySlideLink(slide, reel) {
  */
 function updateFeedNavArrows(index) {
   feedArrowUp.disabled = index <= 0;
-  feedArrowDown.disabled = index >= state.reels.length - 1;
+  const hasMore = state.reels.length < state.total;
+  feedArrowDown.disabled = index >= state.reels.length - 1 && !hasMore;
 }
 
 /**
@@ -4141,7 +4265,8 @@ function updateFeedNavArrows(index) {
 function formatFeedCounterKicker(reel, index, total) {
   const input = getSlideAspectInput(reel);
   const kindLabel = input.isClips === false ? 'POST' : 'REEL';
-  return `${kindLabel} ${index + 1} OF ${total}`;
+  const effectiveTotal = Math.max(Number(total) || 0, Number(state.total) || 0, state.reels.length || 0);
+  return `${kindLabel} ${index + 1} OF ${effectiveTotal}`;
 }
 
 /**
@@ -4165,11 +4290,15 @@ function setupFeedIntersectionObserver() {
         state.currentFeedReelId = reelId;
         syncActiveSlideInert(index);
 
-        feedCounterKicker.textContent = formatFeedCounterKicker(reel, index, state.reels.length);
+        feedCounterKicker.textContent = formatFeedCounterKicker(reel, index, state.total || state.reels.length);
         updateFeedNavArrows(index);
 
         if (reel) {
           mountFeedIframe(slide, reel);
+        }
+
+        if (index >= state.reels.length - 3 && state.reels.length < state.total && !isFeedLoadingMore) {
+          loadMoreFeedReels(false);
         }
       } else if (!entry.isIntersecting || entry.intersectionRatio < 0.2) {
         unmountSlideIframe(iframeBox);
@@ -4214,7 +4343,7 @@ function openReelsFeed(startReel, triggerEl = null) {
   const startIndex = Math.max(0, state.reels.findIndex((r) => r.id === startReel?.id));
   state.currentFeedIndex = startIndex;
   state.currentFeedReelId = startReel?.id || null;
-  feedCounterKicker.textContent = formatFeedCounterKicker(startReel, startIndex, state.reels.length);
+  feedCounterKicker.textContent = formatFeedCounterKicker(startReel, startIndex, state.total || state.reels.length);
   updateFeedNavArrows(startIndex);
 
   renderFeedSlides();
@@ -4294,7 +4423,92 @@ function scrollFeedBy(direction) {
       const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
       nextSlide.scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth', block: 'start' });
     }
+  } else if (direction > 0 && targetIndex >= state.reels.length && state.reels.length < state.total) {
+    loadMoreFeedReels(true);
   }
+}
+
+/**
+ * Loads the next page of reels for the vertical snap feed, appending new slides without interrupting playback.
+ * @param {boolean} [autoAdvance=false]
+ */
+async function loadMoreFeedReels(autoAdvance = false) {
+  if (isFeedLoadingMore) return;
+  if (state.reels.length >= state.total) return;
+
+  const nextPage = Math.floor(state.reels.length / state.filters.limit) + 1;
+  const maxPage = Math.max(1, Math.ceil(state.total / state.filters.limit) || 1);
+  if (nextPage > maxPage) return;
+
+  isFeedLoadingMore = true;
+  if (autoAdvance) {
+    feedArrowDown.setAttribute('aria-busy', 'true');
+  }
+
+  try {
+    const prevCount = state.reels.length;
+    await fetchReels({ append: true, pageOverride: nextPage, silent: true });
+    if (autoAdvance && state.reels.length > prevCount) {
+      scrollFeedBy(1);
+    }
+  } catch (err) {
+    console.error('Failed to load more feed reels:', err);
+  } finally {
+    isFeedLoadingMore = false;
+    feedArrowDown.removeAttribute('aria-busy');
+    updateFeedNavArrows(state.currentFeedIndex);
+  }
+}
+
+/**
+ * Loads the next page of reels for continuous catalog scrolling, appending new cards/rows and updating counts.
+ */
+async function loadMoreCatalogReels() {
+  if (isCatalogLoadingMore || isFeedLoadingMore) return;
+  if (state.reels.length >= state.total) return;
+
+  const nextPage = Math.floor(state.reels.length / state.filters.limit) + 1;
+  const maxPage = Math.max(1, Math.ceil(state.total / state.filters.limit) || 1);
+  if (nextPage > maxPage) return;
+
+  isCatalogLoadingMore = true;
+  const spinner = document.getElementById('catalog-scroll-spinner');
+  if (spinner) spinner.hidden = false;
+
+  try {
+    await fetchReels({ append: true, pageOverride: nextPage, silent: true });
+  } catch (err) {
+    console.error('Failed to load more catalog reels:', err);
+  } finally {
+    isCatalogLoadingMore = false;
+    if (spinner) spinner.hidden = true;
+  }
+}
+
+/**
+ * Observes the catalog sentinel element to automatically prefetch and append next page of reels as the user scrolls.
+ */
+function setupCatalogInfiniteObserver() {
+  const sentinel = document.getElementById('catalog-sentinel');
+  if (!sentinel) return;
+  if (catalogIntersectionObserver) {
+    catalogIntersectionObserver.disconnect();
+  }
+
+  catalogIntersectionObserver = new IntersectionObserver((entries) => {
+    const entry = entries[0];
+    if (entry && entry.isIntersecting) {
+      if (state.reels.length > 0 && state.reels.length < state.total && !isCatalogLoadingMore) {
+        loadMoreCatalogReels();
+      }
+    }
+  }, {
+    root: null,
+    rootMargin: '400px 0px',
+    threshold: 0.01,
+  });
+
+  catalogIntersectionObserver.observe(sentinel);
 }
 
 /**
@@ -5188,6 +5402,8 @@ function setupEventListeners() {
       importBtn.disabled = false;
     }
   });
+
+  setupCatalogInfiniteObserver();
 }
 
 document.addEventListener('DOMContentLoaded', init);
