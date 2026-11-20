@@ -881,4 +881,11 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
   assert.ok(js.includes('copy-bot-handle'), 'app.js must support copying bot handle in onboarding');
   assert.ok(css.includes('.ftue-onboarding-card'), 'style.css must style .ftue-onboarding-card');
   assert.ok(css.includes('.ftue-steps-grid'), 'style.css must style .ftue-steps-grid');
+
+  // 9. Real-time search and creator filter enhancements
+  assert.ok(html.includes('id="search-input"'), 'index.html must define search-input');
+  assert.ok(html.includes('id="clear-search"'), 'index.html must define clear-search');
+  assert.ok(js.includes("e.key === 'Escape' && searchInput.value"), 'app.js must clear search on Escape key');
+  assert.ok(js.includes("e.key === 'Escape' && creatorFilterInput.value"), 'app.js must clear creator filter on Escape key');
+  assert.ok(js.includes('state.filters.creatorId === id && id'), 'app.js must support 1-tap creator filter toggle-off');
 });

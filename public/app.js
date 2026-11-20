@@ -1852,8 +1852,9 @@ function renderCreatorStrip() {
  * @param {string} id
  */
 function selectCreator(id) {
-  state.filters.creatorId = id;
-  state.selectedCreator = id ? findCreatorById(id) : null;
+  const nextId = (state.filters.creatorId === id && id) ? '' : id;
+  state.filters.creatorId = nextId;
+  state.selectedCreator = nextId ? findCreatorById(nextId) : null;
   state.filters.page = 1;
   syncKpiActiveStates();
   syncUrlState();
@@ -4887,17 +4888,28 @@ function setupEventListeners() {
     }
   });
 
+  searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && searchInput.value) {
+      e.preventDefault();
+      clearSearchBtn.click();
+    }
+  });
+
   searchInput.addEventListener('input', (e) => {
     clearTimeout(searchTimeout);
     const val = e.target.value;
     clearSearchBtn.hidden = !val;
+    const trimmed = val.trim();
+    if (trimmed) {
+      resultsCount.textContent = `Searching "${trimmed}"...`;
+    }
     searchTimeout = setTimeout(() => {
       state.filters.search = val;
       state.filters.page = 1;
       syncKpiActiveStates();
       syncUrlState();
       fetchReels();
-    }, 220);
+    }, 180);
   });
 
   clearSearchBtn.addEventListener('click', () => {
@@ -4915,6 +4927,13 @@ function setupEventListeners() {
   });
 
   if (creatorFilterInput) {
+    creatorFilterInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && creatorFilterInput.value) {
+        e.preventDefault();
+        clearCreatorFilterBtn?.click();
+      }
+    });
+
     creatorFilterInput.addEventListener('input', (e) => {
       const val = e.target.value || '';
       state.creatorQuery = val;
