@@ -839,4 +839,14 @@ test('playerGeometry and app embed contracts: landscape alignment, square grid r
   const expectedSrc = `https://www.instagram.com/p/${encodeURIComponent(shortcode)}/embed/?cr=1&rd=${originParam}&rp=${pathParam}`;
   assert.ok(expectedSrc.includes('?cr=1&rd='), 'Embed URL must include cr=1 cross-origin parameter');
   assert.ok(expectedSrc.includes(encodeURIComponent('https://reeler-staging.onrender.com')));
+
+  // 6. Pre-probe fallback classification preserves landscape thumbnails (> 1.08)
+  const preProbeLandscapeReel = ReelerGeometry.classifyPostAspect({
+    embedRatio: null,
+    isClips: true,
+    thumbAspectRatio: 1.778,
+  });
+  assert.equal(preProbeLandscapeReel.isPillarboxedReel, false, 'Landscape thumbnail must preserve wide classification');
+  assert.equal(preProbeLandscapeReel.displayRatio, 1.778);
+  assert.equal(preProbeLandscapeReel.effectiveEmbedRatio, 1.778);
 });

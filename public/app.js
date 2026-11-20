@@ -3731,6 +3731,9 @@ function mountFeedIframe(slide, reel) {
     'title',
     frameCreator.isAttributedName ? `Instagram post by ${frameCreator.accessibleName}` : 'Embedded Instagram post'
   );
+  iframe.addEventListener('load', () => {
+    mounted = true;
+  });
   iframe.addEventListener('error', () => {
     finalizeAndReveal(null, false, 0, true);
   }, { once: true });
@@ -3968,7 +3971,7 @@ function mountFeedIframe(slide, reel) {
     iframeBox.appendChild(iframe);
 
     safetyTimer = setTimeout(() => {
-      finalizeAndReveal(cached.embedRatio, false, 0, false);
+      finalizeAndReveal(cached.embedRatio, false, 0, !mounted);
     }, 2500);
   } else {
     iframe.dataset.probing = '1';
@@ -3980,7 +3983,7 @@ function mountFeedIframe(slide, reel) {
 
     safetyTimer = setTimeout(() => {
       phase = 'aborted';
-      finalizeAndReveal(null, false, 0, false);
+      finalizeAndReveal(null, false, 0, !mounted);
     }, 6500);
   }
 }
