@@ -44,6 +44,9 @@ function recordVaultActivity(force = false) {
   if (!force && now - lastActivityRecordTime < 10000) {
     return;
   }
+  if (checkVaultInactivity(false)) {
+    return;
+  }
   lastActivityRecordTime = now;
   try {
     if (localStorage.getItem(VAULT_KEY_STORAGE)) {
@@ -63,7 +66,14 @@ function recordVaultActivity(force = false) {
 function checkVaultInactivity(quiet = false) {
   try {
     const key = localStorage.getItem(VAULT_KEY_STORAGE);
-    if (!key) return false;
+    if (!key) {
+      if (vaultGateScreen && vaultGateScreen.classList.contains('is-hidden')) {
+        if (typeof closeReelsFeed === 'function') closeReelsFeed();
+        if (typeof resetVaultSessionState === 'function') resetVaultSessionState();
+        if (typeof showVaultGateScreen === 'function') showVaultGateScreen(undefined, { preserveWorkspace: false });
+      }
+      return false;
+    }
 
     const rawLastActive = localStorage.getItem(VAULT_LAST_ACTIVE_STORAGE);
     if (!rawLastActive) {
@@ -771,6 +781,9 @@ function cancelSwitchVault() {
  */
 function confirmSignOutVault() {
   const options = arguments[0] || {};
+  if (typeof closeReelsFeed === 'function') {
+    closeReelsFeed();
+  }
   invalidatePendingVaultAuth();
   clearPendingOtpAttempt();
   vaultSessionGeneration++;
