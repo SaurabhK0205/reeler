@@ -3902,6 +3902,8 @@ function mountFeedIframe(slide, reel) {
       fallbackBox.hidden = true;
       iframe.hidden = false;
       settled = false;
+      finalizeAndReveal(cached?.embedRatio ?? null, false, 40, false);
+      return;
     }
 
     if (phase === 'cached') {
