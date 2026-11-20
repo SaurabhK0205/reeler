@@ -2092,23 +2092,28 @@ test('Security - Repository.activateDefaultReminder enforces atomic CAS on await
   Repository.resetMemoryStoreForTests();
   try {
     const creator = await Repository.upsertCreator({ username: 'cas_creator' });
+    const deadline = new Date(Date.now() - 60_000).toISOString();
     const reel = await Repository.upsertSavedReel({
       shortcode: 'CasReelShortcode1',
       reel_url: 'https://www.instagram.com/reel/CasReelShortcode1/',
       creator_id: creator.id,
       media_type: 'reel',
       watch_status: 'watch_later',
-      awaiting_reminder_choice_until: new Date(Date.now() - 60_000).toISOString(),
+      awaiting_reminder_choice_until: deadline,
     });
 
-    // First activation succeeds and returns reel with cleared awaiting choice
-    const firstActivation = await Repository.activateDefaultReminder(reel.id, 10);
+    // Activation with stale/mismatched deadline returns null (e.g. sender re-shared reel with newer window)
+    const staleActivation = await Repository.activateDefaultReminder(reel.id, '2020-01-01T00:00:00.000Z', 10);
+    assert.equal(staleActivation.reel, null);
+
+    // First activation with matching deadline succeeds and returns reel with cleared awaiting choice
+    const firstActivation = await Repository.activateDefaultReminder(reel.id, deadline, 10);
     assert.ok(firstActivation.reel !== null);
     assert.equal(firstActivation.reel?.awaiting_reminder_choice_until, null);
     assert.equal(firstActivation.reel?.reminder_interval_hours, 10);
 
     // Second activation on already-cleared reel returns null reel (CAS lost, prevents duplicate DMs)
-    const secondActivation = await Repository.activateDefaultReminder(reel.id, 10);
+    const secondActivation = await Repository.activateDefaultReminder(reel.id, deadline, 10);
     assert.equal(secondActivation.reel, null);
   } finally {
     Repository.resetMemoryStoreForTests();
@@ -2151,7 +2156,37 @@ test('Security - apiRouter returns 404 JSON for unrecognized API endpoints and 4
       const invalidEndBody = (await invalidEndRes.json()) as { error?: string };
       assert.equal(invalidEndBody.error, 'INVALID_DATE_FORMAT');
 
-      // 4. Valid ISO date parameters proceed normally
+      // 4. Non-string query objects (Express 4 extended query parsing) return 400 Bad Request
+      const objectStartRes = await fetch(`${baseUrl}/api/reels?startDate[invalid]=value`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(objectStartRes.status, 400);
+      const objectStartBody = (await objectStartRes.json()) as { error?: string };
+      assert.equal(objectStartBody.error, 'INVALID_DATE_FORMAT');
+
+      const objectEndRes = await fetch(`${baseUrl}/api/reels?endDate[invalid]=value`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(objectEndRes.status, 400);
+      const objectEndBody = (await objectEndRes.json()) as { error?: string };
+      assert.equal(objectEndBody.error, 'INVALID_DATE_FORMAT');
+
+      // 5. Impossible calendar dates (e.g. Feb 30, April 31) return 400 Bad Request
+      const feb30Res = await fetch(`${baseUrl}/api/reels?startDate=2026-02-30T00:00:00.000Z`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(feb30Res.status, 400);
+      const feb30Body = (await feb30Res.json()) as { error?: string };
+      assert.equal(feb30Body.error, 'INVALID_DATE_FORMAT');
+
+      const apr31Res = await fetch(`${baseUrl}/api/reels?endDate=2026-04-31`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(apr31Res.status, 400);
+      const apr31Body = (await apr31Res.json()) as { error?: string };
+      assert.equal(apr31Body.error, 'INVALID_DATE_FORMAT');
+
+      // 6. Valid ISO date parameters proceed normally
       const validDateRes = await fetch(`${baseUrl}/api/reels?startDate=2026-01-01T00:00:00.000Z`, {
         headers: { 'X-Vault-Key': adminKey },
       });

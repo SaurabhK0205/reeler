@@ -5,6 +5,7 @@ import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
 import { getTimeZoneSummary, resolveTimeZone } from '../utils/timezone.ts';
+import { parseDurationOrDateInput } from '../utils/duration.ts';
 import { feedMetaCacheControl, isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
 import {
   vaultAuthMiddleware,
@@ -311,14 +312,27 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
       ? req.query.creatorId.trim().slice(0, 128)
       : undefined;
 
-    const rawStartDate = typeof req.query.startDate === 'string' ? req.query.startDate.trim().slice(0, 40) : undefined;
-    const rawEndDate = typeof req.query.endDate === 'string' ? req.query.endDate.trim().slice(0, 40) : undefined;
+    if (req.query.startDate !== undefined && typeof req.query.startDate !== 'string') {
+      res.status(400).json({ error: 'INVALID_DATE_FORMAT', message: 'startDate must be a string timestamp.' });
+      return;
+    }
+    if (req.query.endDate !== undefined && typeof req.query.endDate !== 'string') {
+      res.status(400).json({ error: 'INVALID_DATE_FORMAT', message: 'endDate must be a string timestamp.' });
+      return;
+    }
 
-    if (rawStartDate && Number.isNaN(Date.parse(rawStartDate))) {
+    const rawStartDate = typeof req.query.startDate === 'string' && req.query.startDate.trim()
+      ? req.query.startDate.trim().slice(0, 40)
+      : undefined;
+    const rawEndDate = typeof req.query.endDate === 'string' && req.query.endDate.trim()
+      ? req.query.endDate.trim().slice(0, 40)
+      : undefined;
+
+    if (rawStartDate && !parseDurationOrDateInput(rawStartDate)) {
       res.status(400).json({ error: 'INVALID_DATE_FORMAT', message: 'startDate must be a valid date or timestamp.' });
       return;
     }
-    if (rawEndDate && Number.isNaN(Date.parse(rawEndDate))) {
+    if (rawEndDate && !parseDurationOrDateInput(rawEndDate)) {
       res.status(400).json({ error: 'INVALID_DATE_FORMAT', message: 'endDate must be a valid date or timestamp.' });
       return;
     }

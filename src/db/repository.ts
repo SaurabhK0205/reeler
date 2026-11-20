@@ -3033,7 +3033,11 @@ export class Repository {
     return data as SavedReel[];
   }
 
-  static async activateDefaultReminder(id: string, defaultHours: number = 10): Promise<{ reel: SavedReel | null; targetTime: Date }> {
+  static async activateDefaultReminder(
+    id: string,
+    expectedDeadline: string,
+    defaultHours: number = 10
+  ): Promise<{ reel: SavedReel | null; targetTime: Date }> {
     const now = new Date();
     const targetTime = new Date(now.getTime() + defaultHours * 3600 * 1000);
     const targetIso = targetTime.toISOString();
@@ -3041,7 +3045,7 @@ export class Repository {
     if (!isSupabaseConfigured()) {
       const reel = memoryStore.reels.get(id);
       if (reel) {
-        if (!reel.awaiting_reminder_choice_until) {
+        if (reel.awaiting_reminder_choice_until !== expectedDeadline) {
           return { reel: null, targetTime };
         }
         reel.awaiting_reminder_choice_until = null;
@@ -3065,7 +3069,7 @@ export class Repository {
         updated_at: now.toISOString(),
       })
       .eq('id', id)
-      .not('awaiting_reminder_choice_until', 'is', null)
+      .eq('awaiting_reminder_choice_until', expectedDeadline)
       .select('*, creator:creators(*)')
       .maybeSingle();
 

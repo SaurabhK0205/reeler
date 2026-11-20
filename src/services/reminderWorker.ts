@@ -392,9 +392,16 @@ export class ReminderWorker {
       const defaultHours = config.reminders.defaultIntervalHours || 10;
 
       for (const reel of expiredReels) {
-        const { reel: activatedReel, targetTime } = await Repository.activateDefaultReminder(reel.id, defaultHours);
+        if (!reel.awaiting_reminder_choice_until) {
+          continue;
+        }
+        const { reel: activatedReel, targetTime } = await Repository.activateDefaultReminder(
+          reel.id,
+          reel.awaiting_reminder_choice_until,
+          defaultHours
+        );
         if (!activatedReel) {
-          // CAS race lost: another tick or worker already activated this reel's reminder
+          // CAS race lost or deadline refreshed: another tick or worker handled this reel, or sender re-shared it
           continue;
         }
 

@@ -414,3 +414,42 @@ export function formatTimeRemaining(ms: number): string {
   const days = Math.round(hrs / 24);
   return `${days}d`;
 }
+
+/**
+ * Validates and parses an ISO date or calendar date string.
+ * Strictly verifies calendar components to reject impossible rollover dates (e.g. February 30, April 31)
+ * that standard JavaScript Date.parse silently shifts to subsequent months.
+ * Returns the parsed Date object, or null if invalid or malformed.
+ */
+export function parseDurationOrDateInput(input: unknown): Date | null {
+  if (typeof input !== 'string') return null;
+  const trimmed = input.trim();
+  if (!trimmed || trimmed.length > 64) return null;
+
+  const timestamp = Date.parse(trimmed);
+  if (Number.isNaN(timestamp)) return null;
+
+  // Validate calendar components for ISO-style YYYY-MM-DD representations
+  const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?(Z|([+-])(\d{2}):?(\d{2})?)?)?$/i);
+  if (isoMatch) {
+    const year = Number(isoMatch[1]);
+    const month = Number(isoMatch[2]);
+    const day = Number(isoMatch[3]);
+
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+    // Determine exact maximum valid days for the given month and year (1-indexed month, day 0 is last day of month)
+    const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    if (day > daysInMonth) return null;
+
+    if (isoMatch[4] !== undefined) {
+      const hour = Number(isoMatch[4]);
+      const minute = Number(isoMatch[5]);
+      const second = isoMatch[6] !== undefined ? Math.floor(Number(isoMatch[6])) : 0;
+      if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) return null;
+    }
+  }
+
+  return new Date(timestamp);
+}
+
