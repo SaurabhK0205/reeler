@@ -414,3 +414,55 @@ export function formatTimeRemaining(ms: number): string {
   const days = Math.round(hrs / 24);
   return `${days}d`;
 }
+
+/**
+ * Validates and parses an ISO date or calendar date string.
+ * Strictly verifies calendar components to reject impossible rollover dates (e.g. February 30, April 31,
+ * or expanded-year variants like +002026-02-30) that standard JavaScript Date.parse silently shifts to subsequent months.
+ * Rejects unsupported or malformed representations before native Date construction.
+ * Returns the parsed Date object, or null if invalid or malformed.
+ */
+export function parseDurationOrDateInput(input: unknown): Date | null {
+  if (typeof input !== 'string') return null;
+  const trimmed = input.trim();
+  if (!trimmed || trimmed.length > 64) return null;
+
+  // Strict ISO pattern supporting 4-digit years or 6-digit expanded years (e.g. +002026)
+  const isoMatch = trimmed.match(
+    /^(?:([+-]\d{6})|(\d{4}))-(\d{2})-(\d{2})(?:[T\s](\d{2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?(Z|([+-])(\d{2}):?(\d{2})?)?)?$/i
+  );
+  if (!isoMatch) {
+    return null; // Reject unsupported or malformed representations
+  }
+
+  const rawYear = isoMatch[1] !== undefined ? isoMatch[1] : isoMatch[2];
+  const year = Number(rawYear);
+  const month = Number(isoMatch[3]);
+  const day = Number(isoMatch[4]);
+
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+  // Determine exact maximum valid days for the given month and year using proleptic Gregorian rules
+  // (avoiding Date.UTC's legacy 0-99 year remapping to 1900-1999)
+  let daysInMonth = 31;
+  if (month === 2) {
+    const isLeap = (year % 4 === 0 && year % 100 !== 0) || (year % 400 === 0);
+    daysInMonth = isLeap ? 29 : 28;
+  } else if (month === 4 || month === 6 || month === 9 || month === 11) {
+    daysInMonth = 30;
+  }
+  if (day > daysInMonth) return null;
+
+  if (isoMatch[5] !== undefined) {
+    const hour = Number(isoMatch[5]);
+    const minute = Number(isoMatch[6]);
+    const second = isoMatch[7] !== undefined ? Math.floor(Number(isoMatch[7])) : 0;
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) return null;
+  }
+
+  const timestamp = Date.parse(trimmed);
+  if (Number.isNaN(timestamp)) return null;
+
+  return new Date(timestamp);
+}
+

@@ -5,6 +5,7 @@ import { ArchiveImportService } from '../services/archiveImportService.ts';
 import { loadConfig } from '../config.ts';
 import { MetaInstagramBotService } from '../services/metaInstagramBotService.ts';
 import { getTimeZoneSummary, resolveTimeZone } from '../utils/timezone.ts';
+import { parseDurationOrDateInput } from '../utils/duration.ts';
 import { feedMetaCacheControl, isValidShortcode, resolveFeedMediaMetadata } from '../services/reelMetadataResolver.ts';
 import {
   vaultAuthMiddleware,
@@ -311,12 +312,36 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
       ? req.query.creatorId.trim().slice(0, 128)
       : undefined;
 
+    if (req.query.startDate !== undefined && typeof req.query.startDate !== 'string') {
+      res.status(400).json({ error: 'INVALID_DATE_FORMAT', message: 'startDate must be a string timestamp.' });
+      return;
+    }
+    if (req.query.endDate !== undefined && typeof req.query.endDate !== 'string') {
+      res.status(400).json({ error: 'INVALID_DATE_FORMAT', message: 'endDate must be a string timestamp.' });
+      return;
+    }
+
+    const trimmedStartDate = typeof req.query.startDate === 'string' ? req.query.startDate.trim() : undefined;
+    const trimmedEndDate = typeof req.query.endDate === 'string' ? req.query.endDate.trim() : undefined;
+
+    if (trimmedStartDate && (trimmedStartDate.length > 40 || !parseDurationOrDateInput(trimmedStartDate))) {
+      res.status(400).json({ error: 'INVALID_DATE_FORMAT', message: 'startDate must be a valid date or timestamp.' });
+      return;
+    }
+    if (trimmedEndDate && (trimmedEndDate.length > 40 || !parseDurationOrDateInput(trimmedEndDate))) {
+      res.status(400).json({ error: 'INVALID_DATE_FORMAT', message: 'endDate must be a valid date or timestamp.' });
+      return;
+    }
+
+    const rawStartDate = trimmedStartDate || undefined;
+    const rawEndDate = trimmedEndDate || undefined;
+
     const filters: ReelQueryFilters = {
       creatorId: safeCreatorId,
       instagramSenderId: senderId,
       datePreset: (req.query.datePreset as DateFilterPreset) || 'all',
-      startDate: typeof req.query.startDate === 'string' ? req.query.startDate.slice(0, 40) : undefined,
-      endDate: typeof req.query.endDate === 'string' ? req.query.endDate.slice(0, 40) : undefined,
+      startDate: rawStartDate,
+      endDate: rawEndDate,
       watchStatus: (req.query.watchStatus as WatchStatus | 'all') || 'all',
       mediaType: (rawMediaType as SavedMediaType | 'all') || 'all',
       source: (rawSource as SavedCollectionSource | 'all') || 'all',
@@ -603,6 +628,18 @@ apiRouter.patch('/user/timezone', async (req: Request, res: Response, next: Next
     success: true,
     timezone: resolved,
     summary: getTimeZoneSummary(resolved),
+  });
+});
+
+/**
+ * Catch-all 404 handler for unrecognized /api routes.
+ * Prevents unknown API calls from falling through to the single-page application index.html shell.
+ */
+apiRouter.all('*', (req: Request, res: Response) => {
+  setResponseHeader(res, 'Cache-Control', 'no-store');
+  res.status(404).json({
+    error: 'NOT_FOUND',
+    message: `API endpoint ${req.method} ${req.path} not found.`,
   });
 });
 
