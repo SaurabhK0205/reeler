@@ -1309,7 +1309,7 @@ kbd {
   display: flex;
   flex-direction: column;
   contain: layout paint;
-  transition: border-color var(--dur-fast) ease, transform var(--dur-fast) var(--ease-spring-snappy), box-shadow var(--dur-fast) ease;
+  transition: border-color var(--dur-fast) ease, transform var(--dur-fast) var(--ease-spring-snappy);
   position: relative;
 }
 
