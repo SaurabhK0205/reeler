@@ -33,6 +33,29 @@ test('VaultAuthService - verifyVaultKey authenticates valid user key and extract
   assert.equal(result.session?.senderId, senderId);
 });
 
+test('VaultAuthService - timestamped user keys are verified and expired keys are rejected', () => {
+  const senderId = 'sender_timestamped_user';
+  const now = Date.now();
+  const validKey = generateUserVaultKey(senderId, now);
+
+  const validResult = verifyVaultKey(validKey);
+  assert.equal(validResult.valid, true);
+  assert.equal(validResult.session?.role, 'user');
+  assert.equal(validResult.session?.senderId, senderId);
+
+  // Expired token (older than 14 days)
+  const expiredIssuedAt = now - (15 * 24 * 60 * 60 * 1000);
+  const expiredKey = generateUserVaultKey(senderId, expiredIssuedAt);
+  const expiredResult = verifyVaultKey(expiredKey);
+  assert.equal(expiredResult.valid, false, 'Expired token must be rejected');
+
+  // Far-future token (beyond 60s clock skew)
+  const futureIssuedAt = now + (10 * 60 * 1000);
+  const futureKey = generateUserVaultKey(senderId, futureIssuedAt);
+  const futureResult = verifyVaultKey(futureKey);
+  assert.equal(futureResult.valid, false, 'Future token beyond clock skew must be rejected');
+});
+
 test('VaultAuthService - verifyVaultKey authenticates admin key', () => {
   const adminKey = getAdminVaultKey();
   const result = verifyVaultKey(adminKey);
@@ -660,9 +683,11 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
     'Reduced-motion block must override .vault-tab-btn transition-property after its base rule'
   );
 
-  // 4. HTML cache-busting query versions stay aligned
+  // 4. HTML cache-busting query versions and PWA manifest stay aligned
   assert.ok(html.includes('style.css?v=4.8'), 'index.html must reference style.css?v=4.8');
   assert.ok(html.includes('app.js?v=4.8'), 'index.html must reference app.js?v=4.8');
+  assert.ok(html.includes('rel="manifest" href="/manifest.json"'), 'index.html must reference /manifest.json');
+  assert.ok(html.includes('name="apple-mobile-web-app-capable"'), 'index.html must support standalone iOS web app mode');
 
   // 5. Emil Kowalski + Benji Taylor motion craft invariants hold
   assert.ok(css.includes('--ease-out: cubic-bezier(0.23, 1, 0.32, 1);'), 'style.css must define custom --ease-out token');
@@ -845,4 +870,9 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
   assert.ok(js.includes('function observeGridCardsForThumbnails()'), 'app.js must wire lazy viewport grid thumbnail hydration');
   assert.ok(js.includes('function resetGridThumbnailHydration()'), 'app.js must cancel stale grid thumbnail lookups on navigation/reset');
   assert.ok(js.includes('MAX_GRID_THUMB_CONCURRENCY'), 'app.js must bound concurrent grid thumbnail lookups');
+
+  // 7. 1-hour privacy auto-logout and inactivity tracking invariants
+  assert.ok(js.includes('VAULT_INACTIVITY_TIMEOUT_MS = 60 * 60 * 1000'), 'app.js must define 1-hour inactivity timeout');
+  assert.ok(js.includes('VAULT_LAST_ACTIVE_STORAGE'), 'app.js must track last active storage key');
+  assert.ok(js.includes('function checkVaultInactivity'), 'app.js must implement checkVaultInactivity');
 });

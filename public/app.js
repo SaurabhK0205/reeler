@@ -30,14 +30,94 @@ function saveViewMode(mode) {
 }
 
 const VAULT_KEY_STORAGE = 'reeler_vault_key';
+const VAULT_LAST_ACTIVE_STORAGE = 'reeler_vault_last_active';
+const VAULT_INACTIVITY_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour inactivity threshold
+
+let lastActivityRecordTime = 0;
+
+/**
+ * Records user interaction timestamp to enforce 1-hour inactivity auto-logout.
+ * Throttled to at most once every 10 seconds to avoid unnecessary localStorage writes.
+ */
+function recordVaultActivity(force = false) {
+  const now = Date.now();
+  if (!force && now - lastActivityRecordTime < 10000) {
+    return;
+  }
+  if (checkVaultInactivity(false)) {
+    return;
+  }
+  lastActivityRecordTime = now;
+  try {
+    if (localStorage.getItem(VAULT_KEY_STORAGE)) {
+      localStorage.setItem(VAULT_LAST_ACTIVE_STORAGE, String(now));
+    }
+  } catch (_) {
+    /* non-fatal */
+  }
+}
+
+/**
+ * Checks whether the current vault session has exceeded the 1-hour inactivity limit.
+ * If expired, immediately purges stored keys, resets state, and shows the gate screen.
+ * @param {boolean} [quiet=false]
+ * @returns {boolean} True if session was expired and logged out.
+ */
+function checkVaultInactivity(quiet = false) {
+  try {
+    const key = localStorage.getItem(VAULT_KEY_STORAGE);
+    if (!key) {
+      if (vaultGateScreen && vaultGateScreen.classList.contains('is-hidden')) {
+        if (typeof closeReelsFeed === 'function') closeReelsFeed();
+        if (typeof resetVaultSessionState === 'function') resetVaultSessionState();
+        if (typeof showVaultGateScreen === 'function') showVaultGateScreen(undefined, { preserveWorkspace: false });
+      }
+      return false;
+    }
+
+    const rawLastActive = localStorage.getItem(VAULT_LAST_ACTIVE_STORAGE);
+    if (!rawLastActive) {
+      localStorage.setItem(VAULT_LAST_ACTIVE_STORAGE, String(Date.now()));
+      return false;
+    }
+
+    const lastActive = Number(rawLastActive);
+    if (Number.isFinite(lastActive) && Date.now() - lastActive > VAULT_INACTIVITY_TIMEOUT_MS) {
+      confirmSignOutVault({
+        reason: 'inactivity',
+        message: 'Your session expired due to 1 hour of inactivity for your privacy. Please sign back in.',
+        quiet,
+      });
+      return true;
+    }
+  } catch (_) {
+    /* non-fatal */
+  }
+  return false;
+}
 
 /**
  * Reads the stored private vault access key from localStorage.
+ * Enforces the 1-hour inactivity check so expired keys are rejected immediately.
  * @returns {string}
  */
 function getVaultAccessKey() {
   try {
-    return localStorage.getItem(VAULT_KEY_STORAGE) || '';
+    const key = localStorage.getItem(VAULT_KEY_STORAGE) || '';
+    if (!key) return '';
+    const rawLastActive = localStorage.getItem(VAULT_LAST_ACTIVE_STORAGE);
+    if (rawLastActive) {
+      const lastActive = Number(rawLastActive);
+      if (Number.isFinite(lastActive) && Date.now() - lastActive > VAULT_INACTIVITY_TIMEOUT_MS) {
+        confirmSignOutVault({
+          reason: 'inactivity',
+          message: 'Your session expired due to 1 hour of inactivity for your privacy. Please sign back in.',
+          quiet: false,
+        });
+        return '';
+      }
+    }
+    return key;
   } catch (_) {
     return '';
   }
@@ -45,15 +125,18 @@ function getVaultAccessKey() {
 
 /**
  * Stores or clears the private vault access key.
+ * Synchronizes the last active timestamp when a valid key is set.
  * @param {string | null | undefined} key
  */
 function setVaultAccessKey(key) {
   try {
     if (key && key.trim()) {
       localStorage.setItem(VAULT_KEY_STORAGE, key.trim());
+      localStorage.setItem(VAULT_LAST_ACTIVE_STORAGE, String(Date.now()));
       syncBrowserTimezone();
     } else {
       localStorage.removeItem(VAULT_KEY_STORAGE);
+      localStorage.removeItem(VAULT_LAST_ACTIVE_STORAGE);
     }
   } catch (_) {
     /* non-fatal */
@@ -122,6 +205,7 @@ function vaultFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
   if (key) {
     headers.set('X-Vault-Key', key);
+    recordVaultActivity(false);
   }
   const method = String(options.method || 'GET').toUpperCase();
   if ((method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') && !headers.has('Idempotency-Key')) {
@@ -696,6 +780,10 @@ function cancelSwitchVault() {
  * Explicitly signs out of the current device, clears the stored vault key, and resets vault state.
  */
 function confirmSignOutVault() {
+  const options = arguments[0] || {};
+  if (typeof closeReelsFeed === 'function') {
+    closeReelsFeed();
+  }
   invalidatePendingVaultAuth();
   clearPendingOtpAttempt();
   vaultSessionGeneration++;
@@ -707,8 +795,12 @@ function confirmSignOutVault() {
   if (vaultKeyInput) vaultKeyInput.value = '';
   showVaultGateScreen(undefined, { preserveWorkspace: false });
   switchVaultGateTab('otp');
+  const message = options.message || 'Signed out of this device. Enter a fresh 6-digit code or vault key to sign back in.';
   if (typeof announceStatus === 'function') {
-    announceStatus('Signed out of this device. Enter a fresh 6-digit code or vault key to sign back in.');
+    announceStatus(message);
+  }
+  if (options.reason === 'inactivity' && !options.quiet) {
+    showToast(message, 'info');
   }
 }
 
@@ -1376,6 +1468,7 @@ function renderInitialSkeletons() {
  * Initializes the vault application, restores URL state, binds events, and loads data in parallel.
  */
 async function init() {
+  checkVaultInactivity(true);
   const { hasUrlView } = restoreFiltersFromUrl();
   applyViewMode(state.viewMode, false, !hasUrlView);
   renderActiveFilterChips();
@@ -4508,6 +4601,24 @@ function handleModalKeydown(e) {
  * Binds UI controls, URL sync, search debounce, key listeners, shortcuts popover, and archive import handlers.
  */
 function setupEventListeners() {
+  // 1-hour privacy auto-logout tracking across interactions, visibility changes, and window focus
+  ['pointerdown', 'keydown', 'scroll', 'touchstart'].forEach((evt) => {
+    window.addEventListener(evt, () => recordVaultActivity(false), { passive: true });
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      checkVaultInactivity(false);
+    }
+  });
+
+  window.addEventListener('focus', () => {
+    checkVaultInactivity(false);
+  });
+
+  setInterval(() => {
+    checkVaultInactivity(false);
+  }, 30000);
   viewModeGridBtn.addEventListener('click', () => applyViewMode('grid'));
   viewModeListBtn.addEventListener('click', () => applyViewMode('list'));
 

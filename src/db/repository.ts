@@ -688,6 +688,7 @@ class InMemoryStore {
 export interface MarkWatchedResult {
   updatedReels: SavedReel[];
   remainingCount: number;
+  remainingReels?: SavedReel[];
 }
 
 export interface LegacyReelUrlCandidate {
@@ -2920,8 +2921,10 @@ export class Repository {
         }
       }
 
+      const updatedIdSet = new Set(updatedReels.map((r) => r.id));
+      const remainingReels = ordered.filter((r) => !updatedIdSet.has(r.id));
       const remainingCount = Math.max(0, ordered.length - updatedReels.length);
-      return { updatedReels, remainingCount };
+      return { updatedReels, remainingCount, remainingReels };
     }
 
     const supabase = getSupabase();
@@ -3008,9 +3011,11 @@ export class Repository {
     const updatedReels = allUpdatedRows.sort(
       (a, b) => (orderIndex.get(a.id) ?? 0) - (orderIndex.get(b.id) ?? 0)
     );
-    const remainingCount = Math.max(0, ordered.length - updatedReels.length);
+    const postUpdateRemaining = await fetchActiveCandidates(matchedScope);
+    const remainingReels = sortWatchLaterReelsMostRecentFirst(postUpdateRemaining);
+    const remainingCount = remainingReels.length;
 
-    return { updatedReels, remainingCount };
+    return { updatedReels, remainingCount, remainingReels };
   }
 
   static async getReelsAwaitingChoiceDue(): Promise<SavedReel[]> {

@@ -421,7 +421,8 @@ export function formatWatchLaterReminderMessage(
 export function formatWatchedConfirmationMessage(
   updatedReels: SavedReel[],
   remainingCount: number,
-  markAll: boolean
+  markAll: boolean,
+  remainingReels?: SavedReel[]
 ): string {
   if (updatedReels.length === 0) {
     return '👍 All set! No pending reels right now.';
@@ -442,6 +443,23 @@ export function formatWatchedConfirmationMessage(
   }
 
   if (remainingCount > 0) {
+    if (remainingReels && remainingReels.length > 0) {
+      const firstRemaining = remainingReels[0];
+      const remainingLabel = formatHumanReelLabel(firstRemaining, 40);
+      if (remainingCount === 1) {
+        return (
+          `✅ Marked ${primaryLabel} as watched! Reminders stopped.\n\n` +
+          `📌 You still have 1 other Watch Later reminder active: ${remainingLabel}.\n` +
+          `Reply "watched" to mark it watched, or "stop all" to clear all.`
+        );
+      }
+      return (
+        `✅ Marked ${primaryLabel} as watched! Reminders stopped.\n\n` +
+        `📌 You still have ${remainingCount} other Watch Later reminders active (next: ${remainingLabel}).\n` +
+        `Reply "stop all" to clear all.`
+      );
+    }
+
     const plural = remainingCount === 1 ? 'reminder' : 'reminders';
     return (
       `✅ Marked ${primaryLabel} as watched! Reminders stopped.\n\n` +
