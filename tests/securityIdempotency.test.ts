@@ -2186,11 +2186,32 @@ test('Security - apiRouter returns 404 JSON for unrecognized API endpoints and 4
       const apr31Body = (await apr31Res.json()) as { error?: string };
       assert.equal(apr31Body.error, 'INVALID_DATE_FORMAT');
 
-      // 6. Valid ISO date parameters proceed normally
+      // 6. Expanded year impossible date (+002026-02-30) returns 400 Bad Request
+      const expandedFeb30Res = await fetch(`${baseUrl}/api/reels?startDate=%2B002026-02-30T00:00:00.000Z`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(expandedFeb30Res.status, 400);
+      const expandedFeb30Body = (await expandedFeb30Res.json()) as { error?: string };
+      assert.equal(expandedFeb30Body.error, 'INVALID_DATE_FORMAT');
+
+      // 7. Trailing junk or length limit excess returns 400 Bad Request
+      const trailingJunkRes = await fetch(`${baseUrl}/api/reels?startDate=${encodeURIComponent('2026-01-01T00:00:00.000Z                junk')}`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(trailingJunkRes.status, 400);
+      const trailingJunkBody = (await trailingJunkRes.json()) as { error?: string };
+      assert.equal(trailingJunkBody.error, 'INVALID_DATE_FORMAT');
+
+      // 8. Valid ISO date parameters proceed normally (both standard 4-digit and 6-digit expanded year)
       const validDateRes = await fetch(`${baseUrl}/api/reels?startDate=2026-01-01T00:00:00.000Z`, {
         headers: { 'X-Vault-Key': adminKey },
       });
       assert.equal(validDateRes.status, 200);
+
+      const validExpandedRes = await fetch(`${baseUrl}/api/reels?startDate=%2B002026-02-28T00:00:00.000Z`, {
+        headers: { 'X-Vault-Key': adminKey },
+      });
+      assert.equal(validExpandedRes.status, 200);
     });
   } finally {
     resetApiRateLimitersForTesting();
