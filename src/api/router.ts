@@ -321,21 +321,20 @@ apiRouter.get('/reels', async (req: Request, res: Response) => {
       return;
     }
 
-    const rawStartDate = typeof req.query.startDate === 'string' && req.query.startDate.trim()
-      ? req.query.startDate.trim().slice(0, 40)
-      : undefined;
-    const rawEndDate = typeof req.query.endDate === 'string' && req.query.endDate.trim()
-      ? req.query.endDate.trim().slice(0, 40)
-      : undefined;
+    const trimmedStartDate = typeof req.query.startDate === 'string' ? req.query.startDate.trim() : undefined;
+    const trimmedEndDate = typeof req.query.endDate === 'string' ? req.query.endDate.trim() : undefined;
 
-    if (rawStartDate && !parseDurationOrDateInput(rawStartDate)) {
+    if (trimmedStartDate && (trimmedStartDate.length > 40 || !parseDurationOrDateInput(trimmedStartDate))) {
       res.status(400).json({ error: 'INVALID_DATE_FORMAT', message: 'startDate must be a valid date or timestamp.' });
       return;
     }
-    if (rawEndDate && !parseDurationOrDateInput(rawEndDate)) {
+    if (trimmedEndDate && (trimmedEndDate.length > 40 || !parseDurationOrDateInput(trimmedEndDate))) {
       res.status(400).json({ error: 'INVALID_DATE_FORMAT', message: 'endDate must be a valid date or timestamp.' });
       return;
     }
+
+    const rawStartDate = trimmedStartDate || undefined;
+    const rawEndDate = trimmedEndDate || undefined;
 
     const filters: ReelQueryFilters = {
       creatorId: safeCreatorId,
