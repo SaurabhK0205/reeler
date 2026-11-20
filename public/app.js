@@ -2141,15 +2141,72 @@ function renderReels() {
       emptyActionHtml = '<button type="button" class="nav-btn nav-btn-primary" data-action="empty-import">Import saved_posts.json</button>';
     }
 
-    const emptyHtml = `
-      <div class="vault-empty-state">
-        <div class="empty-title-text">${emptyTitle}</div>
-        <div class="empty-desc-text">${emptyDesc}</div>
-        <div class="state-actions-row">
-          ${emptyActionHtml}
+    let emptyHtml;
+    if (isVaultEmpty) {
+      emptyHtml = `
+        <div class="vault-empty-state ftue-onboarding-card">
+          <div class="ftue-hero-badge">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect>
+              <path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path>
+              <line x1="17.5" y1="6.5" x2="17.51" y2="6.5"></line>
+            </svg>
+            <span>Welcome to Reeler</span>
+          </div>
+          <div class="empty-title-text ftue-title">Your Private Vault is Ready</div>
+          <div class="empty-desc-text ftue-desc">
+            You scroll through hundreds of reels every day. Save the ones that actually inspire or teach you, organized automatically with creator tags, captions, and reminders.
+          </div>
+          <div class="ftue-steps-grid">
+            <div class="ftue-step-card">
+              <div class="ftue-step-num">1</div>
+              <div class="ftue-step-content">
+                <div class="ftue-step-title">Share Any Reel</div>
+                <div class="ftue-step-text">Tap Share on any Instagram Reel or Post you want to remember.</div>
+              </div>
+            </div>
+            <div class="ftue-step-card">
+              <div class="ftue-step-num">2</div>
+              <div class="ftue-step-content">
+                <div class="ftue-step-title">DM @er_reel_er</div>
+                <div class="ftue-step-text">Send the link directly to our bot in your Instagram DMs.</div>
+              </div>
+            </div>
+            <div class="ftue-step-card">
+              <div class="ftue-step-num">3</div>
+              <div class="ftue-step-content">
+                <div class="ftue-step-title">Indexed Instantly</div>
+                <div class="ftue-step-text">Your reel appears here with instant search, creator tags, and reminders.</div>
+              </div>
+            </div>
+          </div>
+          <div class="state-actions-row ftue-actions-row">
+            <a href="https://ig.me/m/er_reel_er" target="_blank" rel="noopener noreferrer" class="nav-btn nav-btn-primary ftue-btn">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+              Message @er_reel_er
+            </a>
+            <button type="button" class="nav-btn nav-btn-secondary ftue-btn" data-action="empty-import">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+              Import saved_posts.json
+            </button>
+            <button type="button" class="nav-btn nav-btn-ghost ftue-btn" data-action="copy-bot-handle">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+              Copy Bot Handle
+            </button>
+          </div>
         </div>
-      </div>
-    `;
+      `;
+    } else {
+      emptyHtml = `
+        <div class="vault-empty-state">
+          <div class="empty-title-text">${emptyTitle}</div>
+          <div class="empty-desc-text">${emptyDesc}</div>
+          <div class="state-actions-row">
+            ${emptyActionHtml}
+          </div>
+        </div>
+      `;
+    }
     reelsGrid.innerHTML = emptyHtml;
     if (reelsTable) reelsTable.hidden = true;
     if (reelsTableContainer) reelsTableContainer.classList.add('is-empty-state');
@@ -2163,6 +2220,20 @@ function renderReels() {
     });
     vaultContainerEl?.querySelectorAll('[data-action="empty-import"]').forEach((btn) => {
       btn.addEventListener('click', () => importBtn.click());
+    });
+    vaultContainerEl?.querySelectorAll('[data-action="copy-bot-handle"]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        try {
+          if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText('@er_reel_er');
+            showToast('Copied @er_reel_er to clipboard!', 'success');
+          } else {
+            showToast('Instagram handle: @er_reel_er', 'info');
+          }
+        } catch (_) {
+          showToast('Instagram handle: @er_reel_er', 'info');
+        }
+      });
     });
     return;
   }

@@ -875,4 +875,10 @@ test('Frontend CSS tokens, locked workspace isolation, and optical craft invaria
   assert.ok(js.includes('VAULT_INACTIVITY_TIMEOUT_MS = 60 * 60 * 1000'), 'app.js must define 1-hour inactivity timeout');
   assert.ok(js.includes('VAULT_LAST_ACTIVE_STORAGE'), 'app.js must track last active storage key');
   assert.ok(js.includes('function checkVaultInactivity'), 'app.js must implement checkVaultInactivity');
+
+  // 8. FTUE onboarding and empty state invariants
+  assert.ok(js.includes('ftue-onboarding-card'), 'app.js must define ftue-onboarding-card in empty state');
+  assert.ok(js.includes('copy-bot-handle'), 'app.js must support copying bot handle in onboarding');
+  assert.ok(css.includes('.ftue-onboarding-card'), 'style.css must style .ftue-onboarding-card');
+  assert.ok(css.includes('.ftue-steps-grid'), 'style.css must style .ftue-steps-grid');
 });
