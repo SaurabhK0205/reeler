@@ -26,10 +26,16 @@ export function setResponseHeader(res: Response, name: string, value: string): v
 
 /**
  * Resolves the client IP address safely using Express's trust-proxy aware `req.ip`.
+ * Normalizes IPv4-mapped IPv6 addresses (::ffff:x.x.x.x -> x.x.x.x) so IP rotation
+ * and rate-limiting buckets do not bifurcate clients.
  */
 export function getClientIp(req: Request): string {
   const raw = req.ip || req.socket?.remoteAddress || 'unknown';
-  return String(raw).trim() || 'unknown';
+  const ip = String(raw).trim();
+  if (ip.startsWith('::ffff:')) {
+    return ip.slice(7);
+  }
+  return ip || 'unknown';
 }
 
 export interface RateLimiterOptions {
