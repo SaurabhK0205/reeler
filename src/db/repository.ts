@@ -2269,26 +2269,33 @@ export class Repository {
     const targetReelId = options?.targetReelId;
 
     if (!isSupabaseConfigured()) {
-      let candidates = Array.from(memoryStore.reels.values()).filter(
-        (r) => r.watch_status === 'watch_later' && r.instagram_sender_id === trimmedSender
-      );
-      if (allowUnattributedFallback && candidates.length === 0) {
-        candidates = Array.from(memoryStore.reels.values()).filter(
-          (r) => r.watch_status === 'watch_later' && !r.instagram_sender_id
-        );
-      }
-      if (targetReelId) {
-        candidates = candidates.filter((r) => r.id === targetReelId);
-      } else if (targetCreator) {
-        candidates = candidates.filter((r) => {
+      const matchesTarget = (r: SavedReel): boolean => {
+        if (targetReelId) return r.id === targetReelId;
+        if (targetCreator) {
           const creator = memoryStore.creators.get(r.creator_id);
           return String(creator?.username || '').toLowerCase() === targetCreator;
-        });
-      } else {
-        const latestId = memoryStore.latestAdditionReelIdBySender.get(trimmedSender) ||
-          (allowUnattributedFallback ? memoryStore.latestAdditionReelIdBySender.get('__unattributed__') : undefined);
+        }
+        return true;
+      };
+
+      let candidates = Array.from(memoryStore.reels.values()).filter(
+        (r) => r.watch_status === 'watch_later' && r.instagram_sender_id === trimmedSender && matchesTarget(r)
+      );
+      if (!targetReelId && !targetCreator) {
+        const latestId = memoryStore.latestAdditionReelIdBySender.get(trimmedSender);
         if (latestId && memoryStore.reels.get(latestId)?.watch_status === 'watch_later') {
           candidates = candidates.filter((r) => r.id === latestId);
+        }
+      }
+      if (allowUnattributedFallback && candidates.length === 0) {
+        candidates = Array.from(memoryStore.reels.values()).filter(
+          (r) => r.watch_status === 'watch_later' && !r.instagram_sender_id && matchesTarget(r)
+        );
+        if (!targetReelId && !targetCreator) {
+          const latestUnattributedId = memoryStore.latestAdditionReelIdBySender.get('__unattributed__');
+          if (latestUnattributedId && memoryStore.reels.get(latestUnattributedId)?.watch_status === 'watch_later') {
+            candidates = candidates.filter((r) => r.id === latestUnattributedId);
+          }
         }
       }
       if (candidates.length === 0) return null;
@@ -2447,25 +2454,29 @@ export class Repository {
     const targetCreator = options?.targetCreator?.trim()?.toLowerCase();
 
     if (!isSupabaseConfigured()) {
+      const matchesTarget = (r: SavedReel): boolean => {
+        if (targetCreator) {
+          const creator = memoryStore.creators.get(r.creator_id);
+          return String(creator?.username || '').toLowerCase() === targetCreator;
+        }
+        return true;
+      };
+
       let candidates = Array.from(memoryStore.reels.values()).filter(
         (r) =>
           r.watch_status === 'watch_later' &&
           r.instagram_sender_id === trimmedSender &&
-          (r.next_reminder_at || r.awaiting_reminder_choice_until)
+          (r.next_reminder_at || r.awaiting_reminder_choice_until) &&
+          matchesTarget(r)
       );
       if (allowUnattributedFallback && candidates.length === 0) {
         candidates = Array.from(memoryStore.reels.values()).filter(
           (r) =>
             r.watch_status === 'watch_later' &&
             !r.instagram_sender_id &&
-            (r.next_reminder_at || r.awaiting_reminder_choice_until)
+            (r.next_reminder_at || r.awaiting_reminder_choice_until) &&
+            matchesTarget(r)
         );
-      }
-      if (targetCreator) {
-        candidates = candidates.filter((r) => {
-          const creator = memoryStore.creators.get(r.creator_id);
-          return String(creator?.username || '').toLowerCase() === targetCreator;
-        });
       }
       if (candidates.length === 0) return null;
 
@@ -2581,17 +2592,27 @@ export class Repository {
     }
     if (!updated) {
       // Re-read target item to distinguish whether reminder became inactive or schedule changed concurrently
-      const { data: fresh } = await supabase
+      let freshQuery = supabase
         .from('saved_reels')
         .select('*, creator:creators(*)')
-        .eq('id', target.id)
-        .maybeSingle();
+        .eq('id', target.id);
+
+      if (target.instagram_sender_id) {
+        freshQuery = freshQuery.eq('instagram_sender_id', target.instagram_sender_id);
+      } else if (allowUnattributedFallback) {
+        freshQuery = freshQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+
+      const { data: fresh, error: freshErr } = await freshQuery.maybeSingle();
+      if (freshErr) {
+        throw new Error(`Failed to check reminder state on cancellation retry: ${freshErr.message}`);
+      }
       if (
         fresh &&
         fresh.watch_status === 'watch_later' &&
         (fresh.next_reminder_at || fresh.awaiting_reminder_choice_until)
       ) {
-        const retryUpQuery = supabase
+        let retryUpQuery = supabase
           .from('saved_reels')
           .update({
             next_reminder_at: null,
@@ -2601,9 +2622,19 @@ export class Repository {
           .eq('id', target.id)
           .eq('watch_status', 'watch_later');
 
-        const { data: retriedUpdated } = await retryUpQuery
+        if (target.instagram_sender_id) {
+          retryUpQuery = retryUpQuery.eq('instagram_sender_id', target.instagram_sender_id);
+        } else if (allowUnattributedFallback) {
+          retryUpQuery = retryUpQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+        }
+
+        const { data: retriedUpdated, error: retryErr } = await retryUpQuery
           .select('*, creator:creators(*)')
           .maybeSingle();
+
+        if (retryErr) {
+          throw new Error(`Failed to cancel reminder on retry: ${retryErr.message}`);
+        }
         if (retriedUpdated) return { updatedReel: retriedUpdated as SavedReel };
       }
       return null;
@@ -2695,6 +2726,9 @@ export class Repository {
               // Row was promoted to IG saved; move to revert instead of deleting
               if (!state.toRevertIds.includes(id)) {
                 state.toRevertIds.push(id);
+              }
+              if (state.targetUpdatedAts) {
+                state.targetUpdatedAts[id] = reel.updated_at || reel.created_at || '';
               }
             } else {
               memoryStore.reels.delete(id);
@@ -2821,31 +2855,44 @@ export class Repository {
     const now = new Date().toISOString();
     const remainingDeleteIds = state.toDeleteIds.filter((id) => !state!.deletedIds.includes(id));
     if (remainingDeleteIds.length > 0) {
-      // Group remaining delete candidates by their pinned expected updated_at
-      const deleteGroups = new Map<string, string[]>();
-      for (const id of remainingDeleteIds) {
-        const expected = state!.targetUpdatedAts?.[id] || '';
-        const group = deleteGroups.get(expected) || [];
-        group.push(id);
-        deleteGroups.set(expected, group);
-      }
-
       const BATCH_SIZE = 100;
-      for (const [expectedVersion, ids] of deleteGroups.entries()) {
-        for (let i = 0; i < ids.length; i += BATCH_SIZE) {
-          const batch = ids.slice(i, i + BATCH_SIZE);
-          let delQuery = supabase
+      for (let i = 0; i < remainingDeleteIds.length; i += BATCH_SIZE) {
+        const batch = remainingDeleteIds.slice(i, i + BATCH_SIZE);
+        const { data: currentRows, error: fetchErr } = await supabase
+          .from('saved_reels')
+          .select('id, updated_at, is_saved_on_instagram, watch_status')
+          .in('id', batch);
+        if (fetchErr) {
+          throw new Error(`Failed to verify reel status before clear: ${fetchErr.message}`);
+        }
+
+        const validDeleteIds: string[] = [];
+        for (const row of (currentRows || []) as any[]) {
+          if (row.watch_status !== 'watch_later') continue;
+          if (row.is_saved_on_instagram !== false) {
+            // Promoted to IG saved: refresh target timestamp and route to revert
+            if (!state.toRevertIds.includes(row.id)) {
+              state.toRevertIds.push(row.id);
+            }
+            if (state.targetUpdatedAts) {
+              state.targetUpdatedAts[row.id] = row.updated_at || '';
+            }
+            continue;
+          }
+          const expectedVersion = state.targetUpdatedAts?.[row.id] || '';
+          if (!expectedVersion || row.updated_at === expectedVersion) {
+            validDeleteIds.push(row.id);
+          }
+        }
+
+        if (validDeleteIds.length > 0) {
+          const { data: deleted, error: delErr } = await supabase
             .from('saved_reels')
             .delete()
-            .in('id', batch)
+            .in('id', validDeleteIds)
             .eq('is_saved_on_instagram', false)
-            .eq('watch_status', 'watch_later');
-
-          if (expectedVersion) {
-            delQuery = delQuery.eq('updated_at', expectedVersion);
-          }
-
-          const { data: deleted, error: delErr } = await delQuery.select('id');
+            .eq('watch_status', 'watch_later')
+            .select('id');
           if (delErr) {
             throw new Error(`Failed to delete bot-added reels: ${delErr.message}`);
           }
@@ -2857,29 +2904,32 @@ export class Repository {
           }
         }
       }
-      for (const id of remainingDeleteIds) {
-        if (!state.deletedIds.includes(id) && !state.toRevertIds.includes(id)) {
-          state.toRevertIds.push(id);
-        }
-      }
     }
 
     const remainingRevertIds = state.toRevertIds.filter((id) => !state!.revertedIds.includes(id));
     if (remainingRevertIds.length > 0) {
-      // Group remaining revert candidates by their pinned expected updated_at
-      const revertGroups = new Map<string, string[]>();
-      for (const id of remainingRevertIds) {
-        const expected = state!.targetUpdatedAts?.[id] || '';
-        const group = revertGroups.get(expected) || [];
-        group.push(id);
-        revertGroups.set(expected, group);
-      }
-
       const BATCH_SIZE = 100;
-      for (const [expectedVersion, ids] of revertGroups.entries()) {
-        for (let i = 0; i < ids.length; i += BATCH_SIZE) {
-          const batch = ids.slice(i, i + BATCH_SIZE);
-          let revQuery = supabase
+      for (let i = 0; i < remainingRevertIds.length; i += BATCH_SIZE) {
+        const batch = remainingRevertIds.slice(i, i + BATCH_SIZE);
+        const { data: currentRows, error: fetchErr } = await supabase
+          .from('saved_reels')
+          .select('id, updated_at, watch_status')
+          .in('id', batch);
+        if (fetchErr) {
+          throw new Error(`Failed to verify reel status before revert: ${fetchErr.message}`);
+        }
+
+        const validRevertIds: string[] = [];
+        for (const row of (currentRows || []) as any[]) {
+          if (row.watch_status !== 'watch_later') continue;
+          const expectedVersion = state.targetUpdatedAts?.[row.id] || '';
+          if (!expectedVersion || row.updated_at === expectedVersion) {
+            validRevertIds.push(row.id);
+          }
+        }
+
+        if (validRevertIds.length > 0) {
+          const { data: reverted, error: revErr } = await supabase
             .from('saved_reels')
             .update({
               watch_status: 'unwatched',
@@ -2888,14 +2938,9 @@ export class Repository {
               awaiting_reminder_choice_until: null,
               updated_at: now,
             })
-            .in('id', batch)
-            .eq('watch_status', 'watch_later');
-
-          if (expectedVersion) {
-            revQuery = revQuery.eq('updated_at', expectedVersion);
-          }
-
-          const { data: reverted, error: revErr } = await revQuery.select('id');
+            .in('id', validRevertIds)
+            .eq('watch_status', 'watch_later')
+            .select('id');
           if (revErr) {
             throw new Error(`Failed to revert saved reels to unwatched: ${revErr.message}`);
           }
@@ -3013,8 +3058,9 @@ export class Repository {
     const trimmedSender = String(senderId || '').trim();
     const handle = String(creatorHandle || '').trim().replace(/^@+/, '').toLowerCase();
     const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    const priorCompletedCount = options?.completedReelIds?.length || 0;
     if ((!trimmedSender && !allowUnattributedFallback) || !handle) {
-      return { updatedReels: [], totalMarkedCount: options?.completedReelIds?.length || 0 };
+      return { updatedReels: [], totalMarkedCount: priorCompletedCount };
     }
 
     if (!isSupabaseConfigured()) {
@@ -3036,6 +3082,10 @@ export class Repository {
         const targetSet = new Set(options.targetReelIds);
         candidates = candidates.filter((r) => targetSet.has(r.id));
       }
+      if (options?.completedReelIds && options.completedReelIds.length > 0) {
+        const completedSet = new Set(options.completedReelIds);
+        candidates = candidates.filter((r) => !completedSet.has(r.id));
+      }
       const updatedReels: SavedReel[] = [];
       const now = new Date().toISOString();
       for (const reel of candidates) {
@@ -3051,7 +3101,7 @@ export class Repository {
       if (updatedReels.length > 0) {
         options?.onPartialProgress?.(true);
       }
-      const totalMarkedCount = options?.completedReelIds?.length || updatedReels.length;
+      const totalMarkedCount = priorCompletedCount + updatedReels.length;
       return { updatedReels, totalMarkedCount };
     }
 
@@ -3117,6 +3167,11 @@ export class Repository {
       reelIds = fetchedIds;
     }
 
+    if (options?.completedReelIds && options.completedReelIds.length > 0) {
+      const completedSet = new Set(options.completedReelIds);
+      reelIds = reelIds.filter((id) => !completedSet.has(id));
+    }
+
     if (reelIds.length === 0) {
       return { updatedReels: [], totalMarkedCount: options?.completedReelIds?.length || 0 };
     }
@@ -3153,7 +3208,7 @@ export class Repository {
       }
     }
 
-    const totalMarkedCount = options?.completedReelIds?.length || updatedReels.length;
+    const totalMarkedCount = priorCompletedCount + updatedReels.length;
     return { updatedReels, totalMarkedCount };
   }
 
