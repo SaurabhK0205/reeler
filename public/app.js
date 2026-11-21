@@ -5049,6 +5049,23 @@ function setupEventListeners() {
       closeShortcutsPopover(false);
       archiveFileInput.click();
     });
+
+    // Guide tabs inside shortcuts-popover
+    const guideTabBtns = shortcutsPopover.querySelectorAll('.guide-tab-btn');
+    const guidePanels = shortcutsPopover.querySelectorAll('.guide-panel');
+    guideTabBtns.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const targetId = btn.getAttribute('aria-controls');
+        guideTabBtns.forEach((b) => {
+          const isActive = b === btn;
+          b.classList.toggle('active', isActive);
+          b.setAttribute('aria-selected', isActive ? 'true' : 'false');
+        });
+        guidePanels.forEach((p) => {
+          p.classList.toggle('is-hidden', p.id !== targetId);
+        });
+      });
+    });
     document.addEventListener('click', (e) => {
       if (!shortcutsPopover.hidden && !shortcutsPopover.contains(e.target) && !shortcutsHelpBtn.contains(e.target)) {
         closeShortcutsPopover(false);
