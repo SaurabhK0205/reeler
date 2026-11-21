@@ -3102,6 +3102,7 @@ test('MetaInstagramBotService - duration delivered while share upsert is in flig
     return origUpsert.apply(this, args as any);
   };
 
+  let sharePromise: Promise<void> | undefined;
   try {
     const payload1 = {
       object: 'instagram',
@@ -3137,28 +3138,30 @@ test('MetaInstagramBotService - duration delivered while share upsert is in flig
       ],
     };
 
-    const sharePromise = service.handleWebhookPayload(payload1);
-    await saveStarted;
+    sharePromise = service.handleWebhookPayload(payload1);
+    await Promise.race([saveStarted, sharePromise]);
+    assert.ok(saveIntercepted, 'share handler settled before the upsert was intercepted');
     await service.handleWebhookPayload(payload2);
     releaseSave();
     await sharePromise;
 
-    service.clearTimersForTesting();
+      service.clearTimersForTesting();
 
-    const saved = await Repository.getSavedItemByShortcode('DConcurrent01', 'sender_conc_1');
-    assert.ok(saved);
-    assert.strictEqual(saved.watch_status, 'watch_later');
-    assert.strictEqual(saved.reminder_interval_seconds, 45);
-    assert.ok(saved.next_reminder_at);
-    assert.ok(!sentMessages.some((msg) => msg.includes('When should I remind you to watch this?')));
-  } finally {
-    releaseSave();
-    (Repository as any).upsertSavedReel = origUpsert;
-    service.clearTimersForTesting();
-    Repository.resetMemoryStoreForTests();
-    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
-    globalThis.fetch = originalFetch;
-  }
+      const saved = await Repository.getSavedItemByShortcode('DConcurrent01', 'sender_conc_1');
+      assert.ok(saved);
+      assert.strictEqual(saved.watch_status, 'watch_later');
+      assert.strictEqual(saved.reminder_interval_seconds, 45);
+      assert.ok(saved.next_reminder_at);
+      assert.ok(!sentMessages.some((msg) => msg.includes('When should I remind you to watch this?')));
+    } finally {
+      releaseSave();
+      await sharePromise?.catch(() => {});
+      (Repository as any).upsertSavedReel = origUpsert;
+      service.clearTimersForTesting();
+      Repository.resetMemoryStoreForTests();
+      if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+      globalThis.fetch = originalFetch;
+    }
 });
 
 test('MetaInstagramBotService - cancel command removes recently added reel from Watch Later', async () => {
@@ -3638,6 +3641,9 @@ test('MetaInstagramBotService - creator watched & clear commands accept trailing
       instagram_sender_id: sender,
       watch_status: 'watch_later',
       next_reminder_at: new Date(Date.now() + 3600000).toISOString(),
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 1,
     });
 
     await Repository.upsertSavedReel({
@@ -3648,6 +3654,9 @@ test('MetaInstagramBotService - creator watched & clear commands accept trailing
       instagram_sender_id: sender,
       watch_status: 'watch_later',
       next_reminder_at: new Date(Date.now() + 3600000).toISOString(),
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 2,
     });
 
     // 1. Send "watched @ann," (with trailing comma)

@@ -104,6 +104,8 @@ interface WebhookRetryState {
   };
   /** Preserves target IDs for markWatchedForCreator across retries. */
   pinnedWatchedCreatorTargetIds?: string[];
+  /** Preserves confirmed updated IDs for markWatchedForCreator across retry attempts. */
+  pinnedWatchedCreatorCompletedIds?: string[];
   /** Preserves the specific Reel ID targeted by a cancel command across retries. */
   pinnedCancelTargetReelId?: string;
   /** Monotonic sequence assigned on initial reception of a timezone-set command to block stale retries. */
@@ -1576,17 +1578,22 @@ export class MetaInstagramBotService {
           delivery.retryState.pinnedWatchedCreatorTargetIds =
             await Repository.selectWatchLaterTargetIdsForCreator(senderId, targetedWatched.targetCreator);
         }
+        if (delivery && delivery.retryState.pinnedWatchedCreatorCompletedIds === undefined) {
+          delivery.retryState.pinnedWatchedCreatorCompletedIds = [];
+        }
         const result = await Repository.markWatchedForCreator(senderId, targetedWatched.targetCreator, {
           targetReelIds: delivery?.retryState.pinnedWatchedCreatorTargetIds,
+          completedReelIds: delivery?.retryState.pinnedWatchedCreatorCompletedIds,
           onPartialProgress: (mutated) => {
             if (delivery && mutated) delivery.stateMutated = true;
           },
         });
         if (delivery) delivery.stateMutated = true;
-        if (result.updatedReels.length > 0) {
+        const totalCount = delivery?.retryState.pinnedWatchedCreatorCompletedIds?.length || result.totalMarkedCount || result.updatedReels.length;
+        if (totalCount > 0) {
           await this.deliverReply(
             senderId,
-            `✅ Marked ${result.updatedReels.length} item(s) by @${targetedWatched.targetCreator} as watched! Reminders stopped.`,
+            `✅ Marked ${totalCount} item(s) by @${targetedWatched.targetCreator} as watched! Reminders stopped.`,
             delivery
           );
         } else {
