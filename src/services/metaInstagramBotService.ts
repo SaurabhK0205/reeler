@@ -739,7 +739,10 @@ export class MetaInstagramBotService {
       // If the mutation already committed within Meta's 24h redelivery window (even after pending
       // reply text expired), never re-execute the command and risk repeating a stateful mutation.
       if (this.hasCommittedWebhookMutation(opId)) {
-        this.markWebhookMidCompleted(opId);
+        const isDeferredPending = this.pendingSharePrompts.get(senderId)?.opId === opId;
+        if (!isDeferredPending) {
+          this.markWebhookMidCompleted(opId);
+        }
         return;
       }
 
@@ -1000,8 +1003,9 @@ export class MetaInstagramBotService {
       const nextReminder = customDuration ? customDuration.targetDate.toISOString() : null;
       const awaitingUntil = customDuration ? null : new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
+      let savedReel: SavedReel | null = null;
       try {
-        await Repository.upsertSavedReel({
+        savedReel = await Repository.upsertSavedReel({
           instagram_media_id: instagramMediaId,
           shortcode,
           reel_url: canonicalUrl,
@@ -1020,7 +1024,12 @@ export class MetaInstagramBotService {
           is_saved_on_instagram: isSavedOnInstagram,
           instagram_sender_id: senderId,
         });
-        if (delivery) delivery.stateMutated = true;
+        if (delivery) {
+          delivery.stateMutated = true;
+          if (delivery.opId) {
+            this.markWebhookMutationCommitted(delivery.opId);
+          }
+        }
       } catch (error) {
         if (error instanceof SenderReminderConflictError) {
           console.warn(
@@ -1067,7 +1076,9 @@ export class MetaInstagramBotService {
           if (this.pendingSharePrompts.has(senderId)) {
             await this.flushPendingSharePrompt(senderId);
           }
-          const promptReel = await Repository.getSavedItemByShortcode(shortcode, senderId);
+          const promptReel = savedReel
+            ? { ...savedReel, creator }
+            : await Repository.getSavedItemByShortcode(shortcode, senderId);
           if (promptReel) {
             const promptOpId = delivery?.opId;
             const promptRawMid = delivery?.rawMid;
@@ -1120,65 +1131,80 @@ export class MetaInstagramBotService {
     // 0. Check if a share prompt is currently pending debounce for this sender
     if (this.pendingSharePrompts.has(senderId)) {
       const pending = this.pendingSharePrompts.get(senderId)!;
-      const parsedDur = parseDuration(text, new Date(), senderTz);
       const pendingCancel = parseCancelCommand(text);
 
-      if (parsedDur) {
-        clearTimeout(pending.timer);
-        this.pendingSharePrompts.delete(senderId);
+      if (pendingCancel) {
+        if (pendingCancel.isCancelAddition && !pendingCancel.targetCreator) {
+          // Only untargeted cancel shortcuts to recent addition deletion
+          clearTimeout(pending.timer);
+          this.pendingSharePrompts.delete(senderId);
 
-        let targetReel = pending.reel;
-        if (delivery?.retryState?.pinnedDurationTargetReel) {
-          targetReel = delivery.retryState.pinnedDurationTargetReel;
-        } else if (delivery) {
-          delivery.retryState.pinnedDurationTargetReel = targetReel;
-          delivery.retryState.pinnedDuration = parsedDur;
-        }
+          const cancelled = await Repository.cancelRecentAdditionForSender(senderId);
+          if (delivery) delivery.stateMutated = true;
+          if (pending.opId) this.markWebhookMidCompleted(pending.opId);
 
-        const effectiveDur = delivery?.retryState?.pinnedDuration || parsedDur;
-
-        // Apply conditional schedule update to guard against concurrent watch-status mutation
-        const applied = await Repository.updateReminderSchedule(
-          targetReel.id,
-          effectiveDur.targetDate.toISOString(),
-          effectiveDur.seconds,
-          {
-            expectedNextReminderAt: targetReel.next_reminder_at ?? null,
-            expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
-            ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
-          }
-        );
-        if (!applied) {
+          const reelLabel = cancelled ? formatHumanReelLabel(cancelled.cancelledReel, 40) : 'your reel';
+          await this.deliverReply(
+            senderId,
+            `❌ Cancelled! Removed ${reelLabel} from your Watch Later.`,
+            delivery
+          );
           return;
+        } else {
+          // Creator-targeted cancel or cancel-reminder command: flush prompt and fall through
+          await this.flushPendingSharePrompt(senderId);
         }
-        if (delivery) delivery.stateMutated = true;
-        if (pending.opId) this.markWebhookMidCompleted(pending.opId);
-
-        let reply = `${pending.addedHeading}${pending.creatorLine}\n\n⏰ Reminder set for: ${effectiveDur.label} (${effectiveDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
-        if (senderTz === 'UTC') {
-          reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
-        }
-        await this.deliverReply(senderId, reply, delivery);
-        return;
-      } else if (pendingCancel?.isCancelAddition && !pendingCancel.targetCreator) {
-        // Only untargeted cancel shortcuts to recent addition deletion
-        clearTimeout(pending.timer);
-        this.pendingSharePrompts.delete(senderId);
-
-        const cancelled = await Repository.cancelRecentAdditionForSender(senderId);
-        if (delivery) delivery.stateMutated = true;
-        if (pending.opId) this.markWebhookMidCompleted(pending.opId);
-
-        const reelLabel = cancelled ? formatHumanReelLabel(cancelled.cancelledReel, 40) : 'your reel';
-        await this.deliverReply(
-          senderId,
-          `❌ Cancelled! Removed ${reelLabel} from your Watch Later.`,
-          delivery
-        );
-        return;
       } else {
-        // Message is neither duration nor untargeted cancel; flush the buffered prompt before proceeding
-        await this.flushPendingSharePrompt(senderId);
+        const targetedWatched = parseTargetedWatchedCommand(text);
+        const { isCommand: isWatchedCmd } = parseWatchedStopCommand(text);
+        if (targetedWatched || isWatchedCmd) {
+          // Watched or stop command: flush prompt and fall through to command processing
+          await this.flushPendingSharePrompt(senderId);
+        } else {
+          // Not a recognized command; now evaluate whether text is a duration expression
+          const parsedDur = parseDuration(text, new Date(), senderTz);
+          if (parsedDur) {
+            clearTimeout(pending.timer);
+            this.pendingSharePrompts.delete(senderId);
+
+            let targetReel = pending.reel;
+            if (delivery?.retryState?.pinnedDurationTargetReel) {
+              targetReel = delivery.retryState.pinnedDurationTargetReel;
+            } else if (delivery) {
+              delivery.retryState.pinnedDurationTargetReel = targetReel;
+              delivery.retryState.pinnedDuration = parsedDur;
+            }
+
+            const effectiveDur = delivery?.retryState?.pinnedDuration || parsedDur;
+
+            // Apply conditional schedule update to guard against concurrent watch-status mutation
+            const applied = await Repository.updateReminderSchedule(
+              targetReel.id,
+              effectiveDur.targetDate.toISOString(),
+              effectiveDur.seconds,
+              {
+                expectedNextReminderAt: targetReel.next_reminder_at ?? null,
+                expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
+                ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
+              }
+            );
+            if (!applied) {
+              return;
+            }
+            if (delivery) delivery.stateMutated = true;
+            if (pending.opId) this.markWebhookMidCompleted(pending.opId);
+
+            let reply = `${pending.addedHeading}${pending.creatorLine}\n\n⏰ Reminder set for: ${effectiveDur.label} (${effectiveDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
+            if (senderTz === 'UTC') {
+              reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
+            }
+            await this.deliverReply(senderId, reply, delivery);
+            return;
+          } else {
+            // Unrecognized text or greeting or search query: flush prompt and proceed
+            await this.flushPendingSharePrompt(senderId);
+          }
+        }
       }
     }
 

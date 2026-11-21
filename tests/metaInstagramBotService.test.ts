@@ -3312,3 +3312,92 @@ test('MetaInstagramBotService - consecutive shares flush prior pending prompt wi
     Repository.resetMemoryStoreForTests();
   }
 });
+
+test('MetaInstagramBotService - cancel reminder for handle containing time keyword reaches cancel handler instead of scheduling duration', async () => {
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+
+  const service = new MetaInstagramBotService({ shareDebounceDelayMs: 200 });
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    const creator = await Repository.upsertCreator({
+      instagram_user_id: 'c_tomorrow',
+      username: 'tomorrowland',
+      display_name: 'Tomorrowland',
+    });
+
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'media_tomorrow_1',
+      shortcode: 'DTomorrow1',
+      reel_url: 'https://instagram.com/reel/DTomorrow1/',
+      creator_id: creator.id,
+      taken_at: '2026-11-20T10:00:00Z',
+      first_detected_at: '2026-11-20T10:00:00Z',
+      save_order_rank: 1,
+      instagram_sender_id: 'sender_tomorrow_cmd',
+      watch_status: 'watch_later',
+      next_reminder_at: '2026-11-25T10:00:00Z',
+      is_saved_on_instagram: false,
+    });
+
+    // Share a new reel (it enters debounce)
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_tomorrow_cmd' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_share_new',
+                attachments: [{ type: 'share', payload: { url: 'https://instagram.com/reel/DNewShare1/' } }],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    // Send "cancel reminder for @tomorrowland"
+    sentMessages.length = 0;
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_tomorrow_cmd' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_cancel_tomorrow',
+                text: 'cancel reminder for @tomorrowland',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    // Must flush pending prompt AND process cancel reminder
+    assert.ok(sentMessages.some((msg) => msg.includes('Reminder cancelled')));
+
+    const updated = await Repository.getSavedItemByShortcode('DTomorrow1', 'sender_tomorrow_cmd');
+    assert.ok(updated);
+    assert.strictEqual(updated.next_reminder_at, null);
+  } finally {
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+  }
+});
