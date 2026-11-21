@@ -2259,17 +2259,21 @@ export class Repository {
    */
   static async cancelRecentAdditionForSender(
     senderId: string,
-    options?: { targetCreator?: string; targetReelId?: string }
+    options?: { targetCreator?: string; targetReelId?: string; includeUnattributedFallback?: boolean }
   ): Promise<{ cancelledReel: SavedReel; action: 'deleted' | 'reverted' } | null> {
     const trimmedSender = String(senderId || '').trim();
-    if (!trimmedSender) return null;
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    if (!trimmedSender && !allowUnattributedFallback) return null;
 
     const targetCreator = options?.targetCreator?.trim()?.toLowerCase();
     const targetReelId = options?.targetReelId;
 
     if (!isSupabaseConfigured()) {
       let candidates = Array.from(memoryStore.reels.values()).filter(
-        (r) => r.instagram_sender_id === trimmedSender && r.watch_status === 'watch_later'
+        (r) =>
+          r.watch_status === 'watch_later' &&
+          (r.instagram_sender_id === trimmedSender ||
+            (allowUnattributedFallback && !r.instagram_sender_id))
       );
       if (targetReelId) {
         candidates = candidates.filter((r) => r.id === targetReelId);
@@ -2297,7 +2301,9 @@ export class Repository {
 
       const stored = memoryStore.reels.get(target.id);
       if (!stored || stored.watch_status !== 'watch_later') return null;
-      memoryStore.latestAdditionReelIdBySender.delete(trimmedSender);
+      if (memoryStore.latestAdditionReelIdBySender.get(trimmedSender) === target.id) {
+        memoryStore.latestAdditionReelIdBySender.delete(trimmedSender);
+      }
       if (stored.is_saved_on_instagram === false) {
         memoryStore.reels.delete(target.id);
         Repository.invalidateCreatorsCache();
@@ -2329,41 +2335,60 @@ export class Repository {
       if (creatorIds.length === 0) return null;
     }
 
-    let query = supabase
-      .from('saved_reels')
-      .select('*, creator:creators(*)')
-      .eq('instagram_sender_id', trimmedSender)
-      .eq('watch_status', 'watch_later');
+    const fetchCandidates = async (senderFilter: 'exact' | 'unattributed'): Promise<SavedReel[]> => {
+      let query = supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .eq('watch_status', 'watch_later');
 
-    if (targetReelId) {
-      query = query.eq('id', targetReelId);
-    } else if (creatorIds) {
-      query = query.in('creator_id', creatorIds);
+      if (senderFilter === 'exact') {
+        query = query.eq('instagram_sender_id', trimmedSender);
+      } else {
+        query = query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+
+      if (targetReelId) {
+        query = query.eq('id', targetReelId);
+      } else if (creatorIds) {
+        query = query.in('creator_id', creatorIds);
+      }
+
+      const { data, error } = await query
+        .order('created_at', { ascending: false })
+        .order('first_detected_at', { ascending: false })
+        .order('save_order_rank', { ascending: false })
+        .limit(10);
+
+      if (error) {
+        throw new Error(`Failed to fetch reel to cancel: ${error.message}`);
+      }
+      return (data || []) as SavedReel[];
+    };
+
+    let candidates = trimmedSender ? await fetchCandidates('exact') : [];
+    if (allowUnattributedFallback && candidates.length === 0) {
+      candidates = await fetchCandidates('unattributed');
     }
-
-    const { data: candidates, error } = await query
-      .order('created_at', { ascending: false })
-      .order('first_detected_at', { ascending: false })
-      .order('save_order_rank', { ascending: false })
-      .limit(10);
-
-    if (error) {
-      throw new Error(`Failed to fetch reel to cancel: ${error.message}`);
-    }
-    if (!candidates || candidates.length === 0) return null;
+    if (candidates.length === 0) return null;
 
     const target = candidates[0] as SavedReel;
     const now = new Date().toISOString();
 
     if (target.is_saved_on_instagram === false) {
-      const { data: deletedRows, error: delErr } = await supabase
+      let delQuery = supabase
         .from('saved_reels')
         .delete()
         .eq('id', target.id)
-        .eq('instagram_sender_id', trimmedSender)
         .eq('is_saved_on_instagram', false)
-        .eq('watch_status', 'watch_later')
-        .select('id');
+        .eq('watch_status', 'watch_later');
+
+      if (target.instagram_sender_id) {
+        delQuery = delQuery.eq('instagram_sender_id', target.instagram_sender_id);
+      } else if (allowUnattributedFallback) {
+        delQuery = delQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+
+      const { data: deletedRows, error: delErr } = await delQuery.select('id');
       if (delErr) {
         throw new Error(`Failed to delete cancelled reel: ${delErr.message}`);
       }
@@ -2374,7 +2399,7 @@ export class Repository {
       // If row was concurrently promoted to is_saved_on_instagram: true, fall through to revert
     }
 
-    const { data: updated, error: upErr } = await supabase
+    let upQuery = supabase
       .from('saved_reels')
       .update({
         watch_status: 'unwatched',
@@ -2384,8 +2409,15 @@ export class Repository {
         updated_at: now,
       })
       .eq('id', target.id)
-      .eq('instagram_sender_id', trimmedSender)
-      .eq('watch_status', 'watch_later')
+      .eq('watch_status', 'watch_later');
+
+    if (target.instagram_sender_id) {
+      upQuery = upQuery.eq('instagram_sender_id', target.instagram_sender_id);
+    } else if (allowUnattributedFallback) {
+      upQuery = upQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+    }
+
+    const { data: updated, error: upErr } = await upQuery
       .select('*, creator:creators(*)')
       .maybeSingle();
     if (upErr) {
@@ -2401,18 +2433,20 @@ export class Repository {
    */
   static async cancelReminderForSender(
     senderId: string,
-    options?: { targetCreator?: string }
+    options?: { targetCreator?: string; includeUnattributedFallback?: boolean }
   ): Promise<{ updatedReel: SavedReel } | null> {
     const trimmedSender = String(senderId || '').trim();
-    if (!trimmedSender) return null;
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    if (!trimmedSender && !allowUnattributedFallback) return null;
 
     const targetCreator = options?.targetCreator?.trim()?.toLowerCase();
 
     if (!isSupabaseConfigured()) {
       let candidates = Array.from(memoryStore.reels.values()).filter(
         (r) =>
-          r.instagram_sender_id === trimmedSender &&
           r.watch_status === 'watch_later' &&
+          (r.instagram_sender_id === trimmedSender ||
+            (allowUnattributedFallback && !r.instagram_sender_id)) &&
           (r.next_reminder_at || r.awaiting_reminder_choice_until)
       );
       if (targetCreator) {
@@ -2429,7 +2463,14 @@ export class Repository {
       const target = ordered[0];
       const now = new Date().toISOString();
       const stored = memoryStore.reels.get(target.id);
-      if (!stored || stored.watch_status !== 'watch_later') return null;
+      if (
+        !stored ||
+        stored.watch_status !== 'watch_later' ||
+        stored.next_reminder_at !== target.next_reminder_at ||
+        stored.awaiting_reminder_choice_until !== target.awaiting_reminder_choice_until
+      ) {
+        return null;
+      }
       stored.next_reminder_at = null;
       stored.awaiting_reminder_choice_until = null;
       stored.updated_at = now;
@@ -2450,32 +2491,45 @@ export class Repository {
       if (creatorIds.length === 0) return null;
     }
 
-    let query = supabase
-      .from('saved_reels')
-      .select('*, creator:creators(*)')
-      .eq('instagram_sender_id', trimmedSender)
-      .eq('watch_status', 'watch_later')
-      .or('next_reminder_at.not.is.null,awaiting_reminder_choice_until.not.is.null');
+    const fetchReminderCandidates = async (senderFilter: 'exact' | 'unattributed'): Promise<SavedReel[]> => {
+      let query = supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .eq('watch_status', 'watch_later')
+        .or('next_reminder_at.not.is.null,awaiting_reminder_choice_until.not.is.null');
 
-    if (creatorIds) {
-      query = query.in('creator_id', creatorIds);
+      if (senderFilter === 'exact') {
+        query = query.eq('instagram_sender_id', trimmedSender);
+      } else {
+        query = query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+
+      if (creatorIds) {
+        query = query.in('creator_id', creatorIds);
+      }
+
+      const { data, error } = await query
+        .order('updated_at', { ascending: false })
+        .order('last_reminded_at', { ascending: false, nullsFirst: false })
+        .order('created_at', { ascending: false })
+        .limit(10);
+
+      if (error) {
+        throw new Error(`Failed to fetch reminder to cancel: ${error.message}`);
+      }
+      return (data || []) as SavedReel[];
+    };
+
+    let candidates = trimmedSender ? await fetchReminderCandidates('exact') : [];
+    if (allowUnattributedFallback && candidates.length === 0) {
+      candidates = await fetchReminderCandidates('unattributed');
     }
-
-    const { data: candidates, error } = await query
-      .order('updated_at', { ascending: false })
-      .order('last_reminded_at', { ascending: false, nullsFirst: false })
-      .order('created_at', { ascending: false })
-      .limit(10);
-
-    if (error) {
-      throw new Error(`Failed to fetch reminder to cancel: ${error.message}`);
-    }
-    if (!candidates || candidates.length === 0) return null;
+    if (candidates.length === 0) return null;
 
     const target = sortWatchLaterReelsMostRecentFirst(candidates as SavedReel[])[0];
     const now = new Date().toISOString();
 
-    const { data: updated, error: upErr } = await supabase
+    let upQuery = supabase
       .from('saved_reels')
       .update({
         next_reminder_at: null,
@@ -2483,8 +2537,27 @@ export class Repository {
         updated_at: now,
       })
       .eq('id', target.id)
-      .eq('instagram_sender_id', trimmedSender)
-      .eq('watch_status', 'watch_later')
+      .eq('watch_status', 'watch_later');
+
+    if (target.instagram_sender_id) {
+      upQuery = upQuery.eq('instagram_sender_id', target.instagram_sender_id);
+    } else if (allowUnattributedFallback) {
+      upQuery = upQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+    }
+
+    if (target.next_reminder_at !== null && target.next_reminder_at !== undefined) {
+      upQuery = upQuery.eq('next_reminder_at', target.next_reminder_at);
+    } else {
+      upQuery = upQuery.is('next_reminder_at', null);
+    }
+
+    if (target.awaiting_reminder_choice_until !== null && target.awaiting_reminder_choice_until !== undefined) {
+      upQuery = upQuery.eq('awaiting_reminder_choice_until', target.awaiting_reminder_choice_until);
+    } else {
+      upQuery = upQuery.is('awaiting_reminder_choice_until', null);
+    }
+
+    const { data: updated, error: upErr } = await upQuery
       .select('*, creator:creators(*)')
       .maybeSingle();
 
@@ -2503,6 +2576,7 @@ export class Repository {
     senderId: string,
     creatorHandle: string,
     options?: {
+      includeUnattributedFallback?: boolean;
       pinnedState?: {
         toDeleteIds: string[];
         toRevertIds: string[];
@@ -2510,13 +2584,15 @@ export class Repository {
         deletedIds: string[];
         revertedIds: string[];
         targetUpdatedAts?: Record<string, string>;
+        targetCreatedAts?: Record<string, string>;
       };
       onPartialProgress?: (mutated: boolean) => void;
     }
   ): Promise<{ clearedReels: SavedReel[] }> {
     const trimmedSender = String(senderId || '').trim();
     const handle = String(creatorHandle || '').trim().replace(/^@+/, '').toLowerCase();
-    if (!trimmedSender || !handle) return { clearedReels: [] };
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    if ((!trimmedSender && !allowUnattributedFallback) || !handle) return { clearedReels: [] };
 
     if (!isSupabaseConfigured()) {
       let state = options?.pinnedState;
@@ -2528,7 +2604,11 @@ export class Repository {
           state.revertedIds.length === 0)
       ) {
         const candidates = Array.from(memoryStore.reels.values()).filter((r) => {
-          if (r.instagram_sender_id !== trimmedSender || r.watch_status !== 'watch_later') return false;
+          if (r.watch_status !== 'watch_later') return false;
+          const matchesSender =
+            r.instagram_sender_id === trimmedSender ||
+            (allowUnattributedFallback && !r.instagram_sender_id);
+          if (!matchesSender) return false;
           const creator = memoryStore.creators.get(r.creator_id);
           return String(creator?.username || '').toLowerCase() === handle;
         });
@@ -2540,6 +2620,9 @@ export class Repository {
           revertedIds: [],
           targetUpdatedAts: Object.fromEntries(
             candidates.map((r) => [r.id, r.updated_at || r.created_at || ''])
+          ),
+          targetCreatedAts: Object.fromEntries(
+            candidates.map((r) => [r.id, r.created_at || r.first_detected_at || ''])
           ),
         };
         if (state) {
@@ -2554,10 +2637,14 @@ export class Repository {
         if (!state.deletedIds.includes(id)) {
           const reel = memoryStore.reels.get(id);
           const expectedUpdatedAt = state.targetUpdatedAts?.[id];
+          const matchesSender =
+            reel &&
+            (reel.instagram_sender_id === trimmedSender ||
+              (allowUnattributedFallback && !reel.instagram_sender_id));
           if (
             reel &&
+            matchesSender &&
             reel.watch_status === 'watch_later' &&
-            reel.instagram_sender_id === trimmedSender &&
             (!expectedUpdatedAt || (reel.updated_at || reel.created_at || '') === expectedUpdatedAt)
           ) {
             if (reel.is_saved_on_instagram !== false) {
@@ -2579,8 +2666,13 @@ export class Repository {
         if (!state.revertedIds.includes(id)) {
           const reel = memoryStore.reels.get(id);
           const expectedUpdatedAt = state.targetUpdatedAts?.[id];
+          const matchesSender =
+            reel &&
+            (reel.instagram_sender_id === trimmedSender ||
+              (allowUnattributedFallback && !reel.instagram_sender_id));
           if (
             reel &&
+            matchesSender &&
             reel.watch_status === 'watch_later' &&
             (!expectedUpdatedAt || (reel.updated_at || reel.created_at || '') === expectedUpdatedAt)
           ) {
@@ -2625,24 +2717,43 @@ export class Repository {
         .filter(Boolean);
       if (creatorIds.length === 0) return { clearedReels: [] };
 
-      const PAGE_SIZE = 1000;
-      let offset = 0;
-      const reels: any[] = [];
-      while (true) {
-        const { data: page, error: rErr } = await supabase
-          .from('saved_reels')
-          .select('*, creator:creators(*)')
-          .eq('instagram_sender_id', trimmedSender)
-          .eq('watch_status', 'watch_later')
-          .in('creator_id', creatorIds)
-          .range(offset, offset + PAGE_SIZE - 1);
-        if (rErr) {
-          throw new Error(`Failed to fetch watch-later reels for creator: ${rErr.message}`);
+      const fetchReelsForSender = async (senderFilter: 'exact' | 'unattributed'): Promise<any[]> => {
+        const PAGE_SIZE = 1000;
+        let lastSeenId: string | null = null;
+        const res: any[] = [];
+        while (true) {
+          let pageQuery = supabase
+            .from('saved_reels')
+            .select('*, creator:creators(*)')
+            .eq('watch_status', 'watch_later')
+            .in('creator_id', creatorIds)
+            .order('id', { ascending: true })
+            .limit(PAGE_SIZE);
+
+          if (senderFilter === 'exact') {
+            pageQuery = pageQuery.eq('instagram_sender_id', trimmedSender);
+          } else {
+            pageQuery = pageQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+          }
+
+          if (lastSeenId) {
+            pageQuery = pageQuery.gt('id', lastSeenId);
+          }
+          const { data: page, error: rErr } = await pageQuery;
+          if (rErr) {
+            throw new Error(`Failed to fetch watch-later reels for creator: ${rErr.message}`);
+          }
+          if (!page || page.length === 0) break;
+          res.push(...page);
+          if (page.length < PAGE_SIZE) break;
+          lastSeenId = page[page.length - 1].id;
         }
-        if (!page || page.length === 0) break;
-        reels.push(...page);
-        if (page.length < PAGE_SIZE) break;
-        offset += PAGE_SIZE;
+        return res;
+      };
+
+      let reels = trimmedSender ? await fetchReelsForSender('exact') : [];
+      if (allowUnattributedFallback && reels.length === 0) {
+        reels = await fetchReelsForSender('unattributed');
       }
       if (reels.length === 0) return { clearedReels: [] };
 
@@ -2669,26 +2780,27 @@ export class Repository {
     const now = new Date().toISOString();
     const remainingDeleteIds = state.toDeleteIds.filter((id) => !state!.deletedIds.includes(id));
     if (remainingDeleteIds.length > 0) {
-      // In Supabase, verify each remaining delete candidate still has its original updated_at
-      // so if the user re-added the reel in the interim, the re-added reel is preserved.
       let eligibleDeleteIds = remainingDeleteIds;
       if (state.targetUpdatedAts) {
-        const { data: currentRows, error: readErr } = await supabase
-          .from('saved_reels')
-          .select('id, updated_at, created_at')
-          .in('id', remainingDeleteIds);
-        if (readErr) {
-          throw new Error(`Failed to check delete candidate versions: ${readErr.message}`);
+        const matchSet = new Set<string>();
+        const CHUNK_SIZE = 500;
+        for (let i = 0; i < remainingDeleteIds.length; i += CHUNK_SIZE) {
+          const chunk = remainingDeleteIds.slice(i, i + CHUNK_SIZE);
+          const { data: currentRows, error: readErr } = await supabase
+            .from('saved_reels')
+            .select('id, updated_at, created_at')
+            .in('id', chunk);
+          if (readErr) {
+            throw new Error(`Failed to check delete candidate versions: ${readErr.message}`);
+          }
+          for (const row of currentRows || []) {
+            const expected = state!.targetUpdatedAts?.[row.id];
+            const actual = row.updated_at || row.created_at || '';
+            if (!expected || actual === expected) {
+              matchSet.add(row.id);
+            }
+          }
         }
-        const matchSet = new Set(
-          (currentRows || [])
-            .filter((row: any) => {
-              const expected = state!.targetUpdatedAts?.[row.id];
-              const actual = row.updated_at || row.created_at || '';
-              return !expected || actual === expected;
-            })
-            .map((r: any) => r.id)
-        );
         eligibleDeleteIds = remainingDeleteIds.filter((id) => matchSet.has(id));
       }
       const BATCH_SIZE = 100;
@@ -2698,7 +2810,6 @@ export class Repository {
           .from('saved_reels')
           .delete()
           .in('id', batch)
-          .eq('instagram_sender_id', trimmedSender)
           .eq('is_saved_on_instagram', false)
           .eq('watch_status', 'watch_later')
           .select('id');
@@ -2723,26 +2834,32 @@ export class Repository {
     if (remainingRevertIds.length > 0) {
       let eligibleRevertIds = remainingRevertIds;
       if (state.targetUpdatedAts) {
-        const { data: currentRows, error: readErr } = await supabase
-          .from('saved_reels')
-          .select('id, updated_at, created_at, first_detected_at, watch_status')
-          .in('id', remainingRevertIds);
-        if (readErr) {
-          throw new Error(`Failed to check revert candidate versions: ${readErr.message}`);
+        const matchSet = new Set<string>();
+        const CHUNK_SIZE = 500;
+        for (let i = 0; i < remainingRevertIds.length; i += CHUNK_SIZE) {
+          const chunk = remainingRevertIds.slice(i, i + CHUNK_SIZE);
+          const { data: currentRows, error: readErr } = await supabase
+            .from('saved_reels')
+            .select('id, updated_at, created_at, first_detected_at, watch_status')
+            .in('id', chunk);
+          if (readErr) {
+            throw new Error(`Failed to check revert candidate versions: ${readErr.message}`);
+          }
+          for (const row of currentRows || []) {
+            if (row.watch_status && row.watch_status !== 'watch_later') continue;
+            const expectedUpdated = state!.targetUpdatedAts?.[row.id];
+            const actualUpdated = row.updated_at || '';
+            if (expectedUpdated && actualUpdated === expectedUpdated) {
+              matchSet.add(row.id);
+              continue;
+            }
+            const expectedCreated = (state as any)!.targetCreatedAts?.[row.id];
+            const actualCreated = row.created_at || row.first_detected_at || '';
+            if (!expectedCreated || actualCreated === expectedCreated) {
+              matchSet.add(row.id);
+            }
+          }
         }
-        const matchSet = new Set(
-          (currentRows || [])
-            .filter((row: any) => {
-              if (row.watch_status && row.watch_status !== 'watch_later') return false;
-              const expectedUpdated = state!.targetUpdatedAts?.[row.id];
-              const actualUpdated = row.updated_at || '';
-              if (expectedUpdated && actualUpdated === expectedUpdated) return true;
-              const expectedCreated = (state as any)!.targetCreatedAts?.[row.id];
-              const actualCreated = row.created_at || row.first_detected_at || '';
-              return !expectedCreated || actualCreated === expectedCreated;
-            })
-            .map((r: any) => r.id)
-        );
         eligibleRevertIds = remainingRevertIds.filter((id) => matchSet.has(id));
       }
       const BATCH_SIZE = 100;
@@ -2758,7 +2875,6 @@ export class Repository {
             updated_at: now,
           })
           .in('id', batch)
-          .eq('instagram_sender_id', trimmedSender)
           .eq('watch_status', 'watch_later')
           .select('id');
         if (revErr) {
@@ -2784,16 +2900,22 @@ export class Repository {
    */
   static async selectWatchLaterTargetIdsForCreator(
     senderId: string,
-    creatorHandle: string
+    creatorHandle: string,
+    options?: { includeUnattributedFallback?: boolean }
   ): Promise<string[]> {
     const trimmedSender = String(senderId || '').trim();
     const handle = String(creatorHandle || '').trim().replace(/^@+/, '').toLowerCase();
-    if (!trimmedSender || !handle) return [];
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    if ((!trimmedSender && !allowUnattributedFallback) || !handle) return [];
 
     if (!isSupabaseConfigured()) {
       return Array.from(memoryStore.reels.values())
         .filter((r) => {
-          if (r.instagram_sender_id !== trimmedSender || r.watch_status !== 'watch_later') return false;
+          if (r.watch_status !== 'watch_later') return false;
+          const matchesSender =
+            r.instagram_sender_id === trimmedSender ||
+            (allowUnattributedFallback && !r.instagram_sender_id);
+          if (!matchesSender) return false;
           const creator = memoryStore.creators.get(r.creator_id);
           return String(creator?.username || '').toLowerCase() === handle;
         })
@@ -2812,22 +2934,41 @@ export class Repository {
       .filter(Boolean);
     if (creatorIds.length === 0) return [];
 
-    const PAGE_SIZE = 1000;
-    let offset = 0;
-    const allIds: string[] = [];
-    while (true) {
-      const { data: page, error: rErr } = await supabase
-        .from('saved_reels')
-        .select('id')
-        .eq('instagram_sender_id', trimmedSender)
-        .eq('watch_status', 'watch_later')
-        .in('creator_id', creatorIds)
-        .range(offset, offset + PAGE_SIZE - 1);
-      if (rErr) throw new Error(`Failed to fetch watch-later reels: ${rErr.message}`);
-      if (!page || page.length === 0) break;
-      allIds.push(...page.map((r: any) => r.id));
-      if (page.length < PAGE_SIZE) break;
-      offset += PAGE_SIZE;
+    const fetchIdsForSender = async (senderFilter: 'exact' | 'unattributed'): Promise<string[]> => {
+      const PAGE_SIZE = 1000;
+      let lastSeenId: string | null = null;
+      const allIds: string[] = [];
+      while (true) {
+        let pageQuery = supabase
+          .from('saved_reels')
+          .select('id')
+          .eq('watch_status', 'watch_later')
+          .in('creator_id', creatorIds)
+          .order('id', { ascending: true })
+          .limit(PAGE_SIZE);
+
+        if (senderFilter === 'exact') {
+          pageQuery = pageQuery.eq('instagram_sender_id', trimmedSender);
+        } else {
+          pageQuery = pageQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+        }
+
+        if (lastSeenId) {
+          pageQuery = pageQuery.gt('id', lastSeenId);
+        }
+        const { data: page, error: rErr } = await pageQuery;
+        if (rErr) throw new Error(`Failed to fetch watch-later reels: ${rErr.message}`);
+        if (!page || page.length === 0) break;
+        allIds.push(...page.map((r: any) => r.id));
+        if (page.length < PAGE_SIZE) break;
+        lastSeenId = page[page.length - 1].id;
+      }
+      return allIds;
+    };
+
+    let allIds = trimmedSender ? await fetchIdsForSender('exact') : [];
+    if (allowUnattributedFallback && allIds.length === 0) {
+      allIds = await fetchIdsForSender('unattributed');
     }
     return allIds;
   }
@@ -2841,15 +2982,21 @@ export class Repository {
     options?: {
       targetReelIds?: string[];
       onPartialProgress?: (mutated: boolean) => void;
+      includeUnattributedFallback?: boolean;
     }
   ): Promise<{ updatedReels: SavedReel[] }> {
     const trimmedSender = String(senderId || '').trim();
     const handle = String(creatorHandle || '').trim().replace(/^@+/, '').toLowerCase();
-    if (!trimmedSender || !handle) return { updatedReels: [] };
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    if ((!trimmedSender && !allowUnattributedFallback) || !handle) return { updatedReels: [] };
 
     if (!isSupabaseConfigured()) {
       let candidates = Array.from(memoryStore.reels.values()).filter((r) => {
-        if (r.instagram_sender_id !== trimmedSender || r.watch_status !== 'watch_later') return false;
+        if (r.watch_status !== 'watch_later') return false;
+        const matchesSender =
+          r.instagram_sender_id === trimmedSender ||
+          (allowUnattributedFallback && !r.instagram_sender_id);
+        if (!matchesSender) return false;
         const creator = memoryStore.creators.get(r.creator_id);
         return String(creator?.username || '').toLowerCase() === handle;
       });
@@ -2888,54 +3035,77 @@ export class Repository {
 
     let reelIds = options?.targetReelIds;
     if (!reelIds) {
-      const PAGE_SIZE = 1000;
-      let offset = 0;
-      const allReels: any[] = [];
-      while (true) {
-        const { data: page, error: rErr } = await supabase
-          .from('saved_reels')
-          .select('id')
-          .eq('instagram_sender_id', trimmedSender)
-          .eq('watch_status', 'watch_later')
-          .in('creator_id', creatorIds)
-          .range(offset, offset + PAGE_SIZE - 1);
-        if (rErr) {
-          throw new Error(`Failed to fetch watch-later reels for creator: ${rErr.message}`);
+      const fetchReelsForSender = async (senderFilter: 'exact' | 'unattributed'): Promise<string[]> => {
+        const PAGE_SIZE = 1000;
+        let lastSeenId: string | null = null;
+        const allReels: string[] = [];
+        while (true) {
+          let pageQuery = supabase
+            .from('saved_reels')
+            .select('id')
+            .eq('watch_status', 'watch_later')
+            .in('creator_id', creatorIds)
+            .order('id', { ascending: true })
+            .limit(PAGE_SIZE);
+
+          if (senderFilter === 'exact') {
+            pageQuery = pageQuery.eq('instagram_sender_id', trimmedSender);
+          } else {
+            pageQuery = pageQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+          }
+
+          if (lastSeenId) {
+            pageQuery = pageQuery.gt('id', lastSeenId);
+          }
+          const { data: page, error: rErr } = await pageQuery;
+          if (rErr) {
+            throw new Error(`Failed to fetch watch-later reels for creator: ${rErr.message}`);
+          }
+          if (!page || page.length === 0) break;
+          allReels.push(...page.map((r: any) => r.id));
+          if (page.length < PAGE_SIZE) break;
+          lastSeenId = page[page.length - 1].id;
         }
-        if (!page || page.length === 0) break;
-        allReels.push(...page);
-        if (page.length < PAGE_SIZE) break;
-        offset += PAGE_SIZE;
+        return allReels;
+      };
+
+      let fetchedIds = trimmedSender ? await fetchReelsForSender('exact') : [];
+      if (allowUnattributedFallback && fetchedIds.length === 0) {
+        fetchedIds = await fetchReelsForSender('unattributed');
       }
-      if (allReels.length === 0) return { updatedReels: [] };
-      reelIds = allReels.map((r: any) => r.id);
+      if (fetchedIds.length === 0) return { updatedReels: [] };
+      reelIds = fetchedIds;
     }
 
     if (reelIds.length === 0) return { updatedReels: [] };
 
     const now = new Date().toISOString();
-    const { data: updated, error: upErr } = await supabase
-      .from('saved_reels')
-      .update({
-        watch_status: 'watched',
-        next_reminder_at: null,
-        awaiting_reminder_choice_until: null,
-        updated_at: now,
-      })
-      .in('id', reelIds)
-      .eq('instagram_sender_id', trimmedSender)
-      .eq('watch_status', 'watch_later')
-      .in('creator_id', creatorIds)
-      .select('*, creator:creators(*)');
+    const BATCH_SIZE = 500;
+    const updatedReels: SavedReel[] = [];
+    for (let i = 0; i < reelIds.length; i += BATCH_SIZE) {
+      const batch = reelIds.slice(i, i + BATCH_SIZE);
+      const { data: updated, error: upErr } = await supabase
+        .from('saved_reels')
+        .update({
+          watch_status: 'watched',
+          next_reminder_at: null,
+          awaiting_reminder_choice_until: null,
+          updated_at: now,
+        })
+        .in('id', batch)
+        .eq('watch_status', 'watch_later')
+        .in('creator_id', creatorIds)
+        .select('*, creator:creators(*)');
 
-    if (upErr) {
-      throw new Error(`Failed to mark reels watched for creator: ${upErr.message}`);
+      if (upErr) {
+        throw new Error(`Failed to mark reels watched for creator: ${upErr.message}`);
+      }
+      if (updated && updated.length > 0) {
+        updatedReels.push(...(updated as SavedReel[]));
+        options?.onPartialProgress?.(true);
+      }
     }
 
-    const updatedReels = (updated as SavedReel[]) || [];
-    if (updatedReels.length > 0) {
-      options?.onPartialProgress?.(true);
-    }
     return { updatedReels };
   }
 
