@@ -1999,6 +1999,7 @@ export class Repository {
     options?: {
       expectedNextReminderAt?: string | null;
       expectedIntervalSeconds?: number | null;
+      expectedIntervalHours?: number | null;
       expectedUpdatedAt?: string | null;
       expectedWatchStatus?: WatchStatus;
       expectedAwaitingReminderChoiceUntil?: string | null;
@@ -2018,6 +2019,12 @@ export class Repository {
         if (
           options.expectedIntervalSeconds !== undefined &&
           (reel.reminder_interval_seconds ?? null) !== (options.expectedIntervalSeconds ?? null)
+        ) {
+          return false;
+        }
+        if (
+          options.expectedIntervalHours !== undefined &&
+          (reel.reminder_interval_hours ?? null) !== (options.expectedIntervalHours ?? null)
         ) {
           return false;
         }
@@ -2074,6 +2081,11 @@ export class Repository {
         query = options.expectedIntervalSeconds === null
           ? query.is('reminder_interval_seconds', null)
           : query.eq('reminder_interval_seconds', options.expectedIntervalSeconds);
+      }
+      if (options.expectedIntervalHours !== undefined) {
+        query = options.expectedIntervalHours === null
+          ? query.is('reminder_interval_hours', null)
+          : query.eq('reminder_interval_hours', options.expectedIntervalHours);
       }
       if (options.expectedUpdatedAt !== undefined) {
         query = options.expectedUpdatedAt === null
@@ -2201,7 +2213,11 @@ export class Repository {
   static async recordReminderSent(
     id: string,
     nextReminderAt: string | null,
-    options?: { expectedNextReminderAt?: string | null }
+    options?: {
+      expectedNextReminderAt?: string | null;
+      expectedIntervalSeconds?: number | null;
+      expectedIntervalHours?: number | null;
+    }
   ): Promise<boolean> {
     const now = new Date().toISOString();
 
@@ -2223,6 +2239,18 @@ export class Repository {
         ) {
           return false;
         }
+        if (
+          options?.expectedIntervalSeconds !== undefined &&
+          (reel.reminder_interval_seconds ?? null) !== (options.expectedIntervalSeconds ?? null)
+        ) {
+          return false;
+        }
+        if (
+          options?.expectedIntervalHours !== undefined &&
+          (reel.reminder_interval_hours ?? null) !== (options.expectedIntervalHours ?? null)
+        ) {
+          return false;
+        }
         reel.reminders_sent_count = (reel.reminders_sent_count || 0) + 1;
         reel.last_reminded_at = now;
         reel.next_reminder_at = nextReminderAt;
@@ -2236,7 +2264,7 @@ export class Repository {
     // fetch current count and check expected reminder schedule
     const { data: current, error: getErr } = await supabase
       .from('saved_reels')
-      .select('reminders_sent_count, next_reminder_at')
+      .select('reminders_sent_count, next_reminder_at, reminder_interval_seconds, reminder_interval_hours')
       .eq('id', id)
       .maybeSingle();
     if (getErr) throw new Error(`Failed to fetch current reminder state: ${getErr.message}`);
@@ -2246,6 +2274,18 @@ export class Repository {
       !isSameInstant(current.next_reminder_at, options.expectedNextReminderAt)
     ) {
       // Missing or superseded schedule: not a persistence error, leave newer schedule untouched
+      return false;
+    }
+    if (
+      options?.expectedIntervalSeconds !== undefined &&
+      (current.reminder_interval_seconds ?? null) !== (options.expectedIntervalSeconds ?? null)
+    ) {
+      return false;
+    }
+    if (
+      options?.expectedIntervalHours !== undefined &&
+      (current.reminder_interval_hours ?? null) !== (options.expectedIntervalHours ?? null)
+    ) {
       return false;
     }
     const newCount = (current.reminders_sent_count || 0) + 1;
@@ -2263,6 +2303,16 @@ export class Repository {
       upQuery = current.next_reminder_at === null
         ? upQuery.is('next_reminder_at', null)
         : upQuery.eq('next_reminder_at', current.next_reminder_at);
+    }
+    if (options?.expectedIntervalSeconds !== undefined) {
+      upQuery = current.reminder_interval_seconds === null
+        ? upQuery.is('reminder_interval_seconds', null)
+        : upQuery.eq('reminder_interval_seconds', current.reminder_interval_seconds);
+    }
+    if (options?.expectedIntervalHours !== undefined) {
+      upQuery = current.reminder_interval_hours === null
+        ? upQuery.is('reminder_interval_hours', null)
+        : upQuery.eq('reminder_interval_hours', current.reminder_interval_hours);
     }
     const { data, error: upErr } = await upQuery.select('id');
     if (upErr) throw new Error(`Failed to update reminder record: ${upErr.message}`);
@@ -2914,26 +2964,38 @@ export class Repository {
         }
 
         if (validDeleteIds.length > 0) {
-          let delQuery = supabase
-            .from('saved_reels')
-            .delete()
-            .in('id', validDeleteIds)
-            .eq('is_saved_on_instagram', false)
-            .eq('watch_status', 'watch_later');
-          delQuery = applyOwnerFilter(delQuery);
-          const { data: deleted, error: delErr } = await delQuery.select('id');
-          if (delErr) {
-            throw new Error(`Failed to delete bot-added reels: ${delErr.message}`);
+          const deleteGroups = new Map<string, string[]>();
+          for (const id of validDeleteIds) {
+            const version = state.targetUpdatedAts?.[id] || '';
+            if (!deleteGroups.has(version)) deleteGroups.set(version, []);
+            deleteGroups.get(version)!.push(id);
           }
-          const confirmedDeletedIds = (deleted || []).map((d: any) => d.id);
-          state.deletedIds.push(...confirmedDeletedIds);
-          if (confirmedDeletedIds.length > 0) {
-            Repository.invalidateCreatorsCache();
-            options?.onPartialProgress?.(true);
+
+          for (const [version, groupIds] of deleteGroups.entries()) {
+            let delQuery = supabase
+              .from('saved_reels')
+              .delete()
+              .in('id', groupIds)
+              .eq('is_saved_on_instagram', false)
+              .eq('watch_status', 'watch_later');
+            if (version) {
+              delQuery = delQuery.eq('updated_at', version);
+            }
+            delQuery = applyOwnerFilter(delQuery);
+            const { data: deleted, error: delErr } = await delQuery.select('id');
+            if (delErr) {
+              throw new Error(`Failed to delete bot-added reels: ${delErr.message}`);
+            }
+            const confirmedDeletedIds = (deleted || []).map((d: any) => d.id);
+            state.deletedIds.push(...confirmedDeletedIds);
+            if (confirmedDeletedIds.length > 0) {
+              Repository.invalidateCreatorsCache();
+              options?.onPartialProgress?.(true);
+            }
           }
 
           // Handle concurrent promotions between prefetch and delete
-          const deletedSet = new Set(confirmedDeletedIds);
+          const deletedSet = new Set(state.deletedIds);
           const unconfirmedIds = validDeleteIds.filter((id) => !deletedSet.has(id));
           if (unconfirmedIds.length > 0) {
             let recheckQuery = supabase
@@ -2941,7 +3003,10 @@ export class Repository {
               .select('id, updated_at, is_saved_on_instagram, watch_status')
               .in('id', unconfirmedIds);
             recheckQuery = applyOwnerFilter(recheckQuery);
-            const { data: rechecked } = await recheckQuery;
+            const { data: rechecked, error: recheckErr } = await recheckQuery;
+            if (recheckErr) {
+              throw new Error(`Failed to recheck unconfirmed delete reels: ${recheckErr.message}`);
+            }
             for (const row of (rechecked || []) as any[]) {
               if (row.watch_status === 'watch_later' && row.is_saved_on_instagram !== false) {
                 if (!state.toRevertIds.includes(row.id)) {
@@ -2982,26 +3047,38 @@ export class Repository {
         }
 
         if (validRevertIds.length > 0) {
-          let revQuery = supabase
-            .from('saved_reels')
-            .update({
-              watch_status: 'unwatched',
-              next_reminder_at: null,
-              reminder_interval_seconds: null,
-              awaiting_reminder_choice_until: null,
-              updated_at: now,
-            })
-            .in('id', validRevertIds)
-            .eq('watch_status', 'watch_later');
-          revQuery = applyOwnerFilter(revQuery);
-          const { data: reverted, error: revErr } = await revQuery.select('id');
-          if (revErr) {
-            throw new Error(`Failed to revert saved reels to unwatched: ${revErr.message}`);
+          const revertGroups = new Map<string, string[]>();
+          for (const id of validRevertIds) {
+            const version = state.targetUpdatedAts?.[id] || '';
+            if (!revertGroups.has(version)) revertGroups.set(version, []);
+            revertGroups.get(version)!.push(id);
           }
-          const confirmedRevertedIds = (reverted || []).map((r: any) => r.id);
-          state.revertedIds.push(...confirmedRevertedIds);
-          if (confirmedRevertedIds.length > 0) {
-            options?.onPartialProgress?.(true);
+
+          for (const [version, groupIds] of revertGroups.entries()) {
+            let revQuery = supabase
+              .from('saved_reels')
+              .update({
+                watch_status: 'unwatched',
+                next_reminder_at: null,
+                reminder_interval_seconds: null,
+                awaiting_reminder_choice_until: null,
+                updated_at: now,
+              })
+              .in('id', groupIds)
+              .eq('watch_status', 'watch_later');
+            if (version) {
+              revQuery = revQuery.eq('updated_at', version);
+            }
+            revQuery = applyOwnerFilter(revQuery);
+            const { data: reverted, error: revErr } = await revQuery.select('id');
+            if (revErr) {
+              throw new Error(`Failed to revert saved reels to unwatched: ${revErr.message}`);
+            }
+            const confirmedRevertedIds = (reverted || []).map((r: any) => r.id);
+            state.revertedIds.push(...confirmedRevertedIds);
+            if (confirmedRevertedIds.length > 0) {
+              options?.onPartialProgress?.(true);
+            }
           }
         }
       }

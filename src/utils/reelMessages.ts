@@ -96,7 +96,7 @@ export function parseCancelCommand(text: string): CancelCommand | null {
     /^(?:clear|remove|delete|cancel)\s+(@[a-z0-9._]{1,30}|[a-z0-9._]{1,30})[,.!?:;~]*$/i
   );
   if (clearMatch) {
-    const rawArg = clearMatch[1].trim();
+    const rawArg = clearMatch[1].trim().replace(/[.!?,;:~]+$/, '');
     if (!/^(?:all|everything|reminders|that|it|reel|post|addition|my|data|account)$/i.test(rawArg)) {
       const targetCreator = extractCreatorQuery(rawArg);
       if (targetCreator) {
