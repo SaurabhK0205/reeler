@@ -173,6 +173,47 @@ export class MetaInstagramBotService {
     this.recentDurationHints.clear();
   }
 
+  private async flushPendingSharePrompt(senderId: string): Promise<void> {
+    const pending = this.pendingSharePrompts.get(senderId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingSharePrompts.delete(senderId);
+    const ok = await this.deliverReply(senderId, pending.promptText, pending.delivery);
+    if (ok) {
+      if (pending.opId) this.markWebhookMidCompleted(pending.opId);
+    } else if (pending.opId) {
+      this.recordPendingWebhookReplies(pending.opId, senderId, [pending.promptText]);
+      this.scheduleWebhookRetry(pending.opId, 0, () =>
+        this.dispatchWebhookMessage(
+          senderId,
+          pending.rawMid || pending.opId,
+          '',
+          undefined,
+          'deferred_share_prompt_retry',
+          1,
+          pending.opId
+        )
+      );
+    }
+  }
+
+  private recordRecentDurationHint(
+    senderId: string,
+    duration: NonNullable<ReturnType<typeof parseDuration>>
+  ): void {
+    const now = Date.now();
+    for (const [id, hint] of this.recentDurationHints.entries()) {
+      if (now - hint.timestamp > 3500) {
+        this.recentDurationHints.delete(id);
+      }
+    }
+    if (this.recentDurationHints.size >= 500) {
+      const oldestKey = this.recentDurationHints.keys().next().value;
+      if (oldestKey) this.recentDurationHints.delete(oldestKey);
+    }
+    this.recentDurationHints.set(senderId, { duration, timestamp: now });
+  }
+
   setAdminUserId(adminUserId: string | null): void {
     this.adminUserId = adminUserId;
   }
@@ -610,7 +651,7 @@ export class MetaInstagramBotService {
     rawMid: unknown,
     text: string,
     attachments: any[] | undefined,
-    sourceLabel: 'messaging' | 'change',
+    sourceLabel: 'messaging' | 'change' | 'deferred_share_prompt_retry',
     attempt: number = 0,
     existingOpId?: string,
     retryState: WebhookRetryState = {}
@@ -650,11 +691,11 @@ export class MetaInstagramBotService {
     }
 
     const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
-    if (!combinedText) return;
-
     // Use Meta's mid when supplied; for mid-less events, assign a unique per-received-event opId
     // so internal retries still retain an isolated mutation and pending-reply checkpoint.
     const opId = existingOpId || this.normalizeWebhookMid(rawMid) || `event_${crypto.randomUUID()}`;
+
+    if (!combinedText && !this.pendingRepliesByMid.has(opId)) return;
     if (!this.claimWebhookMid(opId)) {
       return;
     }
@@ -708,7 +749,7 @@ export class MetaInstagramBotService {
         unsentMessages: [],
         retryState,
         opId,
-        rawMid,
+        rawMid: this.normalizeWebhookMid(rawMid) ?? undefined,
       };
 
       await this.processIncomingText(
@@ -1024,13 +1065,7 @@ export class MetaInstagramBotService {
 
         if (hasShareAttachment && this.shareDebounceDelayMs > 0) {
           if (this.pendingSharePrompts.has(senderId)) {
-            const existing = this.pendingSharePrompts.get(senderId)!;
-            clearTimeout(existing.timer);
-            this.pendingSharePrompts.delete(senderId);
-            const ok = await this.deliverReply(senderId, existing.promptText, existing.delivery);
-            if (ok && existing.opId) {
-              this.markWebhookMidCompleted(existing.opId);
-            }
+            await this.flushPendingSharePrompt(senderId);
           }
           const promptReel = await Repository.getSavedItemByShortcode(shortcode, senderId);
           if (promptReel) {
@@ -1092,15 +1127,25 @@ export class MetaInstagramBotService {
         clearTimeout(pending.timer);
         this.pendingSharePrompts.delete(senderId);
 
+        let targetReel = pending.reel;
+        if (delivery?.retryState?.pinnedDurationTargetReel) {
+          targetReel = delivery.retryState.pinnedDurationTargetReel;
+        } else if (delivery) {
+          delivery.retryState.pinnedDurationTargetReel = targetReel;
+          delivery.retryState.pinnedDuration = parsedDur;
+        }
+
+        const effectiveDur = delivery?.retryState?.pinnedDuration || parsedDur;
+
         // Apply conditional schedule update to guard against concurrent watch-status mutation
         const applied = await Repository.updateReminderSchedule(
-          pending.reel.id,
-          parsedDur.targetDate.toISOString(),
-          parsedDur.seconds,
+          targetReel.id,
+          effectiveDur.targetDate.toISOString(),
+          effectiveDur.seconds,
           {
-            expectedNextReminderAt: pending.reel.next_reminder_at ?? null,
-            expectedIntervalSeconds: pending.reel.reminder_interval_seconds ?? null,
-            ...(pending.reel.watch_status ? { expectedWatchStatus: pending.reel.watch_status } : {}),
+            expectedNextReminderAt: targetReel.next_reminder_at ?? null,
+            expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
+            ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
           }
         );
         if (!applied) {
@@ -1109,7 +1154,7 @@ export class MetaInstagramBotService {
         if (delivery) delivery.stateMutated = true;
         if (pending.opId) this.markWebhookMidCompleted(pending.opId);
 
-        let reply = `${pending.addedHeading}${pending.creatorLine}\n\n⏰ Reminder set for: ${parsedDur.label} (${parsedDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
+        let reply = `${pending.addedHeading}${pending.creatorLine}\n\n⏰ Reminder set for: ${effectiveDur.label} (${effectiveDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
@@ -1133,12 +1178,7 @@ export class MetaInstagramBotService {
         return;
       } else {
         // Message is neither duration nor untargeted cancel; flush the buffered prompt before proceeding
-        clearTimeout(pending.timer);
-        this.pendingSharePrompts.delete(senderId);
-        const ok = await this.deliverReply(senderId, pending.promptText, pending.delivery);
-        if (ok && pending.opId) {
-          this.markWebhookMidCompleted(pending.opId);
-        }
+        await this.flushPendingSharePrompt(senderId);
       }
     }
 
@@ -1412,10 +1452,7 @@ export class MetaInstagramBotService {
         }
         await this.deliverReply(senderId, reply, delivery);
       } else {
-        this.recentDurationHints.set(senderId, {
-          duration: customDuration,
-          timestamp: Date.now(),
-        });
+        this.recordRecentDurationHint(senderId, customDuration);
         let reply = `⏰ Got it! Duration set to ${customDuration.label} (${customDuration.formattedTarget}). Share any Reel or Post to track it!`;
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <your city>" to use your local time.`;

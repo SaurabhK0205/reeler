@@ -2223,10 +2223,13 @@ export class Repository {
       }
       if (candidates.length === 0) return null;
 
-      const ordered = sortWatchLaterReelsMostRecentFirst(
-        candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) }))
-      );
-      const target = ordered[0];
+      candidates.sort((a, b) => {
+        const timeB = new Date(b.created_at || 0).getTime();
+        const timeA = new Date(a.created_at || 0).getTime();
+        if (timeB !== timeA) return timeB - timeA;
+        return (b.save_order_rank || 0) - (a.save_order_rank || 0);
+      });
+      const target = { ...candidates[0], creator: memoryStore.creators.get(candidates[0].creator_id) };
       const now = new Date().toISOString();
 
       const stored = memoryStore.reels.get(target.id);
@@ -2271,9 +2274,8 @@ export class Repository {
     }
 
     const { data: candidates, error } = await query
-      .order('updated_at', { ascending: false })
-      .order('last_reminded_at', { ascending: false, nullsFirst: false })
       .order('created_at', { ascending: false })
+      .order('save_order_rank', { ascending: false })
       .limit(10);
 
     if (error) {
@@ -2281,7 +2283,7 @@ export class Repository {
     }
     if (!candidates || candidates.length === 0) return null;
 
-    const target = sortWatchLaterReelsMostRecentFirst(candidates as SavedReel[])[0];
+    const target = candidates[0] as SavedReel;
     const now = new Date().toISOString();
 
     if (target.is_saved_on_instagram === false) {

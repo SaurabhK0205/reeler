@@ -2851,10 +2851,20 @@ test('MetaInstagramBotService - parseCancelCommand, parseTargetedWatchedCommand,
     isCancelReminder: true,
     targetCreator: 'creator123',
   });
+  assert.deepStrictEqual(parseCancelCommand('cancel reminder for ann'), {
+    isCancelAddition: false,
+    isCancelReminder: true,
+    targetCreator: 'ann',
+  });
   assert.deepStrictEqual(parseCancelCommand('clear @badcreator'), {
     isCancelAddition: true,
     isCancelReminder: false,
     targetCreator: 'badcreator',
+  });
+  assert.deepStrictEqual(parseCancelCommand('clear ann'), {
+    isCancelAddition: true,
+    isCancelReminder: false,
+    targetCreator: 'ann',
   });
   // Bulk commands should not be parsed as single cancel addition
   assert.strictEqual(parseCancelCommand('cancel all'), null);
@@ -2863,9 +2873,14 @@ test('MetaInstagramBotService - parseCancelCommand, parseTargetedWatchedCommand,
 
   // Targeted watched commands
   assert.deepStrictEqual(parseTargetedWatchedCommand('watched @creator123'), { targetCreator: 'creator123' });
+  assert.deepStrictEqual(parseTargetedWatchedCommand('watched ann'), { targetCreator: 'ann' });
   assert.deepStrictEqual(parseTargetedWatchedCommand('done @creator123'), { targetCreator: 'creator123' });
   assert.deepStrictEqual(parseTargetedWatchedCommand('mark @creator123 as watched'), { targetCreator: 'creator123' });
   assert.strictEqual(parseTargetedWatchedCommand('watched'), null);
+
+  // Greetings and help: @mentions must NOT trigger greeting
+  assert.strictEqual(isGreetingOrHelpMessage('@help'), false);
+  assert.strictEqual(isGreetingOrHelpMessage('@hi'), false);
 
   // Greetings and help
   const greetings = [

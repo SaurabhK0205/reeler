@@ -39,8 +39,12 @@ export function parseCancelCommand(text: string): CancelCommand | null {
   }
 
   // 1. Cancel reminder only: e.g. "cancel reminder", "stop reminder", "no reminder", "remove reminder"
-  if (/^(?:cancel|stop|remove|no)\s+reminders?(?:\s+(?:for\s+)?(?:@?[a-z0-9._]{1,30}))?[!.]*$/i.test(lower)) {
-    const targetCreator = extractCreatorQuery(lower) || undefined;
+  const reminderMatch = lower.match(
+    /^(?:cancel|stop|remove|no)\s+reminders?(?:\s+(?:for\s+)?(@?[a-z0-9._]{1,30}))?[!.]*$/i
+  );
+  if (reminderMatch) {
+    const rawArg = reminderMatch[1];
+    const targetCreator = rawArg ? extractCreatorQuery(rawArg) ?? undefined : undefined;
     return {
       isCancelAddition: false,
       isCancelReminder: true,
@@ -48,9 +52,10 @@ export function parseCancelCommand(text: string): CancelCommand | null {
     };
   }
 
-  // 2. Clear / remove / cancel by creator: e.g. "clear @ykittois", "remove @ykittois", "cancel @ykittois", "delete @ykittois"
-  if (/^(?:clear|remove|delete|cancel)\s+@?[a-z0-9._]{1,30}[!.]*$/i.test(lower)) {
-    const targetCreator = extractCreatorQuery(lower);
+  // 2. Clear / remove / cancel by creator: e.g. "clear @ykittois", "clear ykittois", "remove @ann", "delete ann"
+  const clearMatch = lower.match(/^(?:clear|remove|delete|cancel)\s+(@?[a-z0-9._]{1,30})[!.]*$/i);
+  if (clearMatch) {
+    const targetCreator = extractCreatorQuery(clearMatch[1]);
     if (targetCreator) {
       return {
         isCancelAddition: true,
@@ -79,8 +84,11 @@ export function parseTargetedWatchedCommand(text: string): { targetCreator: stri
   const lower = String(text || '').toLowerCase().trim();
   if (!lower) return null;
 
-  if (/^(?:watched|done|seen|finish|finished|mark)\s+@?[a-z0-9._]{1,30}(?:\s+as\s+watched)?[!.]*$/i.test(lower)) {
-    const targetCreator = extractCreatorQuery(lower);
+  const match = lower.match(
+    /^(?:watched|done|seen|finish|finished|mark)\s+(@?[a-z0-9._]{1,30})(?:\s+as\s+watched)?[!.]*$/i
+  );
+  if (match) {
+    const targetCreator = extractCreatorQuery(match[1]);
     if (targetCreator) {
       return { targetCreator };
     }
@@ -92,9 +100,10 @@ export function parseTargetedWatchedCommand(text: string): { targetCreator: stri
  * Detects common casual greetings, help, and instruction queries.
  */
 export function isGreetingOrHelpMessage(text: string): boolean {
-  const lower = String(text || '').toLowerCase().trim();
-  if (!lower) return false;
+  const trimmed = String(text || '').trim();
+  if (!trimmed || trimmed.startsWith('@')) return false;
 
+  const lower = trimmed.toLowerCase();
   const cleaned = lower.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '');
   if (!cleaned) return false;
 
