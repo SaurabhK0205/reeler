@@ -92,15 +92,27 @@ export function parseCancelCommand(text: string): CancelCommand | null {
   }
 
   // 2. Clear / remove / cancel by creator: e.g. "clear @ykittois", "clear ykittois", "remove @ann", "delete ann"
-  const clearMatch = lower.match(/^(?:clear|remove|delete|cancel)\s+(@?[a-z0-9._]{1,30})[!.]*$/i);
+  const clearMatch = lower.match(
+    /^(?:clear|remove|delete|cancel)\s+(@[a-z0-9._]{1,30}|[a-z0-9._]{1,30})[,.!?:;~]*$/i
+  );
   if (clearMatch) {
-    const targetCreator = extractCreatorQuery(clearMatch[1]);
-    if (targetCreator) {
-      return {
-        isCancelAddition: true,
-        isCancelReminder: false,
-        targetCreator,
-      };
+    const rawArg = clearMatch[1].trim();
+    if (!/^(?:all|everything|reminders|that|it|reel|post|addition|my|data|account)$/i.test(rawArg)) {
+      const targetCreator = extractCreatorQuery(rawArg);
+      if (targetCreator) {
+        return {
+          isCancelAddition: true,
+          isCancelReminder: false,
+          targetCreator,
+        };
+      }
+      if (rawArg.startsWith('@')) {
+        return {
+          isCancelAddition: true,
+          isCancelReminder: false,
+          invalidCreatorTarget: rawArg,
+        };
+      }
     }
   }
 
@@ -115,23 +127,43 @@ export function parseCancelCommand(text: string): CancelCommand | null {
   return null;
 }
 
+export interface TargetedWatchedCommand {
+  targetCreator?: string;
+  invalidCreatorTarget?: string;
+}
+
 /**
  * Parses targeted watched commands for a specific creator:
- * e.g. "watched @creator", "done @creator", "mark @creator as watched"
+ * e.g. "watched @creator", "done @creator", "mark @creator as watched", "watched @creator,"
  */
-export function parseTargetedWatchedCommand(text: string): { targetCreator: string } | null {
+export function parseTargetedWatchedCommand(text: string): TargetedWatchedCommand | null {
   const lower = String(text || '').toLowerCase().trim();
   if (!lower) return null;
 
   const match = lower.match(
-    /^(?:watched|done|seen|finish|finished|mark)\s+(@?[a-z0-9._]{1,30})(?:\s+as\s+watched)?[!.]*$/i
+    /^(?:watched|done|seen|finish|finished|mark)\s+(.+?)(?:\s+as\s+watched)?[!.]*$/i
   );
-  if (match) {
-    const targetCreator = extractCreatorQuery(match[1]);
-    if (targetCreator) {
-      return { targetCreator };
-    }
+  if (!match) return null;
+
+  const rawArg = match[1].trim();
+  const cleaned = rawArg.replace(/[.!?,;:~]+$/, '').trim();
+
+  // Bulk targets belong to parseWatchedStopCommand
+  if (/^(?:all|everything|reminders)$/i.test(cleaned)) {
+    return null;
   }
+
+  const targetCreator = extractCreatorQuery(cleaned);
+  if (targetCreator) {
+    return { targetCreator };
+  }
+
+  // If the user specified something starting with @ or looking like a creator query,
+  // capture it as invalidCreatorTarget rather than dropping into unscoped single-watched command.
+  if (cleaned.startsWith('@') || /^[a-z0-9._-]+$/i.test(cleaned)) {
+    return { invalidCreatorTarget: rawArg };
+  }
+
   return null;
 }
 
@@ -207,6 +239,12 @@ export function parseWatchedStopCommand(text: string): WatchedStopCommand {
   // Explicit scoped reminder cancellation requests (e.g. "stop reminders for @creator")
   // belong to cancel routing rather than bulk watch/stop.
   if (/(?:cancel|stop|remove|no)\s+reminders?\s+for\s+/i.test(lower)) {
+    return { isCommand: false, markAll: false };
+  }
+
+  // Explicit targeted watched commands with creator mentions (e.g. "watched @ann", "done @creator")
+  // belong to parseTargetedWatchedCommand rather than unscoped single-item watch marking.
+  if (/(?:watched|done|seen|finish|finished|mark)\s+@/i.test(lower)) {
     return { isCommand: false, markAll: false };
   }
 

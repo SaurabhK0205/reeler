@@ -3504,3 +3504,108 @@ test('MetaInstagramBotService - cancel reminder for handle containing time keywo
     t.mock.timers.reset();
   }
 });
+
+test('MetaInstagramBotService - creator watched & clear commands accept trailing punctuation and reject invalid targets safely', async (t) => {
+  const { Repository } = await import('../src/db/repository.ts');
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('{}', { status: 404 });
+
+  const service = new MetaInstagramBotService();
+  const sentMessages: string[] = [];
+  (service as any).sendDirectMessage = async (_to: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    Repository.resetMemoryStoreForTests();
+    const sender = 'punct_test_sender';
+
+    const creatorAnn = await Repository.upsertCreator({
+      instagram_user_id: 'c_ann',
+      username: 'ann',
+      display_name: 'Ann',
+    });
+    const creatorAnna = await Repository.upsertCreator({
+      instagram_user_id: 'c_anna',
+      username: 'anna',
+      display_name: 'Anna',
+    });
+
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_ann_1',
+      shortcode: 'DAnn1',
+      reel_url: 'https://instagram.com/reel/DAnn1/',
+      creator_id: creatorAnn.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      next_reminder_at: new Date(Date.now() + 3600000).toISOString(),
+    });
+
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_anna_1',
+      shortcode: 'DAnna1',
+      reel_url: 'https://instagram.com/reel/DAnna1/',
+      creator_id: creatorAnna.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      next_reminder_at: new Date(Date.now() + 3600000).toISOString(),
+    });
+
+    // 1. Send "watched @ann," (with trailing comma)
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: 0,
+          messaging: [
+            {
+              sender: { id: sender },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: { mid: 'm_punct_1', text: 'watched @ann,' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.ok(sentMessages[0].includes('Marked 1 item(s) by @ann as watched'));
+    const annReel = await Repository.getSavedItemByShortcode('DAnn1', sender);
+    const annaReel = await Repository.getSavedItemByShortcode('DAnna1', sender);
+    assert.strictEqual(annReel?.watch_status, 'watched');
+    assert.strictEqual(annaReel?.watch_status, 'watch_later'); // Anna remains unwatched!
+
+    // 2. Send invalid creator target: "watched @invalid---name"
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: 0,
+          messaging: [
+            {
+              sender: { id: sender },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: { mid: 'm_punct_2', text: 'watched @invalid---name' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.ok(sentMessages[1].includes('Could not find a valid creator username'));
+    const annaReelAfter = await Repository.getSavedItemByShortcode('DAnna1', sender);
+    assert.strictEqual(annaReelAfter?.watch_status, 'watch_later'); // Anna STILL remains unwatched!
+  } finally {
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    globalThis.fetch = originalFetch;
+  }
+});

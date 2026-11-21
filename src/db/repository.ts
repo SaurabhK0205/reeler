@@ -2492,6 +2492,7 @@ export class Repository {
         reels: SavedReel[];
         deletedIds: string[];
         revertedIds: string[];
+        targetUpdatedAts?: Record<string, string>;
       };
       onPartialProgress?: (mutated: boolean) => void;
     }
@@ -2520,6 +2521,9 @@ export class Repository {
           reels: candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) })),
           deletedIds: [],
           revertedIds: [],
+          targetUpdatedAts: Object.fromEntries(
+            candidates.map((r) => [r.id, r.updated_at || r.created_at || ''])
+          ),
         };
         if (state) {
           Object.assign(state, initial);
@@ -2532,7 +2536,13 @@ export class Repository {
       for (const id of state.toDeleteIds) {
         if (!state.deletedIds.includes(id)) {
           const reel = memoryStore.reels.get(id);
-          if (reel && reel.watch_status === 'watch_later' && reel.instagram_sender_id === trimmedSender) {
+          const expectedUpdatedAt = state.targetUpdatedAts?.[id];
+          if (
+            reel &&
+            reel.watch_status === 'watch_later' &&
+            reel.instagram_sender_id === trimmedSender &&
+            (!expectedUpdatedAt || (reel.updated_at || reel.created_at || '') === expectedUpdatedAt)
+          ) {
             if (reel.is_saved_on_instagram !== false) {
               // Row was promoted to IG saved; move to revert instead of deleting
               if (!state.toRevertIds.includes(id)) {
@@ -2551,7 +2561,12 @@ export class Repository {
       for (const id of state.toRevertIds) {
         if (!state.revertedIds.includes(id)) {
           const reel = memoryStore.reels.get(id);
-          if (reel && reel.watch_status === 'watch_later') {
+          const expectedUpdatedAt = state.targetUpdatedAts?.[id];
+          if (
+            reel &&
+            reel.watch_status === 'watch_later' &&
+            (!expectedUpdatedAt || (reel.updated_at || reel.created_at || '') === expectedUpdatedAt)
+          ) {
             reel.watch_status = 'unwatched';
             reel.next_reminder_at = null;
             reel.reminder_interval_seconds = null;
@@ -2610,6 +2625,9 @@ export class Repository {
         reels: reels as SavedReel[],
         deletedIds: [],
         revertedIds: [],
+        targetUpdatedAts: Object.fromEntries(
+          reels.map((r: any) => [r.id, r.updated_at || r.created_at || ''])
+        ),
       };
       if (state) {
         Object.assign(state, initial);
@@ -2621,22 +2639,43 @@ export class Repository {
     const now = new Date().toISOString();
     const remainingDeleteIds = state.toDeleteIds.filter((id) => !state!.deletedIds.includes(id));
     if (remainingDeleteIds.length > 0) {
-      const { data: deleted, error: delErr } = await supabase
-        .from('saved_reels')
-        .delete()
-        .in('id', remainingDeleteIds)
-        .eq('instagram_sender_id', trimmedSender)
-        .eq('is_saved_on_instagram', false)
-        .eq('watch_status', 'watch_later')
-        .select('id');
-      if (delErr) {
-        throw new Error(`Failed to delete bot-added reels: ${delErr.message}`);
+      // In Supabase, verify each remaining delete candidate still has its original updated_at
+      // so if the user re-added the reel in the interim, the re-added reel is preserved.
+      let eligibleDeleteIds = remainingDeleteIds;
+      if (state.targetUpdatedAts) {
+        const { data: currentRows } = await supabase
+          .from('saved_reels')
+          .select('id, updated_at, created_at')
+          .in('id', remainingDeleteIds);
+        const matchSet = new Set(
+          (currentRows || [])
+            .filter((row: any) => {
+              const expected = state!.targetUpdatedAts?.[row.id];
+              const actual = row.updated_at || row.created_at || '';
+              return !expected || actual === expected;
+            })
+            .map((r: any) => r.id)
+        );
+        eligibleDeleteIds = remainingDeleteIds.filter((id) => matchSet.has(id));
       }
-      const confirmedDeletedIds = (deleted || []).map((d: any) => d.id);
-      state.deletedIds.push(...confirmedDeletedIds);
-      if (confirmedDeletedIds.length > 0) {
-        Repository.invalidateCreatorsCache();
-        options?.onPartialProgress?.(true);
+      if (eligibleDeleteIds.length > 0) {
+        const { data: deleted, error: delErr } = await supabase
+          .from('saved_reels')
+          .delete()
+          .in('id', eligibleDeleteIds)
+          .eq('instagram_sender_id', trimmedSender)
+          .eq('is_saved_on_instagram', false)
+          .eq('watch_status', 'watch_later')
+          .select('id');
+        if (delErr) {
+          throw new Error(`Failed to delete bot-added reels: ${delErr.message}`);
+        }
+        const confirmedDeletedIds = (deleted || []).map((d: any) => d.id);
+        state.deletedIds.push(...confirmedDeletedIds);
+        if (confirmedDeletedIds.length > 0) {
+          Repository.invalidateCreatorsCache();
+          options?.onPartialProgress?.(true);
+        }
       }
       for (const id of remainingDeleteIds) {
         if (!state.deletedIds.includes(id) && !state.toRevertIds.includes(id)) {
@@ -2647,26 +2686,45 @@ export class Repository {
 
     const remainingRevertIds = state.toRevertIds.filter((id) => !state!.revertedIds.includes(id));
     if (remainingRevertIds.length > 0) {
-      const { data: reverted, error: revErr } = await supabase
-        .from('saved_reels')
-        .update({
-          watch_status: 'unwatched',
-          next_reminder_at: null,
-          reminder_interval_seconds: null,
-          awaiting_reminder_choice_until: null,
-          updated_at: now,
-        })
-        .in('id', remainingRevertIds)
-        .eq('instagram_sender_id', trimmedSender)
-        .eq('watch_status', 'watch_later')
-        .select('*, creator:creators(*)');
-      if (revErr) {
-        throw new Error(`Failed to revert saved reels to unwatched: ${revErr.message}`);
+      let eligibleRevertIds = remainingRevertIds;
+      if (state.targetUpdatedAts) {
+        const { data: currentRows } = await supabase
+          .from('saved_reels')
+          .select('id, updated_at, created_at')
+          .in('id', remainingRevertIds);
+        const matchSet = new Set(
+          (currentRows || [])
+            .filter((row: any) => {
+              const expected = state!.targetUpdatedAts?.[row.id];
+              const actual = row.updated_at || row.created_at || '';
+              return !expected || actual === expected;
+            })
+            .map((r: any) => r.id)
+        );
+        eligibleRevertIds = remainingRevertIds.filter((id) => matchSet.has(id));
       }
-      const confirmedRevertedIds = (reverted || []).map((r: any) => r.id);
-      state.revertedIds.push(...confirmedRevertedIds);
-      if (confirmedRevertedIds.length > 0) {
-        options?.onPartialProgress?.(true);
+      if (eligibleRevertIds.length > 0) {
+        const { data: reverted, error: revErr } = await supabase
+          .from('saved_reels')
+          .update({
+            watch_status: 'unwatched',
+            next_reminder_at: null,
+            reminder_interval_seconds: null,
+            awaiting_reminder_choice_until: null,
+            updated_at: now,
+          })
+          .in('id', eligibleRevertIds)
+          .eq('instagram_sender_id', trimmedSender)
+          .eq('watch_status', 'watch_later')
+          .select('*, creator:creators(*)');
+        if (revErr) {
+          throw new Error(`Failed to revert saved reels to unwatched: ${revErr.message}`);
+        }
+        const confirmedRevertedIds = (reverted || []).map((r: any) => r.id);
+        state.revertedIds.push(...confirmedRevertedIds);
+        if (confirmedRevertedIds.length > 0) {
+          options?.onPartialProgress?.(true);
+        }
       }
     }
 

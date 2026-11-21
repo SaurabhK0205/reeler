@@ -305,8 +305,15 @@ export class ReminderWorker {
       console.log(`[ReminderWorker] Found ${allDueReels.length} Reel(s) due for reminder (dispatching batch of ${dueReels.length}).`);
 
       for (const reel of dueReels) {
-        // Recheck schedule immediately before sending to ensure reminder was not cancelled in the interim
-        const freshReel = await Repository.getSavedItemByShortcode(reel.shortcode, reel.instagram_sender_id);
+        // Recheck schedule immediately before sending to ensure reminder was not cancelled in the interim.
+        // Scope explicitly to unattributed rows (null) if reel.instagram_sender_id is absent.
+        let freshReel: SavedReel | null = null;
+        try {
+          freshReel = await Repository.getSavedItemByShortcode(reel.shortcode, reel.instagram_sender_id ?? null);
+        } catch (err: any) {
+          console.error(`[ReminderWorker] Failed to reload due reel ${reel.shortcode}:`, err.message || err);
+          continue;
+        }
         if (
           !freshReel ||
           freshReel.watch_status !== 'watch_later' ||
