@@ -7,6 +7,8 @@ import { formatTargetTime } from '../utils/duration.ts';
 import { classifySavedMediaType, formatCanonicalInstagramUrl } from '../utils/mediaType.ts';
 import {
   parseWatchedStopCommand,
+  parseCancelCommand,
+  formatHumanReelLabel,
   formatAddedToWatchLaterCreatorBlock,
   formatWatchedConfirmationMessage,
   formatWatchLaterReminderMessage,
@@ -252,12 +254,34 @@ export class ReminderWorker {
       return;
     }
 
-    // Case 2: Text command (e.g. "done", "watched", "stop all", "cancel")
+    // Case 2: Text command (e.g. "done", "watched", "stop all", "cancel", "cancel reminder")
     if (msg.text) {
-      const lower = msg.text.trim().toLowerCase();
-      const isLegacyCancel = /^(?:cancel|cancel\s+reminder)[!.]*$/i.test(lower);
+      const cancelCmd = parseCancelCommand(msg.text);
+      if (cancelCmd) {
+        if (this.adminUserId) {
+          if (cancelCmd.isCancelAddition) {
+            const cancelled = await Repository.cancelRecentAdditionForSender(this.adminUserId, {
+              targetCreator: cancelCmd.targetCreator,
+            });
+            const reply = cancelled
+              ? `❌ Cancelled! Removed ${formatHumanReelLabel(cancelled.cancelledReel, 40)} from your Watch Later.`
+              : `ℹ️ No recent item found in your Watch Later to cancel.`;
+            await this.actionClient.sendDirectMessage(this.adminUserId, reply);
+          } else if (cancelCmd.isCancelReminder) {
+            const result = await Repository.cancelReminderForSender(this.adminUserId, {
+              targetCreator: cancelCmd.targetCreator,
+            });
+            const reply = result
+              ? `⏰ Reminder cancelled for ${formatHumanReelLabel(result.updatedReel, 40)}. It will remain saved in your Watch Later list without alerts.`
+              : `ℹ️ No active reminder found to cancel.`;
+            await this.actionClient.sendDirectMessage(this.adminUserId, reply);
+          }
+        }
+        return;
+      }
+
       const { isCommand, markAll } = parseWatchedStopCommand(msg.text);
-      if (isCommand || isLegacyCancel) {
+      if (isCommand) {
         const { updatedReels, remainingCount, remainingReels } = await Repository.markWatchedForInstagramSender(
           this.adminUserId || '',
           { markAll, includeUnattributedFallback: true }
@@ -311,10 +335,9 @@ export class ReminderWorker {
 
       for (const reel of dueReels) {
         // Recheck schedule immediately before sending to ensure reminder was not cancelled in the interim.
-        // Scope explicitly to unattributed rows (null) if reel.instagram_sender_id is absent.
         let freshReel: SavedReel | null = null;
         try {
-          freshReel = await Repository.getSavedItemByShortcode(reel.shortcode, reel.instagram_sender_id ?? null);
+          freshReel = await Repository.getSavedItemById(reel.id);
         } catch (err: any) {
           console.error(`[ReminderWorker] Failed to reload due reel ${reel.shortcode}:`, err.message || err);
           continue;
@@ -326,6 +349,12 @@ export class ReminderWorker {
           new Date(freshReel.next_reminder_at).getTime() > Date.now()
         ) {
           console.log(`[ReminderWorker] Skipping reel ${reel.shortcode} because its reminder is no longer due.`);
+          continue;
+        }
+
+        const hasRecipient = Boolean(freshReel.instagram_sender_id || (this.adminUserId && config.instagram.isConfigured));
+        if (!hasRecipient) {
+          console.warn(`[ReminderWorker] Skipping reel ${reel.shortcode} because no valid recipient exists.`);
           continue;
         }
 
@@ -377,13 +406,12 @@ export class ReminderWorker {
             }
             this.failedReelSuppression.set(suppressionKey, Date.now() + 5 * 60 * 1000);
 
-            // Attempt fallback persistence: clear due date for one-time reminders (nextDate === null),
-            // or back off 5 minutes for recurring reminders
+            // Attempt fallback persistence: preserve the normal nextDate with the expected-schedule guard
+            // so recovery cannot overwrite a cancellation, without scheduling another delivery 5 minutes later
             try {
-              const fallbackDate = nextDate === null ? null : new Date(Date.now() + 5 * 60 * 1000).toISOString();
               await Repository.updateReminderSchedule(
                 freshReel.id,
-                fallbackDate,
+                nextDate,
                 undefined,
                 { expectedNextReminderAt: freshReel.next_reminder_at }
               );
