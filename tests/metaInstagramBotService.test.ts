@@ -4,6 +4,7 @@ import {
   MetaInstagramBotService,
   isMetaMessagingWindowError,
 } from '../src/services/metaInstagramBotService.ts';
+import { Repository } from '../src/db/repository.ts';
 
 test('MetaInstagramBotService - splitMessageIntoChunks handles short and empty text', () => {
   const service = new MetaInstagramBotService();
@@ -3711,5 +3712,155 @@ test('MetaInstagramBotService - creator watched & clear commands accept trailing
     Repository.resetMemoryStoreForTests();
     if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('Repository - creator filter scoping fallback, markWatched completed exclusion, and safe promotion revert', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+
+  try {
+    Repository.resetMemoryStoreForTests();
+
+    const sender = 'sender_filter_test';
+    const creatorAnn = await Repository.upsertCreator({
+      instagram_user_id: 'c_ann_scope',
+      username: 'ann',
+      display_name: 'Ann',
+    });
+    const creatorAnna = await Repository.upsertCreator({
+      instagram_user_id: 'c_anna_scope',
+      username: 'anna',
+      display_name: 'Anna',
+    });
+
+    // Sender owns reel from Ann
+    const reelAnn = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_ann_scope',
+      shortcode: 'AnnScope',
+      reel_url: 'https://instagram.com/reel/AnnScope/',
+      creator_id: creatorAnn.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      next_reminder_at: new Date(Date.now() + 3600000).toISOString(),
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 1,
+    });
+
+    // Unattributed reel from Anna
+    const reelAnna = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_anna_scope',
+      shortcode: 'AnnaScope',
+      reel_url: 'https://instagram.com/reel/AnnaScope/',
+      creator_id: creatorAnna.id,
+      instagram_sender_id: undefined,
+      watch_status: 'watch_later',
+      next_reminder_at: new Date(Date.now() + 3600000).toISOString(),
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 2,
+    });
+
+    // 1. cancelReminderForSender: sender targets creator 'anna' (owned is 'ann', unattributed is 'anna')
+    // Candidate filtering by creator must occur BEFORE deciding whether to use unattributed fallback
+    const cancelReminderRes = await Repository.cancelReminderForSender(sender, {
+      targetCreator: 'anna',
+      includeUnattributedFallback: true,
+    });
+    assert.ok(cancelReminderRes, 'Expected unattributed reminder for anna to be cancelled');
+    assert.strictEqual(cancelReminderRes.updatedReel.id, reelAnna.id);
+    assert.strictEqual(cancelReminderRes.updatedReel.next_reminder_at, null);
+
+    // Ann's reminder should remain active
+    const freshAnn = await Repository.getSavedItemById(reelAnn.id);
+    assert.ok(freshAnn?.next_reminder_at, 'Ann reminder should still be active');
+
+    // 2. cancelRecentAdditionForSender: same scoping check
+    const cancelAdditionRes = await Repository.cancelRecentAdditionForSender(sender, {
+      targetCreator: 'anna',
+      includeUnattributedFallback: true,
+    });
+    assert.ok(cancelAdditionRes, 'Expected unattributed addition for anna to be cancelled');
+    assert.strictEqual(cancelAdditionRes.cancelledReel.id, reelAnna.id);
+
+    // 3. markWatchedForCreator: completedReelIds exclusion
+    const r1 = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_r1',
+      shortcode: 'R1Code',
+      reel_url: 'https://instagram.com/reel/R1Code/',
+      creator_id: creatorAnn.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 3,
+    });
+    const r2 = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_r2',
+      shortcode: 'R2Code',
+      reel_url: 'https://instagram.com/reel/R2Code/',
+      creator_id: creatorAnn.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 4,
+    });
+
+    const completedIds = [r1.id];
+    const markRes = await Repository.markWatchedForCreator(sender, 'ann', {
+      completedReelIds: completedIds,
+    });
+    // r1 was already in completedReelIds, so only remaining Watch Later reels for Ann (reelAnn and r2) are mutated
+    assert.strictEqual(markRes.totalMarkedCount, 3); // 1 completed + 2 newly marked
+    assert.strictEqual(markRes.updatedReels.some((r) => r.id === r1.id), false); // r1 not mutated again
+
+    // 4. clearWatchLaterForCreator: safe promotion revert
+    const botReel = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_bot_promo',
+      shortcode: 'BotPromo',
+      reel_url: 'https://instagram.com/reel/BotPromo/',
+      creator_id: creatorAnna.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 5,
+    });
+
+    const pinnedClearState = {
+      toDeleteIds: [botReel.id],
+      toRevertIds: [],
+      reels: [botReel],
+      deletedIds: [] as string[],
+      revertedIds: [] as string[],
+      targetUpdatedAts: { [botReel.id]: botReel.updated_at || botReel.created_at || '' },
+    };
+
+    // Simulate archive promotion in between pin and clear execution
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_bot_promo',
+      shortcode: 'BotPromo',
+      reel_url: 'https://instagram.com/reel/BotPromo/',
+      creator_id: creatorAnna.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      is_saved_on_instagram: true,
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 5,
+    });
+
+    const clearRes = await Repository.clearWatchLaterForCreator(sender, 'anna', {
+      pinnedState: pinnedClearState,
+    });
+    assert.strictEqual(clearRes.clearedReels.length, 1);
+    const cleared = await Repository.getSavedItemById(botReel.id);
+    assert.strictEqual(cleared?.watch_status, 'unwatched', 'Promoted reel must be reverted to unwatched, not deleted');
+  } finally {
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
   }
 });

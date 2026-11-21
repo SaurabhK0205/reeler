@@ -30,13 +30,15 @@ export class ReminderWorker {
   private isDispatching = false;
   private isCheckingChoices = false;
   private isPollingInboundDMs = false;
+  private pendingAdminConfirmationReplies: string[] = [];
   private failedReelSuppression = new Map<string, number>();
   private deliveredPersistenceCheckpoints = new Map<
     string,
     {
       reelId: string;
       nextDate: string | null;
-      expectedNextReminderAt: string;
+      expectedNextReminderAt: string | null;
+      deliveryTimestamp: number;
       attempts: number;
       nextRetryAt: number;
     }
@@ -47,7 +49,8 @@ export class ReminderWorker {
     checkpoint: {
       reelId: string;
       nextDate: string | null;
-      expectedNextReminderAt: string;
+      expectedNextReminderAt: string | null;
+      deliveryTimestamp?: number;
       attempts?: number;
       nextRetryAt?: number;
     }
@@ -58,6 +61,7 @@ export class ReminderWorker {
     }
     this.deliveredPersistenceCheckpoints.set(key, {
       ...checkpoint,
+      deliveryTimestamp: checkpoint.deliveryTimestamp ?? Date.now(),
       attempts: checkpoint.attempts ?? 0,
       nextRetryAt: checkpoint.nextRetryAt ?? Date.now(),
     });
@@ -151,6 +155,16 @@ export class ReminderWorker {
         this.adminThreadId = threadRes.data.threadId;
         this.adminUserId = threadRes.data.adminUserId;
         console.log(`[ReminderWorker] Connected to Admin DM thread: ${this.adminThreadId} (Admin User ID: ${this.adminUserId})`);
+      }
+
+      // Flush pending confirmation replies from prior transient DM failures
+      if (this.pendingAdminConfirmationReplies.length > 0 && this.adminUserId) {
+        const remaining: string[] = [];
+        for (const pendingReply of this.pendingAdminConfirmationReplies) {
+          const res = await this.actionClient.sendDirectMessage(this.adminUserId, pendingReply);
+          if (!res.success) remaining.push(pendingReply);
+        }
+        this.pendingAdminConfirmationReplies = remaining;
       }
 
       const messagesRes = await this.actionClient.getThreadMessages(this.adminThreadId);
@@ -299,10 +313,13 @@ export class ReminderWorker {
         if (this.adminUserId) {
           if (cancelCmd.invalidCreatorTarget) {
             const example = cancelCmd.isCancelAddition ? 'clear @creator' : 'cancel reminder for @creator';
-            const reply = `ℹ️ Could not find a valid creator handle in "${cancelCmd.invalidCreatorTarget}". Reply e.g. "${example}".`;
+            const rawTarget = cancelCmd.invalidCreatorTarget;
+            const shownTarget = rawTarget.length > 100 ? `${rawTarget.slice(0, 100)}...` : rawTarget;
+            const reply = `ℹ️ Could not find a valid creator handle in "${shownTarget}". Reply e.g. "${example}".`;
             const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reply);
             if (!sendResult.success) {
               console.error('[ReminderWorker] Failed to send admin error reply:', sendResult.error);
+              this.pendingAdminConfirmationReplies.push(reply);
             }
             return;
           }
@@ -318,6 +335,7 @@ export class ReminderWorker {
               const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reply);
               if (!sendResult.success) {
                 console.error('[ReminderWorker] Failed to send admin clear reply:', sendResult.error);
+                this.pendingAdminConfirmationReplies.push(reply);
               }
             } else {
               const cancelled = await Repository.cancelRecentAdditionForSender(this.adminUserId, {
@@ -329,6 +347,7 @@ export class ReminderWorker {
               const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reply);
               if (!sendResult.success) {
                 console.error('[ReminderWorker] Failed to send admin cancel reply:', sendResult.error);
+                this.pendingAdminConfirmationReplies.push(reply);
               }
             }
           } else if (cancelCmd.isCancelReminder) {
@@ -342,6 +361,7 @@ export class ReminderWorker {
             const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reply);
             if (!sendResult.success) {
               console.error('[ReminderWorker] Failed to send admin cancel reminder reply:', sendResult.error);
+              this.pendingAdminConfirmationReplies.push(reply);
             }
           }
         }
@@ -359,6 +379,7 @@ export class ReminderWorker {
           const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reply);
           if (!sendResult.success) {
             console.error('[ReminderWorker] Failed to send admin watched reply:', sendResult.error);
+            this.pendingAdminConfirmationReplies.push(reply);
           }
         }
         return;
@@ -385,9 +406,9 @@ export class ReminderWorker {
         }
       }
 
-      // Prune stale checkpoints older than 24 hours
+      // Prune stale checkpoints older than 24 hours from original delivery
       for (const [key, checkpoint] of this.deliveredPersistenceCheckpoints.entries()) {
-        if (now > checkpoint.nextRetryAt + 24 * 3600 * 1000) {
+        if (now > checkpoint.deliveryTimestamp + 24 * 3600 * 1000) {
           this.deliveredPersistenceCheckpoints.delete(key);
         }
       }
@@ -400,7 +421,10 @@ export class ReminderWorker {
         checkpointRecoveries++;
         try {
           const fresh = await Repository.getSavedItemById(checkpoint.reelId);
-          if (!fresh || fresh.next_reminder_at !== checkpoint.expectedNextReminderAt) {
+          const matchesExpectation = checkpoint.expectedNextReminderAt === null
+            ? fresh?.next_reminder_at === null
+            : fresh?.next_reminder_at === checkpoint.expectedNextReminderAt;
+          if (!fresh || !matchesExpectation) {
             this.deliveredPersistenceCheckpoints.delete(key);
             continue;
           }
@@ -447,13 +471,15 @@ export class ReminderWorker {
           !freshReel ||
           freshReel.watch_status !== 'watch_later' ||
           !freshReel.next_reminder_at ||
-          new Date(freshReel.next_reminder_at).getTime() > Date.now()
+          new Date(freshReel.next_reminder_at).getTime() > Date.now() ||
+          String(freshReel.instagram_sender_id || '') !== String(reel.instagram_sender_id || '')
         ) {
-          console.log(`[ReminderWorker] Skipping reel ${reel.shortcode} because its reminder is no longer due.`);
+          console.log(`[ReminderWorker] Skipping reel ${reel.shortcode} because its reminder is no longer due or owner changed.`);
           continue;
         }
 
-        const hasRecipient = Boolean(freshReel.instagram_sender_id || (this.adminUserId && config.instagram.isConfigured));
+        const recipientSenderId = freshReel.instagram_sender_id;
+        const hasRecipient = Boolean(recipientSenderId || (this.adminUserId && config.instagram.isConfigured));
         if (!hasRecipient) {
           console.warn(`[ReminderWorker] Skipping reel ${reel.shortcode} because no valid recipient exists.`);
           this.failedReelSuppression.set(`${freshReel.id}:${freshReel.next_reminder_at || ''}`, Date.now() + 5 * 60 * 1000);
@@ -465,10 +491,10 @@ export class ReminderWorker {
         let delivered = false;
 
         try {
-          if (reel.instagram_sender_id && this.metaBot.isConfigured) {
-            console.log(`[ReminderWorker] Dispatching Instagram DM reminder to ${reel.instagram_sender_id}...`);
-            delivered = await this.metaBot.sendDirectMessage(reel.instagram_sender_id, reminderText);
-          } else if (!reel.instagram_sender_id && this.adminUserId && config.instagram.isConfigured) {
+          if (recipientSenderId && this.metaBot.isConfigured) {
+            console.log(`[ReminderWorker] Dispatching Instagram DM reminder to ${recipientSenderId}...`);
+            delivered = await this.metaBot.sendDirectMessage(recipientSenderId, reminderText);
+          } else if (!recipientSenderId && this.adminUserId && config.instagram.isConfigured) {
             // Supported delivery fallback for legacy or unattributed sender reels
             console.log(`[ReminderWorker] Dispatching fallback reminder to admin (${this.adminUserId})...`);
             const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reminderText);
@@ -518,16 +544,16 @@ export class ReminderWorker {
             // Attempt fallback persistence: preserve the normal nextDate with the expected-schedule guard
             // so recovery cannot overwrite a cancellation, without scheduling another delivery 5 minutes later
             try {
-              await Repository.updateReminderSchedule(
+              const fallbackUpdated = await Repository.updateReminderSchedule(
                 freshReel.id,
                 nextDate,
                 undefined,
                 { expectedNextReminderAt: freshReel.next_reminder_at }
               );
-              // Update expectedNextReminderAt on checkpoint so guarded recordReminderSent can still persist delivery metadata
+              // Advance checkpoint expectation only when guarded fallback write was applied
               const existingCheckpoint = this.deliveredPersistenceCheckpoints.get(suppressionKey);
-              if (existingCheckpoint) {
-                existingCheckpoint.expectedNextReminderAt = nextDate ?? '';
+              if (fallbackUpdated && existingCheckpoint) {
+                existingCheckpoint.expectedNextReminderAt = nextDate;
               }
             } catch (fallbackErr: any) {
               console.error(`[ReminderWorker] Fallback schedule update failed for reel ${freshReel.shortcode}:`, fallbackErr.message || fallbackErr);
