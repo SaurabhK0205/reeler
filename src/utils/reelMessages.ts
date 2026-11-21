@@ -371,8 +371,7 @@ export function formatAddedToWatchLaterCreatorBlock(
 ): string {
   const label = formatCreatorDisplayLabel(creator, { includeProfileUrl: false });
   if (!label) return '';
-  const profileLine = formatCreatorProfileLine(creator);
-  return profileLine ? `\nCreator: ${label}\n${profileLine}` : `\nCreator: ${label}`;
+  return `\nCreator: ${label}`;
 }
 
 /**
