@@ -2197,12 +2197,21 @@ export class Repository {
   ): Promise<boolean> {
     const now = new Date().toISOString();
 
+    const isSameInstant = (a: string | null | undefined, b: string | null | undefined): boolean => {
+      const normA = a ?? null;
+      const normB = b ?? null;
+      if (normA === null || normB === null) return normA === normB;
+      const timeA = new Date(normA).getTime();
+      const timeB = new Date(normB).getTime();
+      return !isNaN(timeA) && !isNaN(timeB) && timeA === timeB;
+    };
+
     if (!isSupabaseConfigured()) {
       const reel = memoryStore.reels.get(id);
       if (reel) {
         if (
           options?.expectedNextReminderAt !== undefined &&
-          (reel.next_reminder_at ?? null) !== (options.expectedNextReminderAt ?? null)
+          !isSameInstant(reel.next_reminder_at, options.expectedNextReminderAt)
         ) {
           return false;
         }
@@ -2226,7 +2235,7 @@ export class Repository {
     if (!current) return false;
     if (
       options?.expectedNextReminderAt !== undefined &&
-      (current.next_reminder_at ?? null) !== (options.expectedNextReminderAt ?? null)
+      !isSameInstant(current.next_reminder_at, options.expectedNextReminderAt)
     ) {
       // Missing or superseded schedule: not a persistence error, leave newer schedule untouched
       return false;
@@ -2243,9 +2252,9 @@ export class Repository {
       })
       .eq('id', id);
     if (options?.expectedNextReminderAt !== undefined) {
-      upQuery = options.expectedNextReminderAt === null
+      upQuery = current.next_reminder_at === null
         ? upQuery.is('next_reminder_at', null)
-        : upQuery.eq('next_reminder_at', options.expectedNextReminderAt);
+        : upQuery.eq('next_reminder_at', current.next_reminder_at);
     }
     const { data, error: upErr } = await upQuery.select('id');
     if (upErr) throw new Error(`Failed to update reminder record: ${upErr.message}`);
@@ -2853,20 +2862,35 @@ export class Repository {
     }
 
     const now = new Date().toISOString();
+    const applyOwnerFilter = (query: any) => {
+      if (trimmedSender && !allowUnattributedFallback) {
+        return query.eq('instagram_sender_id', trimmedSender);
+      }
+      if (trimmedSender && allowUnattributedFallback) {
+        return query.or(`instagram_sender_id.eq.${trimmedSender},instagram_sender_id.is.null,instagram_sender_id.eq.`);
+      }
+      if (allowUnattributedFallback) {
+        return query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+      return query;
+    };
+
     const remainingDeleteIds = state.toDeleteIds.filter((id) => !state!.deletedIds.includes(id));
     if (remainingDeleteIds.length > 0) {
       const BATCH_SIZE = 100;
       for (let i = 0; i < remainingDeleteIds.length; i += BATCH_SIZE) {
         const batch = remainingDeleteIds.slice(i, i + BATCH_SIZE);
-        const { data: currentRows, error: fetchErr } = await supabase
+        let fetchQuery = supabase
           .from('saved_reels')
-          .select('id, updated_at, is_saved_on_instagram, watch_status')
+          .select('id, updated_at, is_saved_on_instagram, watch_status, instagram_sender_id')
           .in('id', batch);
+        fetchQuery = applyOwnerFilter(fetchQuery);
+        const { data: currentRows, error: fetchErr } = await fetchQuery;
         if (fetchErr) {
           throw new Error(`Failed to verify reel status before clear: ${fetchErr.message}`);
         }
 
-        const validDeleteIds: string[] = [];
+        const deleteGroups = new Map<string, string[]>();
         for (const row of (currentRows || []) as any[]) {
           if (row.watch_status !== 'watch_later') continue;
           if (row.is_saved_on_instagram !== false) {
@@ -2881,18 +2905,24 @@ export class Repository {
           }
           const expectedVersion = state.targetUpdatedAts?.[row.id] || '';
           if (!expectedVersion || row.updated_at === expectedVersion) {
-            validDeleteIds.push(row.id);
+            const group = deleteGroups.get(expectedVersion) || [];
+            group.push(row.id);
+            deleteGroups.set(expectedVersion, group);
           }
         }
 
-        if (validDeleteIds.length > 0) {
-          const { data: deleted, error: delErr } = await supabase
+        for (const [version, validDeleteIds] of deleteGroups.entries()) {
+          let delQuery = supabase
             .from('saved_reels')
             .delete()
             .in('id', validDeleteIds)
             .eq('is_saved_on_instagram', false)
-            .eq('watch_status', 'watch_later')
-            .select('id');
+            .eq('watch_status', 'watch_later');
+          delQuery = applyOwnerFilter(delQuery);
+          if (version) {
+            delQuery = delQuery.eq('updated_at', version);
+          }
+          const { data: deleted, error: delErr } = await delQuery.select('id');
           if (delErr) {
             throw new Error(`Failed to delete bot-added reels: ${delErr.message}`);
           }
@@ -2911,25 +2941,29 @@ export class Repository {
       const BATCH_SIZE = 100;
       for (let i = 0; i < remainingRevertIds.length; i += BATCH_SIZE) {
         const batch = remainingRevertIds.slice(i, i + BATCH_SIZE);
-        const { data: currentRows, error: fetchErr } = await supabase
+        let fetchQuery = supabase
           .from('saved_reels')
-          .select('id, updated_at, watch_status')
+          .select('id, updated_at, watch_status, instagram_sender_id')
           .in('id', batch);
+        fetchQuery = applyOwnerFilter(fetchQuery);
+        const { data: currentRows, error: fetchErr } = await fetchQuery;
         if (fetchErr) {
           throw new Error(`Failed to verify reel status before revert: ${fetchErr.message}`);
         }
 
-        const validRevertIds: string[] = [];
+        const revertGroups = new Map<string, string[]>();
         for (const row of (currentRows || []) as any[]) {
           if (row.watch_status !== 'watch_later') continue;
           const expectedVersion = state.targetUpdatedAts?.[row.id] || '';
           if (!expectedVersion || row.updated_at === expectedVersion) {
-            validRevertIds.push(row.id);
+            const group = revertGroups.get(expectedVersion) || [];
+            group.push(row.id);
+            revertGroups.set(expectedVersion, group);
           }
         }
 
-        if (validRevertIds.length > 0) {
-          const { data: reverted, error: revErr } = await supabase
+        for (const [version, validRevertIds] of revertGroups.entries()) {
+          let revQuery = supabase
             .from('saved_reels')
             .update({
               watch_status: 'unwatched',
@@ -2939,8 +2973,12 @@ export class Repository {
               updated_at: now,
             })
             .in('id', validRevertIds)
-            .eq('watch_status', 'watch_later')
-            .select('id');
+            .eq('watch_status', 'watch_later');
+          revQuery = applyOwnerFilter(revQuery);
+          if (version) {
+            revQuery = revQuery.eq('updated_at', version);
+          }
+          const { data: reverted, error: revErr } = await revQuery.select('id');
           if (revErr) {
             throw new Error(`Failed to revert saved reels to unwatched: ${revErr.message}`);
           }
