@@ -78,6 +78,8 @@ const DEFAULT_WEBHOOK_RETRY_DELAYS_MS = [2000, 8000];
 interface WebhookRetryState {
   /** Preserves the exact Reel snapshot resolved on the initial duration command across internal retries. */
   pinnedDurationTargetReel?: SavedReel | null;
+  /** Whether the pinned duration target was awaiting a choice after a reshare. */
+  pinnedDurationUpdatesReshare?: boolean;
   /** Preserves the initially parsed target timestamp & duration across internal retries. */
   pinnedDuration?: ReturnType<typeof parseDuration>;
   /** Preserves the duration resolved for an inbound share across internal retries. */
@@ -191,6 +193,26 @@ export class MetaInstagramBotService {
   private inFlightShares = new Map<string, InFlightShareContext>();
   private static readonly MAX_RECENT_ADDITIONS = 1000;
   private lastConfirmedAdditionReelId = new Map<string, string>();
+  private reshareChoiceDeadlines = new Map<string, number>();
+
+  private recordShareChoice(reel: SavedReel, isReshare: boolean): void {
+    this.reshareChoiceDeadlines.delete(reel.id);
+    const deadline = Date.parse(reel.awaiting_reminder_choice_until ?? '');
+    if (!isReshare || !(deadline > Date.now())) return;
+
+    if (this.reshareChoiceDeadlines.size >= MetaInstagramBotService.MAX_RECENT_ADDITIONS) {
+      const oldest = this.reshareChoiceDeadlines.keys().next().value;
+      if (oldest !== undefined) this.reshareChoiceDeadlines.delete(oldest);
+    }
+    this.reshareChoiceDeadlines.set(reel.id, deadline);
+  }
+
+  private isAwaitingReshareChoice(reel: SavedReel): boolean {
+    const deadline = Date.parse(reel.awaiting_reminder_choice_until ?? '');
+    return reel.watch_status === 'watch_later' &&
+      deadline > Date.now() &&
+      this.reshareChoiceDeadlines.get(reel.id) === deadline;
+  }
 
   private recordLastConfirmedAddition(senderId: string, reelId: string): void {
     if (this.lastConfirmedAdditionReelId.has(senderId)) {
@@ -256,6 +278,7 @@ export class MetaInstagramBotService {
     this.pendingSharePrompts.clear();
     this.recentDurationHints.clear();
     this.lastConfirmedAdditionReelId.clear();
+    this.reshareChoiceDeadlines.clear();
   }
 
   private async flushPendingSharePrompt(senderId: string, expectedShareId?: string): Promise<void> {
@@ -1359,6 +1382,7 @@ export class MetaInstagramBotService {
         await this.deliverReply(senderId, reply, delivery);
       } else {
         // No time provided — wait up to 10 minutes for user choice before defaulting to 10 hours
+        if (savedReel) this.recordShareChoice(savedReel, isAlreadyInWatchLater);
         const defaultTriggerDate = new Date(Date.now() + (10 * 60 + 10 * 3600) * 1000);
         const defaultTriggerStr = formatTargetTime(defaultTriggerDate, new Date(), senderTz);
         const promptQuestion = mediaType === 'post'
@@ -1490,7 +1514,7 @@ export class MetaInstagramBotService {
           return;
         }
         delivery.stateMutated = true;
-        let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget);
+        let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget, delivery.retryState.pinnedDurationUpdatesReshare);
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
@@ -2044,6 +2068,8 @@ export class MetaInstagramBotService {
       }
 
       if (targetReel) {
+        const updatesReshare = this.isAwaitingReshareChoice(targetReel);
+        if (delivery) delivery.retryState.pinnedDurationUpdatesReshare = updatesReshare;
         const nextDate = customDuration.targetDate.toISOString();
         const applied = await Repository.updateReminderSchedule(
           targetReel.id,
@@ -2063,7 +2089,7 @@ export class MetaInstagramBotService {
           return;
         }
         if (delivery) delivery.stateMutated = true;
-        let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget);
+        let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget, updatesReshare);
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are currently shown in UTC. Reply e.g. "tz New York" or "tz IST" to set your local time!`;
         }

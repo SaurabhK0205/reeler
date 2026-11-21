@@ -375,21 +375,25 @@ export function formatAddedToWatchLaterCreatorBlock(
 }
 
 /**
- * Formats the "Reminder set" DM with creator attribution, clickable profile URL (when available),
+ * Formats the reminder confirmation DM with creator attribution, clickable profile URL (when available),
  * and human-readable reel or post context (never shortcodes).
  */
 export function formatReminderSetMessage(
   reel: Pick<SavedReel, 'caption' | 'creator' | 'media_type' | 'reel_url' | 'is_saved_on_instagram'>,
   durationLabel: string,
-  formattedTarget: string
+  formattedTarget: string,
+  updatesReshare = false
 ): string {
   const creatorDisplay = formatCreatorDisplayLabel(reel.creator, { includeProfileUrl: false });
   const targetText = creatorDisplay || formatHumanReelLabel(reel, 40);
   const profileLine = formatCreatorProfileLine(reel.creator);
   const profileBlock = profileLine ? `\n${profileLine}` : '';
+  const heading = updatesReshare
+    ? `⏰ Reminder updated for: ${durationLabel} (${formattedTarget})!\nFor: ${targetText}`
+    : `⏰ Reminder set for ${targetText}: ${durationLabel} (${formattedTarget})!`;
 
   return (
-    `⏰ Reminder set for ${targetText}: ${durationLabel} (${formattedTarget})!` +
+    heading +
     `${profileBlock}\n\nReply "watched" when done.`
   );
 }

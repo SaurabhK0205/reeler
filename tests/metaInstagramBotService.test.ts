@@ -4085,8 +4085,7 @@ test('MetaInstagramBotService - reshares distinguish active Watch Later items ("
     });
 
     assert.strictEqual(sentMessages.length, 1);
-    assert.ok(sentMessages[0].text.includes('Reminder set for'), `Got: ${sentMessages[0].text}`);
-    assert.ok(sentMessages[0].text.includes('2 hours'), `Got: ${sentMessages[0].text}`);
+    assert.match(sentMessages[0].text, /Reminder updated for: 2 hours/);
 
     const item1Updated = await Repository.getSavedItemByShortcode('DReshareReel1', senderId);
     assert.strictEqual(item1Updated?.reminder_interval_seconds, 7200);
@@ -4189,4 +4188,52 @@ test('MetaInstagramBotService - reshares distinguish active Watch Later items ("
     if (prevServiceKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevServiceKey;
     if (prevAnonKey !== undefined) process.env.SUPABASE_ANON_KEY = prevAnonKey;
   }
+});
+
+test('MetaInstagramBotService retains reshare wording after an attachment prompt flushes', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  Repository.resetMemoryStoreForTests();
+  const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 60 });
+  t.mock.method(globalThis, 'fetch', async () => new Response('', { status: 404 }));
+  t.after(() => {
+    bot.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+  });
+
+  const senderId = 'sender_flushed_reshare';
+  const url = 'https://www.instagram.com/reel/DFlushedReshare/';
+  const replies: string[] = [];
+  let receivePrompt: ((text: string) => void) | undefined;
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    replies.push(text);
+    receivePrompt?.(text);
+    return true;
+  };
+  const share = async () => {
+    replies.length = 0;
+    const prompt = new Promise<string>((resolve) => { receivePrompt = resolve; });
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: senderId }, message: { attachments: [{ type: 'share', payload: { url } }] } }] }],
+    });
+    assert.strictEqual(replies.length, 0);
+    t.mock.timers.tick(60);
+    const text = await prompt;
+    receivePrompt = undefined;
+    return text;
+  };
+
+  const replyWithTime = async (text: string) => {
+    replies.length = 0;
+    await bot.handleWebhookPayload({ object: 'instagram', entry: [{ messaging: [{ sender: { id: senderId }, message: { text } }] }] });
+    assert.strictEqual(replies.length, 1);
+    return replies[0];
+  };
+
+  assert.match(await share(), /🎬 Added to your Watch Later!/);
+  assert.match(await replyWithTime('30m'), /Reminder set for/);
+  assert.match(await share(), /Already added to your Watch Later!/);
+  assert.match(await replyWithTime('2h'), /Reminder updated for: 2 hours/);
+  assert.strictEqual((await Repository.getSavedItemByShortcode('DFlushedReshare', senderId))?.reminder_interval_seconds, 7200);
+  assert.match(await replyWithTime('3h'), /Reminder set for/);
 });
