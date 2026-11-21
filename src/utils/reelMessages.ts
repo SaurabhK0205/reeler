@@ -44,11 +44,26 @@ export function parseCancelCommand(text: string): CancelCommand | null {
   );
   if (reminderMatch) {
     const rawArg = reminderMatch[1];
-    const targetCreator = rawArg ? extractCreatorQuery(rawArg) ?? undefined : undefined;
+    if (rawArg) {
+      const cleaned = rawArg.replace(/[.!?,;:]+$/, '');
+      const targetCreator = extractCreatorQuery(cleaned);
+      if (!targetCreator) {
+        return {
+          isCancelAddition: false,
+          isCancelReminder: true,
+          invalidCreatorTarget: rawArg,
+        };
+      }
+      return {
+        isCancelAddition: false,
+        isCancelReminder: true,
+        targetCreator,
+      };
+    }
     return {
       isCancelAddition: false,
       isCancelReminder: true,
-      targetCreator,
+      targetCreator: undefined,
     };
   }
 

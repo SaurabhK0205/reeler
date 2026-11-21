@@ -2856,6 +2856,16 @@ test('MetaInstagramBotService - parseCancelCommand, parseTargetedWatchedCommand,
     isCancelReminder: true,
     targetCreator: 'ann',
   });
+  assert.deepStrictEqual(parseCancelCommand('cancel reminder for @ann.'), {
+    isCancelAddition: false,
+    isCancelReminder: true,
+    targetCreator: 'ann',
+  });
+  assert.deepStrictEqual(parseCancelCommand('cancel reminder for a'), {
+    isCancelAddition: false,
+    isCancelReminder: true,
+    invalidCreatorTarget: 'a',
+  });
   assert.deepStrictEqual(parseCancelCommand('clear @badcreator'), {
     isCancelAddition: true,
     isCancelReminder: false,
@@ -3199,6 +3209,8 @@ test('MetaInstagramBotService - cancel reminder clears reminder schedule while k
 });
 
 test('MetaInstagramBotService & Repository - creator commands use exact handle matching and avoid substring collisions', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
   const { Repository } = await import('../src/db/repository.ts');
   Repository.resetMemoryStoreForTests();
 
@@ -3249,16 +3261,20 @@ test('MetaInstagramBotService & Repository - creator commands use exact handle m
     assert.ok(annaReel);
     assert.strictEqual(annaReel.watch_status, 'watch_later');
   } finally {
+    if (prevUrl !== undefined) {
+      process.env.SUPABASE_URL = prevUrl;
+    }
     Repository.resetMemoryStoreForTests();
   }
 });
 
-test('MetaInstagramBotService - consecutive shares flush prior pending prompt without dropping it', async () => {
+test('MetaInstagramBotService - consecutive shares flush prior pending prompt without dropping it', async (t) => {
   const { Repository } = await import('../src/db/repository.ts');
   Repository.resetMemoryStoreForTests();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
 
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const service = new MetaInstagramBotService({ shareDebounceDelayMs: 200 });
   const sentMessages: string[] = [];
   service.sendDirectMessage = async (_recipientId: string, text: string) => {
@@ -3311,12 +3327,12 @@ test('MetaInstagramBotService - consecutive shares flush prior pending prompt wi
       ],
     });
 
-    // Reel 1's prompt must have been flushed when Reel 2 arrived
+    // Reel 1's prompt must have been flushed immediately when Reel 2 arrived without time advancing
     assert.strictEqual(sentMessages.length, 1);
     assert.ok(sentMessages[0].includes('Added to your Watch Later!'));
 
-    // Wait for Reel 2 debounce to settle
-    await new Promise((r) => setTimeout(r, 250));
+    // Advance mock timers to let Reel 2 debounce settle
+    t.mock.timers.tick(250);
 
     // Now Reel 2's prompt must also have been sent
     assert.strictEqual(sentMessages.length, 2);

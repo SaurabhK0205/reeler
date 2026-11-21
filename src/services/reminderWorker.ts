@@ -339,7 +339,9 @@ export class ReminderWorker {
           }
 
           try {
-            await Repository.recordReminderSent(reel.id, nextDate);
+            await Repository.recordReminderSent(reel.id, nextDate, {
+              expectedNextReminderAt: reel.next_reminder_at,
+            });
           } catch (err: any) {
             console.error(`[ReminderWorker] Failed to record reminder for reel ${reel.shortcode}:`, err.message || err);
             // Suppress repeated sending in memory for 5 minutes if DB recording fails
@@ -351,7 +353,12 @@ export class ReminderWorker {
 
             // Attempt fallback backoff in DB to prevent immediate resends on next run
             try {
-              await Repository.updateReminderSchedule(reel.id, new Date(Date.now() + 5 * 60 * 1000).toISOString());
+              await Repository.updateReminderSchedule(
+                reel.id,
+                new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+                undefined,
+                { expectedNextReminderAt: reel.next_reminder_at }
+              );
             } catch (fallbackErr: any) {
               console.error(`[ReminderWorker] Fallback backoff failed for reel ${reel.shortcode}:`, fallbackErr.message || fallbackErr);
             }
@@ -361,7 +368,9 @@ export class ReminderWorker {
           const retryDate = new Date(Date.now() + 5 * 60 * 1000).toISOString();
           console.warn(`[ReminderWorker] Delivery for reel ${reel.shortcode} failed. Backing off until ${retryDate}.`);
           try {
-            await Repository.updateReminderSchedule(reel.id, retryDate);
+            await Repository.updateReminderSchedule(reel.id, retryDate, undefined, {
+              expectedNextReminderAt: reel.next_reminder_at,
+            });
           } catch (err: any) {
             console.error(`[ReminderWorker] Failed to schedule retry for reel ${reel.shortcode}:`, err.message || err);
           }

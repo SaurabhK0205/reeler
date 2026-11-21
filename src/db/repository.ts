@@ -2179,26 +2179,48 @@ export class Repository {
     return sortWatchLaterReelsMostRecentFirst(fallbackCandidates as SavedReel[])[0] || null;
   }
 
-  static async recordReminderSent(id: string, nextReminderAt: string | null): Promise<void> {
+  static async recordReminderSent(
+    id: string,
+    nextReminderAt: string | null,
+    options?: { expectedNextReminderAt?: string | null }
+  ): Promise<boolean> {
     const now = new Date().toISOString();
 
     if (!isSupabaseConfigured()) {
       const reel = memoryStore.reels.get(id);
       if (reel) {
+        if (
+          options?.expectedNextReminderAt !== undefined &&
+          (reel.next_reminder_at ?? null) !== (options.expectedNextReminderAt ?? null)
+        ) {
+          return false;
+        }
         reel.reminders_sent_count = (reel.reminders_sent_count || 0) + 1;
         reel.last_reminded_at = now;
         reel.next_reminder_at = nextReminderAt;
         reel.updated_at = now;
+        return true;
       }
-      return;
+      return false;
     }
 
     const supabase = getSupabase();
-    // fetch current count
-    const { data: current } = await supabase.from('saved_reels').select('reminders_sent_count').eq('id', id).single();
-    const newCount = (current?.reminders_sent_count || 0) + 1;
+    // fetch current count and check expected reminder schedule
+    const { data: current } = await supabase
+      .from('saved_reels')
+      .select('reminders_sent_count, next_reminder_at')
+      .eq('id', id)
+      .maybeSingle();
+    if (!current) return false;
+    if (
+      options?.expectedNextReminderAt !== undefined &&
+      (current.next_reminder_at ?? null) !== (options.expectedNextReminderAt ?? null)
+    ) {
+      return false;
+    }
+    const newCount = (current.reminders_sent_count || 0) + 1;
 
-    await supabase
+    let upQuery = supabase
       .from('saved_reels')
       .update({
         reminders_sent_count: newCount,
@@ -2207,6 +2229,13 @@ export class Repository {
         updated_at: now,
       })
       .eq('id', id);
+    if (options?.expectedNextReminderAt !== undefined) {
+      upQuery = options.expectedNextReminderAt === null
+        ? upQuery.is('next_reminder_at', null)
+        : upQuery.eq('next_reminder_at', options.expectedNextReminderAt);
+    }
+    const { data, error } = await upQuery.select('id');
+    return !error && Array.isArray(data) && data.length > 0;
   }
 
   /**
@@ -2532,7 +2561,7 @@ export class Repository {
       const { data: creators, error: cErr } = await supabase
         .from('creators')
         .select('id, username')
-        .ilike('username', handle.replace(/[_%]/g, '\\$&'));
+        .eq('username', handle);
       if (cErr) {
         throw new Error(`Failed to resolve creator for clear: ${cErr.message}`);
       }
@@ -2622,6 +2651,47 @@ export class Repository {
   }
 
   /**
+   * Resolves the list of active Watch Later reel IDs for a specific creator and Instagram sender
+   * prior to attempting mutations, allowing retries to pin and target the original set.
+   */
+  static async selectWatchLaterTargetIdsForCreator(
+    senderId: string,
+    creatorHandle: string
+  ): Promise<string[]> {
+    const trimmedSender = String(senderId || '').trim();
+    const handle = String(creatorHandle || '').trim().replace(/^@+/, '').toLowerCase();
+    if (!trimmedSender || !handle) return [];
+
+    if (!isSupabaseConfigured()) {
+      return Array.from(memoryStore.reels.values())
+        .filter((r) => {
+          if (r.instagram_sender_id !== trimmedSender || r.watch_status !== 'watch_later') return false;
+          const creator = memoryStore.creators.get(r.creator_id);
+          return String(creator?.username || '').toLowerCase() === handle;
+        })
+        .map((r) => r.id);
+    }
+
+    const supabase = getSupabase();
+    const { data: creators, error: cErr } = await supabase
+      .from('creators')
+      .select('id, username')
+      .eq('username', handle);
+    if (cErr) throw new Error(`Failed to resolve creator: ${cErr.message}`);
+    const creatorIds = (creators || []).map((c: any) => c.id).filter(Boolean);
+    if (creatorIds.length === 0) return [];
+
+    const { data: reels, error: rErr } = await supabase
+      .from('saved_reels')
+      .select('id')
+      .eq('instagram_sender_id', trimmedSender)
+      .eq('watch_status', 'watch_later')
+      .in('creator_id', creatorIds);
+    if (rErr) throw new Error(`Failed to fetch watch-later reels: ${rErr.message}`);
+    return (reels || []).map((r: any) => r.id);
+  }
+
+  /**
    * Marks all Watch Later reels from a specific creator as watched for an Instagram sender.
    */
   static async markWatchedForCreator(
@@ -2662,21 +2732,21 @@ export class Repository {
     }
 
     const supabase = getSupabase();
+    const { data: creators, error: cErr } = await supabase
+      .from('creators')
+      .select('id, username')
+      .eq('username', handle);
+    if (cErr) {
+      throw new Error(`Failed to resolve creator for watch: ${cErr.message}`);
+    }
+    const creatorIds = (creators || [])
+      .filter((c: any) => String(c.username || '').toLowerCase() === handle)
+      .map((c: any) => c.id)
+      .filter(Boolean);
+    if (creatorIds.length === 0) return { updatedReels: [] };
+
     let reelIds = options?.targetReelIds;
     if (!reelIds) {
-      const { data: creators, error: cErr } = await supabase
-        .from('creators')
-        .select('id, username')
-        .ilike('username', handle.replace(/[_%]/g, '\\$&'));
-      if (cErr) {
-        throw new Error(`Failed to resolve creator for watch: ${cErr.message}`);
-      }
-      const creatorIds = (creators || [])
-        .filter((c: any) => String(c.username || '').toLowerCase() === handle)
-        .map((c: any) => c.id)
-        .filter(Boolean);
-      if (creatorIds.length === 0) return { updatedReels: [] };
-
       const { data: reels, error: rErr } = await supabase
         .from('saved_reels')
         .select('id')
@@ -2703,6 +2773,8 @@ export class Repository {
       })
       .in('id', reelIds)
       .eq('instagram_sender_id', trimmedSender)
+      .eq('watch_status', 'watch_later')
+      .in('creator_id', creatorIds)
       .select('*, creator:creators(*)');
 
     if (upErr) {
