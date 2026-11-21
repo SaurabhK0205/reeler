@@ -31,14 +31,25 @@ export class ReminderWorker {
   private isCheckingChoices = false;
   private isPollingInboundDMs = false;
   private static readonly MAX_PENDING_CONFIRMATION_REPLIES = 50;
-  private pendingAdminConfirmationReplies: string[] = [];
+  private pendingAdminConfirmationReplies: Array<{
+    reply: string;
+    attempts: number;
+    nextRetryAt: number;
+  }> = [];
 
   private enqueuePendingAdminConfirmationReply(reply: string) {
     if (this.pendingAdminConfirmationReplies.length >= ReminderWorker.MAX_PENDING_CONFIRMATION_REPLIES) {
       this.pendingAdminConfirmationReplies.shift();
     }
-    this.pendingAdminConfirmationReplies.push(reply);
+    this.pendingAdminConfirmationReplies.push({
+      reply,
+      attempts: 0,
+      nextRetryAt: Date.now(),
+    });
   }
+
+  private pendingAdminClearStates = new Map<string, any>();
+  private latestAdminAdditionReelId: string | null = null;
 
   private failedReelSuppression = new Map<string, number>();
   private deliveredPersistenceCheckpoints = new Map<
@@ -47,6 +58,8 @@ export class ReminderWorker {
       reelId: string;
       nextDate: string | null;
       expectedNextReminderAt: string | null;
+      expectedIntervalSeconds?: number | null;
+      expectedIntervalHours?: number | null;
       deliveryTimestamp: number;
       attempts: number;
       nextRetryAt: number;
@@ -59,6 +72,8 @@ export class ReminderWorker {
       reelId: string;
       nextDate: string | null;
       expectedNextReminderAt: string | null;
+      expectedIntervalSeconds?: number | null;
+      expectedIntervalHours?: number | null;
       deliveryTimestamp?: number;
       attempts?: number;
       nextRetryAt?: number;
@@ -193,8 +208,8 @@ export class ReminderWorker {
         }
       }
 
-      // Process messages from admin only (newest items first)
-      for (const msg of messages) {
+      // Process oldest messages first so an undo applies to the item it follows
+      for (const msg of [...messages].reverse()) {
         if (!msg.itemId || this.processedItemIds.has(msg.itemId)) continue;
 
         // Only handle incoming messages from the admin (ignore bot's own replies without storing them)
@@ -206,6 +221,7 @@ export class ReminderWorker {
           await this.handleAdminMessage(msg);
           this.markItemProcessed(msg.itemId);
           this.failedItemAttempts.delete(msg.itemId);
+          this.pendingAdminClearStates.delete(msg.itemId);
         } catch (err: any) {
           const attempts = (this.failedItemAttempts.get(msg.itemId) ?? 0) + 1;
           if (attempts >= ReminderWorker.MAX_ITEM_ATTEMPTS) {
@@ -215,6 +231,7 @@ export class ReminderWorker {
             );
             this.markItemProcessed(msg.itemId);
             this.failedItemAttempts.delete(msg.itemId);
+            this.pendingAdminClearStates.delete(msg.itemId);
           } else {
             console.error(
               `[ReminderWorker] Failed to process admin DM item ${msg.itemId} (attempt ${attempts}/${ReminderWorker.MAX_ITEM_ATTEMPTS}):`,
@@ -287,7 +304,7 @@ export class ReminderWorker {
       const savedAt = existingItem
         ? (existingItem.saved_at ?? (savedOnIg && existingItem.is_saved_on_instagram === false ? nowIso : null))
         : (savedOnIg ? nowIso : null);
-      await Repository.upsertSavedReel({
+      const saved = await Repository.upsertSavedReel({
         instagram_media_id: existingItem?.instagram_media_id || mediaId || `id_${shortcode}`,
         shortcode,
         reel_url: canonicalUrl,
@@ -304,6 +321,9 @@ export class ReminderWorker {
         next_reminder_at: nextReminderDate,
         is_saved_on_instagram: isSavedOnInstagram,
       });
+      if (saved) {
+        this.latestAdminAdditionReelId = saved.id;
+      }
 
       // 4. Send immediate confirmation DM to admin
       if (this.adminUserId) {
@@ -341,9 +361,18 @@ export class ReminderWorker {
 
           if (cancelCmd.isCancelAddition) {
             if (cancelCmd.targetCreator) {
+              let pinnedState = msg.itemId ? this.pendingAdminClearStates.get(msg.itemId) : undefined;
+              if (!pinnedState && msg.itemId) {
+                pinnedState = { toDeleteIds: [], toRevertIds: [], reels: [], deletedIds: [], revertedIds: [] };
+                this.pendingAdminClearStates.set(msg.itemId, pinnedState);
+              }
               const result = await Repository.clearWatchLaterForCreator(this.adminUserId, cancelCmd.targetCreator, {
                 includeUnattributedFallback: true,
+                pinnedState,
               });
+              if (msg.itemId) {
+                this.pendingAdminClearStates.delete(msg.itemId);
+              }
               const reply = result.clearedReels.length > 0
                 ? `❌ Cleared ${result.clearedReels.length} item(s) by @${cancelCmd.targetCreator} from your Watch Later.`
                 : `ℹ️ No Watch Later items found from @${cancelCmd.targetCreator}.`;
@@ -353,9 +382,14 @@ export class ReminderWorker {
                 this.enqueuePendingAdminConfirmationReply(reply);
               }
             } else {
+              const targetReelId = this.latestAdminAdditionReelId ?? undefined;
               const cancelled = await Repository.cancelRecentAdditionForSender(this.adminUserId, {
+                targetReelId,
                 includeUnattributedFallback: true,
               });
+              if (cancelled && this.latestAdminAdditionReelId === cancelled.cancelledReel.id) {
+                this.latestAdminAdditionReelId = null;
+              }
               const reply = cancelled
                 ? `❌ Cancelled! Removed ${formatHumanReelLabel(cancelled.cancelledReel, 40)} from your Watch Later.`
                 : `ℹ️ No recent item found in your Watch Later to cancel.`;
@@ -410,29 +444,58 @@ export class ReminderWorker {
     if (this.pendingAdminConfirmationReplies.length === 0 || !this.adminUserId) {
       return;
     }
-    const batch = this.pendingAdminConfirmationReplies.splice(0, 5);
-    const retryQueue: string[] = [];
-    for (let i = 0; i < batch.length; i++) {
-      const pendingReply = batch[i];
+    const now = Date.now();
+    const readyItems: Array<{ reply: string; attempts: number; nextRetryAt: number }> = [];
+    const unreadyItems: Array<{ reply: string; attempts: number; nextRetryAt: number }> = [];
+
+    for (const item of this.pendingAdminConfirmationReplies) {
+      if (readyItems.length < 5 && now >= item.nextRetryAt) {
+        readyItems.push(item);
+      } else {
+        unreadyItems.push(item);
+      }
+    }
+
+    if (readyItems.length === 0) return;
+
+    const retryQueue: Array<{ reply: string; attempts: number; nextRetryAt: number }> = [];
+    for (let i = 0; i < readyItems.length; i++) {
+      const item = readyItems[i];
       try {
-        const res = await this.actionClient.sendDirectMessage(this.adminUserId, pendingReply);
+        const res = await this.actionClient.sendDirectMessage(this.adminUserId, item.reply);
         if (!res.success) {
-          retryQueue.push(pendingReply);
+          const attempts = item.attempts + 1;
+          if (attempts < 5) {
+            retryQueue.push({
+              reply: item.reply,
+              attempts,
+              nextRetryAt: now + Math.min(60000, 1000 * Math.pow(2, attempts)),
+            });
+          } else {
+            console.error(
+              `[ReminderWorker] Dropping admin confirmation reply after 5 failed attempts: ${item.reply.slice(0, 50)}...`
+            );
+          }
         }
       } catch (err: any) {
         console.error('[ReminderWorker] Transport error flushing admin confirmation reply:', err?.message || err);
-        retryQueue.push(pendingReply);
-        const unattempted = batch.slice(i + 1);
+        const attempts = item.attempts + 1;
+        if (attempts < 5) {
+          retryQueue.push({
+            reply: item.reply,
+            attempts,
+            nextRetryAt: now + Math.min(60000, 1000 * Math.pow(2, attempts)),
+          });
+        }
+        const unattempted = readyItems.slice(i + 1);
         retryQueue.push(...unattempted);
-        break; // Stop retrying for this poll cycle on transport exception
+        break;
       }
     }
-    if (retryQueue.length > 0) {
-      this.pendingAdminConfirmationReplies = [
-        ...retryQueue,
-        ...this.pendingAdminConfirmationReplies,
-      ].slice(0, ReminderWorker.MAX_PENDING_CONFIRMATION_REPLIES);
-    }
+    this.pendingAdminConfirmationReplies = [
+      ...retryQueue,
+      ...unreadyItems,
+    ].slice(0, ReminderWorker.MAX_PENDING_CONFIRMATION_REPLIES);
   }
 
   /**
@@ -463,9 +526,13 @@ export class ReminderWorker {
         return !isNaN(timeA) && !isNaN(timeB) && timeA === timeB;
       };
 
-      // Prune stale checkpoints older than 24 hours only if the reel's due schedule has changed or is no longer due
+      // Prune stale checkpoints older than 24 hours only if the reel's due schedule has changed or is no longer due (bounded to 10 per tick with backoff)
+      let expiryChecks = 0;
       for (const [key, checkpoint] of Array.from(this.deliveredPersistenceCheckpoints.entries())) {
+        if (expiryChecks >= 10) break;
         if (now > checkpoint.deliveryTimestamp + 24 * 3600 * 1000) {
+          if (now < checkpoint.nextRetryAt) continue;
+          expiryChecks++;
           let fresh: SavedReel | null = null;
           let lookupFailed = false;
           try {
@@ -473,6 +540,8 @@ export class ReminderWorker {
           } catch (err) {
             lookupFailed = true;
             console.warn(`[ReminderWorker] Checkpoint expiry lookup failed for reel ${checkpoint.reelId}; retaining checkpoint:`, err);
+            checkpoint.attempts = (checkpoint.attempts || 0) + 1;
+            checkpoint.nextRetryAt = now + Math.min(3600000, 60000 * Math.pow(2, checkpoint.attempts));
           }
           if (!lookupFailed) {
             const isStillDue = fresh && fresh.watch_status === 'watch_later' &&
@@ -504,6 +573,8 @@ export class ReminderWorker {
           }
           await Repository.recordReminderSent(checkpoint.reelId, checkpoint.nextDate, {
             expectedNextReminderAt: checkpoint.expectedNextReminderAt,
+            expectedIntervalSeconds: checkpoint.expectedIntervalSeconds,
+            expectedIntervalHours: checkpoint.expectedIntervalHours,
           });
           this.deliveredPersistenceCheckpoints.delete(key);
         } catch {
@@ -596,6 +667,8 @@ export class ReminderWorker {
           try {
             await Repository.recordReminderSent(freshReel.id, nextDate, {
               expectedNextReminderAt: freshReel.next_reminder_at,
+              expectedIntervalSeconds: freshReel.reminder_interval_seconds ?? null,
+              expectedIntervalHours: freshReel.reminder_interval_hours ?? null,
             });
           } catch (err: any) {
             console.error(`[ReminderWorker] Failed to record reminder for reel ${freshReel.shortcode}:`, err.message || err);
@@ -613,6 +686,8 @@ export class ReminderWorker {
               reelId: freshReel.id,
               nextDate,
               expectedNextReminderAt: freshReel.next_reminder_at,
+              expectedIntervalSeconds: freshReel.reminder_interval_seconds ?? null,
+              expectedIntervalHours: freshReel.reminder_interval_hours ?? null,
             });
 
             // Attempt fallback persistence: preserve the normal nextDate with the expected-schedule guard
@@ -622,7 +697,11 @@ export class ReminderWorker {
                 freshReel.id,
                 nextDate,
                 undefined,
-                { expectedNextReminderAt: freshReel.next_reminder_at }
+                {
+                  expectedNextReminderAt: freshReel.next_reminder_at,
+                  expectedIntervalSeconds: freshReel.reminder_interval_seconds ?? null,
+                  expectedIntervalHours: freshReel.reminder_interval_hours ?? null,
+                }
               );
               // Advance checkpoint expectation only when guarded fallback write was applied
               const existingCheckpoint = this.deliveredPersistenceCheckpoints.get(suppressionKey);
@@ -640,6 +719,8 @@ export class ReminderWorker {
           try {
             await Repository.updateReminderSchedule(freshReel.id, retryDate, undefined, {
               expectedNextReminderAt: freshReel.next_reminder_at,
+              expectedIntervalSeconds: freshReel.reminder_interval_seconds ?? null,
+              expectedIntervalHours: freshReel.reminder_interval_hours ?? null,
             });
           } catch (err: any) {
             console.error(`[ReminderWorker] Failed to schedule retry for reel ${freshReel.shortcode}:`, err.message || err);

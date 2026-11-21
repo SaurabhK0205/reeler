@@ -90,6 +90,13 @@ interface WebhookRetryState {
   pinnedTargetReelId?: string;
   /** Preserves the expected next reminder instant for CAS schedule updates across internal retries. */
   expectedNextReminderAt?: string | null;
+  /** Preserves the schedule expectation snapshot when applying late duration to an active share across retries. */
+  pinnedLateScheduleSnapshot?: {
+    expectedNextReminderAt: string | null;
+    expectedIntervalSeconds: number | null;
+    expectedAwaitingUntil: string | null;
+    expectedWatchStatus?: WatchStatus;
+  };
   /** Preserves deferred share prompt context across schedule retries so the original confirmation is completed reliably. */
   pinnedDeferredSharePrompt?: {
     reel: SavedReel;
@@ -238,6 +245,9 @@ export class MetaInstagramBotService {
     if (!pending) return;
     if (expectedShareId && pending.shareId !== expectedShareId) return;
 
+    clearTimeout(pending.timer);
+    this.pendingSharePrompts.delete(senderId);
+
     let isStillPending = true;
     try {
       const freshItem = await Repository.getSavedItemById(pending.reel.id);
@@ -252,8 +262,6 @@ export class MetaInstagramBotService {
       }
     } catch (lookupErr) {
       console.warn(`[MetaIG] Pre-flush status check failed for reel ${pending.reel.id}; keeping prompt retryable:`, lookupErr);
-      clearTimeout(pending.timer);
-      this.pendingSharePrompts.delete(senderId);
       if (pending.opId) {
         this.recordPendingWebhookReplies(
           pending.opId,
@@ -277,9 +285,6 @@ export class MetaInstagramBotService {
       }
       return;
     }
-
-    clearTimeout(pending.timer);
-    this.pendingSharePrompts.delete(senderId);
 
     if (!isStillPending) {
       if (pending.opId) this.markWebhookMidCompleted(pending.opId);
@@ -1197,6 +1202,13 @@ export class MetaInstagramBotService {
       try {
         if (delivery?.retryState?.savedReelId) {
           savedReel = await Repository.getSavedItemById(delivery.retryState.savedReelId);
+          if (!savedReel) {
+            console.warn(
+              `[MetaIG] Retry of share for ${shortcode} was undone/cancelled; aborting re-insertion.`
+            );
+            if (delivery.opId) this.markWebhookMidCompleted(delivery.opId);
+            return;
+          }
         }
         if (!savedReel) {
           savedReel = await Repository.upsertSavedReel({
@@ -1237,21 +1249,25 @@ export class MetaInstagramBotService {
         if (durationCandidate && (!customDuration || customDuration.seconds !== durationCandidate.seconds)) {
           const targetDuration = durationCandidate;
           if (savedReel) {
-            if (delivery) {
+            if (delivery && !delivery.retryState.pinnedLateScheduleSnapshot) {
               delivery.retryState.acceptedDurationSeconds = targetDuration.seconds;
-              delivery.retryState.expectedNextReminderAt = savedReel.next_reminder_at ?? null;
+              delivery.retryState.pinnedLateScheduleSnapshot = {
+                expectedNextReminderAt: savedReel.next_reminder_at ?? null,
+                expectedIntervalSeconds: savedReel.reminder_interval_seconds ?? null,
+                expectedAwaitingUntil: savedReel.awaiting_reminder_choice_until ?? null,
+                expectedWatchStatus: savedReel.watch_status,
+              };
             }
+            const snap = delivery?.retryState?.pinnedLateScheduleSnapshot;
             const applied = await Repository.updateReminderSchedule(
               savedReel.id,
               targetDuration.targetDate.toISOString(),
               targetDuration.seconds,
               {
-                expectedNextReminderAt: delivery?.retryState?.expectedNextReminderAt !== undefined
-                  ? delivery.retryState.expectedNextReminderAt
-                  : (savedReel.next_reminder_at ?? null),
-                expectedIntervalSeconds: savedReel.reminder_interval_seconds ?? null,
-                expectedAwaitingReminderChoiceUntil: savedReel.awaiting_reminder_choice_until ?? null,
-                ...(savedReel.watch_status ? { expectedWatchStatus: savedReel.watch_status } : {}),
+                expectedNextReminderAt: snap ? snap.expectedNextReminderAt : (savedReel.next_reminder_at ?? null),
+                expectedIntervalSeconds: snap ? snap.expectedIntervalSeconds : (savedReel.reminder_interval_seconds ?? null),
+                expectedAwaitingReminderChoiceUntil: snap ? snap.expectedAwaitingUntil : (savedReel.awaiting_reminder_choice_until ?? null),
+                ...(snap?.expectedWatchStatus ? { expectedWatchStatus: snap.expectedWatchStatus } : (savedReel.watch_status ? { expectedWatchStatus: savedReel.watch_status } : {})),
               }
             );
             if (applied) {
@@ -1467,8 +1483,10 @@ export class MetaInstagramBotService {
             throw cancelErr;
           }
 
-          this.pendingSharePrompts.delete(senderId);
-          if (cancelled) {
+          if (this.pendingSharePrompts.get(senderId)?.shareId === pending.shareId) {
+            this.pendingSharePrompts.delete(senderId);
+          }
+          if (cancelled && this.lastConfirmedAdditionReelId.get(senderId) === cancelled.cancelledReel.id) {
             this.lastConfirmedAdditionReelId.delete(senderId);
           }
           if (delivery) delivery.stateMutated = true;
@@ -1868,6 +1886,11 @@ export class MetaInstagramBotService {
         let targetReel: SavedReel | null = null;
         if (pinnedTargetId) {
           targetReel = await Repository.getSavedItemById(pinnedTargetId);
+          if (!targetReel) {
+            // Target was cancelled or deleted; end pinned operation rather than retargeting another reel
+            if (delivery?.opId) this.markWebhookMidCompleted(delivery.opId);
+            return;
+          }
         } else if (activeShare?.savedReel) {
           targetReel = activeShare.savedReel;
           if (delivery) {
@@ -1908,6 +1931,11 @@ export class MetaInstagramBotService {
               reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <your city>" to use your local time.`;
             }
             await this.deliverReply(senderId, reply, delivery);
+            return;
+          }
+          if (pinnedTargetId) {
+            // CAS failed on pinned target; do not fall through to generic selector
+            if (delivery?.opId) this.markWebhookMidCompleted(delivery.opId);
             return;
           }
         }

@@ -5,7 +5,7 @@ import {
   isMetaMessagingWindowError,
 } from '../src/services/metaInstagramBotService.ts';
 import { Repository } from '../src/db/repository.ts';
-import { parseTargetedWatchedCommand } from '../src/utils/reelMessages.ts';
+import { parseTargetedWatchedCommand, parseCancelCommand } from '../src/utils/reelMessages.ts';
 import { extractCreatorQueryWithFilter } from '../src/utils/creatorQuery.ts';
 
 test('MetaInstagramBotService - splitMessageIntoChunks handles short and empty text', () => {
@@ -3930,6 +3930,76 @@ test('Routing and Undo - done posts search routing and addition-order undo selec
     const undone = await Repository.cancelRecentAdditionForSender('undo_user');
     assert.ok(undone);
     assert.strictEqual(undone.cancelledReel.id, newerReel.id, 'Must cancel the most recently added item, ignoring archive rank');
+  } finally {
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+  }
+});
+
+test('parseCancelCommand strips trailing punctuation and matches creator queries', () => {
+  const p1 = parseCancelCommand('clear @ykittois.');
+  assert.ok(p1);
+  assert.strictEqual(p1.isCancelAddition, true);
+  assert.strictEqual(p1.targetCreator, 'ykittois');
+
+  const p2 = parseCancelCommand('clear @ykittois,');
+  assert.ok(p2);
+  assert.strictEqual(p2.targetCreator, 'ykittois');
+
+  const p3 = parseCancelCommand('cancel reminder for @ykittois.');
+  assert.ok(p3);
+  assert.strictEqual(p3.isCancelReminder, true);
+  assert.strictEqual(p3.targetCreator, 'ykittois');
+});
+
+test('Repository.updateReminderSchedule guards recurring intervals with expectedIntervalHours & expectedIntervalSeconds', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  try {
+    Repository.resetMemoryStoreForTests();
+    const creator = await Repository.upsertCreator({
+      instagram_user_id: 'c_interval_guard',
+      username: 'interval_guard',
+    });
+    const reel = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_interval_guard',
+      shortcode: 'IntGuard1',
+      reel_url: 'https://instagram.com/reel/IntGuard1/',
+      creator_id: creator.id,
+      instagram_sender_id: 'interval_user',
+      watch_status: 'watch_later',
+      reminder_interval_seconds: 7200,
+      reminder_interval_hours: 2,
+      next_reminder_at: '2026-11-21T12:00:00Z',
+    });
+    assert.ok(reel);
+
+    // Mismatched expectedIntervalSeconds returns false
+    const okWrongSec = await Repository.updateReminderSchedule(
+      reel.id,
+      '2026-11-21T14:00:00Z',
+      3600,
+      { expectedIntervalSeconds: 3600 }
+    );
+    assert.strictEqual(okWrongSec, false);
+
+    // Mismatched expectedIntervalHours returns false
+    const okWrongHrs = await Repository.updateReminderSchedule(
+      reel.id,
+      '2026-11-21T14:00:00Z',
+      3600,
+      { expectedIntervalHours: 1 }
+    );
+    assert.strictEqual(okWrongHrs, false);
+
+    // Matching expectations returns true
+    const okMatching = await Repository.updateReminderSchedule(
+      reel.id,
+      '2026-11-21T14:00:00Z',
+      3600,
+      { expectedIntervalSeconds: 7200, expectedIntervalHours: 2 }
+    );
+    assert.strictEqual(okMatching, true);
   } finally {
     Repository.resetMemoryStoreForTests();
     if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
