@@ -6,7 +6,7 @@ import { Repository, SenderReminderConflictError, SenderDeletionBarrierError } f
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
 import { parseDuration, formatTargetTime } from '../utils/duration.ts';
 import { getTimeZoneSummary } from '../utils/timezone.ts';
-import { extractCreatorQueryWithFilter } from '../utils/creatorQuery.ts';
+import { extractCreatorQueryWithFilter, extractCreatorQuery } from '../utils/creatorQuery.ts';
 import {
   classifySavedMediaType,
   extractInstagramShortcodeAndPath,
@@ -94,6 +94,8 @@ interface WebhookRetryState {
   };
   /** Preserves target IDs for markWatchedForCreator across retries. */
   pinnedWatchedCreatorTargetIds?: string[];
+  /** Preserves the specific Reel ID targeted by a cancel command across retries. */
+  pinnedCancelTargetReelId?: string;
   /** Monotonic sequence assigned on initial reception of a timezone-set command to block stale retries. */
   timezoneCommandSeq?: number;
 }
@@ -1181,7 +1183,13 @@ export class MetaInstagramBotService {
           clearTimeout(pending.timer);
           this.pendingSharePrompts.delete(senderId);
 
-          const cancelled = await Repository.cancelRecentAdditionForSender(senderId);
+          let targetReelId = delivery?.retryState?.pinnedCancelTargetReelId;
+          if (!targetReelId) {
+            targetReelId = pending.reel.id;
+            if (delivery) delivery.retryState.pinnedCancelTargetReelId = targetReelId;
+          }
+
+          const cancelled = await Repository.cancelRecentAdditionForSender(senderId, { targetReelId });
           if (delivery) delivery.stateMutated = true;
           if (pending.opId) this.markWebhookMidCompleted(pending.opId);
 
@@ -1199,8 +1207,9 @@ export class MetaInstagramBotService {
       } else {
         const targetedWatched = parseTargetedWatchedCommand(text);
         const { isCommand: isWatchedCmd } = parseWatchedStopCommand(text);
-        if (targetedWatched || isWatchedCmd) {
-          // Watched or stop command: flush prompt and fall through to command processing
+        const isCreatorQuery = Boolean(extractCreatorQuery(text));
+        if (targetedWatched || isWatchedCmd || isCreatorQuery) {
+          // Watched command, stop command, or creator search: flush prompt and fall through
           await this.flushPendingSharePrompt(senderId);
         } else {
           // Not a recognized command; now evaluate whether text is a duration expression
@@ -1304,8 +1313,14 @@ export class MetaInstagramBotService {
           return;
         }
 
-        const result = await Repository.cancelRecentAdditionForSender(senderId);
-        if (delivery) delivery.stateMutated = true;
+        const targetReelId = delivery?.retryState?.pinnedCancelTargetReelId;
+        const result = await Repository.cancelRecentAdditionForSender(senderId, { targetReelId });
+        if (delivery) {
+          delivery.stateMutated = true;
+          if (!delivery.retryState.pinnedCancelTargetReelId && result) {
+            delivery.retryState.pinnedCancelTargetReelId = result.cancelledReel.id;
+          }
+        }
         if (result) {
           const label = formatHumanReelLabel(result.cancelledReel, 40);
           await this.deliverReply(

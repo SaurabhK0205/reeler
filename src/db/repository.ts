@@ -2216,18 +2216,21 @@ export class Repository {
    */
   static async cancelRecentAdditionForSender(
     senderId: string,
-    options?: { targetCreator?: string }
+    options?: { targetCreator?: string; targetReelId?: string }
   ): Promise<{ cancelledReel: SavedReel; action: 'deleted' | 'reverted' } | null> {
     const trimmedSender = String(senderId || '').trim();
     if (!trimmedSender) return null;
 
     const targetCreator = options?.targetCreator?.trim()?.toLowerCase();
+    const targetReelId = options?.targetReelId;
 
     if (!isSupabaseConfigured()) {
       let candidates = Array.from(memoryStore.reels.values()).filter(
         (r) => r.instagram_sender_id === trimmedSender && r.watch_status === 'watch_later'
       );
-      if (targetCreator) {
+      if (targetReelId) {
+        candidates = candidates.filter((r) => r.id === targetReelId);
+      } else if (targetCreator) {
         candidates = candidates.filter((r) => {
           const creator = memoryStore.creators.get(r.creator_id);
           return String(creator?.username || '').toLowerCase() === targetCreator;
@@ -2236,8 +2239,8 @@ export class Repository {
       if (candidates.length === 0) return null;
 
       candidates.sort((a, b) => {
-        const timeB = new Date(b.created_at || 0).getTime();
-        const timeA = new Date(a.created_at || 0).getTime();
+        const timeB = Math.max(new Date(b.created_at || 0).getTime(), new Date(b.updated_at || 0).getTime());
+        const timeA = Math.max(new Date(a.created_at || 0).getTime(), new Date(a.updated_at || 0).getTime());
         if (timeB !== timeA) return timeB - timeA;
         return (b.save_order_rank || 0) - (a.save_order_rank || 0);
       });
@@ -2263,7 +2266,7 @@ export class Repository {
 
     const supabase = getSupabase();
     let creatorIds: string[] | null = null;
-    if (targetCreator) {
+    if (targetCreator && !targetReelId) {
       const { data: creators, error: cErr } = await supabase
         .from('creators')
         .select('id, username')
@@ -2281,11 +2284,14 @@ export class Repository {
       .eq('instagram_sender_id', trimmedSender)
       .eq('watch_status', 'watch_later');
 
-    if (creatorIds) {
+    if (targetReelId) {
+      query = query.eq('id', targetReelId);
+    } else if (creatorIds) {
       query = query.in('creator_id', creatorIds);
     }
 
     const { data: candidates, error } = await query
+      .order('updated_at', { ascending: false })
       .order('created_at', { ascending: false })
       .order('save_order_rank', { ascending: false })
       .limit(10);
