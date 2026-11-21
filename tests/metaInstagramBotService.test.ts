@@ -2947,10 +2947,13 @@ test('MetaInstagramBotService - greeting and help queries return unified help me
   assert.strictEqual(sentMessages[0], expectedHelp);
 });
 
-test('MetaInstagramBotService - share debouncing unifies share-sheet attachment and duration text into one message', async () => {
+test('MetaInstagramBotService - share debouncing unifies share-sheet attachment and duration text into one message', async (t) => {
   const { Repository } = await import('../src/db/repository.ts');
   Repository.resetMemoryStoreForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
 
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const service = new MetaInstagramBotService({ shareDebounceDelayMs: 60 });
   const sentMessages: string[] = [];
   service.sendDirectMessage = async (_recipientId: string, text: string) => {
@@ -3014,12 +3017,12 @@ test('MetaInstagramBotService - share debouncing unifies share-sheet attachment 
     // At this moment, Event 1 is buffered, so no prompt was sent yet!
     assert.strictEqual(sentMessages.length, 0);
 
-    // Send Event 2 (duration) 15ms later (well within 60ms buffer)
-    await new Promise((r) => setTimeout(r, 15));
+    // Advance controlled clock by 15ms (within 60ms debounce buffer)
+    t.mock.timers.tick(15);
     await service.handleWebhookPayload(payload2);
 
-    // Wait for debounce timer window to completely settle
-    await new Promise((r) => setTimeout(r, 80));
+    // Advance controlled clock past the debounce deadline
+    t.mock.timers.tick(80);
 
     // Must have sent exactly 1 message combining addition confirmation + reminder confirmation
     assert.strictEqual(sentMessages.length, 1);
@@ -3035,12 +3038,16 @@ test('MetaInstagramBotService - share debouncing unifies share-sheet attachment 
   } finally {
     service.clearTimersForTesting();
     Repository.resetMemoryStoreForTests();
+    globalThis.fetch = originalFetch;
+    t.mock.timers.reset();
   }
 });
 
 test('MetaInstagramBotService - cancel command removes recently added reel from Watch Later', async () => {
   const { Repository } = await import('../src/db/repository.ts');
   Repository.resetMemoryStoreForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
 
   const service = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
   const sentMessages: string[] = [];
@@ -3108,12 +3115,15 @@ test('MetaInstagramBotService - cancel command removes recently added reel from 
   } finally {
     service.clearTimersForTesting();
     Repository.resetMemoryStoreForTests();
+    globalThis.fetch = originalFetch;
   }
 });
 
 test('MetaInstagramBotService - cancel reminder clears reminder schedule while keeping item in Watch Later', async () => {
   const { Repository } = await import('../src/db/repository.ts');
   Repository.resetMemoryStoreForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
 
   const service = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
   const sentMessages: string[] = [];
@@ -3184,6 +3194,7 @@ test('MetaInstagramBotService - cancel reminder clears reminder schedule while k
   } finally {
     service.clearTimersForTesting();
     Repository.resetMemoryStoreForTests();
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -3245,6 +3256,8 @@ test('MetaInstagramBotService & Repository - creator commands use exact handle m
 test('MetaInstagramBotService - consecutive shares flush prior pending prompt without dropping it', async () => {
   const { Repository } = await import('../src/db/repository.ts');
   Repository.resetMemoryStoreForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
 
   const service = new MetaInstagramBotService({ shareDebounceDelayMs: 200 });
   const sentMessages: string[] = [];
@@ -3310,12 +3323,15 @@ test('MetaInstagramBotService - consecutive shares flush prior pending prompt wi
   } finally {
     service.clearTimersForTesting();
     Repository.resetMemoryStoreForTests();
+    globalThis.fetch = originalFetch;
   }
 });
 
 test('MetaInstagramBotService - cancel reminder for handle containing time keyword reaches cancel handler instead of scheduling duration', async () => {
   const { Repository } = await import('../src/db/repository.ts');
   Repository.resetMemoryStoreForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
 
   const service = new MetaInstagramBotService({ shareDebounceDelayMs: 200 });
   const sentMessages: string[] = [];
@@ -3399,5 +3415,6 @@ test('MetaInstagramBotService - cancel reminder for handle containing time keywo
   } finally {
     service.clearTimersForTesting();
     Repository.resetMemoryStoreForTests();
+    globalThis.fetch = originalFetch;
   }
 });

@@ -84,6 +84,16 @@ interface WebhookRetryState {
   pinnedShareDuration?: ReturnType<typeof parseDuration>;
   /** Preserves the exact Watch Later Reel IDs resolved on the initial watched/stop command across retries. */
   pinnedWatchedTargetIds?: string[];
+  /** Preserves target IDs and execution progress for clearWatchLaterForCreator across partial failure retries. */
+  pinnedClearCreatorState?: {
+    toDeleteIds: string[];
+    toRevertIds: string[];
+    reels: SavedReel[];
+    deletedIds: string[];
+    revertedIds: string[];
+  };
+  /** Preserves target IDs for markWatchedForCreator across retries. */
+  pinnedWatchedCreatorTargetIds?: string[];
   /** Monotonic sequence assigned on initial reception of a timezone-set command to block stale retries. */
   timezoneCommandSeq?: number;
 }
@@ -1128,6 +1138,38 @@ export class MetaInstagramBotService {
       return;
     }
 
+    // 0a. If this is an internal retry of a pinned duration command, process it directly
+    // without consuming or clearing any newer pending share prompt for this sender.
+    if (delivery?.retryState?.pinnedDurationTargetReel) {
+      const targetReel = delivery.retryState.pinnedDurationTargetReel;
+      const parsedDur = parseDuration(text, new Date(), senderTz);
+      const effectiveDur = delivery.retryState.pinnedDuration || parsedDur;
+      if (effectiveDur) {
+        const applied = await Repository.updateReminderSchedule(
+          targetReel.id,
+          effectiveDur.targetDate.toISOString(),
+          effectiveDur.seconds,
+          {
+            expectedNextReminderAt: targetReel.next_reminder_at ?? null,
+            expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
+            expectedAwaitingReminderChoiceUntil: targetReel.awaiting_reminder_choice_until ?? null,
+            ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
+          }
+        );
+        if (!applied) {
+          return;
+        }
+        delivery.stateMutated = true;
+        const creatorHandle = targetReel.creator?.username ? `@${targetReel.creator.username}` : 'your reel';
+        let reply = `⏰ Reminder set for ${creatorHandle}: ${effectiveDur.label} (${effectiveDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
+        if (senderTz === 'UTC') {
+          reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
+        }
+        await this.deliverReply(senderId, reply, delivery);
+        return;
+      }
+    }
+
     // 0. Check if a share prompt is currently pending debounce for this sender
     if (this.pendingSharePrompts.has(senderId)) {
       const pending = this.pendingSharePrompts.get(senderId)!;
@@ -1168,9 +1210,7 @@ export class MetaInstagramBotService {
             this.pendingSharePrompts.delete(senderId);
 
             let targetReel = pending.reel;
-            if (delivery?.retryState?.pinnedDurationTargetReel) {
-              targetReel = delivery.retryState.pinnedDurationTargetReel;
-            } else if (delivery) {
+            if (delivery) {
               delivery.retryState.pinnedDurationTargetReel = targetReel;
               delivery.retryState.pinnedDuration = parsedDur;
             }
@@ -1185,6 +1225,7 @@ export class MetaInstagramBotService {
               {
                 expectedNextReminderAt: targetReel.next_reminder_at ?? null,
                 expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
+                expectedAwaitingReminderChoiceUntil: targetReel.awaiting_reminder_choice_until ?? null,
                 ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
               }
             );
@@ -1231,7 +1272,21 @@ export class MetaInstagramBotService {
 
       if (cancelCmd.isCancelAddition) {
         if (cancelCmd.targetCreator) {
-          const result = await Repository.clearWatchLaterForCreator(senderId, cancelCmd.targetCreator);
+          if (delivery && !delivery.retryState.pinnedClearCreatorState) {
+            delivery.retryState.pinnedClearCreatorState = {
+              toDeleteIds: [],
+              toRevertIds: [],
+              reels: [],
+              deletedIds: [],
+              revertedIds: [],
+            };
+          }
+          const result = await Repository.clearWatchLaterForCreator(senderId, cancelCmd.targetCreator, {
+            pinnedState: delivery?.retryState.pinnedClearCreatorState,
+            onPartialProgress: (mutated) => {
+              if (delivery && mutated) delivery.stateMutated = true;
+            },
+          });
           if (delivery) delivery.stateMutated = true;
           if (result.clearedReels.length > 0) {
             await this.deliverReply(
@@ -1268,8 +1323,18 @@ export class MetaInstagramBotService {
     // 1b. Targeted Watched command: e.g. "watched @creator", "done @creator"
     const targetedWatched = parseTargetedWatchedCommand(text);
     if (targetedWatched) {
-      const result = await Repository.markWatchedForCreator(senderId, targetedWatched.targetCreator);
-      if (delivery) delivery.stateMutated = true;
+      const result = await Repository.markWatchedForCreator(senderId, targetedWatched.targetCreator, {
+        targetReelIds: delivery?.retryState.pinnedWatchedCreatorTargetIds,
+        onPartialProgress: (mutated) => {
+          if (delivery && mutated) delivery.stateMutated = true;
+        },
+      });
+      if (delivery) {
+        delivery.stateMutated = true;
+        if (delivery.retryState.pinnedWatchedCreatorTargetIds === undefined && result.updatedReels.length > 0) {
+          delivery.retryState.pinnedWatchedCreatorTargetIds = result.updatedReels.map((r) => r.id);
+        }
+      }
       if (result.updatedReels.length > 0) {
         await this.deliverReply(
           senderId,
