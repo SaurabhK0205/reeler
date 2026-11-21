@@ -5,6 +5,8 @@ import {
   isMetaMessagingWindowError,
 } from '../src/services/metaInstagramBotService.ts';
 import { Repository } from '../src/db/repository.ts';
+import { parseTargetedWatchedCommand } from '../src/utils/reelMessages.ts';
+import { extractCreatorQueryWithFilter } from '../src/utils/creatorQuery.ts';
 
 test('MetaInstagramBotService - splitMessageIntoChunks handles short and empty text', () => {
   const service = new MetaInstagramBotService();
@@ -3495,6 +3497,7 @@ test('MetaInstagramBotService - consecutive shares flush prior pending prompt wi
 
     // Advance mock timers to let Reel 2 debounce settle
     t.mock.timers.tick(250);
+    await new Promise((resolve) => setImmediate(resolve));
 
     // Now Reel 2's prompt must also have been sent
     assert.strictEqual(sentMessages.length, 2);
@@ -3718,9 +3721,11 @@ test('MetaInstagramBotService - creator watched & clear commands accept trailing
   }
 });
 
-test('Repository - creator filter scoping fallback, markWatched completed exclusion, and safe promotion revert', async () => {
+test('Repository - creator filter scoping fallback, markWatched completed exclusion, and safe promotion revert', async (t) => {
   const prevUrl = process.env.SUPABASE_URL;
   delete process.env.SUPABASE_URL;
+
+  t.mock.timers.enable({ apis: ['Date'] });
 
   try {
     Repository.resetMemoryStoreForTests();
@@ -3842,6 +3847,9 @@ test('Repository - creator filter scoping fallback, markWatched completed exclus
       targetUpdatedAts: { [botReel.id]: botReel.updated_at || botReel.created_at || '' },
     };
 
+    // Advance controlled clock before promoting to guarantee updated_at differs from pinned version
+    t.mock.timers.tick(2000);
+
     // Simulate archive promotion in between pin and clear execution
     await Repository.upsertSavedReel({
       instagram_media_id: 'm_bot_promo',
@@ -3862,6 +3870,66 @@ test('Repository - creator filter scoping fallback, markWatched completed exclus
     assert.strictEqual(clearRes.clearedReels.length, 1);
     const cleared = await Repository.getSavedItemById(botReel.id);
     assert.strictEqual(cleared?.watch_status, 'unwatched', 'Promoted reel must be reverted to unwatched, not deleted');
+  } finally {
+    t.mock.timers.reset();
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+  }
+});
+
+test('Routing and Undo - done posts search routing and addition-order undo selection', async () => {
+  // 1. parseTargetedWatchedCommand returns null for done posts/reels
+  assert.strictEqual(parseTargetedWatchedCommand('done posts'), null);
+  assert.strictEqual(parseTargetedWatchedCommand('done reels'), null);
+  assert.strictEqual(parseTargetedWatchedCommand('watched posts'), null);
+
+  // 2. extractCreatorQueryWithFilter routes done posts to creator search
+  const extracted = extractCreatorQueryWithFilter('done posts');
+  assert.deepStrictEqual(extracted, { username: 'done', mediaFilter: 'post' });
+
+  // 3. cancelRecentAdditionForSender chooses most recently added item (created_at DESC), not archive rank
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+
+  try {
+    Repository.resetMemoryStoreForTests();
+    const creator = await Repository.upsertCreator({
+      instagram_user_id: 'c_undo_order',
+      username: 'undo_artist',
+      display_name: 'Undo Artist',
+    });
+
+    // Older item added first, but with higher archive rank
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_undo_older',
+      shortcode: 'UndoOlder',
+      reel_url: 'https://instagram.com/reel/UndoOlder/',
+      creator_id: creator.id,
+      instagram_sender_id: 'undo_user',
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+      taken_at: '2026-11-20T10:00:00Z',
+      first_detected_at: '2026-11-20T10:00:00Z',
+      save_order_rank: 10,
+    });
+
+    // Newer item added second, with lower archive rank
+    const newerReel = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_undo_newer',
+      shortcode: 'UndoNewer',
+      reel_url: 'https://instagram.com/reel/UndoNewer/',
+      creator_id: creator.id,
+      instagram_sender_id: 'undo_user',
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+      taken_at: '2026-11-21T10:00:00Z',
+      first_detected_at: '2026-11-21T10:00:00Z',
+      save_order_rank: 1,
+    });
+
+    const undone = await Repository.cancelRecentAdditionForSender('undo_user');
+    assert.ok(undone);
+    assert.strictEqual(undone.cancelledReel.id, newerReel.id, 'Must cancel the most recently added item, ignoring archive rank');
   } finally {
     Repository.resetMemoryStoreForTests();
     if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;

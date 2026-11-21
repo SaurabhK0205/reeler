@@ -148,8 +148,8 @@ export function parseTargetedWatchedCommand(text: string): TargetedWatchedComman
   const rawArg = match[1].trim();
   const cleaned = rawArg.replace(/[.!?,;:~]+$/, '').trim();
 
-  // Bulk targets belong to parseWatchedStopCommand
-  if (/^(?:all|everything|reminders)$/i.test(cleaned)) {
+  // Bulk targets belong to parseWatchedStopCommand or search
+  if (/^(?:all|everything|reminders|posts?|reels?)$/i.test(cleaned)) {
     return null;
   }
 
@@ -199,20 +199,20 @@ export function formatBotHelpMessage(): string {
     `👋 Welcome to Reeler — Your Reels & Posts Vault!\n\n` +
     `📥 Save & Reminders\n` +
     `• Share any Reel or Post here via the Share (airplane) button.\n` +
-    `• Add a time in the share text (e.g. "30s", "2h", "tomorrow 5pm") to set a reminder instantly!\n` +
+    `• Add a time in share text (e.g. "30s", "2h", "5pm") to set a reminder instantly!\n` +
     `• Or reply with a time anytime (e.g. "1h", "snooze 2h").\n\n` +
     `⏰ Manage Reminders & Watch Later\n` +
     `• "watched" or "done" — Mark latest reminder as watched.\n` +
     `• "cancel" or "undo" — Remove recently added item if sent by mistake.\n` +
     `• "cancel reminder" — Stop alarms but keep item in Watch Later.\n` +
     `• "clear @creator" / "watched @creator" — Manage items by creator.\n` +
-    `• "stop all" — Clear all active reminders.\n\n` +
+    `• "stop all" — Mark all items as watched & clear active reminders.\n\n` +
     `🔍 Search & Web Vault\n` +
     `• "@creator" or "reels by @creator" — View your saved items.\n` +
     `• "vault" — Open your private web vault.\n` +
     `• "code" — Get a 6-digit login code for PC/laptop access.\n\n` +
     `⚙️ Settings\n` +
-    `• "tz <city>" (e.g. "tz IST", "tz London") — Set your timezone.\n` +
+    `• "tz <city>" (e.g. "tz IST", "tz London") — Set timezone.\n` +
     `• "delete my data" — Wipe all your data and history.`
   );
 }
