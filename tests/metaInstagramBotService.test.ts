@@ -3066,6 +3066,93 @@ test('MetaInstagramBotService - share debouncing unifies share-sheet attachment 
   }
 });
 
+test('MetaInstagramBotService - duration delivered while share upsert is in flight applies cleanly without prompt', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
+
+  const service = new MetaInstagramBotService({ shareDebounceDelayMs: 60 });
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  const origUpsert = Repository.upsertSavedReel;
+  let releaseSave!: () => void;
+  const saveGate = new Promise<void>((resolve) => {
+    releaseSave = resolve;
+  });
+  let saveIntercepted = false;
+
+  (Repository as any).upsertSavedReel = async function (...args: any[]) {
+    if (!saveIntercepted && args[0]?.shortcode === 'DConcurrent01') {
+      saveIntercepted = true;
+      await saveGate;
+    }
+    return origUpsert.apply(this, args as any);
+  };
+
+  try {
+    const payload1 = {
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_conc_1' },
+              message: {
+                mid: 'mid.conc_share_1',
+                attachments: [{ type: 'share', payload: { url: 'https://www.instagram.com/reel/DConcurrent01/' } }],
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const payload2 = {
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_conc_1' },
+              message: {
+                mid: 'mid.conc_dur_1',
+                text: '45 seconds',
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const sharePromise = service.handleWebhookPayload(payload1);
+    await service.handleWebhookPayload(payload2);
+    releaseSave();
+    await sharePromise;
+
+    service.clearTimersForTesting();
+
+    const saved = await Repository.getSavedItemByShortcode('DConcurrent01', 'sender_conc_1');
+    assert.ok(saved);
+    assert.strictEqual(saved.watch_status, 'watch_later');
+    assert.strictEqual(saved.reminder_interval_seconds, 45);
+    assert.ok(saved.next_reminder_at);
+    assert.ok(!sentMessages.some((msg) => msg.includes('When should I remind you to watch this?')));
+  } finally {
+    (Repository as any).upsertSavedReel = origUpsert;
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('MetaInstagramBotService - cancel command removes recently added reel from Watch Later', async () => {
   const prevUrl = process.env.SUPABASE_URL;
   delete process.env.SUPABASE_URL;
