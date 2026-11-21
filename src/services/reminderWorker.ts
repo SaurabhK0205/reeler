@@ -305,7 +305,26 @@ export class ReminderWorker {
       console.log(`[ReminderWorker] Found ${allDueReels.length} Reel(s) due for reminder (dispatching batch of ${dueReels.length}).`);
 
       for (const reel of dueReels) {
-        const reminderText = formatWatchLaterReminderMessage(reel);
+        // Recheck schedule immediately before sending to ensure reminder was not cancelled in the interim.
+        // Scope explicitly to unattributed rows (null) if reel.instagram_sender_id is absent.
+        let freshReel: SavedReel | null = null;
+        try {
+          freshReel = await Repository.getSavedItemByShortcode(reel.shortcode, reel.instagram_sender_id ?? null);
+        } catch (err: any) {
+          console.error(`[ReminderWorker] Failed to reload due reel ${reel.shortcode}:`, err.message || err);
+          continue;
+        }
+        if (
+          !freshReel ||
+          freshReel.watch_status !== 'watch_later' ||
+          !freshReel.next_reminder_at ||
+          new Date(freshReel.next_reminder_at).getTime() > Date.now()
+        ) {
+          console.log(`[ReminderWorker] Skipping reel ${reel.shortcode} because its reminder is no longer due.`);
+          continue;
+        }
+
+        const reminderText = formatWatchLaterReminderMessage(freshReel);
 
         let delivered = false;
 
@@ -330,7 +349,7 @@ export class ReminderWorker {
           // Calculate next reminder date only after confirmed delivery:
           // Short intervals (< 1 hour) are one-time reminders (next_reminder_at = null)
           // Longer intervals (>= 1 hour) repeat with a gentle 24-hour cadence
-          const intervalSec = reel.reminder_interval_seconds ?? (reel.reminder_interval_hours ? reel.reminder_interval_hours * 3600 : intervalHours * 3600);
+          const intervalSec = freshReel.reminder_interval_seconds ?? (freshReel.reminder_interval_hours ? freshReel.reminder_interval_hours * 3600 : intervalHours * 3600);
           let nextDate: string | null = null;
           if (intervalSec >= 3600) {
             nextDate = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
@@ -339,31 +358,42 @@ export class ReminderWorker {
           }
 
           try {
-            await Repository.recordReminderSent(reel.id, nextDate);
+            await Repository.recordReminderSent(freshReel.id, nextDate, {
+              expectedNextReminderAt: freshReel.next_reminder_at,
+            });
           } catch (err: any) {
-            console.error(`[ReminderWorker] Failed to record reminder for reel ${reel.shortcode}:`, err.message || err);
+            console.error(`[ReminderWorker] Failed to record reminder for reel ${freshReel.shortcode}:`, err.message || err);
             // Suppress repeated sending in memory for 5 minutes if DB recording fails
             if (this.failedReelSuppression.size >= 1000) {
               const firstKey = this.failedReelSuppression.keys().next().value;
               if (firstKey) this.failedReelSuppression.delete(firstKey);
             }
-            this.failedReelSuppression.set(reel.id, Date.now() + 5 * 60 * 1000);
+            this.failedReelSuppression.set(freshReel.id, Date.now() + 5 * 60 * 1000);
 
-            // Attempt fallback backoff in DB to prevent immediate resends on next run
+            // Attempt fallback persistence: clear due date for one-time reminders (nextDate === null),
+            // or back off 5 minutes for recurring reminders
             try {
-              await Repository.updateReminderSchedule(reel.id, new Date(Date.now() + 5 * 60 * 1000).toISOString());
+              const fallbackDate = nextDate === null ? null : new Date(Date.now() + 5 * 60 * 1000).toISOString();
+              await Repository.updateReminderSchedule(
+                freshReel.id,
+                fallbackDate,
+                undefined,
+                { expectedNextReminderAt: freshReel.next_reminder_at }
+              );
             } catch (fallbackErr: any) {
-              console.error(`[ReminderWorker] Fallback backoff failed for reel ${reel.shortcode}:`, fallbackErr.message || fallbackErr);
+              console.error(`[ReminderWorker] Fallback schedule update failed for reel ${freshReel.shortcode}:`, fallbackErr.message || fallbackErr);
             }
           }
         } else {
           // On delivery failure, retain reminder and back off 5 minutes before retrying
           const retryDate = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-          console.warn(`[ReminderWorker] Delivery for reel ${reel.shortcode} failed. Backing off until ${retryDate}.`);
+          console.warn(`[ReminderWorker] Delivery for reel ${freshReel.shortcode} failed. Backing off until ${retryDate}.`);
           try {
-            await Repository.updateReminderSchedule(reel.id, retryDate);
+            await Repository.updateReminderSchedule(freshReel.id, retryDate, undefined, {
+              expectedNextReminderAt: freshReel.next_reminder_at,
+            });
           } catch (err: any) {
-            console.error(`[ReminderWorker] Failed to schedule retry for reel ${reel.shortcode}:`, err.message || err);
+            console.error(`[ReminderWorker] Failed to schedule retry for reel ${freshReel.shortcode}:`, err.message || err);
           }
         }
       }
