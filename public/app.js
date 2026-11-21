@@ -3882,10 +3882,12 @@ function mountFeedIframe(slide, reel) {
     // Any valid postMessage from Instagram confirms the frame is mounted
     mounted = true;
 
+    let recoveredFromFallback = false;
     if (fallbackBox && !fallbackBox.hidden) {
       fallbackBox.hidden = true;
       iframe.hidden = false;
       settled = false;
+      recoveredFromFallback = true;
     }
 
     if (phase === 'cached') {
@@ -3893,7 +3895,7 @@ function mountFeedIframe(slide, reel) {
       return;
     }
 
-    if (phase === 'aborted') {
+    if (phase === 'aborted' || (recoveredFromFallback && !safetyTimer)) {
       const currentW = Math.round(parseFloat(iframe.style.width) || iframe.offsetWidth || 0);
       iframe.dataset.probing = '1';
       if (safetyTimer) clearTimeout(safetyTimer);
@@ -3921,11 +3923,11 @@ function mountFeedIframe(slide, reel) {
         iframe.style.width = `${ReelerGeometry.PROBE_WIDTH_2}px`;
         if (safetyTimer) {
           clearTimeout(safetyTimer);
-          safetyTimer = setTimeout(() => {
-            phase = 'aborted';
-            finalizeAndReveal(null, false, 0, false);
-          }, 3500);
         }
+        safetyTimer = setTimeout(() => {
+          phase = 'aborted';
+          finalizeAndReveal(null, false, 0, false);
+        }, 3500);
       }
       return;
     }
