@@ -124,8 +124,8 @@ export function isGreetingOrHelpMessage(text: string): boolean {
 
   if (
     /^(?:hi|hello|hey|heya|yo|sup|wassup|what'?s\s+up|howdy|hola|greetings|gm|gn)[!.]*$/i.test(cleaned) ||
-    /^(?:hi|hello|hey|yo|sup|what'?s\s+up)\s+(?:bot|there|reeler|bro|dude|man|homie|mate|nigga|niga)[!.]*$/i.test(cleaned) ||
-    /^(?:nigga|niga|bro|dude|homie)[!.]*$/i.test(cleaned) ||
+    /^(?:hi|hello|hey|yo|sup|what'?s\s+up)\s+(?:bot|there|reeler|bro|dude|man|homie|mate|friend|pal|buddy)[!.]*$/i.test(cleaned) ||
+    /^(?:bro|dude|homie|pal|buddy)[!.]*$/i.test(cleaned) ||
     /^(?:help|commands?|menu|start|info|instructions?|guide|options?)[!.]*$/i.test(cleaned) ||
     /^(?:how\s+to\s+use|what\s+can\s+you\s+do|what\s+do\s+you\s+do|how\s+does\s+this\s+work|how\s+it\s+works)[!.]*$/i.test(cleaned)
   ) {

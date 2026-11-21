@@ -2895,10 +2895,10 @@ test('MetaInstagramBotService - parseCancelCommand, parseTargetedWatchedCommand,
   // Greetings and help
   const greetings = [
     'hi', 'hello', 'hey', 'heya', 'yo', 'sup', 'wassup', "what's up", 'whats up',
-    'nigga', 'niga', 'hey nigga', 'sup nigga', 'yo nigga', 'bro', 'sup bro',
+    'bro', 'sup bro', 'hey buddy', 'sup dude', 'yo homie',
     'help', 'commands', 'command', 'instructions', 'guide', 'how to use',
     'what can you do', 'what do you do', 'how does this work',
-    'hi!', 'hello?', 'yo...', 'hey bot', 'sup dude!', 'nigga?!'
+    'hi!', 'hello?', 'yo...', 'hey bot', 'sup dude!'
   ];
   for (const g of greetings) {
     assert.strictEqual(isGreetingOrHelpMessage(g), true, `Expected "${g}" to be recognized as greeting or help`);
@@ -2941,7 +2941,7 @@ test('MetaInstagramBotService - greeting and help queries return unified help me
   assert.strictEqual(sentMessages.length, 1);
   assert.strictEqual(sentMessages[0], expectedHelp);
 
-  // "nigga"
+  // "sup bro"
   sentMessages.length = 0;
   await service.handleWebhookPayload({
     object: 'instagram',
@@ -2949,7 +2949,7 @@ test('MetaInstagramBotService - greeting and help queries return unified help me
       {
         id: 'page_123',
         time: Date.now(),
-        messaging: [{ sender: { id: 'sender_greeting_1' }, recipient: { id: 'page_123' }, timestamp: Date.now(), message: { mid: 'm2', text: 'nigga' } }],
+        messaging: [{ sender: { id: 'sender_greeting_1' }, recipient: { id: 'page_123' }, timestamp: Date.now(), message: { mid: 'm2', text: 'sup bro' } }],
       },
     ],
   });
@@ -2958,6 +2958,8 @@ test('MetaInstagramBotService - greeting and help queries return unified help me
 });
 
 test('MetaInstagramBotService - share debouncing unifies share-sheet attachment and duration text into one message', async (t) => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
   const { Repository } = await import('../src/db/repository.ts');
   Repository.resetMemoryStoreForTests();
   const originalFetch = globalThis.fetch;
@@ -3048,12 +3050,15 @@ test('MetaInstagramBotService - share debouncing unifies share-sheet attachment 
   } finally {
     service.clearTimersForTesting();
     Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
     globalThis.fetch = originalFetch;
     t.mock.timers.reset();
   }
 });
 
 test('MetaInstagramBotService - cancel command removes recently added reel from Watch Later', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
   const { Repository } = await import('../src/db/repository.ts');
   Repository.resetMemoryStoreForTests();
   const originalFetch = globalThis.fetch;
@@ -3125,11 +3130,14 @@ test('MetaInstagramBotService - cancel command removes recently added reel from 
   } finally {
     service.clearTimersForTesting();
     Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
     globalThis.fetch = originalFetch;
   }
 });
 
 test('MetaInstagramBotService - cancel reminder clears reminder schedule while keeping item in Watch Later', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
   const { Repository } = await import('../src/db/repository.ts');
   Repository.resetMemoryStoreForTests();
   const originalFetch = globalThis.fetch;
@@ -3204,6 +3212,7 @@ test('MetaInstagramBotService - cancel reminder clears reminder schedule while k
   } finally {
     service.clearTimersForTesting();
     Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
     globalThis.fetch = originalFetch;
   }
 });
@@ -3261,14 +3270,16 @@ test('MetaInstagramBotService & Repository - creator commands use exact handle m
     assert.ok(annaReel);
     assert.strictEqual(annaReel.watch_status, 'watch_later');
   } finally {
+    Repository.resetMemoryStoreForTests();
     if (prevUrl !== undefined) {
       process.env.SUPABASE_URL = prevUrl;
     }
-    Repository.resetMemoryStoreForTests();
   }
 });
 
 test('MetaInstagramBotService - consecutive shares flush prior pending prompt without dropping it', async (t) => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
   const { Repository } = await import('../src/db/repository.ts');
   Repository.resetMemoryStoreForTests();
   const originalFetch = globalThis.fetch;
@@ -3283,6 +3294,41 @@ test('MetaInstagramBotService - consecutive shares flush prior pending prompt wi
   };
 
   try {
+    const c1 = await Repository.upsertCreator({
+      instagram_user_id: 'c_consec_1',
+      username: 'creator_first',
+      display_name: 'Creator First',
+    });
+    const c2 = await Repository.upsertCreator({
+      instagram_user_id: 'c_consec_2',
+      username: 'creator_second',
+      display_name: 'Creator Second',
+    });
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_consec_1',
+      shortcode: 'DConsec1',
+      reel_url: 'https://instagram.com/reel/DConsec1/',
+      creator_id: c1.id,
+      taken_at: '2026-11-20T10:00:00Z',
+      first_detected_at: '2026-11-20T10:00:00Z',
+      save_order_rank: 1,
+      instagram_sender_id: 'sender_consec_1',
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+    });
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_consec_2',
+      shortcode: 'DConsec2',
+      reel_url: 'https://instagram.com/reel/DConsec2/',
+      creator_id: c2.id,
+      taken_at: '2026-11-20T10:00:00Z',
+      first_detected_at: '2026-11-20T10:00:00Z',
+      save_order_rank: 2,
+      instagram_sender_id: 'sender_consec_1',
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+    });
+
     // Share Reel 1
     await service.handleWebhookPayload({
       object: 'instagram',
@@ -3329,26 +3375,32 @@ test('MetaInstagramBotService - consecutive shares flush prior pending prompt wi
 
     // Reel 1's prompt must have been flushed immediately when Reel 2 arrived without time advancing
     assert.strictEqual(sentMessages.length, 1);
-    assert.ok(sentMessages[0].includes('Added to your Watch Later!'));
+    assert.ok(sentMessages[0].includes('@creator_first'));
 
     // Advance mock timers to let Reel 2 debounce settle
     t.mock.timers.tick(250);
 
     // Now Reel 2's prompt must also have been sent
     assert.strictEqual(sentMessages.length, 2);
+    assert.ok(sentMessages[1].includes('@creator_second'));
   } finally {
     service.clearTimersForTesting();
     Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
     globalThis.fetch = originalFetch;
+    t.mock.timers.reset();
   }
 });
 
-test('MetaInstagramBotService - cancel reminder for handle containing time keyword reaches cancel handler instead of scheduling duration', async () => {
+test('MetaInstagramBotService - cancel reminder for handle containing time keyword reaches cancel handler instead of scheduling duration', async (t) => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
   const { Repository } = await import('../src/db/repository.ts');
   Repository.resetMemoryStoreForTests();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
 
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const service = new MetaInstagramBotService({ shareDebounceDelayMs: 200 });
   const sentMessages: string[] = [];
   service.sendDirectMessage = async (_recipientId: string, text: string) => {
@@ -3399,8 +3451,8 @@ test('MetaInstagramBotService - cancel reminder for handle containing time keywo
       ],
     });
 
-    // Send "cancel reminder for @tomorrowland"
-    sentMessages.length = 0;
+    // Hold mock clock before debounce deadline and send "cancel reminder for @tomorrowland"
+    assert.strictEqual(sentMessages.length, 0);
     await service.handleWebhookPayload({
       object: 'instagram',
       entry: [
@@ -3422,8 +3474,10 @@ test('MetaInstagramBotService - cancel reminder for handle containing time keywo
       ],
     });
 
-    // Must flush pending prompt AND process cancel reminder
-    assert.ok(sentMessages.some((msg) => msg.includes('Reminder cancelled')));
+    // Must flush pending prompt for the new share AND confirm cancellation without time advancing
+    assert.strictEqual(sentMessages.length, 2);
+    assert.ok(sentMessages[0].includes('Added to your Watch Later!'));
+    assert.ok(sentMessages[1].includes('Reminder cancelled for @tomorrowland'));
 
     const updated = await Repository.getSavedItemByShortcode('DTomorrow1', 'sender_tomorrow_cmd');
     assert.ok(updated);
@@ -3431,6 +3485,8 @@ test('MetaInstagramBotService - cancel reminder for handle containing time keywo
   } finally {
     service.clearTimersForTesting();
     Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
     globalThis.fetch = originalFetch;
+    t.mock.timers.reset();
   }
 });

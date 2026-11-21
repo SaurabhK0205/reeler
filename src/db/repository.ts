@@ -2206,16 +2206,18 @@ export class Repository {
 
     const supabase = getSupabase();
     // fetch current count and check expected reminder schedule
-    const { data: current } = await supabase
+    const { data: current, error: getErr } = await supabase
       .from('saved_reels')
       .select('reminders_sent_count, next_reminder_at')
       .eq('id', id)
       .maybeSingle();
+    if (getErr) throw new Error(`Failed to fetch current reminder state: ${getErr.message}`);
     if (!current) return false;
     if (
       options?.expectedNextReminderAt !== undefined &&
       (current.next_reminder_at ?? null) !== (options.expectedNextReminderAt ?? null)
     ) {
+      // Missing or superseded schedule: not a persistence error, leave newer schedule untouched
       return false;
     }
     const newCount = (current.reminders_sent_count || 0) + 1;
@@ -2234,8 +2236,9 @@ export class Repository {
         ? upQuery.is('next_reminder_at', null)
         : upQuery.eq('next_reminder_at', options.expectedNextReminderAt);
     }
-    const { data, error } = await upQuery.select('id');
-    return !error && Array.isArray(data) && data.length > 0;
+    const { data, error: upErr } = await upQuery.select('id');
+    if (upErr) throw new Error(`Failed to update reminder record: ${upErr.message}`);
+    return Array.isArray(data) && data.length > 0;
   }
 
   /**
@@ -2277,13 +2280,15 @@ export class Repository {
       const now = new Date().toISOString();
 
       const stored = memoryStore.reels.get(target.id);
-      if (!stored) return null;
+      if (!stored || stored.watch_status !== 'watch_later') return null;
       if (stored.is_saved_on_instagram === false) {
         memoryStore.reels.delete(target.id);
+        Repository.invalidateCreatorsCache();
         return { cancelledReel: target, action: 'deleted' };
       } else {
         stored.watch_status = 'unwatched';
         stored.next_reminder_at = null;
+        stored.reminder_interval_seconds = null;
         stored.awaiting_reminder_choice_until = null;
         stored.updated_at = now;
         return {
@@ -2340,11 +2345,13 @@ export class Repository {
         .eq('id', target.id)
         .eq('instagram_sender_id', trimmedSender)
         .eq('is_saved_on_instagram', false)
+        .eq('watch_status', 'watch_later')
         .select('id');
       if (delErr) {
         throw new Error(`Failed to delete cancelled reel: ${delErr.message}`);
       }
       if (deletedRows && deletedRows.length > 0) {
+        Repository.invalidateCreatorsCache();
         return { cancelledReel: target, action: 'deleted' };
       }
       // If row was concurrently promoted to is_saved_on_instagram: true, fall through to revert
@@ -2355,17 +2362,20 @@ export class Repository {
       .update({
         watch_status: 'unwatched',
         next_reminder_at: null,
+        reminder_interval_seconds: null,
         awaiting_reminder_choice_until: null,
         updated_at: now,
       })
       .eq('id', target.id)
       .eq('instagram_sender_id', trimmedSender)
+      .eq('watch_status', 'watch_later')
       .select('*, creator:creators(*)')
       .maybeSingle();
     if (upErr) {
       throw new Error(`Failed to revert cancelled reel: ${upErr.message}`);
     }
-    return { cancelledReel: (updated as SavedReel) || target, action: 'reverted' };
+    if (!updated) return null;
+    return { cancelledReel: updated as SavedReel, action: 'reverted' };
   }
 
   /**
@@ -2401,7 +2411,8 @@ export class Repository {
       );
       const target = ordered[0];
       const now = new Date().toISOString();
-      const stored = memoryStore.reels.get(target.id)!;
+      const stored = memoryStore.reels.get(target.id);
+      if (!stored || stored.watch_status !== 'watch_later') return null;
       stored.next_reminder_at = null;
       stored.awaiting_reminder_choice_until = null;
       stored.updated_at = now;
@@ -2456,13 +2467,15 @@ export class Repository {
       })
       .eq('id', target.id)
       .eq('instagram_sender_id', trimmedSender)
+      .eq('watch_status', 'watch_later')
       .select('*, creator:creators(*)')
       .maybeSingle();
 
     if (upErr) {
       throw new Error(`Failed to cancel reminder: ${upErr.message}`);
     }
-    return { updatedReel: (updated as SavedReel) || target };
+    if (!updated) return null;
+    return { updatedReel: updated as SavedReel };
   }
 
   /**
@@ -2519,8 +2532,9 @@ export class Repository {
       for (const id of state.toDeleteIds) {
         if (!state.deletedIds.includes(id)) {
           const reel = memoryStore.reels.get(id);
-          if (reel) {
+          if (reel && reel.watch_status === 'watch_later') {
             memoryStore.reels.delete(id);
+            Repository.invalidateCreatorsCache();
             state.deletedIds.push(id);
             options?.onPartialProgress?.(true);
           }
@@ -2530,9 +2544,10 @@ export class Repository {
       for (const id of state.toRevertIds) {
         if (!state.revertedIds.includes(id)) {
           const reel = memoryStore.reels.get(id);
-          if (reel) {
+          if (reel && reel.watch_status === 'watch_later') {
             reel.watch_status = 'unwatched';
             reel.next_reminder_at = null;
+            reel.reminder_interval_seconds = null;
             reel.awaiting_reminder_choice_until = null;
             reel.updated_at = now;
             state.revertedIds.push(id);
@@ -2561,7 +2576,7 @@ export class Repository {
       const { data: creators, error: cErr } = await supabase
         .from('creators')
         .select('id, username')
-        .eq('username', handle);
+        .ilike('username', handle.replace(/[_%]/g, '\\$&'));
       if (cErr) {
         throw new Error(`Failed to resolve creator for clear: ${cErr.message}`);
       }
@@ -2605,6 +2620,7 @@ export class Repository {
         .in('id', remainingDeleteIds)
         .eq('instagram_sender_id', trimmedSender)
         .eq('is_saved_on_instagram', false)
+        .eq('watch_status', 'watch_later')
         .select('id');
       if (delErr) {
         throw new Error(`Failed to delete bot-added reels: ${delErr.message}`);
@@ -2612,6 +2628,7 @@ export class Repository {
       const confirmedDeletedIds = (deleted || []).map((d: any) => d.id);
       state.deletedIds.push(...confirmedDeletedIds);
       if (confirmedDeletedIds.length > 0) {
+        Repository.invalidateCreatorsCache();
         options?.onPartialProgress?.(true);
       }
       for (const id of remainingDeleteIds) {
@@ -2628,11 +2645,13 @@ export class Repository {
         .update({
           watch_status: 'unwatched',
           next_reminder_at: null,
+          reminder_interval_seconds: null,
           awaiting_reminder_choice_until: null,
           updated_at: now,
         })
         .in('id', remainingRevertIds)
         .eq('instagram_sender_id', trimmedSender)
+        .eq('watch_status', 'watch_later')
         .select('*, creator:creators(*)');
       if (revErr) {
         throw new Error(`Failed to revert saved reels to unwatched: ${revErr.message}`);
@@ -2676,9 +2695,12 @@ export class Repository {
     const { data: creators, error: cErr } = await supabase
       .from('creators')
       .select('id, username')
-      .eq('username', handle);
+      .ilike('username', handle.replace(/[_%]/g, '\\$&'));
     if (cErr) throw new Error(`Failed to resolve creator: ${cErr.message}`);
-    const creatorIds = (creators || []).map((c: any) => c.id).filter(Boolean);
+    const creatorIds = (creators || [])
+      .filter((c: any) => String(c.username || '').toLowerCase() === handle)
+      .map((c: any) => c.id)
+      .filter(Boolean);
     if (creatorIds.length === 0) return [];
 
     const { data: reels, error: rErr } = await supabase
@@ -2735,7 +2757,7 @@ export class Repository {
     const { data: creators, error: cErr } = await supabase
       .from('creators')
       .select('id, username')
-      .eq('username', handle);
+      .ilike('username', handle.replace(/[_%]/g, '\\$&'));
     if (cErr) {
       throw new Error(`Failed to resolve creator for watch: ${cErr.message}`);
     }
