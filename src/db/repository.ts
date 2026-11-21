@@ -258,8 +258,12 @@ class InMemoryStore {
       existing.effective_saved_at = resolveEffectiveSavedAt(existing);
       if (data.instagram_sender_id !== undefined) existing.instagram_sender_id = data.instagram_sender_id;
       existing.updated_at = now;
-      if (existing.watch_status === 'watch_later' && existing.instagram_sender_id) {
-        this.latestAdditionReelIdBySender.set(String(existing.instagram_sender_id).trim(), existing.id);
+      if (existing.watch_status === 'watch_later') {
+        if (existing.instagram_sender_id) {
+          this.latestAdditionReelIdBySender.set(String(existing.instagram_sender_id).trim(), existing.id);
+        } else {
+          this.latestAdditionReelIdBySender.set('__unattributed__', existing.id);
+        }
       }
       options?.onInsertResult?.(false);
       return options?.skipReturn ? null : { ...existing, creator: this.creators.get(existing.creator_id) };
@@ -302,8 +306,12 @@ class InMemoryStore {
     };
 
     this.reels.set(newReel.id, newReel);
-    if (newReel.watch_status === 'watch_later' && newReel.instagram_sender_id) {
-      this.latestAdditionReelIdBySender.set(String(newReel.instagram_sender_id).trim(), newReel.id);
+    if (newReel.watch_status === 'watch_later') {
+      if (newReel.instagram_sender_id) {
+        this.latestAdditionReelIdBySender.set(String(newReel.instagram_sender_id).trim(), newReel.id);
+      } else {
+        this.latestAdditionReelIdBySender.set('__unattributed__', newReel.id);
+      }
     }
     options?.onInsertResult?.(true);
     return options?.skipReturn ? null : newReel;
@@ -2310,12 +2318,10 @@ export class Repository {
       if (candidates.length === 0) return null;
 
       candidates.sort((a, b) => {
-        const rankB = b.save_order_rank ?? 0;
-        const rankA = a.save_order_rank ?? 0;
-        if (rankB !== rankA) return rankB - rankA;
-        const timeB = new Date(b.updated_at || b.created_at || 0).getTime();
-        const timeA = new Date(a.updated_at || a.created_at || 0).getTime();
-        return timeB - timeA;
+        const timeB = new Date(b.created_at || b.first_detected_at || 0).getTime();
+        const timeA = new Date(a.created_at || a.first_detected_at || 0).getTime();
+        if (timeB !== timeA) return timeB - timeA;
+        return String(b.id || '').localeCompare(String(a.id || ''));
       });
       const target = { ...candidates[0], creator: memoryStore.creators.get(candidates[0].creator_id) };
       const now = new Date().toISOString();
@@ -2324,6 +2330,9 @@ export class Repository {
       if (!stored || stored.watch_status !== 'watch_later') return null;
       if (memoryStore.latestAdditionReelIdBySender.get(trimmedSender) === target.id) {
         memoryStore.latestAdditionReelIdBySender.delete(trimmedSender);
+      }
+      if (memoryStore.latestAdditionReelIdBySender.get('__unattributed__') === target.id) {
+        memoryStore.latestAdditionReelIdBySender.delete('__unattributed__');
       }
       if (stored.is_saved_on_instagram === false) {
         memoryStore.reels.delete(target.id);
@@ -2375,9 +2384,9 @@ export class Repository {
       }
 
       const { data, error } = await query
-        .order('save_order_rank', { ascending: false })
-        .order('updated_at', { ascending: false })
         .order('created_at', { ascending: false })
+        .order('first_detected_at', { ascending: false })
+        .order('id', { ascending: false })
         .limit(10);
 
       if (error) {
@@ -2661,6 +2670,7 @@ export class Repository {
     options?: {
       includeUnattributedFallback?: boolean;
       pinnedState?: {
+        ownerScope?: 'exact' | 'unattributed';
         toDeleteIds: string[];
         toRevertIds: string[];
         reels: SavedReel[];
@@ -2725,26 +2735,23 @@ export class Repository {
             reel &&
             (reel.instagram_sender_id === trimmedSender ||
               (allowUnattributedFallback && !reel.instagram_sender_id));
-          if (
-            reel &&
-            matchesSender &&
-            reel.watch_status === 'watch_later' &&
-            (!expectedUpdatedAt || (reel.updated_at || reel.created_at || '') === expectedUpdatedAt)
-          ) {
-            if (reel.is_saved_on_instagram !== false) {
-              // Row was promoted to IG saved; move to revert instead of deleting
-              if (!state.toRevertIds.includes(id)) {
-                state.toRevertIds.push(id);
-              }
-              if (state.targetUpdatedAts) {
-                state.targetUpdatedAts[id] = reel.updated_at || reel.created_at || '';
-              }
-            } else {
-              memoryStore.reels.delete(id);
-              Repository.invalidateCreatorsCache();
-              state.deletedIds.push(id);
-              options?.onPartialProgress?.(true);
+          if (!reel || !matchesSender || reel.watch_status !== 'watch_later') {
+            continue;
+          }
+
+          if (reel.is_saved_on_instagram !== false) {
+            // Row was promoted to IG saved; move to revert instead of deleting
+            if (!state.toRevertIds.includes(id)) {
+              state.toRevertIds.push(id);
             }
+            if (state.targetUpdatedAts) {
+              state.targetUpdatedAts[id] = reel.updated_at || reel.created_at || '';
+            }
+          } else if (!expectedUpdatedAt || (reel.updated_at || reel.created_at || '') === expectedUpdatedAt) {
+            memoryStore.reels.delete(id);
+            Repository.invalidateCreatorsCache();
+            state.deletedIds.push(id);
+            options?.onPartialProgress?.(true);
           }
         }
       }
@@ -2838,13 +2845,16 @@ export class Repository {
         return res;
       };
 
+      let ownerScope: 'exact' | 'unattributed' = 'exact';
       let reels = trimmedSender ? await fetchReelsForSender('exact') : [];
       if (allowUnattributedFallback && reels.length === 0) {
         reels = await fetchReelsForSender('unattributed');
+        ownerScope = 'unattributed';
       }
       if (reels.length === 0) return { clearedReels: [] };
 
       const initial = {
+        ownerScope,
         toDeleteIds: reels.filter((r) => r.is_saved_on_instagram === false).map((r) => r.id),
         toRevertIds: reels.filter((r) => r.is_saved_on_instagram !== false).map((r) => r.id),
         reels: reels as SavedReel[],
@@ -2863,16 +2873,10 @@ export class Repository {
 
     const now = new Date().toISOString();
     const applyOwnerFilter = (query: any) => {
-      if (trimmedSender && !allowUnattributedFallback) {
+      if (state.ownerScope === 'exact' && trimmedSender) {
         return query.eq('instagram_sender_id', trimmedSender);
       }
-      if (trimmedSender && allowUnattributedFallback) {
-        return query.or(`instagram_sender_id.eq.${trimmedSender},instagram_sender_id.is.null,instagram_sender_id.eq.`);
-      }
-      if (allowUnattributedFallback) {
-        return query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
-      }
-      return query;
+      return query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
     };
 
     const remainingDeleteIds = state.toDeleteIds.filter((id) => !state!.deletedIds.includes(id));
@@ -2890,7 +2894,7 @@ export class Repository {
           throw new Error(`Failed to verify reel status before clear: ${fetchErr.message}`);
         }
 
-        const deleteGroups = new Map<string, string[]>();
+        const validDeleteIds: string[] = [];
         for (const row of (currentRows || []) as any[]) {
           if (row.watch_status !== 'watch_later') continue;
           if (row.is_saved_on_instagram !== false) {
@@ -2905,13 +2909,11 @@ export class Repository {
           }
           const expectedVersion = state.targetUpdatedAts?.[row.id] || '';
           if (!expectedVersion || row.updated_at === expectedVersion) {
-            const group = deleteGroups.get(expectedVersion) || [];
-            group.push(row.id);
-            deleteGroups.set(expectedVersion, group);
+            validDeleteIds.push(row.id);
           }
         }
 
-        for (const [version, validDeleteIds] of deleteGroups.entries()) {
+        if (validDeleteIds.length > 0) {
           let delQuery = supabase
             .from('saved_reels')
             .delete()
@@ -2919,9 +2921,6 @@ export class Repository {
             .eq('is_saved_on_instagram', false)
             .eq('watch_status', 'watch_later');
           delQuery = applyOwnerFilter(delQuery);
-          if (version) {
-            delQuery = delQuery.eq('updated_at', version);
-          }
           const { data: deleted, error: delErr } = await delQuery.select('id');
           if (delErr) {
             throw new Error(`Failed to delete bot-added reels: ${delErr.message}`);
@@ -2931,6 +2930,28 @@ export class Repository {
           if (confirmedDeletedIds.length > 0) {
             Repository.invalidateCreatorsCache();
             options?.onPartialProgress?.(true);
+          }
+
+          // Handle concurrent promotions between prefetch and delete
+          const deletedSet = new Set(confirmedDeletedIds);
+          const unconfirmedIds = validDeleteIds.filter((id) => !deletedSet.has(id));
+          if (unconfirmedIds.length > 0) {
+            let recheckQuery = supabase
+              .from('saved_reels')
+              .select('id, updated_at, is_saved_on_instagram, watch_status')
+              .in('id', unconfirmedIds);
+            recheckQuery = applyOwnerFilter(recheckQuery);
+            const { data: rechecked } = await recheckQuery;
+            for (const row of (rechecked || []) as any[]) {
+              if (row.watch_status === 'watch_later' && row.is_saved_on_instagram !== false) {
+                if (!state.toRevertIds.includes(row.id)) {
+                  state.toRevertIds.push(row.id);
+                }
+                if (state.targetUpdatedAts) {
+                  state.targetUpdatedAts[row.id] = row.updated_at || '';
+                }
+              }
+            }
           }
         }
       }
@@ -2951,18 +2972,16 @@ export class Repository {
           throw new Error(`Failed to verify reel status before revert: ${fetchErr.message}`);
         }
 
-        const revertGroups = new Map<string, string[]>();
+        const validRevertIds: string[] = [];
         for (const row of (currentRows || []) as any[]) {
           if (row.watch_status !== 'watch_later') continue;
           const expectedVersion = state.targetUpdatedAts?.[row.id] || '';
           if (!expectedVersion || row.updated_at === expectedVersion) {
-            const group = revertGroups.get(expectedVersion) || [];
-            group.push(row.id);
-            revertGroups.set(expectedVersion, group);
+            validRevertIds.push(row.id);
           }
         }
 
-        for (const [version, validRevertIds] of revertGroups.entries()) {
+        if (validRevertIds.length > 0) {
           let revQuery = supabase
             .from('saved_reels')
             .update({
@@ -2975,9 +2994,6 @@ export class Repository {
             .in('id', validRevertIds)
             .eq('watch_status', 'watch_later');
           revQuery = applyOwnerFilter(revQuery);
-          if (version) {
-            revQuery = revQuery.eq('updated_at', version);
-          }
           const { data: reverted, error: revErr } = await revQuery.select('id');
           if (revErr) {
             throw new Error(`Failed to revert saved reels to unwatched: ${revErr.message}`);

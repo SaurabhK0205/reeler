@@ -95,8 +95,9 @@ export function extractCreatorQueryWithFilter(text: string): CreatorQueryResult 
   );
   if (typedPrefixMatch) {
     const candidate = typedPrefixMatch[2].toLowerCase();
+    const isReserved = candidate !== 'done' && RESERVED_WORDS.has(candidate);
     if (
-      RESERVED_WORDS.has(candidate) ||
+      isReserved ||
       isDurationShortcut(candidate) ||
       !isPlausibleInstagramHandle(candidate)
     ) {
@@ -108,8 +109,9 @@ export function extractCreatorQueryWithFilter(text: string): CreatorQueryResult 
   const typedSuffixMatch = trimmed.match(/^([a-zA-Z0-9._]{2,30})\s+(reels?|posts?)$/i);
   if (typedSuffixMatch) {
     const candidate = typedSuffixMatch[1].toLowerCase();
+    const isReserved = candidate !== 'done' && RESERVED_WORDS.has(candidate);
     if (
-      RESERVED_WORDS.has(candidate) ||
+      isReserved ||
       isDurationShortcut(candidate) ||
       !isPlausibleInstagramHandle(candidate)
     ) {

@@ -175,6 +175,8 @@ export class ReminderWorker {
         console.log(`[ReminderWorker] Connected to Admin DM thread: ${this.adminThreadId} (Admin User ID: ${this.adminUserId})`);
       }
 
+      await this.drainPendingConfirmationReplies();
+
       const messagesRes = await this.actionClient.getThreadMessages(this.adminThreadId);
       if (!messagesRes.success) return;
 
@@ -223,6 +225,11 @@ export class ReminderWorker {
         }
       }
     } finally {
+      try {
+        await this.drainPendingConfirmationReplies();
+      } catch (drainErr) {
+        console.error('[ReminderWorker] Error in post-poll confirmation reply drain:', drainErr);
+      }
       this.isPollingInboundDMs = false;
     }
   }
@@ -394,28 +401,37 @@ export class ReminderWorker {
       }
     }
 
-    // Flush pending confirmation replies after processing current commands (bounded to at most 5 per poll, non-blocking)
-    if (this.pendingAdminConfirmationReplies.length > 0 && this.adminUserId) {
-      const batch = this.pendingAdminConfirmationReplies.splice(0, 5);
-      const retryQueue: string[] = [];
-      for (const pendingReply of batch) {
-        try {
-          const res = await this.actionClient.sendDirectMessage(this.adminUserId, pendingReply);
-          if (!res.success) {
-            retryQueue.push(pendingReply);
-          }
-        } catch (err: any) {
-          console.error('[ReminderWorker] Transport error flushing admin confirmation reply:', err?.message || err);
+  }
+
+  /**
+   * Flushes pending confirmation replies to the admin (bounded to at most 5 per call, non-blocking).
+   */
+  private async drainPendingConfirmationReplies(): Promise<void> {
+    if (this.pendingAdminConfirmationReplies.length === 0 || !this.adminUserId) {
+      return;
+    }
+    const batch = this.pendingAdminConfirmationReplies.splice(0, 5);
+    const retryQueue: string[] = [];
+    for (let i = 0; i < batch.length; i++) {
+      const pendingReply = batch[i];
+      try {
+        const res = await this.actionClient.sendDirectMessage(this.adminUserId, pendingReply);
+        if (!res.success) {
           retryQueue.push(pendingReply);
-          break; // Stop retrying for this poll cycle on transport exception
         }
+      } catch (err: any) {
+        console.error('[ReminderWorker] Transport error flushing admin confirmation reply:', err?.message || err);
+        retryQueue.push(pendingReply);
+        const unattempted = batch.slice(i + 1);
+        retryQueue.push(...unattempted);
+        break; // Stop retrying for this poll cycle on transport exception
       }
-      if (retryQueue.length > 0) {
-        this.pendingAdminConfirmationReplies = [
-          ...retryQueue,
-          ...this.pendingAdminConfirmationReplies,
-        ].slice(0, ReminderWorker.MAX_PENDING_CONFIRMATION_REPLIES);
-      }
+    }
+    if (retryQueue.length > 0) {
+      this.pendingAdminConfirmationReplies = [
+        ...retryQueue,
+        ...this.pendingAdminConfirmationReplies,
+      ].slice(0, ReminderWorker.MAX_PENDING_CONFIRMATION_REPLIES);
     }
   }
 
@@ -450,14 +466,23 @@ export class ReminderWorker {
       // Prune stale checkpoints older than 24 hours only if the reel's due schedule has changed or is no longer due
       for (const [key, checkpoint] of Array.from(this.deliveredPersistenceCheckpoints.entries())) {
         if (now > checkpoint.deliveryTimestamp + 24 * 3600 * 1000) {
-          const fresh = await Repository.getSavedItemById(checkpoint.reelId).catch(() => null);
-          const isStillDue = fresh && fresh.watch_status === 'watch_later' &&
-            fresh.next_reminder_at &&
-            (checkpoint.expectedNextReminderAt === null
-              ? false
-              : isSameInstant(fresh.next_reminder_at, checkpoint.expectedNextReminderAt));
-          if (!isStillDue) {
-            this.deliveredPersistenceCheckpoints.delete(key);
+          let fresh: SavedReel | null = null;
+          let lookupFailed = false;
+          try {
+            fresh = await Repository.getSavedItemById(checkpoint.reelId);
+          } catch (err) {
+            lookupFailed = true;
+            console.warn(`[ReminderWorker] Checkpoint expiry lookup failed for reel ${checkpoint.reelId}; retaining checkpoint:`, err);
+          }
+          if (!lookupFailed) {
+            const isStillDue = fresh && fresh.watch_status === 'watch_later' &&
+              fresh.next_reminder_at &&
+              (checkpoint.expectedNextReminderAt === null
+                ? false
+                : isSameInstant(fresh.next_reminder_at, checkpoint.expectedNextReminderAt));
+            if (!isStillDue) {
+              this.deliveredPersistenceCheckpoints.delete(key);
+            }
           }
         }
       }
