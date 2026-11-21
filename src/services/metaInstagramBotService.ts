@@ -118,6 +118,7 @@ interface WebhookRetryState {
     opId?: string;
     rawMid?: string;
     shareId: string;
+    isAlreadyInWatchLater?: boolean;
   };
   /** Preserves the exact Watch Later Reel IDs resolved on the initial watched/stop command across retries. */
   pinnedWatchedTargetIds?: string[];
@@ -137,6 +138,8 @@ interface WebhookRetryState {
   pinnedWatchedCreatorCompletedIds?: string[];
   /** Preserves the specific Reel ID targeted by a cancel command across retries. */
   pinnedCancelTargetReelId?: string;
+  /** Preserves whether an inbound share was already active in Watch Later across retries. */
+  pinnedIsAlreadyInWatchLater?: boolean;
   /** Monotonic sequence assigned on initial reception of a timezone-set command to block stale retries. */
   timezoneCommandSeq?: number;
 }
@@ -213,6 +216,7 @@ export class MetaInstagramBotService {
       opId?: string;
       rawMid?: string;
       shareId: string;
+      isAlreadyInWatchLater?: boolean;
     }
   >();
   private recentDurationHints = new Map<
@@ -1203,7 +1207,18 @@ export class MetaInstagramBotService {
         display_name: creator.display_name,
       });
 
-      const addedHeading = mediaType === 'post' ? '🖼️ Added post to your Watch Later!' : '🎬 Added to your Watch Later!';
+      const isAlreadyInWatchLater =
+        delivery?.retryState?.pinnedIsAlreadyInWatchLater !== undefined
+          ? delivery.retryState.pinnedIsAlreadyInWatchLater
+          : Boolean(existingItem && existingItem.watch_status === 'watch_later');
+
+      if (delivery && delivery.retryState.pinnedIsAlreadyInWatchLater === undefined) {
+        delivery.retryState.pinnedIsAlreadyInWatchLater = isAlreadyInWatchLater;
+      }
+
+      const addedHeading = isAlreadyInWatchLater
+        ? (mediaType === 'post' ? '🖼️ Already added to your Watch Later!' : '🎬 Already added to your Watch Later!')
+        : (mediaType === 'post' ? '🖼️ Added post to your Watch Later!' : '🎬 Added to your Watch Later!');
 
       // Final check: if duration arrived while creator was being upserted
       if (shareCtx.acceptedDuration) {
@@ -1336,7 +1351,8 @@ export class MetaInstagramBotService {
 
       if (customDuration) {
         // User provided a specific time along with the item or right before it!
-        let reply = `${addedHeading}${creatorLine}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
+        const reminderActionLabel = isAlreadyInWatchLater ? 'Reminder updated for:' : 'Reminder set for:';
+        let reply = `${addedHeading}${creatorLine}\n\n⏰ ${reminderActionLabel} ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
@@ -1391,6 +1407,7 @@ export class MetaInstagramBotService {
                 opId: promptOpId,
                 rawMid: promptRawMid,
                 shareId,
+                isAlreadyInWatchLater,
               });
             }
           });
@@ -1440,7 +1457,8 @@ export class MetaInstagramBotService {
         delivery.stateMutated = true;
         if (promptInfo.opId) this.markWebhookMidCompleted(promptInfo.opId);
 
-        let reply = `${promptInfo.addedHeading}${promptInfo.creatorLine}\n\n⏰ Reminder set for: ${effectiveDur.label} (${effectiveDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
+        const reminderActionLabel = promptInfo.isAlreadyInWatchLater ? 'Reminder updated for:' : 'Reminder set for:';
+        let reply = `${promptInfo.addedHeading}${promptInfo.creatorLine}\n\n⏰ ${reminderActionLabel} ${effectiveDur.label} (${effectiveDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
@@ -1556,6 +1574,7 @@ export class MetaInstagramBotService {
                 opId: pending.opId,
                 rawMid: pending.rawMid,
                 shareId: pending.shareId,
+                isAlreadyInWatchLater: pending.isAlreadyInWatchLater,
               };
               delivery.retryState.pinnedDurationTargetReel = targetReel;
               delivery.retryState.pinnedDuration = parsedDur;
@@ -1587,7 +1606,8 @@ export class MetaInstagramBotService {
             if (delivery) delivery.stateMutated = true;
             if (pending.opId) this.markWebhookMidCompleted(pending.opId);
 
-            let reply = `${pending.addedHeading}${pending.creatorLine}\n\n⏰ Reminder set for: ${effectiveDur.label} (${effectiveDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
+            const reminderActionLabel = pending.isAlreadyInWatchLater ? 'Reminder updated for:' : 'Reminder set for:';
+            let reply = `${pending.addedHeading}${pending.creatorLine}\n\n⏰ ${reminderActionLabel} ${effectiveDur.label} (${effectiveDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
             if (senderTz === 'UTC') {
               reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
             }
