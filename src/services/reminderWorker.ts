@@ -29,11 +29,39 @@ export class ReminderWorker {
   private adminUserId: string | null = null;
   private isDispatching = false;
   private isCheckingChoices = false;
+  private isPollingInboundDMs = false;
   private failedReelSuppression = new Map<string, number>();
   private deliveredPersistenceCheckpoints = new Map<
     string,
-    { reelId: string; nextDate: string | null; expectedNextReminderAt: string }
+    {
+      reelId: string;
+      nextDate: string | null;
+      expectedNextReminderAt: string;
+      attempts: number;
+      nextRetryAt: number;
+    }
   >();
+
+  private setDeliveredPersistenceCheckpoint(
+    key: string,
+    checkpoint: {
+      reelId: string;
+      nextDate: string | null;
+      expectedNextReminderAt: string;
+      attempts?: number;
+      nextRetryAt?: number;
+    }
+  ) {
+    if (this.deliveredPersistenceCheckpoints.size >= 1000) {
+      const oldest = this.deliveredPersistenceCheckpoints.keys().next().value;
+      if (oldest) this.deliveredPersistenceCheckpoints.delete(oldest);
+    }
+    this.deliveredPersistenceCheckpoints.set(key, {
+      ...checkpoint,
+      attempts: checkpoint.attempts ?? 0,
+      nextRetryAt: checkpoint.nextRetryAt ?? Date.now(),
+    });
+  }
 
   private markItemProcessed(itemId: string) {
     if (!itemId) return;
@@ -107,67 +135,73 @@ export class ReminderWorker {
    * Polls the admin DM thread to process shared Reels and commands.
    */
   async pollInboundDMs() {
-    const config = loadConfig();
-    const adminUsername = config.instagram.adminUsername;
-    if (!adminUsername) return;
+    if (this.isPollingInboundDMs) return;
+    this.isPollingInboundDMs = true;
+    try {
+      const config = loadConfig();
+      const adminUsername = config.instagram.adminUsername;
+      if (!adminUsername) return;
 
-    // Locate admin thread if not cached
-    if (!this.adminThreadId || !this.adminUserId) {
-      const threadRes = await this.actionClient.findAdminThread(adminUsername);
-      if (!threadRes.success || !threadRes.data) {
-        return; // No thread yet with admin
-      }
-      this.adminThreadId = threadRes.data.threadId;
-      this.adminUserId = threadRes.data.adminUserId;
-      console.log(`[ReminderWorker] Connected to Admin DM thread: ${this.adminThreadId} (Admin User ID: ${this.adminUserId})`);
-    }
-
-    const messagesRes = await this.actionClient.getThreadMessages(this.adminThreadId);
-    if (!messagesRes.success) return;
-
-    const messages = messagesRes.data;
-    const activeIds = new Set(messages.map((m) => m.itemId).filter(Boolean));
-    for (const id of this.processedItemIds) {
-      if (!activeIds.has(id)) {
-        this.processedItemIds.delete(id);
-      }
-    }
-    for (const id of this.failedItemAttempts.keys()) {
-      if (!activeIds.has(id)) {
-        this.failedItemAttempts.delete(id);
-      }
-    }
-
-    // Process messages from admin only (newest items first)
-    for (const msg of messages) {
-      if (!msg.itemId || this.processedItemIds.has(msg.itemId)) continue;
-
-      // Only handle incoming messages from the admin (ignore bot's own replies without storing them)
-      if (msg.userId === config.instagram.userId) {
-        continue;
+      // Locate admin thread if not cached
+      if (!this.adminThreadId || !this.adminUserId) {
+        const threadRes = await this.actionClient.findAdminThread(adminUsername);
+        if (!threadRes.success || !threadRes.data) {
+          return; // No thread yet with admin
+        }
+        this.adminThreadId = threadRes.data.threadId;
+        this.adminUserId = threadRes.data.adminUserId;
+        console.log(`[ReminderWorker] Connected to Admin DM thread: ${this.adminThreadId} (Admin User ID: ${this.adminUserId})`);
       }
 
-      try {
-        await this.handleAdminMessage(msg);
-        this.markItemProcessed(msg.itemId);
-        this.failedItemAttempts.delete(msg.itemId);
-      } catch (err: any) {
-        const attempts = (this.failedItemAttempts.get(msg.itemId) ?? 0) + 1;
-        if (attempts >= ReminderWorker.MAX_ITEM_ATTEMPTS) {
-          console.error(
-            `[ReminderWorker] Permanent failure processing admin DM item ${msg.itemId} after ${attempts} attempts; marking processed:`,
-            err?.message || err
-          );
-          this.markItemProcessed(msg.itemId);
-          this.failedItemAttempts.delete(msg.itemId);
-        } else {
-          console.error(
-            `[ReminderWorker] Failed to process admin DM item ${msg.itemId} (attempt ${attempts}/${ReminderWorker.MAX_ITEM_ATTEMPTS}):`,
-            err?.message || err
-          );
-          this.setFailedItemAttempts(msg.itemId, attempts);
+      const messagesRes = await this.actionClient.getThreadMessages(this.adminThreadId);
+      if (!messagesRes.success) return;
+
+      const messages = messagesRes.data;
+      const activeIds = new Set(messages.map((m) => m.itemId).filter(Boolean));
+      for (const id of this.processedItemIds) {
+        if (!activeIds.has(id)) {
+          this.processedItemIds.delete(id);
         }
       }
+      for (const id of this.failedItemAttempts.keys()) {
+        if (!activeIds.has(id)) {
+          this.failedItemAttempts.delete(id);
+        }
+      }
+
+      // Process messages from admin only (newest items first)
+      for (const msg of messages) {
+        if (!msg.itemId || this.processedItemIds.has(msg.itemId)) continue;
+
+        // Only handle incoming messages from the admin (ignore bot's own replies without storing them)
+        if (!this.adminUserId || String(msg.userId) !== this.adminUserId) {
+          continue;
+        }
+
+        try {
+          await this.handleAdminMessage(msg);
+          this.markItemProcessed(msg.itemId);
+          this.failedItemAttempts.delete(msg.itemId);
+        } catch (err: any) {
+          const attempts = (this.failedItemAttempts.get(msg.itemId) ?? 0) + 1;
+          if (attempts >= ReminderWorker.MAX_ITEM_ATTEMPTS) {
+            console.error(
+              `[ReminderWorker] Permanent failure processing admin DM item ${msg.itemId} after ${attempts} attempts; marking processed:`,
+              err?.message || err
+            );
+            this.markItemProcessed(msg.itemId);
+            this.failedItemAttempts.delete(msg.itemId);
+          } else {
+            console.error(
+              `[ReminderWorker] Failed to process admin DM item ${msg.itemId} (attempt ${attempts}/${ReminderWorker.MAX_ITEM_ATTEMPTS}):`,
+              err?.message || err
+            );
+            this.setFailedItemAttempts(msg.itemId, attempts);
+          }
+        }
+      }
+    } finally {
+      this.isPollingInboundDMs = false;
     }
   }
 
@@ -343,9 +377,6 @@ export class ReminderWorker {
     this.isDispatching = true;
 
     try {
-      const allDueReels = await Repository.getReelsDueForReminder();
-      if (allDueReels.length === 0) return;
-
       const now = Date.now();
       // Clean up expired entries in the suppression map
       for (const [key, expireTime] of this.failedReelSuppression.entries()) {
@@ -354,8 +385,19 @@ export class ReminderWorker {
         }
       }
 
-      // 1. Retry persistence for delivered reminders first without re-sending DMs
+      // Prune stale checkpoints older than 24 hours
+      for (const [key, checkpoint] of this.deliveredPersistenceCheckpoints.entries()) {
+        if (now > checkpoint.nextRetryAt + 24 * 3600 * 1000) {
+          this.deliveredPersistenceCheckpoints.delete(key);
+        }
+      }
+
+      // 1. Retry persistence for delivered reminders first without re-sending DMs (bounded to 10 per tick with backoff)
+      let checkpointRecoveries = 0;
       for (const [key, checkpoint] of Array.from(this.deliveredPersistenceCheckpoints.entries())) {
+        if (checkpointRecoveries >= 10) break;
+        if (now < checkpoint.nextRetryAt) continue;
+        checkpointRecoveries++;
         try {
           const fresh = await Repository.getSavedItemById(checkpoint.reelId);
           if (!fresh || fresh.next_reminder_at !== checkpoint.expectedNextReminderAt) {
@@ -367,9 +409,13 @@ export class ReminderWorker {
           });
           this.deliveredPersistenceCheckpoints.delete(key);
         } catch {
-          // Keep in checkpoint
+          checkpoint.attempts = (checkpoint.attempts || 0) + 1;
+          checkpoint.nextRetryAt = now + Math.min(3600000, 60000 * Math.pow(2, checkpoint.attempts));
         }
       }
+
+      const allDueReels = await Repository.getReelsDueForReminder();
+      if (allDueReels.length === 0) return;
 
       // Filter out temporarily suppressed reminders and delivered checkpoints so we never re-send DMs
       const eligibleReels = allDueReels.filter((r) => {
@@ -463,7 +509,7 @@ export class ReminderWorker {
             this.failedReelSuppression.set(suppressionKey, Date.now() + 5 * 60 * 1000);
 
             // Record checkpoint so future ticks retry DB write without re-sending the DM
-            this.deliveredPersistenceCheckpoints.set(suppressionKey, {
+            this.setDeliveredPersistenceCheckpoint(suppressionKey, {
               reelId: freshReel.id,
               nextDate,
               expectedNextReminderAt: freshReel.next_reminder_at,
@@ -478,7 +524,11 @@ export class ReminderWorker {
                 undefined,
                 { expectedNextReminderAt: freshReel.next_reminder_at }
               );
-              this.deliveredPersistenceCheckpoints.delete(suppressionKey);
+              // Update expectedNextReminderAt on checkpoint so guarded recordReminderSent can still persist delivery metadata
+              const existingCheckpoint = this.deliveredPersistenceCheckpoints.get(suppressionKey);
+              if (existingCheckpoint) {
+                existingCheckpoint.expectedNextReminderAt = nextDate ?? '';
+              }
             } catch (fallbackErr: any) {
               console.error(`[ReminderWorker] Fallback schedule update failed for reel ${freshReel.shortcode}:`, fallbackErr.message || fallbackErr);
             }
