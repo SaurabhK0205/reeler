@@ -6,7 +6,7 @@ import { Repository, SenderReminderConflictError, SenderDeletionBarrierError } f
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
 import { parseDuration, formatTargetTime } from '../utils/duration.ts';
 import { getTimeZoneSummary } from '../utils/timezone.ts';
-import { extractCreatorQueryWithFilter } from '../utils/creatorQuery.ts';
+import { extractCreatorQueryWithFilter, extractCreatorQuery } from '../utils/creatorQuery.ts';
 import {
   classifySavedMediaType,
   extractInstagramShortcodeAndPath,
@@ -15,6 +15,11 @@ import {
 } from '../utils/mediaType.ts';
 import {
   parseWatchedStopCommand,
+  parseCancelCommand,
+  parseTargetedWatchedCommand,
+  isGreetingOrHelpMessage,
+  formatBotHelpMessage,
+  formatHumanReelLabel,
   extractPublicCreatorUsername,
   formatAddedToWatchLaterCreatorBlock,
   formatWatchedConfirmationMessage,
@@ -75,8 +80,63 @@ interface WebhookRetryState {
   pinnedDurationTargetReel?: SavedReel | null;
   /** Preserves the initially parsed target timestamp & duration across internal retries. */
   pinnedDuration?: ReturnType<typeof parseDuration>;
+  /** Preserves the duration resolved for an inbound share across internal retries. */
+  pinnedShareDuration?: ReturnType<typeof parseDuration>;
+  /** Preserves the accepted duration in seconds for an inbound share across internal retries. */
+  acceptedDurationSeconds?: number;
+  /** Preserves the saved reel ID created during share upsert across internal retries. */
+  savedReelId?: string;
+  /** Preserves the target reel ID when scheduling an active in-flight share across internal retries. */
+  pinnedTargetReelId?: string;
+  /** Preserves the expected next reminder instant for CAS schedule updates across internal retries. */
+  expectedNextReminderAt?: string | null;
+  /** Preserves the expected awaiting choice deadline for CAS schedule updates across internal retries. */
+  expectedAwaitingReminderChoiceUntil?: string | null;
+  /** Preserves late duration applied to an active in-flight share across retries. */
+  pinnedLateDuration?: ReturnType<typeof parseDuration>;
+  /** Tracks whether the late duration schedule update committed across retries. */
+  lateDurationWriteCommitted?: boolean;
+  /** Preserves full schedule CAS expectation snapshot across internal retries. */
+  pinnedScheduleExpectation?: {
+    expectedNextReminderAt: string | null;
+    expectedIntervalSeconds: number | null;
+    expectedAwaitingUntil: string | null;
+    expectedWatchStatus?: WatchStatus;
+  };
+  /** Preserves the schedule expectation snapshot when applying late duration to an active share across retries. */
+  pinnedLateScheduleSnapshot?: {
+    expectedNextReminderAt: string | null;
+    expectedIntervalSeconds: number | null;
+    expectedAwaitingUntil: string | null;
+    expectedWatchStatus?: WatchStatus;
+  };
+  /** Preserves deferred share prompt context across schedule retries so the original confirmation is completed reliably. */
+  pinnedDeferredSharePrompt?: {
+    reel: SavedReel;
+    addedHeading: string;
+    creatorLine: string;
+    opId?: string;
+    rawMid?: string;
+    shareId: string;
+  };
   /** Preserves the exact Watch Later Reel IDs resolved on the initial watched/stop command across retries. */
   pinnedWatchedTargetIds?: string[];
+  /** Preserves target IDs and execution progress for clearWatchLaterForCreator across partial failure retries. */
+  pinnedClearCreatorState?: {
+    ownerScope?: 'exact' | 'unattributed';
+    toDeleteIds: string[];
+    toRevertIds: string[];
+    reels: SavedReel[];
+    deletedIds: string[];
+    revertedIds: string[];
+    targetUpdatedAts?: Record<string, string>;
+  };
+  /** Preserves target IDs for markWatchedForCreator across retries. */
+  pinnedWatchedCreatorTargetIds?: string[];
+  /** Preserves confirmed updated IDs for markWatchedForCreator across retry attempts. */
+  pinnedWatchedCreatorCompletedIds?: string[];
+  /** Preserves the specific Reel ID targeted by a cancel command across retries. */
+  pinnedCancelTargetReelId?: string;
   /** Monotonic sequence assigned on initial reception of a timezone-set command to block stale retries. */
   timezoneCommandSeq?: number;
 }
@@ -86,8 +146,13 @@ interface WebhookDeliveryContext {
   anyDeliveryFailed: boolean;
   unsentMessages: string[];
   retryState: WebhookRetryState;
+  attempt?: number;
   /** Tracks a newly issued OTP code so superseded OTP replies are discarded instead of replayed later. */
   issuedOtpCode?: string;
+  /** Set when reply delivery is deferred to a timer, so dispatch does not prematurely mark the mid complete. */
+  isDeferredReply?: boolean;
+  opId?: string;
+  rawMid?: string;
 }
 
 interface PendingWebhookReply {
@@ -95,6 +160,17 @@ interface PendingWebhookReply {
   messages: string[];
   expiresAt: number;
   otpCode?: string;
+  targetReelId?: string;
+  expectedAwaitingUntil?: string | null;
+}
+
+interface InFlightShareContext {
+  shareId: string;
+  senderId: string;
+  acceptedDuration?: ReturnType<typeof parseDuration>;
+  savedReel?: SavedReel;
+  saveCompleted: boolean;
+  delivery?: WebhookDeliveryContext;
 }
 
 export class MetaInstagramBotService {
@@ -109,18 +185,197 @@ export class MetaInstagramBotService {
   private scheduledRetries = new Map<string, ReturnType<typeof setTimeout>>();
   private timezoneCommandSeq = 0;
   private lastCommittedTimezoneSeqBySender = new Map<string, number>();
+  private inFlightShares = new Map<string, InFlightShareContext>();
+  private static readonly MAX_RECENT_ADDITIONS = 1000;
+  private lastConfirmedAdditionReelId = new Map<string, string>();
+
+  private recordLastConfirmedAddition(senderId: string, reelId: string): void {
+    if (this.lastConfirmedAdditionReelId.has(senderId)) {
+      this.lastConfirmedAdditionReelId.delete(senderId);
+    } else if (this.lastConfirmedAdditionReelId.size >= MetaInstagramBotService.MAX_RECENT_ADDITIONS) {
+      const oldest = this.lastConfirmedAdditionReelId.keys().next().value;
+      if (oldest) this.lastConfirmedAdditionReelId.delete(oldest);
+    }
+    this.lastConfirmedAdditionReelId.set(senderId, reelId);
+  }
+  private promptReplacementChains = new Map<string, Promise<void>>();
+  private pendingSharePrompts = new Map<
+    string,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      reel: SavedReel;
+      delivery?: WebhookDeliveryContext;
+      promptText: string;
+      addedHeading: string;
+      creatorLine: string;
+      defaultReminderFormatted: string;
+      senderTz: string;
+      opId?: string;
+      rawMid?: string;
+      shareId: string;
+    }
+  >();
+  private recentDurationHints = new Map<
+    string,
+    {
+      duration: NonNullable<ReturnType<typeof parseDuration>>;
+      timestamp: number;
+    }
+  >();
+  private shareDebounceDelayMs: number;
   public adminUserId: string | null = null;
 
-  constructor(options?: { adminUserId?: string | null; retryDelaysMs?: number[] }) {
+  constructor(options?: {
+    adminUserId?: string | null;
+    retryDelaysMs?: number[];
+    shareDebounceDelayMs?: number;
+  }) {
     this.accessToken = process.env.META_PAGE_ACCESS_TOKEN || '';
     this.verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN || 'rea_instagram_saved_token';
     this.appSecret = process.env.META_APP_SECRET || '';
     this.retryDelaysMs = options?.retryDelaysMs ?? DEFAULT_WEBHOOK_RETRY_DELAYS_MS;
+    this.shareDebounceDelayMs =
+      options?.shareDebounceDelayMs !== undefined
+        ? options.shareDebounceDelayMs
+        : (process.env.NODE_ENV === 'test' ? 0 : 1200);
     this.adminUserId =
       options?.adminUserId ||
       process.env.ADMIN_SENDER_ID ||
       process.env.INSTAGRAM_ADMIN_SENDER_ID ||
       null;
+  }
+
+  clearTimersForTesting(): void {
+    for (const pending of this.pendingSharePrompts.values()) {
+      clearTimeout(pending.timer);
+    }
+    this.pendingSharePrompts.clear();
+    this.recentDurationHints.clear();
+    this.lastConfirmedAdditionReelId.clear();
+  }
+
+  private async flushPendingSharePrompt(senderId: string, expectedShareId?: string): Promise<void> {
+    const pending = this.pendingSharePrompts.get(senderId);
+    if (!pending) return;
+    if (expectedShareId && pending.shareId !== expectedShareId) return;
+
+    clearTimeout(pending.timer);
+    this.pendingSharePrompts.delete(senderId);
+
+    let isStillPending = true;
+    try {
+      const freshItem = await Repository.getSavedItemById(pending.reel.id);
+      if (
+        !freshItem ||
+        freshItem.watch_status !== 'watch_later' ||
+        (pending.reel.awaiting_reminder_choice_until &&
+          (!freshItem.awaiting_reminder_choice_until ||
+            freshItem.awaiting_reminder_choice_until !== pending.reel.awaiting_reminder_choice_until ||
+            new Date(freshItem.awaiting_reminder_choice_until).getTime() <= Date.now()))
+      ) {
+        isStillPending = false;
+      }
+    } catch (lookupErr) {
+      console.warn(`[MetaIG] Pre-flush status check failed for reel ${pending.reel.id}; keeping prompt retryable:`, lookupErr);
+      if (pending.opId) {
+        this.recordPendingWebhookReplies(
+          pending.opId,
+          senderId,
+          [pending.promptText],
+          undefined,
+          pending.reel.id,
+          pending.reel.awaiting_reminder_choice_until
+        );
+        this.scheduleWebhookRetry(pending.opId, 0, () =>
+          this.dispatchWebhookMessage(
+            senderId,
+            pending.rawMid || pending.opId,
+            '',
+            undefined,
+            'deferred_share_prompt_retry',
+            1,
+            pending.opId
+          )
+        );
+      }
+      return;
+    }
+
+    if (!isStillPending) {
+      if (pending.opId) this.markWebhookMidCompleted(pending.opId);
+      return;
+    }
+
+    const ok = await this.deliverReply(senderId, pending.promptText, pending.delivery);
+    if (ok) {
+      if (pending.opId) this.markWebhookMidCompleted(pending.opId);
+    } else if (pending.opId) {
+      this.recordPendingWebhookReplies(
+        pending.opId,
+        senderId,
+        [pending.promptText],
+        undefined,
+        pending.reel.id,
+        pending.reel.awaiting_reminder_choice_until
+      );
+      this.scheduleWebhookRetry(pending.opId, 0, () =>
+        this.dispatchWebhookMessage(
+          senderId,
+          pending.rawMid || pending.opId,
+          '',
+          undefined,
+          'deferred_share_prompt_retry',
+          1,
+          pending.opId
+        )
+      );
+    }
+  }
+
+  private async serializePromptOperation<T>(senderId: string, op: () => Promise<T>): Promise<T> {
+    const prev = this.promptReplacementChains.get(senderId) || Promise.resolve();
+    let resolveCurrent!: () => void;
+    const current = new Promise<void>((resolve) => {
+      resolveCurrent = resolve;
+    });
+    this.promptReplacementChains.set(senderId, current);
+
+    try {
+      await prev;
+      return await op();
+    } finally {
+      resolveCurrent();
+      if (this.promptReplacementChains.get(senderId) === current) {
+        this.promptReplacementChains.delete(senderId);
+      }
+    }
+  }
+
+  private recordRecentDurationHint(
+    senderId: string,
+    duration: NonNullable<ReturnType<typeof parseDuration>>
+  ): void {
+    const now = Date.now();
+    for (const [id, hint] of this.recentDurationHints.entries()) {
+      if (now - hint.timestamp > 3500) {
+        this.recentDurationHints.delete(id);
+      }
+    }
+    if (this.recentDurationHints.size >= 500) {
+      const oldestKey = this.recentDurationHints.keys().next().value;
+      if (oldestKey) this.recentDurationHints.delete(oldestKey);
+    }
+    this.recentDurationHints.set(senderId, { duration, timestamp: now });
+  }
+
+  private takeRecentDurationHint(senderId: string): ReturnType<typeof parseDuration> {
+    const hint = this.recentDurationHints.get(senderId);
+    if (!hint) return null;
+    this.recentDurationHints.delete(senderId);
+    if (Date.now() - hint.timestamp < 3500) {
+      return hint.duration;
+    }
+    return null;
   }
 
   setAdminUserId(adminUserId: string | null): void {
@@ -282,7 +537,9 @@ export class MetaInstagramBotService {
     mid: string,
     recipientId: string,
     messages: string[],
-    otpCode?: string
+    otpCode?: string,
+    targetReelId?: string,
+    expectedAwaitingUntil?: string | null
   ): void {
     const now = Date.now();
     if (this.pendingRepliesByMid.size >= WEBHOOK_PENDING_REPLY_MAX_ENTRIES) {
@@ -302,6 +559,7 @@ export class MetaInstagramBotService {
       messages,
       expiresAt: now + WEBHOOK_PENDING_REPLY_TTL_MS,
       ...(otpCode ? { otpCode } : {}),
+      ...(targetReelId ? { targetReelId, expectedAwaitingUntil } : {}),
     });
   }
 
@@ -560,7 +818,7 @@ export class MetaInstagramBotService {
     rawMid: unknown,
     text: string,
     attachments: any[] | undefined,
-    sourceLabel: 'messaging' | 'change',
+    sourceLabel: 'messaging' | 'change' | 'deferred_share_prompt_retry',
     attempt: number = 0,
     existingOpId?: string,
     retryState: WebhookRetryState = {}
@@ -568,6 +826,7 @@ export class MetaInstagramBotService {
     let reelUrl: string | null = null;
     let attachmentType: string | null = null;
     let attachmentTitle: string | null = null;
+    let hasShareAttachment = false;
     if (Array.isArray(attachments)) {
       for (const att of attachments) {
         const urlCandidate =
@@ -577,6 +836,7 @@ export class MetaInstagramBotService {
           null;
         if (urlCandidate) {
           reelUrl = urlCandidate;
+          hasShareAttachment = true;
           attachmentType = typeof att.type === 'string' ? att.type : null;
           attachmentTitle =
             typeof att.payload?.title === 'string' && att.payload.title.trim()
@@ -588,6 +848,7 @@ export class MetaInstagramBotService {
           const titleMatch = extractInstagramShortcodeAndPath(att.payload.title);
           if (titleMatch) {
             reelUrl = titleMatch.matchedText;
+            hasShareAttachment = true;
             attachmentType = typeof att.type === 'string' ? att.type : null;
             attachmentTitle = att.payload.title.trim();
             break;
@@ -597,11 +858,11 @@ export class MetaInstagramBotService {
     }
 
     const combinedText = reelUrl ? `${reelUrl} ${text}`.trim() : text;
-    if (!combinedText) return;
-
     // Use Meta's mid when supplied; for mid-less events, assign a unique per-received-event opId
     // so internal retries still retain an isolated mutation and pending-reply checkpoint.
     const opId = existingOpId || this.normalizeWebhookMid(rawMid) || `event_${crypto.randomUUID()}`;
+
+    if (!combinedText && !this.pendingRepliesByMid.has(opId)) return;
     if (!this.claimWebhookMid(opId)) {
       return;
     }
@@ -617,6 +878,20 @@ export class MetaInstagramBotService {
           // A newer login code superseded (or already consumed/expired) this OTP; discard stale reply.
           this.markWebhookMidCompleted(opId);
           return;
+        }
+        if (pending.targetReelId) {
+          const freshItem = await Repository.getSavedItemById(pending.targetReelId);
+          if (
+            !freshItem ||
+            freshItem.watch_status !== 'watch_later' ||
+            !freshItem.awaiting_reminder_choice_until ||
+            freshItem.awaiting_reminder_choice_until !== pending.expectedAwaitingUntil ||
+            new Date(freshItem.awaiting_reminder_choice_until).getTime() <= Date.now()
+          ) {
+            // Choice already settled, deadline expired, or item cancelled/watched; discard stale prompt replay.
+            this.markWebhookMidCompleted(opId);
+            return;
+          }
         }
         const remaining: string[] = [];
         let failed = false;
@@ -634,7 +909,14 @@ export class MetaInstagramBotService {
         if (!failed) {
           this.markWebhookMidCompleted(opId);
         } else {
-          this.recordPendingWebhookReplies(opId, pending.recipientId, remaining, pending.otpCode);
+          this.recordPendingWebhookReplies(
+            opId,
+            pending.recipientId,
+            remaining,
+            pending.otpCode,
+            pending.targetReelId,
+            pending.expectedAwaitingUntil
+          );
           shouldScheduleRetry = true;
         }
         return;
@@ -645,7 +927,10 @@ export class MetaInstagramBotService {
       // If the mutation already committed within Meta's 24h redelivery window (even after pending
       // reply text expired), never re-execute the command and risk repeating a stateful mutation.
       if (this.hasCommittedWebhookMutation(opId)) {
-        this.markWebhookMidCompleted(opId);
+        const isDeferredPending = this.pendingSharePrompts.get(senderId)?.opId === opId;
+        if (!isDeferredPending) {
+          this.markWebhookMidCompleted(opId);
+        }
         return;
       }
 
@@ -654,16 +939,28 @@ export class MetaInstagramBotService {
         anyDeliveryFailed: false,
         unsentMessages: [],
         retryState,
+        attempt,
+        opId,
+        rawMid: this.normalizeWebhookMid(rawMid) ?? undefined,
       };
 
-      await this.processIncomingText(senderId, combinedText, attachmentType, attachmentTitle, delivery);
+      await this.processIncomingText(
+        senderId,
+        combinedText,
+        attachmentType,
+        attachmentTitle,
+        delivery,
+        hasShareAttachment
+      );
 
       if (delivery.stateMutated) {
         this.markWebhookMutationCommitted(opId);
       }
 
       if (!delivery.anyDeliveryFailed) {
-        this.markWebhookMidCompleted(opId);
+        if (!delivery.isDeferredReply) {
+          this.markWebhookMidCompleted(opId);
+        }
       } else {
         if (delivery.stateMutated && delivery.unsentMessages.length > 0) {
           this.recordPendingWebhookReplies(opId, senderId, delivery.unsentMessages, delivery.issuedOtpCode);
@@ -763,7 +1060,8 @@ export class MetaInstagramBotService {
     text: string,
     attachmentType?: string | null,
     attachmentTitle?: string | null,
-    delivery?: WebhookDeliveryContext
+    delivery?: WebhookDeliveryContext,
+    hasShareAttachment: boolean = false
   ): Promise<void> {
     console.log(`[MetaIG] Incoming DM from Instagram user ${senderId}: "${text}"`);
     const senderTz = await Repository.getSenderTimezone(senderId);
@@ -771,9 +1069,33 @@ export class MetaInstagramBotService {
     // Check for Reel or Post URL
     const mediaLink = extractInstagramShortcodeAndPath(text);
     if (mediaLink) {
-      const { shortcode, pathType, matchedText } = mediaLink;
+      const currentShareId = `share_${senderId}_${Date.now()}_${Math.random()}`;
+      const shareCtx: InFlightShareContext = {
+        shareId: currentShareId,
+        senderId,
+        saveCompleted: false,
+        delivery,
+      };
+      this.inFlightShares.set(senderId, shareCtx);
+      try {
+        const { shortcode, pathType, matchedText } = mediaLink;
       const remaining = text.replace(matchedText, '').trim();
-      const customDuration = parseDuration(remaining, new Date(), senderTz);
+      const isRetryAttempt = delivery && 'pinnedShareDuration' in delivery.retryState;
+      let customDuration =
+        isRetryAttempt
+          ? delivery.retryState.pinnedShareDuration
+          : parseDuration(remaining, new Date(), senderTz);
+
+      if (!customDuration && !isRetryAttempt) {
+        const hint = this.takeRecentDurationHint(senderId);
+        if (hint) {
+          customDuration = hint;
+          shareCtx.acceptedDuration = customDuration;
+        }
+      }
+      if (delivery && !isRetryAttempt) {
+        delivery.retryState.pinnedShareDuration = customDuration;
+      }
 
       // Fetch public metadata (probe /p/ first for post links, /reel/ first for reel/tv links)
       const preferredPath = pathType === 'p' ? 'p' : 'reel';
@@ -781,6 +1103,24 @@ export class MetaInstagramBotService {
         fetchReelMetadata(shortcode, undefined, preferredPath),
         Repository.getSavedItemByShortcode(shortcode, senderId),
       ]);
+
+      // If duration text arrived while metadata was fetching:
+      // Keep duration matched to active share until it finishes (no short expiry on active share)
+      if (!customDuration && shareCtx.acceptedDuration) {
+        customDuration = shareCtx.acceptedDuration;
+        if (delivery) {
+          delivery.retryState.pinnedShareDuration = customDuration;
+        }
+      } else if (!customDuration) {
+        const hint = this.takeRecentDurationHint(senderId);
+        if (hint) {
+          customDuration = hint;
+          shareCtx.acceptedDuration = customDuration;
+          if (delivery) {
+            delivery.retryState.pinnedShareDuration = customDuration;
+          }
+        }
+      }
 
       // Read-only metadata reuse from another row with the same shortcode if this sender has no row yet
       const metadataFallbackItem = existingItem
@@ -865,30 +1205,113 @@ export class MetaInstagramBotService {
 
       const addedHeading = mediaType === 'post' ? '🖼️ Added post to your Watch Later!' : '🎬 Added to your Watch Later!';
 
+      // Final check: if duration arrived while creator was being upserted
+      if (shareCtx.acceptedDuration) {
+        customDuration = shareCtx.acceptedDuration;
+        if (delivery) {
+          delivery.retryState.pinnedShareDuration = customDuration;
+        }
+      }
+
       const nextReminder = customDuration ? customDuration.targetDate.toISOString() : null;
       const awaitingUntil = customDuration ? null : new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
+      let savedReel: SavedReel | null = null;
       try {
-        await Repository.upsertSavedReel({
-          instagram_media_id: instagramMediaId,
-          shortcode,
-          reel_url: canonicalUrl,
-          media_type: mediaType,
-          creator_id: creator.id,
-          caption,
-          thumbnail_url: thumbnailUrl,
-          taken_at: takenAt,
-          saved_at: savedAt,
-          first_detected_at: firstDetectedAt,
-          save_order_rank: saveOrderRank,
-          watch_status: 'watch_later',
-          reminder_interval_seconds: customDuration ? customDuration.seconds : null,
-          next_reminder_at: nextReminder,
-          awaiting_reminder_choice_until: awaitingUntil,
-          is_saved_on_instagram: isSavedOnInstagram,
-          instagram_sender_id: senderId,
-        });
-        if (delivery) delivery.stateMutated = true;
+        if (delivery?.retryState?.savedReelId) {
+          savedReel = await Repository.getSavedItemById(delivery.retryState.savedReelId);
+          if (!savedReel) {
+            console.warn(
+              `[MetaIG] Retry of share for ${shortcode} was undone/cancelled; aborting re-insertion.`
+            );
+            if (delivery.opId) this.markWebhookMidCompleted(delivery.opId);
+            return;
+          }
+        }
+        if (!savedReel) {
+          savedReel = await Repository.upsertSavedReel({
+            instagram_media_id: instagramMediaId,
+            shortcode,
+            reel_url: canonicalUrl,
+            media_type: mediaType,
+            creator_id: creator.id,
+            caption,
+            thumbnail_url: thumbnailUrl,
+            taken_at: takenAt,
+            saved_at: savedAt,
+            first_detected_at: firstDetectedAt,
+            save_order_rank: saveOrderRank,
+            watch_status: 'watch_later',
+            reminder_interval_seconds: customDuration ? customDuration.seconds : null,
+            next_reminder_at: nextReminder,
+            awaiting_reminder_choice_until: awaitingUntil,
+            is_saved_on_instagram: isSavedOnInstagram,
+            instagram_sender_id: senderId,
+          });
+          if (savedReel && delivery) {
+            delivery.retryState.savedReelId = savedReel.id;
+          }
+        }
+        shareCtx.savedReel = savedReel;
+        shareCtx.saveCompleted = true;
+        if (savedReel) {
+          this.recordLastConfirmedAddition(senderId, savedReel.id);
+        }
+        const lateDurationCandidate = shareCtx.acceptedDuration ?? delivery?.retryState?.pinnedLateDuration ?? null;
+
+        if (lateDurationCandidate && savedReel) {
+          const targetDuration = lateDurationCandidate;
+          if (delivery) {
+            delivery.retryState.pinnedLateDuration = targetDuration;
+            if (!delivery.retryState.pinnedLateScheduleSnapshot) {
+              delivery.retryState.pinnedLateScheduleSnapshot = {
+                expectedNextReminderAt: savedReel.next_reminder_at ?? null,
+                expectedIntervalSeconds: savedReel.reminder_interval_seconds ?? null,
+                expectedAwaitingUntil: savedReel.awaiting_reminder_choice_until ?? null,
+                expectedWatchStatus: savedReel.watch_status,
+              };
+            }
+          }
+
+          let applied = Boolean(delivery?.retryState?.lateDurationWriteCommitted);
+          if (!applied) {
+            const requestedNextIso = targetDuration.targetDate.toISOString();
+            if (savedReel.next_reminder_at === requestedNextIso) {
+              applied = true;
+            } else {
+              const snap = delivery?.retryState?.pinnedLateScheduleSnapshot;
+              applied = await Repository.updateReminderSchedule(
+                savedReel.id,
+                requestedNextIso,
+                targetDuration.seconds,
+                {
+                  expectedNextReminderAt: snap ? snap.expectedNextReminderAt : (savedReel.next_reminder_at ?? null),
+                  expectedIntervalSeconds: snap ? snap.expectedIntervalSeconds : (savedReel.reminder_interval_seconds ?? null),
+                  expectedAwaitingReminderChoiceUntil: snap ? snap.expectedAwaitingUntil : (savedReel.awaiting_reminder_choice_until ?? null),
+                  ...(snap?.expectedWatchStatus ? { expectedWatchStatus: snap.expectedWatchStatus } : (savedReel.watch_status ? { expectedWatchStatus: savedReel.watch_status } : {})),
+                }
+              );
+            }
+            if (applied && delivery) {
+              delivery.retryState.lateDurationWriteCommitted = true;
+            }
+          }
+
+          if (applied) {
+            customDuration = targetDuration;
+            if (delivery) {
+              delivery.retryState.pinnedShareDuration = customDuration;
+            }
+          } else {
+            customDuration = null;
+          }
+        }
+        if (delivery) {
+          delivery.stateMutated = true;
+          if (delivery.opId) {
+            this.markWebhookMutationCommitted(delivery.opId);
+          }
+        }
       } catch (error) {
         if (error instanceof SenderReminderConflictError) {
           console.warn(
@@ -912,8 +1335,8 @@ export class MetaInstagramBotService {
       }
 
       if (customDuration) {
-        // User provided a specific time along with the item!
-        let reply = `${addedHeading}${creatorLine}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done!`;
+        // User provided a specific time along with the item or right before it!
+        let reply = `${addedHeading}${creatorLine}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
@@ -930,12 +1353,409 @@ export class MetaInstagramBotService {
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz London" or "tz IST") to set your local timezone.`;
         }
+
+        if (this.pendingSharePrompts.has(senderId)) {
+          await this.flushPendingSharePrompt(senderId);
+        }
+
+        if (hasShareAttachment && this.shareDebounceDelayMs > 0) {
+          await this.serializePromptOperation(senderId, async () => {
+            if (customDuration || shareCtx.acceptedDuration) return;
+            const promptReel = savedReel
+              ? { ...savedReel, creator }
+              : await Repository.getSavedItemByShortcode(shortcode, senderId);
+            if (promptReel) {
+              if (promptReel.next_reminder_at && !promptReel.awaiting_reminder_choice_until) {
+                return;
+              }
+              const promptOpId = delivery?.opId;
+              const promptRawMid = delivery?.rawMid;
+              if (delivery) {
+                delivery.isDeferredReply = true;
+              }
+
+              const shareId = shareCtx.shareId;
+              const timer = setTimeout(async () => {
+                await this.flushPendingSharePrompt(senderId, shareId);
+              }, this.shareDebounceDelayMs);
+
+              this.pendingSharePrompts.set(senderId, {
+                timer,
+                reel: promptReel,
+                delivery,
+                promptText: reply,
+                addedHeading,
+                creatorLine,
+                defaultReminderFormatted: defaultTriggerStr,
+                senderTz,
+                opId: promptOpId,
+                rawMid: promptRawMid,
+                shareId,
+              });
+            }
+          });
+          return;
+        }
+
         await this.deliverReply(senderId, reply, delivery);
       }
+    } finally {
+      if (this.inFlightShares.get(senderId)?.shareId === currentShareId) {
+        this.inFlightShares.delete(senderId);
+      }
+    }
+    return;
+  }
+
+    // 0a. If this is an internal retry of a deferred share prompt duration command, process it directly
+    // using the pinned deferred prompt context across retries so completion and conflict handling match.
+    if (delivery?.retryState?.pinnedDeferredSharePrompt) {
+      const promptInfo = delivery.retryState.pinnedDeferredSharePrompt;
+      const targetReel = promptInfo.reel;
+      const parsedDur = parseDuration(text, new Date(), senderTz);
+      const effectiveDur = delivery.retryState.pinnedDuration || parsedDur;
+      if (effectiveDur) {
+        const applied = await Repository.updateReminderSchedule(
+          targetReel.id,
+          effectiveDur.targetDate.toISOString(),
+          effectiveDur.seconds,
+          {
+            expectedNextReminderAt: targetReel.next_reminder_at ?? null,
+            expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
+            expectedAwaitingReminderChoiceUntil: targetReel.awaiting_reminder_choice_until ?? null,
+            ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
+          }
+        );
+        if (!applied) {
+          // A newer reminder schedule or watch-status change already updated this Reel before this retry ran.
+          let reply = `${promptInfo.addedHeading}${promptInfo.creatorLine}\n\nℹ️ Your reel was saved to Watch Later, but its reminder schedule was updated by a newer command.`;
+          await this.deliverReply(senderId, reply, delivery);
+          return;
+        }
+        if (this.pendingSharePrompts.get(senderId)?.shareId === promptInfo.shareId) {
+          const pending = this.pendingSharePrompts.get(senderId)!;
+          clearTimeout(pending.timer);
+          this.pendingSharePrompts.delete(senderId);
+        }
+        delivery.stateMutated = true;
+        if (promptInfo.opId) this.markWebhookMidCompleted(promptInfo.opId);
+
+        let reply = `${promptInfo.addedHeading}${promptInfo.creatorLine}\n\n⏰ Reminder set for: ${effectiveDur.label} (${effectiveDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
+        if (senderTz === 'UTC') {
+          reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
+        }
+        await this.deliverReply(senderId, reply, delivery);
+        return;
+      }
+    }
+
+    // 0b. If this is an internal retry of a pinned duration command for an existing reel,
+    // process it directly without consuming or clearing any newer pending share prompt.
+    if (delivery?.retryState?.pinnedDurationTargetReel) {
+      const targetReel = delivery.retryState.pinnedDurationTargetReel;
+      const parsedDur = parseDuration(text, new Date(), senderTz);
+      const effectiveDur = delivery.retryState.pinnedDuration || parsedDur;
+      if (effectiveDur) {
+        const applied = await Repository.updateReminderSchedule(
+          targetReel.id,
+          effectiveDur.targetDate.toISOString(),
+          effectiveDur.seconds,
+          {
+            expectedNextReminderAt: targetReel.next_reminder_at ?? null,
+            expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
+            expectedAwaitingReminderChoiceUntil: targetReel.awaiting_reminder_choice_until ?? null,
+            ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
+          }
+        );
+        if (!applied) {
+          // A newer reminder schedule or watch-status change already updated this Reel before this retry ran.
+          return;
+        }
+        delivery.stateMutated = true;
+        let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget);
+        if (senderTz === 'UTC') {
+          reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
+        }
+        await this.deliverReply(senderId, reply, delivery);
+        return;
+      }
+    }
+
+    // 0. Check if a share prompt is currently pending debounce for this sender
+    if (this.pendingSharePrompts.has(senderId)) {
+      const pending = this.pendingSharePrompts.get(senderId)!;
+      const pendingCancel = parseCancelCommand(text);
+
+      if (pendingCancel) {
+        if (pendingCancel.isCancelAddition && !pendingCancel.targetCreator && !pendingCancel.invalidCreatorTarget) {
+          // Only untargeted cancel shortcuts to recent addition deletion
+          let targetReelId = delivery?.retryState?.pinnedCancelTargetReelId;
+          const latestConfirmed = this.lastConfirmedAdditionReelId.get(senderId);
+          if (!targetReelId && latestConfirmed && latestConfirmed !== pending.reel.id) {
+            targetReelId = latestConfirmed;
+            if (delivery) delivery.retryState.pinnedCancelTargetReelId = targetReelId;
+            await this.flushPendingSharePrompt(senderId);
+          } else if (targetReelId && pending.reel.id !== targetReelId) {
+            // A newer share arrived while an earlier cancel attempt was pending retry.
+            // Flush the newer share's prompt so it is not lost!
+            await this.flushPendingSharePrompt(senderId);
+          } else if (!targetReelId) {
+            targetReelId = pending.reel.id;
+            if (delivery) delivery.retryState.pinnedCancelTargetReelId = targetReelId;
+          }
+
+          let cancelled: Awaited<ReturnType<typeof Repository.cancelRecentAdditionForSender>>;
+          try {
+            cancelled = await Repository.cancelRecentAdditionForSender(senderId, { targetReelId });
+          } catch (cancelErr) {
+            // Cancellation write failed; keep prompt and timer active across retries
+            throw cancelErr;
+          }
+
+          if (cancelled && this.pendingSharePrompts.get(senderId)?.reel.id === cancelled.cancelledReel.id) {
+            const currentPending = this.pendingSharePrompts.get(senderId)!;
+            clearTimeout(currentPending.timer);
+            this.pendingSharePrompts.delete(senderId);
+            if (currentPending.opId) this.markWebhookMidCompleted(currentPending.opId);
+          }
+          if (cancelled && this.lastConfirmedAdditionReelId.get(senderId) === cancelled.cancelledReel.id) {
+            this.lastConfirmedAdditionReelId.delete(senderId);
+          }
+          if (delivery) delivery.stateMutated = true;
+
+          const replyText = cancelled
+            ? `❌ Cancelled! Removed ${formatHumanReelLabel(cancelled.cancelledReel, 40)} from your Watch Later.`
+            : `ℹ️ No recent item found in your Watch Later to cancel.`;
+          await this.deliverReply(senderId, replyText, delivery);
+          return;
+        } else {
+          // Creator-targeted cancel or cancel-reminder command: flush prompt and fall through
+          await this.flushPendingSharePrompt(senderId);
+        }
+      } else {
+        const targetedWatched = parseTargetedWatchedCommand(text);
+        const { isCommand: isWatchedCmd } = parseWatchedStopCommand(text);
+        const isCreatorQuery = Boolean(extractCreatorQuery(text));
+        if (targetedWatched || isWatchedCmd || isCreatorQuery) {
+          // Watched command, stop command, or creator search: flush prompt and fall through
+          await this.flushPendingSharePrompt(senderId);
+        } else if (this.inFlightShares.has(senderId)) {
+          // An active share is currently being ingested for this sender.
+          // Flush the older share prompt so this duration applies to the incoming active share.
+          await this.flushPendingSharePrompt(senderId);
+        } else {
+          // Not a recognized command; now evaluate whether text is a duration expression
+          const parsedDur = parseDuration(text, new Date(), senderTz);
+          if (parsedDur) {
+            let targetReel = pending.reel;
+            if (delivery) {
+              delivery.retryState.pinnedDeferredSharePrompt = {
+                reel: pending.reel,
+                addedHeading: pending.addedHeading,
+                creatorLine: pending.creatorLine,
+                opId: pending.opId,
+                rawMid: pending.rawMid,
+                shareId: pending.shareId,
+              };
+              delivery.retryState.pinnedDurationTargetReel = targetReel;
+              delivery.retryState.pinnedDuration = parsedDur;
+            }
+
+            const effectiveDur = delivery?.retryState?.pinnedDuration || parsedDur;
+
+            // Apply conditional schedule update to guard against concurrent watch-status mutation
+            const applied = await Repository.updateReminderSchedule(
+              targetReel.id,
+              effectiveDur.targetDate.toISOString(),
+              effectiveDur.seconds,
+              {
+                expectedNextReminderAt: targetReel.next_reminder_at ?? null,
+                expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
+                expectedAwaitingReminderChoiceUntil: targetReel.awaiting_reminder_choice_until ?? null,
+                ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
+              }
+            );
+            if (this.pendingSharePrompts.get(senderId)?.shareId === pending.shareId) {
+              clearTimeout(pending.timer);
+              this.pendingSharePrompts.delete(senderId);
+            }
+            if (!applied) {
+              let reply = `${pending.addedHeading}${pending.creatorLine}\n\nℹ️ Your reel was saved to Watch Later, but its reminder schedule was updated by a newer command.`;
+              await this.deliverReply(senderId, reply, delivery);
+              return;
+            }
+            if (delivery) delivery.stateMutated = true;
+            if (pending.opId) this.markWebhookMidCompleted(pending.opId);
+
+            let reply = `${pending.addedHeading}${pending.creatorLine}\n\n⏰ Reminder set for: ${effectiveDur.label} (${effectiveDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
+            if (senderTz === 'UTC') {
+              reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
+            }
+            await this.deliverReply(senderId, reply, delivery);
+            return;
+          } else {
+            // Unrecognized text or greeting or search query: flush prompt and proceed
+            await this.flushPendingSharePrompt(senderId);
+          }
+        }
+      }
+    }
+
+    // 1. Cancel / Undo commands (e.g. "cancel", "undo", "cancel reminder", "clear @creator")
+    const cancelCmd = parseCancelCommand(text);
+    if (cancelCmd) {
+      if (cancelCmd.invalidCreatorTarget) {
+        const example = cancelCmd.isCancelAddition ? 'clear @creator' : 'cancel reminder for @creator';
+        await this.deliverReply(
+          senderId,
+          `ℹ️ Could not find a valid creator handle in "${cancelCmd.invalidCreatorTarget}". Reply e.g. "${example}".`,
+          delivery
+        );
+        return;
+      }
+
+      if (cancelCmd.isCancelReminder) {
+        const result = await Repository.cancelReminderForSender(senderId, {
+          targetCreator: cancelCmd.targetCreator,
+        });
+        if (delivery) delivery.stateMutated = true;
+        if (result) {
+          const label = formatHumanReelLabel(result.updatedReel, 40);
+          await this.deliverReply(
+            senderId,
+            `⏰ Reminder cancelled for ${label}. It will remain saved in your Watch Later list without alerts.`,
+            delivery
+          );
+        } else {
+          await this.deliverReply(senderId, `ℹ️ No active reminder found to cancel.`, delivery);
+        }
+        return;
+      }
+
+      if (cancelCmd.isCancelAddition) {
+        if (cancelCmd.targetCreator) {
+          if (delivery && !delivery.retryState.pinnedClearCreatorState) {
+            delivery.retryState.pinnedClearCreatorState = {
+              toDeleteIds: [],
+              toRevertIds: [],
+              reels: [],
+              deletedIds: [],
+              revertedIds: [],
+            };
+          }
+          const result = await Repository.clearWatchLaterForCreator(senderId, cancelCmd.targetCreator, {
+            pinnedState: delivery?.retryState.pinnedClearCreatorState,
+            onPartialProgress: (mutated) => {
+              if (delivery && mutated) delivery.stateMutated = true;
+            },
+          });
+          if (delivery) delivery.stateMutated = true;
+          if (result.clearedReels.length > 0) {
+            this.lastConfirmedAdditionReelId.delete(senderId);
+            await this.deliverReply(
+              senderId,
+              `❌ Cleared ${result.clearedReels.length} item(s) by @${cancelCmd.targetCreator} from your Watch Later.`,
+              delivery
+            );
+          } else {
+            await this.deliverReply(
+              senderId,
+              `ℹ️ No Watch Later items found from @${cancelCmd.targetCreator}.`,
+              delivery
+            );
+          }
+          return;
+        }
+
+        let targetReelId = delivery?.retryState?.pinnedCancelTargetReelId;
+        if (!targetReelId) {
+          targetReelId = this.lastConfirmedAdditionReelId.get(senderId);
+          if (!targetReelId) {
+            const lastReel = await Repository.getLastReelForInstagramSender(senderId);
+            if (lastReel?.watch_status === 'watch_later') {
+              targetReelId = lastReel.id;
+            }
+          }
+          if (targetReelId && delivery) {
+            delivery.retryState.pinnedCancelTargetReelId = targetReelId;
+          }
+        }
+        const result = await Repository.cancelRecentAdditionForSender(senderId, { targetReelId });
+        if (result) {
+          this.lastConfirmedAdditionReelId.delete(senderId);
+        }
+        if (delivery) {
+          delivery.stateMutated = true;
+          if (!delivery.retryState.pinnedCancelTargetReelId && result) {
+            delivery.retryState.pinnedCancelTargetReelId = result.cancelledReel.id;
+          }
+        }
+        if (result) {
+          const label = formatHumanReelLabel(result.cancelledReel, 40);
+          await this.deliverReply(
+            senderId,
+            `❌ Cancelled! Removed ${label} from your Watch Later.`,
+            delivery
+          );
+        } else {
+          await this.deliverReply(senderId, `ℹ️ No recent item found in your Watch Later to cancel.`, delivery);
+        }
+        return;
+      }
+    }
+
+    // 1b. Targeted Watched command: e.g. "watched @creator", "done @creator"
+    const targetedWatched = parseTargetedWatchedCommand(text);
+    if (targetedWatched) {
+      if (targetedWatched.invalidCreatorTarget) {
+        await this.deliverReply(
+          senderId,
+          `ℹ️ Could not find a valid creator username in "${targetedWatched.invalidCreatorTarget}". To mark items by creator, use e.g. "watched @creator".`,
+          delivery
+        );
+        return;
+      }
+      if (targetedWatched.targetCreator) {
+        if (delivery && delivery.retryState.pinnedWatchedCreatorTargetIds === undefined) {
+          delivery.retryState.pinnedWatchedCreatorTargetIds =
+            await Repository.selectWatchLaterTargetIdsForCreator(senderId, targetedWatched.targetCreator);
+        }
+        if (delivery && delivery.retryState.pinnedWatchedCreatorCompletedIds === undefined) {
+          delivery.retryState.pinnedWatchedCreatorCompletedIds = [];
+        }
+        const result = await Repository.markWatchedForCreator(senderId, targetedWatched.targetCreator, {
+          targetReelIds: delivery?.retryState.pinnedWatchedCreatorTargetIds,
+          completedReelIds: delivery?.retryState.pinnedWatchedCreatorCompletedIds,
+          onPartialProgress: (mutated) => {
+            if (delivery && mutated) delivery.stateMutated = true;
+          },
+        });
+        if (delivery) delivery.stateMutated = true;
+        const totalCount = delivery?.retryState.pinnedWatchedCreatorCompletedIds?.length || result.totalMarkedCount || result.updatedReels.length;
+        if (totalCount > 0) {
+          await this.deliverReply(
+            senderId,
+            `✅ Marked ${totalCount} item(s) by @${targetedWatched.targetCreator} as watched! Reminders stopped.`,
+            delivery
+          );
+        } else {
+          await this.deliverReply(
+            senderId,
+            `ℹ️ No Watch Later items found from @${targetedWatched.targetCreator}.`,
+            delivery
+          );
+        }
+        return;
+      }
+    }
+
+    // 1c. Greeting / Help / Instructions command (e.g. "hi", "hello", "hey", "sup", "help", "commands")
+    if (isGreetingOrHelpMessage(text)) {
+      await this.deliverReply(senderId, formatBotHelpMessage(), delivery);
       return;
     }
 
-    // 1. Mark as watched / stop command
+    // 1d. Mark as watched / stop command
     // Handles single ("watched", "done", "stop") and bulk ("stop all", "watched all", "clear all", "unsub")
     const { isCommand, markAll } = parseWatchedStopCommand(text);
     if (isCommand) {
@@ -954,6 +1774,9 @@ export class MetaInstagramBotService {
         ...(targetReelIds !== undefined ? { targetReelIds } : {}),
       });
       if (delivery) delivery.stateMutated = true;
+      if (updatedReels.length > 0) {
+        this.lastConfirmedAdditionReelId.delete(senderId);
+      }
       const reply = formatWatchedConfirmationMessage(updatedReels, remainingCount, markAll, remainingReels);
       await this.deliverReply(senderId, reply, delivery);
       return;
@@ -964,6 +1787,7 @@ export class MetaInstagramBotService {
     if (['delete my data', 'delete account', 'purge data', 'purge my data', 'erase my data', 'delete all my data'].includes(normalizedText)) {
       try {
         const deletedCount = await Repository.deleteUserDataForSender(senderId);
+        this.lastConfirmedAdditionReelId.delete(senderId);
         if (delivery) delivery.stateMutated = true;
         const reply =
           `🗑️ Your data deletion request has been processed.\n\n` +
@@ -1081,6 +1905,109 @@ export class MetaInstagramBotService {
       delivery.retryState.pinnedDuration = customDuration;
     }
     if (customDuration) {
+      const activeShare = this.inFlightShares.get(senderId);
+      const pinnedTargetId = delivery?.retryState?.pinnedTargetReelId;
+      if (activeShare || pinnedTargetId) {
+        if (activeShare && !activeShare.saveCompleted && !pinnedTargetId) {
+          activeShare.acceptedDuration = customDuration;
+          if (activeShare.delivery) {
+            activeShare.delivery.retryState.pinnedShareDuration = customDuration;
+            activeShare.delivery.retryState.acceptedDurationSeconds = customDuration.seconds;
+          }
+          if (delivery) delivery.stateMutated = true;
+          let reply = `⏰ Got it! Duration set to ${customDuration.label} (${customDuration.formattedTarget}). Applying to your shared reel!`;
+          if (senderTz === 'UTC') {
+            reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <your city>" to use your local time.`;
+          }
+          await this.deliverReply(senderId, reply, delivery);
+          return;
+        }
+
+        let targetReel: SavedReel | null = null;
+        if (pinnedTargetId) {
+          targetReel = await Repository.getSavedItemById(pinnedTargetId);
+          if (!targetReel) {
+            // Target was cancelled or deleted; end pinned operation rather than retargeting another reel
+            if (delivery?.opId) this.markWebhookMidCompleted(delivery.opId);
+            return;
+          }
+        } else if (activeShare?.savedReel) {
+          targetReel = activeShare.savedReel;
+          if (delivery) {
+            delivery.retryState.pinnedTargetReelId = targetReel.id;
+            delivery.retryState.expectedNextReminderAt = targetReel.next_reminder_at ?? null;
+            delivery.retryState.expectedAwaitingReminderChoiceUntil = targetReel.awaiting_reminder_choice_until ?? null;
+            delivery.retryState.pinnedDuration = customDuration;
+            if (!delivery.retryState.pinnedScheduleExpectation) {
+              delivery.retryState.pinnedScheduleExpectation = {
+                expectedNextReminderAt: targetReel.next_reminder_at ?? null,
+                expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
+                expectedAwaitingUntil: targetReel.awaiting_reminder_choice_until ?? null,
+                expectedWatchStatus: targetReel.watch_status,
+              };
+            }
+          }
+        }
+
+        if (targetReel) {
+          if (delivery && !delivery.retryState.pinnedScheduleExpectation) {
+            delivery.retryState.pinnedScheduleExpectation = {
+              expectedNextReminderAt: targetReel.next_reminder_at ?? null,
+              expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
+              expectedAwaitingUntil: targetReel.awaiting_reminder_choice_until ?? null,
+              expectedWatchStatus: targetReel.watch_status,
+            };
+          }
+          const schedSnap = delivery?.retryState?.pinnedScheduleExpectation;
+          const expectedNextReminderAt = schedSnap
+            ? schedSnap.expectedNextReminderAt
+            : (targetReel.next_reminder_at ?? null);
+          const expectedAwaitingReminderChoiceUntil = schedSnap
+            ? schedSnap.expectedAwaitingUntil
+            : (targetReel.awaiting_reminder_choice_until ?? null);
+          const expectedIntervalSeconds = schedSnap
+            ? schedSnap.expectedIntervalSeconds
+            : (targetReel.reminder_interval_seconds ?? null);
+          const expectedWatchStatus = schedSnap?.expectedWatchStatus ?? targetReel.watch_status;
+
+          const nextDate = customDuration.targetDate.toISOString();
+          const applied = await Repository.updateReminderSchedule(
+            targetReel.id,
+            nextDate,
+            customDuration.seconds,
+            {
+              expectedNextReminderAt,
+              expectedIntervalSeconds,
+              expectedAwaitingReminderChoiceUntil,
+              ...(expectedWatchStatus ? { expectedWatchStatus } : {}),
+            }
+          );
+          if (applied) {
+            if (delivery) delivery.stateMutated = true;
+            if (this.pendingSharePrompts.has(senderId)) {
+              const pending = this.pendingSharePrompts.get(senderId)!;
+              if (pending.reel.id === targetReel.id || (activeShare && pending.shareId === activeShare.shareId)) {
+                clearTimeout(pending.timer);
+                this.pendingSharePrompts.delete(senderId);
+                if (pending.opId) this.markWebhookMidCompleted(pending.opId);
+              }
+            }
+            let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget);
+            if (senderTz === 'UTC') {
+              reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <your city>" to use your local time.`;
+            }
+            await this.deliverReply(senderId, reply, delivery);
+            return;
+          }
+          const effectivePinnedTargetId = pinnedTargetId || delivery?.retryState?.pinnedTargetReelId;
+          if (effectivePinnedTargetId) {
+            // CAS failed on targeted/pinned reel; do not fall through to generic selector
+            if (delivery?.opId) this.markWebhookMidCompleted(delivery.opId);
+            return;
+          }
+        }
+      }
+
       let targetReel: SavedReel | null;
       if (delivery && delivery.retryState.pinnedDurationTargetReel !== undefined) {
         // Reuse the exact Reel snapshot resolved on the initial attempt so an internal retry never
@@ -1107,6 +2034,7 @@ export class MetaInstagramBotService {
             // promotion updating is_saved_on_instagram/updated_at) do not falsely discard durations.
             expectedNextReminderAt: targetReel.next_reminder_at ?? null,
             expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
+            expectedAwaitingReminderChoiceUntil: targetReel.awaiting_reminder_choice_until ?? null,
             ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
           }
         );
@@ -1121,6 +2049,8 @@ export class MetaInstagramBotService {
         }
         await this.deliverReply(senderId, reply, delivery);
       } else {
+        this.recordRecentDurationHint(senderId, customDuration);
+        if (delivery) delivery.stateMutated = true;
         let reply = `⏰ Got it! Duration set to ${customDuration.label} (${customDuration.formattedTarget}). Share any Reel or Post to track it!`;
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <your city>" to use your local time.`;
@@ -1218,7 +2148,6 @@ export class MetaInstagramBotService {
     }
 
     // Default welcome / help reply
-    const helpMsg = `👋 Hi! Whenever you see a Reel or Post you want to track or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username (or "reels by @name" / "posts by @name") to view your tracked items!\nType "tz" to check or set your local timezone!\nType "vault" to browse your saved items on the web, or "code" to get a 6-digit login code for your laptop.`;
-    await this.deliverReply(senderId, helpMsg, delivery);
+    await this.deliverReply(senderId, formatBotHelpMessage(), delivery);
   }
 }

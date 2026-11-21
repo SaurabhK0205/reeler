@@ -134,6 +134,7 @@ export function shouldBackfillSavedAt(
 class InMemoryStore {
   creators: Map<string, Creator> = new Map();
   reels: Map<string, SavedReel> = new Map();
+  latestAdditionReelIdBySender: Map<string, string> = new Map();
 
   async upsertCreator(data: {
     instagram_user_id: string;
@@ -257,6 +258,13 @@ class InMemoryStore {
       existing.effective_saved_at = resolveEffectiveSavedAt(existing);
       if (data.instagram_sender_id !== undefined) existing.instagram_sender_id = data.instagram_sender_id;
       existing.updated_at = now;
+      if (existing.watch_status === 'watch_later') {
+        if (existing.instagram_sender_id) {
+          this.latestAdditionReelIdBySender.set(String(existing.instagram_sender_id).trim(), existing.id);
+        } else {
+          this.latestAdditionReelIdBySender.set('__unattributed__', existing.id);
+        }
+      }
       options?.onInsertResult?.(false);
       return options?.skipReturn ? null : { ...existing, creator: this.creators.get(existing.creator_id) };
     }
@@ -298,6 +306,13 @@ class InMemoryStore {
     };
 
     this.reels.set(newReel.id, newReel);
+    if (newReel.watch_status === 'watch_later') {
+      if (newReel.instagram_sender_id) {
+        this.latestAdditionReelIdBySender.set(String(newReel.instagram_sender_id).trim(), newReel.id);
+      } else {
+        this.latestAdditionReelIdBySender.set('__unattributed__', newReel.id);
+      }
+    }
     options?.onInsertResult?.(true);
     return options?.skipReturn ? null : newReel;
   }
@@ -1973,15 +1988,21 @@ export class Repository {
     return (data || []) as SavedReel[];
   }
 
+  /**
+   * Updates a reel's reminder schedule and resets choice expiration.
+   * @param nextReminderAt ISO timestamp string for the next reminder, or null to clear the due schedule (one-time reminder completion).
+   */
   static async updateReminderSchedule(
     id: string,
-    nextReminderAt: string,
+    nextReminderAt: string | null,
     intervalSeconds?: number,
     options?: {
       expectedNextReminderAt?: string | null;
       expectedIntervalSeconds?: number | null;
+      expectedIntervalHours?: number | null;
       expectedUpdatedAt?: string | null;
       expectedWatchStatus?: WatchStatus;
+      expectedAwaitingReminderChoiceUntil?: string | null;
     }
   ): Promise<boolean> {
     const now = new Date().toISOString();
@@ -2002,6 +2023,12 @@ export class Repository {
           return false;
         }
         if (
+          options.expectedIntervalHours !== undefined &&
+          (reel.reminder_interval_hours ?? null) !== (options.expectedIntervalHours ?? null)
+        ) {
+          return false;
+        }
+        if (
           options.expectedUpdatedAt !== undefined &&
           (reel.updated_at ?? null) !== (options.expectedUpdatedAt ?? null)
         ) {
@@ -2010,6 +2037,12 @@ export class Repository {
         if (
           options.expectedWatchStatus !== undefined &&
           reel.watch_status !== options.expectedWatchStatus
+        ) {
+          return false;
+        }
+        if (
+          options.expectedAwaitingReminderChoiceUntil !== undefined &&
+          (reel.awaiting_reminder_choice_until ?? null) !== (options.expectedAwaitingReminderChoiceUntil ?? null)
         ) {
           return false;
         }
@@ -2049,6 +2082,11 @@ export class Repository {
           ? query.is('reminder_interval_seconds', null)
           : query.eq('reminder_interval_seconds', options.expectedIntervalSeconds);
       }
+      if (options.expectedIntervalHours !== undefined) {
+        query = options.expectedIntervalHours === null
+          ? query.is('reminder_interval_hours', null)
+          : query.eq('reminder_interval_hours', options.expectedIntervalHours);
+      }
       if (options.expectedUpdatedAt !== undefined) {
         query = options.expectedUpdatedAt === null
           ? query.is('updated_at', null)
@@ -2056,6 +2094,11 @@ export class Repository {
       }
       if (options.expectedWatchStatus !== undefined) {
         query = query.eq('watch_status', options.expectedWatchStatus);
+      }
+      if (options.expectedAwaitingReminderChoiceUntil !== undefined) {
+        query = options.expectedAwaitingReminderChoiceUntil === null
+          ? query.is('awaiting_reminder_choice_until', null)
+          : query.eq('awaiting_reminder_choice_until', options.expectedAwaitingReminderChoiceUntil);
       }
     }
 
@@ -2167,26 +2210,87 @@ export class Repository {
     return sortWatchLaterReelsMostRecentFirst(fallbackCandidates as SavedReel[])[0] || null;
   }
 
-  static async recordReminderSent(id: string, nextReminderAt: string | null): Promise<void> {
+  static async recordReminderSent(
+    id: string,
+    nextReminderAt: string | null,
+    options?: {
+      expectedNextReminderAt?: string | null;
+      expectedIntervalSeconds?: number | null;
+      expectedIntervalHours?: number | null;
+    }
+  ): Promise<boolean> {
     const now = new Date().toISOString();
+
+    const isSameInstant = (a: string | null | undefined, b: string | null | undefined): boolean => {
+      const normA = a ?? null;
+      const normB = b ?? null;
+      if (normA === null || normB === null) return normA === normB;
+      const timeA = new Date(normA).getTime();
+      const timeB = new Date(normB).getTime();
+      return !isNaN(timeA) && !isNaN(timeB) && timeA === timeB;
+    };
 
     if (!isSupabaseConfigured()) {
       const reel = memoryStore.reels.get(id);
       if (reel) {
+        if (
+          options?.expectedNextReminderAt !== undefined &&
+          !isSameInstant(reel.next_reminder_at, options.expectedNextReminderAt)
+        ) {
+          return false;
+        }
+        if (
+          options?.expectedIntervalSeconds !== undefined &&
+          (reel.reminder_interval_seconds ?? null) !== (options.expectedIntervalSeconds ?? null)
+        ) {
+          return false;
+        }
+        if (
+          options?.expectedIntervalHours !== undefined &&
+          (reel.reminder_interval_hours ?? null) !== (options.expectedIntervalHours ?? null)
+        ) {
+          return false;
+        }
         reel.reminders_sent_count = (reel.reminders_sent_count || 0) + 1;
         reel.last_reminded_at = now;
         reel.next_reminder_at = nextReminderAt;
         reel.updated_at = now;
+        return true;
       }
-      return;
+      return false;
     }
 
     const supabase = getSupabase();
-    // fetch current count
-    const { data: current } = await supabase.from('saved_reels').select('reminders_sent_count').eq('id', id).single();
-    const newCount = (current?.reminders_sent_count || 0) + 1;
+    // fetch current count and check expected reminder schedule
+    const { data: current, error: getErr } = await supabase
+      .from('saved_reels')
+      .select('reminders_sent_count, next_reminder_at, reminder_interval_seconds, reminder_interval_hours')
+      .eq('id', id)
+      .maybeSingle();
+    if (getErr) throw new Error(`Failed to fetch current reminder state: ${getErr.message}`);
+    if (!current) return false;
+    if (
+      options?.expectedNextReminderAt !== undefined &&
+      !isSameInstant(current.next_reminder_at, options.expectedNextReminderAt)
+    ) {
+      // Missing or superseded schedule: not a persistence error, leave newer schedule untouched
+      return false;
+    }
+    if (
+      options?.expectedIntervalSeconds !== undefined &&
+      (current.reminder_interval_seconds ?? null) !== (options.expectedIntervalSeconds ?? null)
+    ) {
+      return false;
+    }
+    if (
+      options?.expectedIntervalHours !== undefined &&
+      (current.reminder_interval_hours ?? null) !== (options.expectedIntervalHours ?? null)
+    ) {
+      return false;
+    }
+    const newCount = (current.reminders_sent_count || 0) + 1;
 
-    await supabase
+    let upQuery = supabase
       .from('saved_reels')
       .update({
         reminders_sent_count: newCount,
@@ -2195,6 +2299,1048 @@ export class Repository {
         updated_at: now,
       })
       .eq('id', id);
+    if (options?.expectedNextReminderAt !== undefined) {
+      upQuery = current.next_reminder_at === null
+        ? upQuery.is('next_reminder_at', null)
+        : upQuery.eq('next_reminder_at', current.next_reminder_at);
+    }
+    if (options?.expectedIntervalSeconds !== undefined) {
+      upQuery = current.reminder_interval_seconds === null
+        ? upQuery.is('reminder_interval_seconds', null)
+        : upQuery.eq('reminder_interval_seconds', current.reminder_interval_seconds);
+    }
+    if (options?.expectedIntervalHours !== undefined) {
+      upQuery = current.reminder_interval_hours === null
+        ? upQuery.is('reminder_interval_hours', null)
+        : upQuery.eq('reminder_interval_hours', current.reminder_interval_hours);
+    }
+    const { data, error: upErr } = await upQuery.select('id');
+    if (upErr) throw new Error(`Failed to update reminder record: ${upErr.message}`);
+    return Array.isArray(data) && data.length > 0;
+  }
+
+  /**
+   * Cancels a recently added Watch Later reel for an Instagram sender (e.g. if sent by mistake).
+   * For items sent directly to the bot (`is_saved_on_instagram === false`), the row is permanently deleted.
+   * For items from Instagram saved posts, it reverts `watch_status` to `'unwatched'` and clears reminders.
+   */
+  static async cancelRecentAdditionForSender(
+    senderId: string,
+    options?: { targetCreator?: string; targetReelId?: string; includeUnattributedFallback?: boolean }
+  ): Promise<{ cancelledReel: SavedReel; action: 'deleted' | 'reverted' } | null> {
+    const trimmedSender = String(senderId || '').trim();
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    if (!trimmedSender && !allowUnattributedFallback) return null;
+
+    const targetCreator = options?.targetCreator?.trim()?.toLowerCase();
+    const targetReelId = options?.targetReelId;
+
+    if (!isSupabaseConfigured()) {
+      const matchesTarget = (r: SavedReel): boolean => {
+        if (targetReelId) return r.id === targetReelId;
+        if (targetCreator) {
+          const creator = memoryStore.creators.get(r.creator_id);
+          return String(creator?.username || '').toLowerCase() === targetCreator;
+        }
+        return true;
+      };
+
+      let candidates = Array.from(memoryStore.reels.values()).filter(
+        (r) => r.watch_status === 'watch_later' && r.instagram_sender_id === trimmedSender && matchesTarget(r)
+      );
+      if (!targetReelId && !targetCreator) {
+        const latestId = memoryStore.latestAdditionReelIdBySender.get(trimmedSender);
+        if (latestId && memoryStore.reels.get(latestId)?.watch_status === 'watch_later') {
+          candidates = candidates.filter((r) => r.id === latestId);
+        }
+      }
+      if (allowUnattributedFallback && candidates.length === 0) {
+        candidates = Array.from(memoryStore.reels.values()).filter(
+          (r) => r.watch_status === 'watch_later' && !r.instagram_sender_id && matchesTarget(r)
+        );
+        if (!targetReelId && !targetCreator) {
+          const latestUnattributedId = memoryStore.latestAdditionReelIdBySender.get('__unattributed__');
+          if (latestUnattributedId && memoryStore.reels.get(latestUnattributedId)?.watch_status === 'watch_later') {
+            candidates = candidates.filter((r) => r.id === latestUnattributedId);
+          }
+        }
+      }
+      if (candidates.length === 0) return null;
+
+      candidates.sort((a, b) => {
+        const timeB = new Date(b.created_at || b.first_detected_at || 0).getTime();
+        const timeA = new Date(a.created_at || a.first_detected_at || 0).getTime();
+        if (timeB !== timeA) return timeB - timeA;
+        return String(b.id || '').localeCompare(String(a.id || ''));
+      });
+      const target = { ...candidates[0], creator: memoryStore.creators.get(candidates[0].creator_id) };
+      const now = new Date().toISOString();
+
+      const stored = memoryStore.reels.get(target.id);
+      if (!stored || stored.watch_status !== 'watch_later') return null;
+      if (memoryStore.latestAdditionReelIdBySender.get(trimmedSender) === target.id) {
+        memoryStore.latestAdditionReelIdBySender.delete(trimmedSender);
+      }
+      if (memoryStore.latestAdditionReelIdBySender.get('__unattributed__') === target.id) {
+        memoryStore.latestAdditionReelIdBySender.delete('__unattributed__');
+      }
+      if (stored.is_saved_on_instagram === false) {
+        memoryStore.reels.delete(target.id);
+        Repository.invalidateCreatorsCache();
+        return { cancelledReel: target, action: 'deleted' };
+      } else {
+        stored.watch_status = 'unwatched';
+        stored.next_reminder_at = null;
+        stored.reminder_interval_seconds = null;
+        stored.awaiting_reminder_choice_until = null;
+        stored.updated_at = now;
+        return {
+          cancelledReel: { ...stored, creator: memoryStore.creators.get(stored.creator_id) },
+          action: 'reverted',
+        };
+      }
+    }
+
+    const supabase = getSupabase();
+    let creatorIds: string[] | null = null;
+    if (targetCreator && !targetReelId) {
+      const { data: creators, error: cErr } = await supabase
+        .from('creators')
+        .select('id, username')
+        .ilike('username', targetCreator.replace(/[_%]/g, '\\$&'));
+      if (cErr) throw new Error(`Failed to resolve creator: ${cErr.message}`);
+      creatorIds = (creators || [])
+        .filter((c: any) => String(c.username || '').toLowerCase() === targetCreator)
+        .map((c: any) => c.id);
+      if (creatorIds.length === 0) return null;
+    }
+
+    const fetchCandidates = async (senderFilter: 'exact' | 'unattributed'): Promise<SavedReel[]> => {
+      let query = supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .eq('watch_status', 'watch_later');
+
+      if (senderFilter === 'exact') {
+        query = query.eq('instagram_sender_id', trimmedSender);
+      } else {
+        query = query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+
+      if (targetReelId) {
+        query = query.eq('id', targetReelId);
+      } else if (creatorIds) {
+        query = query.in('creator_id', creatorIds);
+      }
+
+      const { data, error } = await query
+        .order('created_at', { ascending: false })
+        .order('first_detected_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(10);
+
+      if (error) {
+        throw new Error(`Failed to fetch reel to cancel: ${error.message}`);
+      }
+      return (data || []) as SavedReel[];
+    };
+
+    let candidates = trimmedSender ? await fetchCandidates('exact') : [];
+    if (allowUnattributedFallback && candidates.length === 0) {
+      candidates = await fetchCandidates('unattributed');
+    }
+    if (candidates.length === 0) return null;
+
+    const target = candidates[0] as SavedReel;
+    const now = new Date().toISOString();
+
+    if (target.is_saved_on_instagram === false) {
+      let delQuery = supabase
+        .from('saved_reels')
+        .delete()
+        .eq('id', target.id)
+        .eq('is_saved_on_instagram', false)
+        .eq('watch_status', 'watch_later');
+
+      if (target.instagram_sender_id) {
+        delQuery = delQuery.eq('instagram_sender_id', target.instagram_sender_id);
+      } else if (allowUnattributedFallback) {
+        delQuery = delQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+
+      const { data: deletedRows, error: delErr } = await delQuery.select('id');
+      if (delErr) {
+        throw new Error(`Failed to delete cancelled reel: ${delErr.message}`);
+      }
+      if (deletedRows && deletedRows.length > 0) {
+        Repository.invalidateCreatorsCache();
+        return { cancelledReel: target, action: 'deleted' };
+      }
+      // If row was concurrently promoted to is_saved_on_instagram: true, fall through to revert
+    }
+
+    let upQuery = supabase
+      .from('saved_reels')
+      .update({
+        watch_status: 'unwatched',
+        next_reminder_at: null,
+        reminder_interval_seconds: null,
+        awaiting_reminder_choice_until: null,
+        updated_at: now,
+      })
+      .eq('id', target.id)
+      .eq('watch_status', 'watch_later');
+
+    if (target.instagram_sender_id) {
+      upQuery = upQuery.eq('instagram_sender_id', target.instagram_sender_id);
+    } else if (allowUnattributedFallback) {
+      upQuery = upQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+    }
+
+    const { data: updated, error: upErr } = await upQuery
+      .select('*, creator:creators(*)')
+      .maybeSingle();
+    if (upErr) {
+      throw new Error(`Failed to revert cancelled reel: ${upErr.message}`);
+    }
+    if (!updated) return null;
+    return { cancelledReel: updated as SavedReel, action: 'reverted' };
+  }
+
+  /**
+   * Cancels active reminder alarms on Watch Later reels for an Instagram sender
+   * while keeping the item safely in their Watch Later list without alerts.
+   */
+  static async cancelReminderForSender(
+    senderId: string,
+    options?: { targetCreator?: string; includeUnattributedFallback?: boolean }
+  ): Promise<{ updatedReel: SavedReel } | null> {
+    const trimmedSender = String(senderId || '').trim();
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    if (!trimmedSender && !allowUnattributedFallback) return null;
+
+    const targetCreator = options?.targetCreator?.trim()?.toLowerCase();
+
+    if (!isSupabaseConfigured()) {
+      const matchesTarget = (r: SavedReel): boolean => {
+        if (targetCreator) {
+          const creator = memoryStore.creators.get(r.creator_id);
+          return String(creator?.username || '').toLowerCase() === targetCreator;
+        }
+        return true;
+      };
+
+      let candidates = Array.from(memoryStore.reels.values()).filter(
+        (r) =>
+          r.watch_status === 'watch_later' &&
+          r.instagram_sender_id === trimmedSender &&
+          (r.next_reminder_at || r.awaiting_reminder_choice_until) &&
+          matchesTarget(r)
+      );
+      if (allowUnattributedFallback && candidates.length === 0) {
+        candidates = Array.from(memoryStore.reels.values()).filter(
+          (r) =>
+            r.watch_status === 'watch_later' &&
+            !r.instagram_sender_id &&
+            (r.next_reminder_at || r.awaiting_reminder_choice_until) &&
+            matchesTarget(r)
+        );
+      }
+      if (candidates.length === 0) return null;
+
+      const ordered = sortWatchLaterReelsMostRecentFirst(
+        candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) }))
+      );
+      const target = ordered[0];
+      const now = new Date().toISOString();
+      const stored = memoryStore.reels.get(target.id);
+      if (!stored || stored.watch_status !== 'watch_later') {
+        return null;
+      }
+      if (
+        stored.next_reminder_at !== target.next_reminder_at ||
+        stored.awaiting_reminder_choice_until !== target.awaiting_reminder_choice_until
+      ) {
+        if (!stored.next_reminder_at && !stored.awaiting_reminder_choice_until) {
+          return null;
+        }
+      }
+      stored.next_reminder_at = null;
+      stored.awaiting_reminder_choice_until = null;
+      stored.updated_at = now;
+      return { updatedReel: { ...stored, creator: memoryStore.creators.get(stored.creator_id) } };
+    }
+
+    const supabase = getSupabase();
+    let creatorIds: string[] | null = null;
+    if (targetCreator) {
+      const { data: creators, error: cErr } = await supabase
+        .from('creators')
+        .select('id, username')
+        .ilike('username', targetCreator.replace(/[_%]/g, '\\$&'));
+      if (cErr) throw new Error(`Failed to resolve creator: ${cErr.message}`);
+      creatorIds = (creators || [])
+        .filter((c: any) => String(c.username || '').toLowerCase() === targetCreator)
+        .map((c: any) => c.id);
+      if (creatorIds.length === 0) return null;
+    }
+
+    const fetchReminderCandidates = async (senderFilter: 'exact' | 'unattributed'): Promise<SavedReel[]> => {
+      let query = supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .eq('watch_status', 'watch_later')
+        .or('next_reminder_at.not.is.null,awaiting_reminder_choice_until.not.is.null');
+
+      if (senderFilter === 'exact') {
+        query = query.eq('instagram_sender_id', trimmedSender);
+      } else {
+        query = query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+
+      if (creatorIds) {
+        query = query.in('creator_id', creatorIds);
+      }
+
+      const { data, error } = await query
+        .order('updated_at', { ascending: false })
+        .order('last_reminded_at', { ascending: false, nullsFirst: false })
+        .order('created_at', { ascending: false })
+        .limit(10);
+
+      if (error) {
+        throw new Error(`Failed to fetch reminder to cancel: ${error.message}`);
+      }
+      return (data || []) as SavedReel[];
+    };
+
+    let candidates = trimmedSender ? await fetchReminderCandidates('exact') : [];
+    if (allowUnattributedFallback && candidates.length === 0) {
+      candidates = await fetchReminderCandidates('unattributed');
+    }
+    if (candidates.length === 0) return null;
+
+    const target = sortWatchLaterReelsMostRecentFirst(candidates as SavedReel[])[0];
+    const now = new Date().toISOString();
+
+    let upQuery = supabase
+      .from('saved_reels')
+      .update({
+        next_reminder_at: null,
+        awaiting_reminder_choice_until: null,
+        updated_at: now,
+      })
+      .eq('id', target.id)
+      .eq('watch_status', 'watch_later');
+
+    if (target.instagram_sender_id) {
+      upQuery = upQuery.eq('instagram_sender_id', target.instagram_sender_id);
+    } else if (allowUnattributedFallback) {
+      upQuery = upQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+    }
+
+    if (target.next_reminder_at !== null && target.next_reminder_at !== undefined) {
+      upQuery = upQuery.eq('next_reminder_at', target.next_reminder_at);
+    } else {
+      upQuery = upQuery.is('next_reminder_at', null);
+    }
+
+    if (target.awaiting_reminder_choice_until !== null && target.awaiting_reminder_choice_until !== undefined) {
+      upQuery = upQuery.eq('awaiting_reminder_choice_until', target.awaiting_reminder_choice_until);
+    } else {
+      upQuery = upQuery.is('awaiting_reminder_choice_until', null);
+    }
+
+    const { data: updated, error: upErr } = await upQuery
+      .select('*, creator:creators(*)')
+      .maybeSingle();
+
+    if (upErr) {
+      throw new Error(`Failed to cancel reminder: ${upErr.message}`);
+    }
+    if (!updated) {
+      // Re-read target item to distinguish whether reminder became inactive or schedule changed concurrently
+      let freshQuery = supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .eq('id', target.id);
+
+      if (target.instagram_sender_id) {
+        freshQuery = freshQuery.eq('instagram_sender_id', target.instagram_sender_id);
+      } else if (allowUnattributedFallback) {
+        freshQuery = freshQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      }
+
+      const { data: fresh, error: freshErr } = await freshQuery.maybeSingle();
+      if (freshErr) {
+        throw new Error(`Failed to check reminder state on cancellation retry: ${freshErr.message}`);
+      }
+      if (
+        fresh &&
+        fresh.watch_status === 'watch_later' &&
+        (fresh.next_reminder_at || fresh.awaiting_reminder_choice_until)
+      ) {
+        let retryUpQuery = supabase
+          .from('saved_reels')
+          .update({
+            next_reminder_at: null,
+            awaiting_reminder_choice_until: null,
+            updated_at: now,
+          })
+          .eq('id', target.id)
+          .eq('watch_status', 'watch_later');
+
+        if (target.instagram_sender_id) {
+          retryUpQuery = retryUpQuery.eq('instagram_sender_id', target.instagram_sender_id);
+        } else if (allowUnattributedFallback) {
+          retryUpQuery = retryUpQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+        }
+
+        const { data: retriedUpdated, error: retryErr } = await retryUpQuery
+          .select('*, creator:creators(*)')
+          .maybeSingle();
+
+        if (retryErr) {
+          throw new Error(`Failed to cancel reminder on retry: ${retryErr.message}`);
+        }
+        if (retriedUpdated) return { updatedReel: retriedUpdated as SavedReel };
+      }
+      return null;
+    }
+    return { updatedReel: updated as SavedReel };
+  }
+
+  /**
+   * Clears Watch Later reels from a specific creator for an Instagram sender.
+   * If sent directly to the bot, rows are deleted; if from IG Saved, status reverts to unwatched.
+   */
+  static async clearWatchLaterForCreator(
+    senderId: string,
+    creatorHandle: string,
+    options?: {
+      includeUnattributedFallback?: boolean;
+      pinnedState?: {
+        ownerScope?: 'exact' | 'unattributed';
+        toDeleteIds: string[];
+        toRevertIds: string[];
+        reels: SavedReel[];
+        deletedIds: string[];
+        revertedIds: string[];
+        targetUpdatedAts?: Record<string, string>;
+      };
+      onPartialProgress?: (mutated: boolean) => void;
+    }
+  ): Promise<{ clearedReels: SavedReel[] }> {
+    const trimmedSender = String(senderId || '').trim();
+    const handle = String(creatorHandle || '').trim().replace(/^@+/, '').toLowerCase();
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    if ((!trimmedSender && !allowUnattributedFallback) || !handle) return { clearedReels: [] };
+
+    if (!isSupabaseConfigured()) {
+      let state = options?.pinnedState;
+      if (
+        !state ||
+        (state.toDeleteIds.length === 0 &&
+          state.toRevertIds.length === 0 &&
+          state.deletedIds.length === 0 &&
+          state.revertedIds.length === 0)
+      ) {
+        let candidates = Array.from(memoryStore.reels.values()).filter((r) => {
+          if (r.watch_status !== 'watch_later') return false;
+          if (r.instagram_sender_id !== trimmedSender) return false;
+          const creator = memoryStore.creators.get(r.creator_id);
+          return String(creator?.username || '').toLowerCase() === handle;
+        });
+        if (allowUnattributedFallback && candidates.length === 0) {
+          candidates = Array.from(memoryStore.reels.values()).filter((r) => {
+            if (r.watch_status !== 'watch_later') return false;
+            if (r.instagram_sender_id) return false;
+            const creator = memoryStore.creators.get(r.creator_id);
+            return String(creator?.username || '').toLowerCase() === handle;
+          });
+        }
+        const initial = {
+          toDeleteIds: candidates.filter((r) => r.is_saved_on_instagram === false).map((r) => r.id),
+          toRevertIds: candidates.filter((r) => r.is_saved_on_instagram !== false).map((r) => r.id),
+          reels: candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) })),
+          deletedIds: [],
+          revertedIds: [],
+          targetUpdatedAts: Object.fromEntries(
+            candidates.map((r) => [r.id, r.updated_at || r.created_at || ''])
+          ),
+        };
+        if (state) {
+          Object.assign(state, initial);
+        } else {
+          state = initial;
+        }
+      }
+
+      const now = new Date().toISOString();
+      for (const id of state.toDeleteIds) {
+        if (!state.deletedIds.includes(id)) {
+          const reel = memoryStore.reels.get(id);
+          const expectedUpdatedAt = state.targetUpdatedAts?.[id];
+          const matchesSender =
+            reel &&
+            (reel.instagram_sender_id === trimmedSender ||
+              (allowUnattributedFallback && !reel.instagram_sender_id));
+          if (!reel || !matchesSender || reel.watch_status !== 'watch_later') {
+            continue;
+          }
+
+          if (reel.is_saved_on_instagram !== false) {
+            // Row was promoted to IG saved; move to revert instead of deleting
+            if (!state.toRevertIds.includes(id)) {
+              state.toRevertIds.push(id);
+            }
+            if (state.targetUpdatedAts) {
+              state.targetUpdatedAts[id] = reel.updated_at || reel.created_at || '';
+            }
+          } else if (!expectedUpdatedAt || (reel.updated_at || reel.created_at || '') === expectedUpdatedAt) {
+            memoryStore.reels.delete(id);
+            Repository.invalidateCreatorsCache();
+            state.deletedIds.push(id);
+            options?.onPartialProgress?.(true);
+          }
+        }
+      }
+
+      for (const id of state.toRevertIds) {
+        if (!state.revertedIds.includes(id)) {
+          const reel = memoryStore.reels.get(id);
+          const expectedUpdatedAt = state.targetUpdatedAts?.[id];
+          const matchesSender =
+            reel &&
+            (reel.instagram_sender_id === trimmedSender ||
+              (allowUnattributedFallback && !reel.instagram_sender_id));
+          if (
+            reel &&
+            matchesSender &&
+            reel.watch_status === 'watch_later' &&
+            (!expectedUpdatedAt || (reel.updated_at || reel.created_at || '') === expectedUpdatedAt)
+          ) {
+            reel.watch_status = 'unwatched';
+            reel.next_reminder_at = null;
+            reel.reminder_interval_seconds = null;
+            reel.awaiting_reminder_choice_until = null;
+            reel.updated_at = now;
+            state.revertedIds.push(id);
+            options?.onPartialProgress?.(true);
+          }
+        }
+      }
+
+      const deletedSet = new Set(state.deletedIds);
+      const revertedSet = new Set(state.revertedIds);
+      const clearedReels: SavedReel[] = state.reels.filter(
+        (r) => deletedSet.has(r.id) || revertedSet.has(r.id)
+      );
+      return { clearedReels };
+    }
+
+    const supabase = getSupabase();
+    let state = options?.pinnedState;
+    if (
+      !state ||
+      (state.toDeleteIds.length === 0 &&
+        state.toRevertIds.length === 0 &&
+        state.deletedIds.length === 0 &&
+        state.revertedIds.length === 0)
+    ) {
+      const { data: creators, error: cErr } = await supabase
+        .from('creators')
+        .select('id, username')
+        .ilike('username', handle.replace(/[_%]/g, '\\$&'));
+      if (cErr) {
+        throw new Error(`Failed to resolve creator for clear: ${cErr.message}`);
+      }
+      const creatorIds = (creators || [])
+        .filter((c: any) => String(c.username || '').toLowerCase() === handle)
+        .map((c: any) => c.id)
+        .filter(Boolean);
+      if (creatorIds.length === 0) return { clearedReels: [] };
+
+      const fetchReelsForSender = async (senderFilter: 'exact' | 'unattributed'): Promise<any[]> => {
+        const PAGE_SIZE = 1000;
+        let lastSeenId: string | null = null;
+        const res: any[] = [];
+        while (true) {
+          let pageQuery = supabase
+            .from('saved_reels')
+            .select('*, creator:creators(*)')
+            .eq('watch_status', 'watch_later')
+            .in('creator_id', creatorIds)
+            .order('id', { ascending: true })
+            .limit(PAGE_SIZE);
+
+          if (senderFilter === 'exact') {
+            pageQuery = pageQuery.eq('instagram_sender_id', trimmedSender);
+          } else {
+            pageQuery = pageQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+          }
+
+          if (lastSeenId) {
+            pageQuery = pageQuery.gt('id', lastSeenId);
+          }
+          const { data: page, error: rErr } = await pageQuery;
+          if (rErr) {
+            throw new Error(`Failed to fetch watch-later reels for creator: ${rErr.message}`);
+          }
+          if (!page || page.length === 0) break;
+          res.push(...page);
+          if (page.length < PAGE_SIZE) break;
+          lastSeenId = page[page.length - 1].id;
+        }
+        return res;
+      };
+
+      let ownerScope: 'exact' | 'unattributed' = 'exact';
+      let reels = trimmedSender ? await fetchReelsForSender('exact') : [];
+      if (allowUnattributedFallback && reels.length === 0) {
+        reels = await fetchReelsForSender('unattributed');
+        ownerScope = 'unattributed';
+      }
+      if (reels.length === 0) return { clearedReels: [] };
+
+      const initial = {
+        ownerScope,
+        toDeleteIds: reels.filter((r) => r.is_saved_on_instagram === false).map((r) => r.id),
+        toRevertIds: reels.filter((r) => r.is_saved_on_instagram !== false).map((r) => r.id),
+        reels: reels as SavedReel[],
+        deletedIds: [],
+        revertedIds: [],
+        targetUpdatedAts: Object.fromEntries(
+          reels.map((r: any) => [r.id, r.updated_at || r.created_at || ''])
+        ),
+      };
+      if (state) {
+        Object.assign(state, initial);
+      } else {
+        state = initial;
+      }
+    }
+
+    const now = new Date().toISOString();
+    const applyOwnerFilter = (query: any) => {
+      if (state.ownerScope === 'exact' && trimmedSender) {
+        return query.eq('instagram_sender_id', trimmedSender);
+      }
+      return query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+    };
+
+    const remainingDeleteIds = state.toDeleteIds.filter((id) => !state!.deletedIds.includes(id));
+    if (remainingDeleteIds.length > 0) {
+      const BATCH_SIZE = 100;
+      for (let i = 0; i < remainingDeleteIds.length; i += BATCH_SIZE) {
+        const batch = remainingDeleteIds.slice(i, i + BATCH_SIZE);
+        let fetchQuery = supabase
+          .from('saved_reels')
+          .select('id, updated_at, is_saved_on_instagram, watch_status, instagram_sender_id')
+          .in('id', batch);
+        fetchQuery = applyOwnerFilter(fetchQuery);
+        const { data: currentRows, error: fetchErr } = await fetchQuery;
+        if (fetchErr) {
+          throw new Error(`Failed to verify reel status before clear: ${fetchErr.message}`);
+        }
+
+        const validDeleteIds: string[] = [];
+        for (const row of (currentRows || []) as any[]) {
+          if (row.watch_status !== 'watch_later') continue;
+          if (row.is_saved_on_instagram !== false) {
+            // Promoted to IG saved: refresh target timestamp and route to revert
+            if (!state.toRevertIds.includes(row.id)) {
+              state.toRevertIds.push(row.id);
+            }
+            if (state.targetUpdatedAts) {
+              state.targetUpdatedAts[row.id] = row.updated_at || '';
+            }
+            continue;
+          }
+          const expectedVersion = state.targetUpdatedAts?.[row.id] || '';
+          if (!expectedVersion || row.updated_at === expectedVersion) {
+            validDeleteIds.push(row.id);
+          }
+        }
+
+        if (validDeleteIds.length > 0) {
+          const deleteGroups = new Map<string, string[]>();
+          for (const id of validDeleteIds) {
+            const version = state.targetUpdatedAts?.[id] || '';
+            if (!deleteGroups.has(version)) deleteGroups.set(version, []);
+            deleteGroups.get(version)!.push(id);
+          }
+
+          for (const [version, groupIds] of deleteGroups.entries()) {
+            let delQuery = supabase
+              .from('saved_reels')
+              .delete()
+              .in('id', groupIds)
+              .eq('is_saved_on_instagram', false)
+              .eq('watch_status', 'watch_later');
+            if (version) {
+              delQuery = delQuery.eq('updated_at', version);
+            }
+            delQuery = applyOwnerFilter(delQuery);
+            const { data: deleted, error: delErr } = await delQuery.select('id');
+            if (delErr) {
+              throw new Error(`Failed to delete bot-added reels: ${delErr.message}`);
+            }
+            const confirmedDeletedIds = (deleted || []).map((d: any) => d.id);
+            state.deletedIds.push(...confirmedDeletedIds);
+            if (confirmedDeletedIds.length > 0) {
+              Repository.invalidateCreatorsCache();
+              options?.onPartialProgress?.(true);
+            }
+          }
+
+          // Handle concurrent promotions between prefetch and delete
+          const deletedSet = new Set(state.deletedIds);
+          const unconfirmedIds = validDeleteIds.filter((id) => !deletedSet.has(id));
+          if (unconfirmedIds.length > 0) {
+            let recheckQuery = supabase
+              .from('saved_reels')
+              .select('id, updated_at, is_saved_on_instagram, watch_status')
+              .in('id', unconfirmedIds);
+            recheckQuery = applyOwnerFilter(recheckQuery);
+            const { data: rechecked, error: recheckErr } = await recheckQuery;
+            if (recheckErr) {
+              throw new Error(`Failed to recheck unconfirmed delete reels: ${recheckErr.message}`);
+            }
+            for (const row of (rechecked || []) as any[]) {
+              if (row.watch_status === 'watch_later' && row.is_saved_on_instagram !== false) {
+                if (!state.toRevertIds.includes(row.id)) {
+                  state.toRevertIds.push(row.id);
+                }
+                if (state.targetUpdatedAts) {
+                  state.targetUpdatedAts[row.id] = row.updated_at || '';
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const remainingRevertIds = state.toRevertIds.filter((id) => !state!.revertedIds.includes(id));
+    if (remainingRevertIds.length > 0) {
+      const BATCH_SIZE = 100;
+      for (let i = 0; i < remainingRevertIds.length; i += BATCH_SIZE) {
+        const batch = remainingRevertIds.slice(i, i + BATCH_SIZE);
+        let fetchQuery = supabase
+          .from('saved_reels')
+          .select('id, updated_at, watch_status, instagram_sender_id')
+          .in('id', batch);
+        fetchQuery = applyOwnerFilter(fetchQuery);
+        const { data: currentRows, error: fetchErr } = await fetchQuery;
+        if (fetchErr) {
+          throw new Error(`Failed to verify reel status before revert: ${fetchErr.message}`);
+        }
+
+        const validRevertIds: string[] = [];
+        for (const row of (currentRows || []) as any[]) {
+          if (row.watch_status !== 'watch_later') continue;
+          const expectedVersion = state.targetUpdatedAts?.[row.id] || '';
+          if (!expectedVersion || row.updated_at === expectedVersion) {
+            validRevertIds.push(row.id);
+          }
+        }
+
+        if (validRevertIds.length > 0) {
+          const revertGroups = new Map<string, string[]>();
+          for (const id of validRevertIds) {
+            const version = state.targetUpdatedAts?.[id] || '';
+            if (!revertGroups.has(version)) revertGroups.set(version, []);
+            revertGroups.get(version)!.push(id);
+          }
+
+          for (const [version, groupIds] of revertGroups.entries()) {
+            let revQuery = supabase
+              .from('saved_reels')
+              .update({
+                watch_status: 'unwatched',
+                next_reminder_at: null,
+                reminder_interval_seconds: null,
+                awaiting_reminder_choice_until: null,
+                updated_at: now,
+              })
+              .in('id', groupIds)
+              .eq('watch_status', 'watch_later');
+            if (version) {
+              revQuery = revQuery.eq('updated_at', version);
+            }
+            revQuery = applyOwnerFilter(revQuery);
+            const { data: reverted, error: revErr } = await revQuery.select('id');
+            if (revErr) {
+              throw new Error(`Failed to revert saved reels to unwatched: ${revErr.message}`);
+            }
+            const confirmedRevertedIds = (reverted || []).map((r: any) => r.id);
+            state.revertedIds.push(...confirmedRevertedIds);
+            if (confirmedRevertedIds.length > 0) {
+              options?.onPartialProgress?.(true);
+            }
+          }
+        }
+      }
+    }
+
+    const deletedSet = new Set(state.deletedIds);
+    const revertedSet = new Set(state.revertedIds);
+    const clearedReels = state.reels.filter((r) => deletedSet.has(r.id) || revertedSet.has(r.id));
+    return { clearedReels };
+  }
+
+  /**
+   * Resolves the list of active Watch Later reel IDs for a specific creator and Instagram sender
+   * prior to attempting mutations, allowing retries to pin and target the original set.
+   */
+  static async selectWatchLaterTargetIdsForCreator(
+    senderId: string,
+    creatorHandle: string,
+    options?: { includeUnattributedFallback?: boolean }
+  ): Promise<string[]> {
+    const trimmedSender = String(senderId || '').trim();
+    const handle = String(creatorHandle || '').trim().replace(/^@+/, '').toLowerCase();
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    if ((!trimmedSender && !allowUnattributedFallback) || !handle) return [];
+
+    if (!isSupabaseConfigured()) {
+      let candidates = Array.from(memoryStore.reels.values()).filter((r) => {
+        if (r.watch_status !== 'watch_later') return false;
+        if (r.instagram_sender_id !== trimmedSender) return false;
+        const creator = memoryStore.creators.get(r.creator_id);
+        return String(creator?.username || '').toLowerCase() === handle;
+      });
+      if (allowUnattributedFallback && candidates.length === 0) {
+        candidates = Array.from(memoryStore.reels.values()).filter((r) => {
+          if (r.watch_status !== 'watch_later') return false;
+          if (r.instagram_sender_id) return false;
+          const creator = memoryStore.creators.get(r.creator_id);
+          return String(creator?.username || '').toLowerCase() === handle;
+        });
+      }
+      return candidates.map((r) => r.id);
+    }
+
+    const supabase = getSupabase();
+    const { data: creators, error: cErr } = await supabase
+      .from('creators')
+      .select('id, username')
+      .ilike('username', handle.replace(/[_%]/g, '\\$&'));
+    if (cErr) throw new Error(`Failed to resolve creator: ${cErr.message}`);
+    const creatorIds = (creators || [])
+      .filter((c: any) => String(c.username || '').toLowerCase() === handle)
+      .map((c: any) => c.id)
+      .filter(Boolean);
+    if (creatorIds.length === 0) return [];
+
+    const fetchIdsForSender = async (senderFilter: 'exact' | 'unattributed'): Promise<string[]> => {
+      const PAGE_SIZE = 1000;
+      let lastSeenId: string | null = null;
+      const allIds: string[] = [];
+      while (true) {
+        let pageQuery = supabase
+          .from('saved_reels')
+          .select('id')
+          .eq('watch_status', 'watch_later')
+          .in('creator_id', creatorIds)
+          .order('id', { ascending: true })
+          .limit(PAGE_SIZE);
+
+        if (senderFilter === 'exact') {
+          pageQuery = pageQuery.eq('instagram_sender_id', trimmedSender);
+        } else {
+          pageQuery = pageQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+        }
+
+        if (lastSeenId) {
+          pageQuery = pageQuery.gt('id', lastSeenId);
+        }
+        const { data: page, error: rErr } = await pageQuery;
+        if (rErr) throw new Error(`Failed to fetch watch-later reels: ${rErr.message}`);
+        if (!page || page.length === 0) break;
+        allIds.push(...page.map((r: any) => r.id));
+        if (page.length < PAGE_SIZE) break;
+        lastSeenId = page[page.length - 1].id;
+      }
+      return allIds;
+    };
+
+    let allIds = trimmedSender ? await fetchIdsForSender('exact') : [];
+    if (allowUnattributedFallback && allIds.length === 0) {
+      allIds = await fetchIdsForSender('unattributed');
+    }
+    return allIds;
+  }
+
+  /**
+   * Marks all Watch Later reels from a specific creator as watched for an Instagram sender.
+   */
+  static async markWatchedForCreator(
+    senderId: string,
+    creatorHandle: string,
+    options?: {
+      targetReelIds?: string[];
+      completedReelIds?: string[];
+      onPartialProgress?: (mutated: boolean) => void;
+      includeUnattributedFallback?: boolean;
+    }
+  ): Promise<{ updatedReels: SavedReel[]; totalMarkedCount: number }> {
+    const trimmedSender = String(senderId || '').trim();
+    const handle = String(creatorHandle || '').trim().replace(/^@+/, '').toLowerCase();
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    const priorCompletedCount = options?.completedReelIds?.length || 0;
+    if ((!trimmedSender && !allowUnattributedFallback) || !handle) {
+      return { updatedReels: [], totalMarkedCount: priorCompletedCount };
+    }
+
+    if (!isSupabaseConfigured()) {
+      let candidates = Array.from(memoryStore.reels.values()).filter((r) => {
+        if (r.watch_status !== 'watch_later') return false;
+        if (r.instagram_sender_id !== trimmedSender) return false;
+        const creator = memoryStore.creators.get(r.creator_id);
+        return String(creator?.username || '').toLowerCase() === handle;
+      });
+      if (allowUnattributedFallback && candidates.length === 0) {
+        candidates = Array.from(memoryStore.reels.values()).filter((r) => {
+          if (r.watch_status !== 'watch_later') return false;
+          if (r.instagram_sender_id) return false;
+          const creator = memoryStore.creators.get(r.creator_id);
+          return String(creator?.username || '').toLowerCase() === handle;
+        });
+      }
+      if (options?.targetReelIds) {
+        const targetSet = new Set(options.targetReelIds);
+        candidates = candidates.filter((r) => targetSet.has(r.id));
+      }
+      if (options?.completedReelIds && options.completedReelIds.length > 0) {
+        const completedSet = new Set(options.completedReelIds);
+        candidates = candidates.filter((r) => !completedSet.has(r.id));
+      }
+      const updatedReels: SavedReel[] = [];
+      const now = new Date().toISOString();
+      for (const reel of candidates) {
+        reel.watch_status = 'watched';
+        reel.next_reminder_at = null;
+        reel.awaiting_reminder_choice_until = null;
+        reel.updated_at = now;
+        updatedReels.push({ ...reel, creator: memoryStore.creators.get(reel.creator_id) });
+        if (options?.completedReelIds && !options.completedReelIds.includes(reel.id)) {
+          options.completedReelIds.push(reel.id);
+        }
+      }
+      if (updatedReels.length > 0) {
+        options?.onPartialProgress?.(true);
+      }
+      const totalMarkedCount = priorCompletedCount + updatedReels.length;
+      return { updatedReels, totalMarkedCount };
+    }
+
+    const supabase = getSupabase();
+    const { data: creators, error: cErr } = await supabase
+      .from('creators')
+      .select('id, username')
+      .ilike('username', handle.replace(/[_%]/g, '\\$&'));
+    if (cErr) {
+      throw new Error(`Failed to resolve creator for watch: ${cErr.message}`);
+    }
+    const creatorIds = (creators || [])
+      .filter((c: any) => String(c.username || '').toLowerCase() === handle)
+      .map((c: any) => c.id)
+      .filter(Boolean);
+    if (creatorIds.length === 0) {
+      return { updatedReels: [], totalMarkedCount: options?.completedReelIds?.length || 0 };
+    }
+
+    let reelIds = options?.targetReelIds;
+    if (!reelIds) {
+      const fetchReelsForSender = async (senderFilter: 'exact' | 'unattributed'): Promise<string[]> => {
+        const PAGE_SIZE = 1000;
+        let lastSeenId: string | null = null;
+        const allReels: string[] = [];
+        while (true) {
+          let pageQuery = supabase
+            .from('saved_reels')
+            .select('id')
+            .eq('watch_status', 'watch_later')
+            .in('creator_id', creatorIds)
+            .order('id', { ascending: true })
+            .limit(PAGE_SIZE);
+
+          if (senderFilter === 'exact') {
+            pageQuery = pageQuery.eq('instagram_sender_id', trimmedSender);
+          } else {
+            pageQuery = pageQuery.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+          }
+
+          if (lastSeenId) {
+            pageQuery = pageQuery.gt('id', lastSeenId);
+          }
+          const { data: page, error: rErr } = await pageQuery;
+          if (rErr) {
+            throw new Error(`Failed to fetch watch-later reels for creator: ${rErr.message}`);
+          }
+          if (!page || page.length === 0) break;
+          allReels.push(...page.map((r: any) => r.id));
+          if (page.length < PAGE_SIZE) break;
+          lastSeenId = page[page.length - 1].id;
+        }
+        return allReels;
+      };
+
+      let fetchedIds = trimmedSender ? await fetchReelsForSender('exact') : [];
+      if (allowUnattributedFallback && fetchedIds.length === 0) {
+        fetchedIds = await fetchReelsForSender('unattributed');
+      }
+      if (fetchedIds.length === 0) {
+        return { updatedReels: [], totalMarkedCount: options?.completedReelIds?.length || 0 };
+      }
+      reelIds = fetchedIds;
+    }
+
+    if (options?.completedReelIds && options.completedReelIds.length > 0) {
+      const completedSet = new Set(options.completedReelIds);
+      reelIds = reelIds.filter((id) => !completedSet.has(id));
+    }
+
+    if (reelIds.length === 0) {
+      return { updatedReels: [], totalMarkedCount: options?.completedReelIds?.length || 0 };
+    }
+
+    const now = new Date().toISOString();
+    const BATCH_SIZE = 500;
+    const updatedReels: SavedReel[] = [];
+    for (let i = 0; i < reelIds.length; i += BATCH_SIZE) {
+      const batch = reelIds.slice(i, i + BATCH_SIZE);
+      const { data: updated, error: upErr } = await supabase
+        .from('saved_reels')
+        .update({
+          watch_status: 'watched',
+          next_reminder_at: null,
+          awaiting_reminder_choice_until: null,
+          updated_at: now,
+        })
+        .in('id', batch)
+        .eq('watch_status', 'watch_later')
+        .in('creator_id', creatorIds)
+        .select('*, creator:creators(*)');
+
+      if (upErr) {
+        throw new Error(`Failed to mark reels watched for creator: ${upErr.message}`);
+      }
+      if (updated && updated.length > 0) {
+        for (const row of updated as SavedReel[]) {
+          updatedReels.push(row);
+          if (options?.completedReelIds && !options.completedReelIds.includes(row.id)) {
+            options.completedReelIds.push(row.id);
+          }
+        }
+        options?.onPartialProgress?.(true);
+      }
+    }
+
+    const totalMarkedCount = priorCompletedCount + updatedReels.length;
+    return { updatedReels, totalMarkedCount };
   }
 
   /**
@@ -2754,6 +3900,7 @@ export class Repository {
     if (!isSupabaseConfigured()) {
       memoryStore.creators.clear();
       memoryStore.reels.clear();
+      memoryStore.latestAdditionReelIdBySender.clear();
     }
   }
 
@@ -3260,6 +4407,42 @@ export class Repository {
     };
   }
 
+  /**
+   * Looks up a single saved reel by exact row ID.
+   */
+  static async getSavedItemById(id: string): Promise<SavedReel | null> {
+    const cleanId = String(id || '').trim();
+    if (!cleanId) return null;
+
+    if (!isSupabaseConfigured()) {
+      const reel = memoryStore.reels.get(cleanId);
+      if (!reel) return null;
+      return {
+        ...reel,
+        media_type: classifySavedMediaType({ mediaType: reel.media_type, reelUrl: reel.reel_url }),
+        creator: memoryStore.creators.get(reel.creator_id),
+      };
+    }
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('id', cleanId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to look up saved item ${cleanId}: ${error.message}`);
+    }
+    if (!data) return null;
+
+    const row = data as SavedReel;
+    return {
+      ...row,
+      media_type: classifySavedMediaType({ mediaType: row.media_type, reelUrl: row.reel_url }),
+    };
+  }
+
   private static senderDeletionTimestamps = new Map<string, number>();
   private static activeSenderDeletions = new Map<string, number>();
   private static senderDeletionGenerations = new Map<string, number>();
@@ -3489,6 +4672,7 @@ export class Repository {
       Repository.senderTimezones.delete(trimmed);
 
       if (!isSupabaseConfigured()) {
+        memoryStore.latestAdditionReelIdBySender.delete(trimmed);
         let count = 0;
         for (const [id, reel] of memoryStore.reels.entries()) {
           if (reel.instagram_sender_id === trimmed) {

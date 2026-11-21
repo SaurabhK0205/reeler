@@ -4,6 +4,9 @@ import {
   MetaInstagramBotService,
   isMetaMessagingWindowError,
 } from '../src/services/metaInstagramBotService.ts';
+import { Repository } from '../src/db/repository.ts';
+import { parseTargetedWatchedCommand, parseCancelCommand } from '../src/utils/reelMessages.ts';
+import { extractCreatorQueryWithFilter } from '../src/utils/creatorQuery.ts';
 
 test('MetaInstagramBotService - splitMessageIntoChunks handles short and empty text', () => {
   const service = new MetaInstagramBotService();
@@ -2825,5 +2828,1182 @@ test('fetchReelMetadata supports Meta oEmbed fallback with code-10 cooldown and 
     else delete process.env.METADATA_PROXY_URL;
     if (prevProxyToken !== undefined) process.env.METADATA_PROXY_TOKEN = prevProxyToken;
     else delete process.env.METADATA_PROXY_TOKEN;
+  }
+});
+
+test('MetaInstagramBotService - parseCancelCommand, parseTargetedWatchedCommand, and isGreetingOrHelpMessage parsing', async () => {
+  const {
+    parseCancelCommand,
+    parseTargetedWatchedCommand,
+    isGreetingOrHelpMessage,
+    formatBotHelpMessage,
+  } = await import('../src/utils/reelMessages.ts');
+
+  // Cancel commands
+  assert.deepStrictEqual(parseCancelCommand('cancel'), { isCancelAddition: true, isCancelReminder: false });
+  assert.deepStrictEqual(parseCancelCommand('undo'), { isCancelAddition: true, isCancelReminder: false });
+  assert.deepStrictEqual(parseCancelCommand('undo that!'), { isCancelAddition: true, isCancelReminder: false });
+  assert.deepStrictEqual(parseCancelCommand('remove that'), { isCancelAddition: true, isCancelReminder: false });
+  assert.deepStrictEqual(parseCancelCommand('cancel reminder'), {
+    isCancelAddition: false,
+    isCancelReminder: true,
+    targetCreator: undefined,
+  });
+  assert.deepStrictEqual(parseCancelCommand('stop reminder for @creator123'), {
+    isCancelAddition: false,
+    isCancelReminder: true,
+    targetCreator: 'creator123',
+  });
+  assert.deepStrictEqual(parseCancelCommand('cancel reminder for ann'), {
+    isCancelAddition: false,
+    isCancelReminder: true,
+    targetCreator: 'ann',
+  });
+  assert.deepStrictEqual(parseCancelCommand('cancel reminder for @ann.'), {
+    isCancelAddition: false,
+    isCancelReminder: true,
+    targetCreator: 'ann',
+  });
+  assert.deepStrictEqual(parseCancelCommand('cancel reminder for a'), {
+    isCancelAddition: false,
+    isCancelReminder: true,
+    invalidCreatorTarget: 'a',
+  });
+  assert.deepStrictEqual(parseCancelCommand('clear @badcreator'), {
+    isCancelAddition: true,
+    isCancelReminder: false,
+    targetCreator: 'badcreator',
+  });
+  assert.deepStrictEqual(parseCancelCommand('clear ann'), {
+    isCancelAddition: true,
+    isCancelReminder: false,
+    targetCreator: 'ann',
+  });
+  // Bulk commands should not be parsed as single cancel addition
+  assert.strictEqual(parseCancelCommand('cancel all'), null);
+  assert.strictEqual(parseCancelCommand('stop all'), null);
+  assert.strictEqual(parseCancelCommand('stop reminders'), null);
+
+  // Targeted watched commands
+  assert.deepStrictEqual(parseTargetedWatchedCommand('watched @creator123'), { targetCreator: 'creator123' });
+  assert.deepStrictEqual(parseTargetedWatchedCommand('watched ann'), { targetCreator: 'ann' });
+  assert.deepStrictEqual(parseTargetedWatchedCommand('done @creator123'), { targetCreator: 'creator123' });
+  assert.deepStrictEqual(parseTargetedWatchedCommand('mark @creator123 as watched'), { targetCreator: 'creator123' });
+  assert.strictEqual(parseTargetedWatchedCommand('watched'), null);
+
+  // Greetings and help: @mentions must NOT trigger greeting
+  assert.strictEqual(isGreetingOrHelpMessage('@help'), false);
+  assert.strictEqual(isGreetingOrHelpMessage('@hi'), false);
+
+  // Greetings and help
+  const greetings = [
+    'hi', 'hello', 'hey', 'heya', 'yo', 'sup', 'wassup', "what's up", 'whats up',
+    'bro', 'sup bro', 'hey buddy', 'sup dude', 'yo homie',
+    'help', 'commands', 'command', 'instructions', 'guide', 'how to use',
+    'what can you do', 'what do you do', 'how does this work',
+    'hi!', 'hello?', 'yo...', 'hey bot', 'sup dude!'
+  ];
+  for (const g of greetings) {
+    assert.strictEqual(isGreetingOrHelpMessage(g), true, `Expected "${g}" to be recognized as greeting or help`);
+  }
+  assert.strictEqual(isGreetingOrHelpMessage('https://instagram.com/reel/123'), false);
+  assert.strictEqual(isGreetingOrHelpMessage('30m'), false);
+  assert.strictEqual(isGreetingOrHelpMessage('watched'), false);
+
+  // Help message length fits within single-bubble 950 char threshold
+  const help = formatBotHelpMessage();
+  assert.ok(help.length <= 950, `formatBotHelpMessage exceeds 950 chars: ${help.length}`);
+  assert.ok(help.includes('Save & Reminders'));
+  assert.ok(help.includes('cancel'));
+  assert.ok(help.includes('vault'));
+  assert.ok(help.includes('code'));
+});
+
+test('MetaInstagramBotService - greeting and help queries return unified help message', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+
+  const service = new MetaInstagramBotService();
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    const { formatBotHelpMessage } = await import('../src/utils/reelMessages.ts');
+    const expectedHelp = formatBotHelpMessage();
+
+    // "hi"
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [{ sender: { id: 'sender_greeting_1' }, recipient: { id: 'page_123' }, timestamp: Date.now(), message: { mid: 'm1', text: 'hi' } }],
+        },
+      ],
+    });
+    assert.strictEqual(sentMessages.length, 1);
+    assert.strictEqual(sentMessages[0], expectedHelp);
+
+    // "sup bro"
+    sentMessages.length = 0;
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [{ sender: { id: 'sender_greeting_1' }, recipient: { id: 'page_123' }, timestamp: Date.now(), message: { mid: 'm2', text: 'sup bro' } }],
+        },
+      ],
+    });
+    assert.strictEqual(sentMessages.length, 1);
+    assert.strictEqual(sentMessages[0], expectedHelp);
+  } finally {
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+  }
+});
+
+test('MetaInstagramBotService - share debouncing unifies share-sheet attachment and duration text into one message', async (t) => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
+
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const service = new MetaInstagramBotService({ shareDebounceDelayMs: 60 });
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    // Event 1: Share-sheet attachment arrives with no duration
+    const payload1 = {
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_debounce_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'mid_att_1',
+                attachments: [
+                  {
+                    type: 'share',
+                    payload: {
+                      url: 'https://www.instagram.com/reel/DDebounce01/',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    // Event 2: Accompanying text arrives 15ms later
+    const payload2 = {
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_debounce_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'mid_txt_1',
+                text: '20 seconds',
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    await service.handleWebhookPayload(payload1);
+    // At this moment, Event 1 is buffered, so no prompt was sent yet!
+    assert.strictEqual(sentMessages.length, 0);
+
+    // Advance controlled clock by 15ms (within 60ms debounce buffer)
+    t.mock.timers.tick(15);
+    await service.handleWebhookPayload(payload2);
+
+    // Advance controlled clock past the debounce deadline
+    t.mock.timers.tick(80);
+
+    // Must have sent exactly 1 message combining addition confirmation + reminder confirmation
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].includes('Added to your Watch Later!'));
+    assert.ok(sentMessages[0].includes('Reminder set for: 20 seconds'));
+    assert.ok(!sentMessages[0].includes('When should I remind you to watch this?'));
+
+    // Check DB state: reel is saved with 20 second reminder
+    const saved = await Repository.getSavedItemByShortcode('DDebounce01', 'sender_debounce_1');
+    assert.ok(saved);
+    assert.strictEqual(saved.watch_status, 'watch_later');
+    assert.strictEqual(saved.reminder_interval_seconds, 20);
+  } finally {
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    globalThis.fetch = originalFetch;
+    t.mock.timers.reset();
+  }
+});
+
+test('MetaInstagramBotService - duration delivered while share upsert is in flight applies cleanly without prompt', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
+
+  const service = new MetaInstagramBotService({ shareDebounceDelayMs: 60 });
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  const origUpsert = Repository.upsertSavedReel;
+  let releaseSave!: () => void;
+  const saveGate = new Promise<void>((resolve) => {
+    releaseSave = resolve;
+  });
+  let saveIntercepted = false;
+
+  let notifySaveStarted!: () => void;
+  const saveStarted = new Promise<void>((resolve) => {
+    notifySaveStarted = resolve;
+  });
+
+  (Repository as any).upsertSavedReel = async function (...args: any[]) {
+    if (!saveIntercepted && args[0]?.shortcode === 'DConcurrent01') {
+      saveIntercepted = true;
+      notifySaveStarted();
+      await saveGate;
+    }
+    return origUpsert.apply(this, args as any);
+  };
+
+  let sharePromise: Promise<void> | undefined;
+  try {
+    const payload1 = {
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_conc_1' },
+              message: {
+                mid: 'mid.conc_share_1',
+                attachments: [{ type: 'share', payload: { url: 'https://www.instagram.com/reel/DConcurrent01/' } }],
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const payload2 = {
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: 'sender_conc_1' },
+              message: {
+                mid: 'mid.conc_dur_1',
+                text: '45 seconds',
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    sharePromise = service.handleWebhookPayload(payload1);
+    await Promise.race([saveStarted, sharePromise]);
+    assert.ok(saveIntercepted, 'share handler settled before the upsert was intercepted');
+    await service.handleWebhookPayload(payload2);
+    releaseSave();
+    await sharePromise;
+
+      service.clearTimersForTesting();
+
+      const saved = await Repository.getSavedItemByShortcode('DConcurrent01', 'sender_conc_1');
+      assert.ok(saved);
+      assert.strictEqual(saved.watch_status, 'watch_later');
+      assert.strictEqual(saved.reminder_interval_seconds, 45);
+      assert.ok(saved.next_reminder_at);
+      assert.ok(!sentMessages.some((msg) => msg.includes('When should I remind you to watch this?')));
+    } finally {
+      releaseSave();
+      await sharePromise?.catch(() => {});
+      (Repository as any).upsertSavedReel = origUpsert;
+      service.clearTimersForTesting();
+      Repository.resetMemoryStoreForTests();
+      if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+      globalThis.fetch = originalFetch;
+    }
+});
+
+test('MetaInstagramBotService - cancel command removes recently added reel from Watch Later', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
+
+  const service = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    // 1. Share a reel
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_cancel_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_cancel_add',
+                text: 'https://www.instagram.com/reel/DCancelMe1/',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const itemBeforeCancel = await Repository.getSavedItemByShortcode('DCancelMe1', 'sender_cancel_1');
+    assert.ok(itemBeforeCancel);
+    assert.strictEqual(itemBeforeCancel.watch_status, 'watch_later');
+
+    // 2. User says "cancel"
+    sentMessages.length = 0;
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_cancel_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_cancel_cmd',
+                text: 'cancel',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].includes('Cancelled! Removed'));
+
+    // DB: item is completely deleted since is_saved_on_instagram === false
+    const itemAfterCancel = await Repository.getSavedItemByShortcode('DCancelMe1', 'sender_cancel_1');
+    assert.strictEqual(itemAfterCancel, null);
+  } finally {
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('MetaInstagramBotService - cancel reminder clears reminder schedule while keeping item in Watch Later', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
+
+  const service = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    // 1. Share a reel with duration
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_rem_cancel_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_rem_add',
+                text: 'https://www.instagram.com/reel/DRemCancel1/ 30m',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const itemBefore = await Repository.getSavedItemByShortcode('DRemCancel1', 'sender_rem_cancel_1');
+    assert.ok(itemBefore);
+    assert.ok(itemBefore.next_reminder_at);
+
+    // 2. User says "cancel reminder"
+    sentMessages.length = 0;
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_rem_cancel_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_rem_cmd',
+                text: 'cancel reminder',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].includes('Reminder cancelled'));
+    assert.ok(sentMessages[0].includes('It will remain saved in your Watch Later list without alerts.'));
+
+    // DB: item is still in Watch Later, but next_reminder_at is null
+    const itemAfter = await Repository.getSavedItemByShortcode('DRemCancel1', 'sender_rem_cancel_1');
+    assert.ok(itemAfter);
+    assert.strictEqual(itemAfter.watch_status, 'watch_later');
+    assert.strictEqual(itemAfter.next_reminder_at, null);
+  } finally {
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('MetaInstagramBotService & Repository - creator commands use exact handle matching and avoid substring collisions', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+
+  try {
+    const creatorAnn = await Repository.upsertCreator({
+      instagram_user_id: 'c_ann',
+      username: 'ann',
+      display_name: 'Ann Original',
+    });
+    const creatorAnna = await Repository.upsertCreator({
+      instagram_user_id: 'c_anna',
+      username: 'anna',
+      display_name: 'Anna Other',
+    });
+
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'media_ann_1',
+      shortcode: 'DShortAnn1',
+      reel_url: 'https://instagram.com/reel/DShortAnn1/',
+      creator_id: creatorAnn.id,
+      taken_at: '2026-11-20T10:00:00Z',
+      first_detected_at: '2026-11-20T10:00:00Z',
+      save_order_rank: 1,
+      instagram_sender_id: 'sender_handle_isolation',
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+    });
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'media_anna_1',
+      shortcode: 'DShortAnna1',
+      reel_url: 'https://instagram.com/reel/DShortAnna1/',
+      creator_id: creatorAnna.id,
+      taken_at: '2026-11-20T10:00:00Z',
+      first_detected_at: '2026-11-20T10:00:00Z',
+      save_order_rank: 2,
+      instagram_sender_id: 'sender_handle_isolation',
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+    });
+
+    // Clear only @ann
+    const clearResult = await Repository.clearWatchLaterForCreator('sender_handle_isolation', 'ann');
+    assert.strictEqual(clearResult.clearedReels.length, 1);
+    assert.strictEqual(clearResult.clearedReels[0].shortcode, 'DShortAnn1');
+
+    // Ann's reel must be completely removed from the sender's Watch Later
+    const annReel = await Repository.getSavedItemByShortcode('DShortAnn1', 'sender_handle_isolation');
+    assert.strictEqual(annReel, null);
+
+    // Anna's reel must still be preserved in Watch Later
+    const annaReel = await Repository.getSavedItemByShortcode('DShortAnna1', 'sender_handle_isolation');
+    assert.ok(annaReel);
+    assert.strictEqual(annaReel.watch_status, 'watch_later');
+  } finally {
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) {
+      process.env.SUPABASE_URL = prevUrl;
+    }
+  }
+});
+
+test('MetaInstagramBotService - consecutive shares flush prior pending prompt without dropping it', async (t) => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
+
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const service = new MetaInstagramBotService({ shareDebounceDelayMs: 200 });
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    const c1 = await Repository.upsertCreator({
+      instagram_user_id: 'c_consec_1',
+      username: 'creator_first',
+      display_name: 'Creator First',
+    });
+    const c2 = await Repository.upsertCreator({
+      instagram_user_id: 'c_consec_2',
+      username: 'creator_second',
+      display_name: 'Creator Second',
+    });
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_consec_1',
+      shortcode: 'DConsec1',
+      reel_url: 'https://instagram.com/reel/DConsec1/',
+      creator_id: c1.id,
+      taken_at: '2026-11-20T10:00:00Z',
+      first_detected_at: '2026-11-20T10:00:00Z',
+      save_order_rank: 1,
+      instagram_sender_id: 'sender_consec_1',
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+    });
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_consec_2',
+      shortcode: 'DConsec2',
+      reel_url: 'https://instagram.com/reel/DConsec2/',
+      creator_id: c2.id,
+      taken_at: '2026-11-20T10:00:00Z',
+      first_detected_at: '2026-11-20T10:00:00Z',
+      save_order_rank: 2,
+      instagram_sender_id: 'sender_consec_1',
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+    });
+
+    // Share Reel 1
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_consec_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_consec_1',
+                attachments: [{ type: 'share', payload: { url: 'https://instagram.com/reel/DConsec1/' } }],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    // Assert that the first prompt is still pending debounce before the second share
+    assert.strictEqual(sentMessages.length, 0);
+
+    // Share Reel 2 immediately while Reel 1 is pending debounce
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_consec_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_consec_2',
+                attachments: [{ type: 'share', payload: { url: 'https://instagram.com/reel/DConsec2/' } }],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    // Reel 1's prompt must have been flushed immediately when Reel 2 arrived without time advancing
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].includes('@creator_first'));
+
+    // Advance mock timers to let Reel 2 debounce settle
+    t.mock.timers.tick(250);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Now Reel 2's prompt must also have been sent
+    assert.strictEqual(sentMessages.length, 2);
+    assert.ok(sentMessages[1].includes('@creator_second'));
+  } finally {
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    globalThis.fetch = originalFetch;
+    t.mock.timers.reset();
+  }
+});
+
+test('MetaInstagramBotService - cancel reminder for handle containing time keyword reaches cancel handler instead of scheduling duration', async (t) => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
+
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const service = new MetaInstagramBotService({ shareDebounceDelayMs: 200 });
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    const creator = await Repository.upsertCreator({
+      instagram_user_id: 'c_tomorrow',
+      username: 'tomorrowland',
+      display_name: 'Tomorrowland',
+    });
+
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'media_tomorrow_1',
+      shortcode: 'DTomorrow1',
+      reel_url: 'https://instagram.com/reel/DTomorrow1/',
+      creator_id: creator.id,
+      taken_at: '2026-11-20T10:00:00Z',
+      first_detected_at: '2026-11-20T10:00:00Z',
+      save_order_rank: 1,
+      instagram_sender_id: 'sender_tomorrow_cmd',
+      watch_status: 'watch_later',
+      next_reminder_at: '2026-11-25T10:00:00Z',
+      is_saved_on_instagram: false,
+    });
+
+    // Share a new reel (it enters debounce)
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_tomorrow_cmd' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_share_new',
+                attachments: [{ type: 'share', payload: { url: 'https://instagram.com/reel/DNewShare1/' } }],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    // Hold mock clock before debounce deadline and send "cancel reminder for @tomorrowland"
+    assert.strictEqual(sentMessages.length, 0);
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_tomorrow_cmd' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_cancel_tomorrow',
+                text: 'cancel reminder for @tomorrowland',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    // Must flush pending prompt for the new share AND confirm cancellation without time advancing
+    assert.strictEqual(sentMessages.length, 2);
+    assert.ok(sentMessages[0].includes('Added to your Watch Later!'));
+    assert.ok(sentMessages[1].includes('Reminder cancelled for @tomorrowland'));
+
+    const updated = await Repository.getSavedItemByShortcode('DTomorrow1', 'sender_tomorrow_cmd');
+    assert.ok(updated);
+    assert.strictEqual(updated.next_reminder_at, null);
+  } finally {
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    globalThis.fetch = originalFetch;
+    t.mock.timers.reset();
+  }
+});
+
+test('MetaInstagramBotService - creator watched & clear commands accept trailing punctuation and reject invalid targets safely', async (t) => {
+  const { Repository } = await import('../src/db/repository.ts');
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('{}', { status: 404 });
+
+  const service = new MetaInstagramBotService();
+  const sentMessages: string[] = [];
+  (service as any).sendDirectMessage = async (_to: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    Repository.resetMemoryStoreForTests();
+    const sender = 'punct_test_sender';
+
+    const creatorAnn = await Repository.upsertCreator({
+      instagram_user_id: 'c_ann',
+      username: 'ann',
+      display_name: 'Ann',
+    });
+    const creatorAnna = await Repository.upsertCreator({
+      instagram_user_id: 'c_anna',
+      username: 'anna',
+      display_name: 'Anna',
+    });
+
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_ann_1',
+      shortcode: 'DAnn1',
+      reel_url: 'https://instagram.com/reel/DAnn1/',
+      creator_id: creatorAnn.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      next_reminder_at: new Date(Date.now() + 3600000).toISOString(),
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 1,
+    });
+
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_anna_1',
+      shortcode: 'DAnna1',
+      reel_url: 'https://instagram.com/reel/DAnna1/',
+      creator_id: creatorAnna.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      next_reminder_at: new Date(Date.now() + 3600000).toISOString(),
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 2,
+    });
+
+    // 1. Send "watched @ann," (with trailing comma)
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: 0,
+          messaging: [
+            {
+              sender: { id: sender },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: { mid: 'm_punct_1', text: 'watched @ann,' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.ok(sentMessages[0].includes('Marked 1 item(s) by @ann as watched'));
+    const annReel = await Repository.getSavedItemByShortcode('DAnn1', sender);
+    const annaReel = await Repository.getSavedItemByShortcode('DAnna1', sender);
+    assert.strictEqual(annReel?.watch_status, 'watched');
+    assert.strictEqual(annaReel?.watch_status, 'watch_later'); // Anna remains unwatched!
+
+    // 2. Send invalid creator target: "watched @invalid---name"
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: 0,
+          messaging: [
+            {
+              sender: { id: sender },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: { mid: 'm_punct_2', text: 'watched @invalid---name' },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.ok(sentMessages[1].includes('Could not find a valid creator username'));
+    const annaReelAfter = await Repository.getSavedItemByShortcode('DAnna1', sender);
+    assert.strictEqual(annaReelAfter?.watch_status, 'watch_later'); // Anna STILL remains unwatched!
+  } finally {
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Repository - creator filter scoping fallback, markWatched completed exclusion, and safe promotion revert', async (t) => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+
+  t.mock.timers.enable({ apis: ['Date'] });
+
+  try {
+    Repository.resetMemoryStoreForTests();
+
+    const sender = 'sender_filter_test';
+    const creatorAnn = await Repository.upsertCreator({
+      instagram_user_id: 'c_ann_scope',
+      username: 'ann',
+      display_name: 'Ann',
+    });
+    const creatorAnna = await Repository.upsertCreator({
+      instagram_user_id: 'c_anna_scope',
+      username: 'anna',
+      display_name: 'Anna',
+    });
+
+    // Sender owns reel from Ann
+    const reelAnn = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_ann_scope',
+      shortcode: 'AnnScope',
+      reel_url: 'https://instagram.com/reel/AnnScope/',
+      creator_id: creatorAnn.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      next_reminder_at: new Date(Date.now() + 3600000).toISOString(),
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 1,
+    });
+
+    // Unattributed reel from Anna
+    const reelAnna = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_anna_scope',
+      shortcode: 'AnnaScope',
+      reel_url: 'https://instagram.com/reel/AnnaScope/',
+      creator_id: creatorAnna.id,
+      instagram_sender_id: undefined,
+      watch_status: 'watch_later',
+      next_reminder_at: new Date(Date.now() + 3600000).toISOString(),
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 2,
+    });
+
+    // 1. cancelReminderForSender: sender targets creator 'anna' (owned is 'ann', unattributed is 'anna')
+    // Candidate filtering by creator must occur BEFORE deciding whether to use unattributed fallback
+    const cancelReminderRes = await Repository.cancelReminderForSender(sender, {
+      targetCreator: 'anna',
+      includeUnattributedFallback: true,
+    });
+    assert.ok(cancelReminderRes, 'Expected unattributed reminder for anna to be cancelled');
+    assert.strictEqual(cancelReminderRes.updatedReel.id, reelAnna.id);
+    assert.strictEqual(cancelReminderRes.updatedReel.next_reminder_at, null);
+
+    // Ann's reminder should remain active
+    const freshAnn = await Repository.getSavedItemById(reelAnn.id);
+    assert.ok(freshAnn?.next_reminder_at, 'Ann reminder should still be active');
+
+    // 2. cancelRecentAdditionForSender: same scoping check
+    const cancelAdditionRes = await Repository.cancelRecentAdditionForSender(sender, {
+      targetCreator: 'anna',
+      includeUnattributedFallback: true,
+    });
+    assert.ok(cancelAdditionRes, 'Expected unattributed addition for anna to be cancelled');
+    assert.strictEqual(cancelAdditionRes.cancelledReel.id, reelAnna.id);
+
+    // 3. markWatchedForCreator: completedReelIds exclusion
+    const r1 = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_r1',
+      shortcode: 'R1Code',
+      reel_url: 'https://instagram.com/reel/R1Code/',
+      creator_id: creatorAnn.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 3,
+    });
+    const r2 = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_r2',
+      shortcode: 'R2Code',
+      reel_url: 'https://instagram.com/reel/R2Code/',
+      creator_id: creatorAnn.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 4,
+    });
+
+    const completedIds = [r1.id];
+    const markRes = await Repository.markWatchedForCreator(sender, 'ann', {
+      completedReelIds: completedIds,
+    });
+    // r1 was already in completedReelIds, so only remaining Watch Later reels for Ann (reelAnn and r2) are mutated
+    assert.strictEqual(markRes.totalMarkedCount, 3); // 1 completed + 2 newly marked
+    assert.strictEqual(markRes.updatedReels.some((r) => r.id === r1.id), false); // r1 not mutated again
+
+    // 4. clearWatchLaterForCreator: safe promotion revert
+    const botReel = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_bot_promo',
+      shortcode: 'BotPromo',
+      reel_url: 'https://instagram.com/reel/BotPromo/',
+      creator_id: creatorAnna.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 5,
+    });
+
+    const pinnedClearState = {
+      toDeleteIds: [botReel.id],
+      toRevertIds: [],
+      reels: [botReel],
+      deletedIds: [] as string[],
+      revertedIds: [] as string[],
+      targetUpdatedAts: { [botReel.id]: botReel.updated_at || botReel.created_at || '' },
+    };
+
+    // Advance controlled clock before promoting to guarantee updated_at differs from pinned version
+    t.mock.timers.tick(2000);
+
+    // Simulate archive promotion in between pin and clear execution
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_bot_promo',
+      shortcode: 'BotPromo',
+      reel_url: 'https://instagram.com/reel/BotPromo/',
+      creator_id: creatorAnna.id,
+      instagram_sender_id: sender,
+      watch_status: 'watch_later',
+      is_saved_on_instagram: true,
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 5,
+    });
+
+    const clearRes = await Repository.clearWatchLaterForCreator(sender, 'anna', {
+      pinnedState: pinnedClearState,
+    });
+    assert.strictEqual(clearRes.clearedReels.length, 1);
+    const cleared = await Repository.getSavedItemById(botReel.id);
+    assert.strictEqual(cleared?.watch_status, 'unwatched', 'Promoted reel must be reverted to unwatched, not deleted');
+  } finally {
+    t.mock.timers.reset();
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+  }
+});
+
+test('Routing and Undo - done posts search routing and addition-order undo selection', async () => {
+  // 1. parseTargetedWatchedCommand returns null for done posts/reels
+  assert.strictEqual(parseTargetedWatchedCommand('done posts'), null);
+  assert.strictEqual(parseTargetedWatchedCommand('done reels'), null);
+  assert.strictEqual(parseTargetedWatchedCommand('watched posts'), null);
+
+  // 2. extractCreatorQueryWithFilter routes done posts to creator search
+  const extracted = extractCreatorQueryWithFilter('done posts');
+  assert.deepStrictEqual(extracted, { username: 'done', mediaFilter: 'post' });
+
+  // 3. cancelRecentAdditionForSender chooses most recently added item (created_at DESC), not archive rank
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+
+  try {
+    Repository.resetMemoryStoreForTests();
+    const creator = await Repository.upsertCreator({
+      instagram_user_id: 'c_undo_order',
+      username: 'undo_artist',
+      display_name: 'Undo Artist',
+    });
+
+    // Older item added first, but with higher archive rank
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_undo_older',
+      shortcode: 'UndoOlder',
+      reel_url: 'https://instagram.com/reel/UndoOlder/',
+      creator_id: creator.id,
+      instagram_sender_id: 'undo_user',
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+      created_at: '2026-11-20T10:00:00Z',
+      taken_at: '2026-11-20T10:00:00Z',
+      first_detected_at: '2026-11-20T10:00:00Z',
+      save_order_rank: 10,
+    });
+
+    // Newer item added second, with lower archive rank
+    const newerReel = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_undo_newer',
+      shortcode: 'UndoNewer',
+      reel_url: 'https://instagram.com/reel/UndoNewer/',
+      creator_id: creator.id,
+      instagram_sender_id: 'undo_user',
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+      created_at: '2026-11-21T10:00:00Z',
+      taken_at: '2026-11-21T10:00:00Z',
+      first_detected_at: '2026-11-21T10:00:00Z',
+      save_order_rank: 1,
+    });
+
+    const undone = await Repository.cancelRecentAdditionForSender('undo_user');
+    assert.ok(undone);
+    assert.strictEqual(undone.cancelledReel.id, newerReel.id, 'Must cancel the most recently added item, ignoring archive rank');
+  } finally {
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+  }
+});
+
+test('parseCancelCommand strips trailing punctuation and matches creator queries', () => {
+  const p1 = parseCancelCommand('clear @ykittois.');
+  assert.ok(p1);
+  assert.strictEqual(p1.isCancelAddition, true);
+  assert.strictEqual(p1.targetCreator, 'ykittois');
+
+  const p2 = parseCancelCommand('clear @ykittois,');
+  assert.ok(p2);
+  assert.strictEqual(p2.targetCreator, 'ykittois');
+
+  const p3 = parseCancelCommand('cancel reminder for @ykittois.');
+  assert.ok(p3);
+  assert.strictEqual(p3.isCancelReminder, true);
+  assert.strictEqual(p3.targetCreator, 'ykittois');
+});
+
+test('Repository.updateReminderSchedule guards recurring intervals with expectedIntervalHours & expectedIntervalSeconds', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  try {
+    Repository.resetMemoryStoreForTests();
+    const creator = await Repository.upsertCreator({
+      instagram_user_id: 'c_interval_guard',
+      username: 'interval_guard',
+    });
+    const reel = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_interval_guard',
+      shortcode: 'IntGuard1',
+      reel_url: 'https://instagram.com/reel/IntGuard1/',
+      creator_id: creator.id,
+      instagram_sender_id: 'interval_user',
+      watch_status: 'watch_later',
+      reminder_interval_seconds: 7200,
+      reminder_interval_hours: 2,
+      next_reminder_at: '2026-11-21T12:00:00Z',
+    });
+    assert.ok(reel);
+
+    // Mismatched expectedIntervalSeconds returns false
+    const okWrongSec = await Repository.updateReminderSchedule(
+      reel.id,
+      '2026-11-21T14:00:00Z',
+      3600,
+      { expectedIntervalSeconds: 3600 }
+    );
+    assert.strictEqual(okWrongSec, false);
+
+    // Mismatched expectedIntervalHours returns false
+    const okWrongHrs = await Repository.updateReminderSchedule(
+      reel.id,
+      '2026-11-21T14:00:00Z',
+      3600,
+      { expectedIntervalHours: 1 }
+    );
+    assert.strictEqual(okWrongHrs, false);
+
+    // Matching expectations returns true
+    const okMatching = await Repository.updateReminderSchedule(
+      reel.id,
+      '2026-11-21T14:00:00Z',
+      3600,
+      { expectedIntervalSeconds: 7200, expectedIntervalHours: 2 }
+    );
+    assert.strictEqual(okMatching, true);
+  } finally {
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
   }
 });
