@@ -3088,9 +3088,15 @@ test('MetaInstagramBotService - duration delivered while share upsert is in flig
   });
   let saveIntercepted = false;
 
+  let notifySaveStarted!: () => void;
+  const saveStarted = new Promise<void>((resolve) => {
+    notifySaveStarted = resolve;
+  });
+
   (Repository as any).upsertSavedReel = async function (...args: any[]) {
     if (!saveIntercepted && args[0]?.shortcode === 'DConcurrent01') {
       saveIntercepted = true;
+      notifySaveStarted();
       await saveGate;
     }
     return origUpsert.apply(this, args as any);
@@ -3132,6 +3138,7 @@ test('MetaInstagramBotService - duration delivered while share upsert is in flig
     };
 
     const sharePromise = service.handleWebhookPayload(payload1);
+    await saveStarted;
     await service.handleWebhookPayload(payload2);
     releaseSave();
     await sharePromise;
@@ -3145,6 +3152,7 @@ test('MetaInstagramBotService - duration delivered while share upsert is in flig
     assert.ok(saved.next_reminder_at);
     assert.ok(!sentMessages.some((msg) => msg.includes('When should I remind you to watch this?')));
   } finally {
+    releaseSave();
     (Repository as any).upsertSavedReel = origUpsert;
     service.clearTimersForTesting();
     Repository.resetMemoryStoreForTests();
