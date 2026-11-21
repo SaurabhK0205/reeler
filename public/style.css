@@ -3870,13 +3870,17 @@ kbd {
 .vault-container.is-vault-locked .library-header-meta,
 .vault-container.is-vault-locked #reels-grid,
 .vault-container.is-vault-locked #reels-table-container,
-.vault-container.is-vault-locked #pagination-bar {
+.vault-container.is-vault-locked #pagination-bar,
+.vault-container.is-vault-locked .catalog-sentinel,
+.vault-container.is-vault-locked #catalog-sentinel {
   display: none !important;
 }
 
 .vault-container.is-vault-locked .library-main {
   flex: 1;
+  width: 100%;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
 }
@@ -3898,10 +3902,12 @@ kbd {
 
 .vault-gate-screen {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
   padding: 36px 16px;
   width: 100%;
+  margin: 0 auto;
 }
 
 .vault-gate-screen.is-hidden {
@@ -3911,6 +3917,7 @@ kbd {
 .vault-gate-card {
   max-width: 440px;
   width: 100%;
+  margin: 0 auto;
   background: var(--surface-panel);
   border: 1px solid var(--hairline-strong);
   border-radius: var(--radius-lg);
