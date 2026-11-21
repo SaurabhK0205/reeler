@@ -23,6 +23,7 @@ export interface CancelCommand {
   isCancelAddition: boolean;
   isCancelReminder: boolean;
   targetCreator?: string;
+  invalidCreatorTarget?: string;
 }
 
 /**
@@ -38,9 +39,32 @@ export function parseCancelCommand(text: string): CancelCommand | null {
     return null;
   }
 
-  // 1. Cancel reminder only: e.g. "cancel reminder", "stop reminder", "no reminder", "remove reminder"
+  // 1. Scoped or single cancel reminder:
+  // First, check if user explicitly targeted a creator with "for": e.g. "cancel reminder for @ann", "stop reminders for @ann please"
+  const targetedReminderMatch = lower.match(
+    /^(?:cancel|stop|remove|no)\s+reminders?\s+for\s+(.+?)[!.]*$/i
+  );
+  if (targetedReminderMatch) {
+    const rawArg = targetedReminderMatch[1].trim();
+    const cleaned = rawArg.replace(/[.!?,;:]+$/, '');
+    const targetCreator = extractCreatorQuery(cleaned);
+    if (!targetCreator) {
+      return {
+        isCancelAddition: false,
+        isCancelReminder: true,
+        invalidCreatorTarget: rawArg,
+      };
+    }
+    return {
+      isCancelAddition: false,
+      isCancelReminder: true,
+      targetCreator,
+    };
+  }
+
+  // Next, check single cancel reminder without "for": e.g. "cancel reminder", "stop reminder @ann", "no reminder"
   const reminderMatch = lower.match(
-    /^(?:cancel|stop|remove|no)\s+reminders?(?:\s+(?:for\s+)?(@?[a-z0-9._]{1,30}))?[!.]*$/i
+    /^(?:cancel|stop|remove|no)\s+reminders?(?:\s+(@?[a-z0-9._]{1,30}))?[!.]*$/i
   );
   if (reminderMatch) {
     const rawArg = reminderMatch[1];
@@ -177,6 +201,12 @@ export function parseWatchedStopCommand(text: string): WatchedStopCommand {
     /^(?:(?:show|get|fetch|find)\s+)?(?:(?:reels?|posts?)\s+(?:by|of|from)|show|get|fetch|find|creator)\s+@?[a-z0-9._]+$/i.test(lower) ||
     /^@?[a-z0-9._]+\s+(?:reels?|posts?)$/i.test(lower)
   ) {
+    return { isCommand: false, markAll: false };
+  }
+
+  // Explicit scoped reminder cancellation requests (e.g. "stop reminders for @creator")
+  // belong to cancel routing rather than bulk watch/stop.
+  if (/(?:cancel|stop|remove|no)\s+reminders?\s+for\s+/i.test(lower)) {
     return { isCommand: false, markAll: false };
   }
 

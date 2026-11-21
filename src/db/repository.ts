@@ -2532,11 +2532,18 @@ export class Repository {
       for (const id of state.toDeleteIds) {
         if (!state.deletedIds.includes(id)) {
           const reel = memoryStore.reels.get(id);
-          if (reel && reel.watch_status === 'watch_later') {
-            memoryStore.reels.delete(id);
-            Repository.invalidateCreatorsCache();
-            state.deletedIds.push(id);
-            options?.onPartialProgress?.(true);
+          if (reel && reel.watch_status === 'watch_later' && reel.instagram_sender_id === trimmedSender) {
+            if (reel.is_saved_on_instagram !== false) {
+              // Row was promoted to IG saved; move to revert instead of deleting
+              if (!state.toRevertIds.includes(id)) {
+                state.toRevertIds.push(id);
+              }
+            } else {
+              memoryStore.reels.delete(id);
+              Repository.invalidateCreatorsCache();
+              state.deletedIds.push(id);
+              options?.onPartialProgress?.(true);
+            }
           }
         }
       }

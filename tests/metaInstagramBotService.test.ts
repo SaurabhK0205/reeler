@@ -2917,6 +2917,11 @@ test('MetaInstagramBotService - parseCancelCommand, parseTargetedWatchedCommand,
 });
 
 test('MetaInstagramBotService - greeting and help queries return unified help message', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_URL;
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+
   const service = new MetaInstagramBotService();
   const sentMessages: string[] = [];
   service.sendDirectMessage = async (_recipientId: string, text: string) => {
@@ -2924,37 +2929,42 @@ test('MetaInstagramBotService - greeting and help queries return unified help me
     return true;
   };
 
-  const { formatBotHelpMessage } = await import('../src/utils/reelMessages.ts');
-  const expectedHelp = formatBotHelpMessage();
+  try {
+    const { formatBotHelpMessage } = await import('../src/utils/reelMessages.ts');
+    const expectedHelp = formatBotHelpMessage();
 
-  // "hi"
-  await service.handleWebhookPayload({
-    object: 'instagram',
-    entry: [
-      {
-        id: 'page_123',
-        time: Date.now(),
-        messaging: [{ sender: { id: 'sender_greeting_1' }, recipient: { id: 'page_123' }, timestamp: Date.now(), message: { mid: 'm1', text: 'hi' } }],
-      },
-    ],
-  });
-  assert.strictEqual(sentMessages.length, 1);
-  assert.strictEqual(sentMessages[0], expectedHelp);
+    // "hi"
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [{ sender: { id: 'sender_greeting_1' }, recipient: { id: 'page_123' }, timestamp: Date.now(), message: { mid: 'm1', text: 'hi' } }],
+        },
+      ],
+    });
+    assert.strictEqual(sentMessages.length, 1);
+    assert.strictEqual(sentMessages[0], expectedHelp);
 
-  // "sup bro"
-  sentMessages.length = 0;
-  await service.handleWebhookPayload({
-    object: 'instagram',
-    entry: [
-      {
-        id: 'page_123',
-        time: Date.now(),
-        messaging: [{ sender: { id: 'sender_greeting_1' }, recipient: { id: 'page_123' }, timestamp: Date.now(), message: { mid: 'm2', text: 'sup bro' } }],
-      },
-    ],
-  });
-  assert.strictEqual(sentMessages.length, 1);
-  assert.strictEqual(sentMessages[0], expectedHelp);
+    // "sup bro"
+    sentMessages.length = 0;
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [{ sender: { id: 'sender_greeting_1' }, recipient: { id: 'page_123' }, timestamp: Date.now(), message: { mid: 'm2', text: 'sup bro' } }],
+        },
+      ],
+    });
+    assert.strictEqual(sentMessages.length, 1);
+    assert.strictEqual(sentMessages[0], expectedHelp);
+  } finally {
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+  }
 });
 
 test('MetaInstagramBotService - share debouncing unifies share-sheet attachment and duration text into one message', async (t) => {
@@ -3264,6 +3274,10 @@ test('MetaInstagramBotService & Repository - creator commands use exact handle m
     const clearResult = await Repository.clearWatchLaterForCreator('sender_handle_isolation', 'ann');
     assert.strictEqual(clearResult.clearedReels.length, 1);
     assert.strictEqual(clearResult.clearedReels[0].shortcode, 'DShortAnn1');
+
+    // Ann's reel must be completely removed from the sender's Watch Later
+    const annReel = await Repository.getSavedItemByShortcode('DShortAnn1', 'sender_handle_isolation');
+    assert.strictEqual(annReel, null);
 
     // Anna's reel must still be preserved in Watch Later
     const annaReel = await Repository.getSavedItemByShortcode('DShortAnna1', 'sender_handle_isolation');

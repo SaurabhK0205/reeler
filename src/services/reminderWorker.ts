@@ -305,7 +305,19 @@ export class ReminderWorker {
       console.log(`[ReminderWorker] Found ${allDueReels.length} Reel(s) due for reminder (dispatching batch of ${dueReels.length}).`);
 
       for (const reel of dueReels) {
-        const reminderText = formatWatchLaterReminderMessage(reel);
+        // Recheck schedule immediately before sending to ensure reminder was not cancelled in the interim
+        const freshReel = await Repository.getSavedItemByShortcode(reel.shortcode, reel.instagram_sender_id);
+        if (
+          !freshReel ||
+          freshReel.watch_status !== 'watch_later' ||
+          !freshReel.next_reminder_at ||
+          new Date(freshReel.next_reminder_at).getTime() > Date.now()
+        ) {
+          console.log(`[ReminderWorker] Skipping reel ${reel.shortcode} because its reminder is no longer due.`);
+          continue;
+        }
+
+        const reminderText = formatWatchLaterReminderMessage(freshReel);
 
         let delivered = false;
 
@@ -351,16 +363,18 @@ export class ReminderWorker {
             }
             this.failedReelSuppression.set(reel.id, Date.now() + 5 * 60 * 1000);
 
-            // Attempt fallback backoff in DB to prevent immediate resends on next run
+            // Attempt fallback persistence: clear due date for one-time reminders (nextDate === null),
+            // or back off 5 minutes for recurring reminders
             try {
+              const fallbackDate = nextDate === null ? null : new Date(Date.now() + 5 * 60 * 1000).toISOString();
               await Repository.updateReminderSchedule(
                 reel.id,
-                new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+                fallbackDate,
                 undefined,
                 { expectedNextReminderAt: reel.next_reminder_at }
               );
             } catch (fallbackErr: any) {
-              console.error(`[ReminderWorker] Fallback backoff failed for reel ${reel.shortcode}:`, fallbackErr.message || fallbackErr);
+              console.error(`[ReminderWorker] Fallback schedule update failed for reel ${reel.shortcode}:`, fallbackErr.message || fallbackErr);
             }
           }
         } else {
