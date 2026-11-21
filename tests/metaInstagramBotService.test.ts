@@ -2827,3 +2827,347 @@ test('fetchReelMetadata supports Meta oEmbed fallback with code-10 cooldown and 
     else delete process.env.METADATA_PROXY_TOKEN;
   }
 });
+
+test('MetaInstagramBotService - parseCancelCommand, parseTargetedWatchedCommand, and isGreetingOrHelpMessage parsing', async () => {
+  const {
+    parseCancelCommand,
+    parseTargetedWatchedCommand,
+    isGreetingOrHelpMessage,
+    formatBotHelpMessage,
+  } = await import('../src/utils/reelMessages.ts');
+
+  // Cancel commands
+  assert.deepStrictEqual(parseCancelCommand('cancel'), { isCancelAddition: true, isCancelReminder: false });
+  assert.deepStrictEqual(parseCancelCommand('undo'), { isCancelAddition: true, isCancelReminder: false });
+  assert.deepStrictEqual(parseCancelCommand('undo that!'), { isCancelAddition: true, isCancelReminder: false });
+  assert.deepStrictEqual(parseCancelCommand('remove that'), { isCancelAddition: true, isCancelReminder: false });
+  assert.deepStrictEqual(parseCancelCommand('cancel reminder'), {
+    isCancelAddition: false,
+    isCancelReminder: true,
+    targetCreator: undefined,
+  });
+  assert.deepStrictEqual(parseCancelCommand('stop reminder for @creator123'), {
+    isCancelAddition: false,
+    isCancelReminder: true,
+    targetCreator: 'creator123',
+  });
+  assert.deepStrictEqual(parseCancelCommand('clear @badcreator'), {
+    isCancelAddition: true,
+    isCancelReminder: false,
+    targetCreator: 'badcreator',
+  });
+  // Bulk commands should not be parsed as single cancel addition
+  assert.strictEqual(parseCancelCommand('cancel all'), null);
+  assert.strictEqual(parseCancelCommand('stop all'), null);
+  assert.strictEqual(parseCancelCommand('stop reminders'), null);
+
+  // Targeted watched commands
+  assert.deepStrictEqual(parseTargetedWatchedCommand('watched @creator123'), { targetCreator: 'creator123' });
+  assert.deepStrictEqual(parseTargetedWatchedCommand('done @creator123'), { targetCreator: 'creator123' });
+  assert.deepStrictEqual(parseTargetedWatchedCommand('mark @creator123 as watched'), { targetCreator: 'creator123' });
+  assert.strictEqual(parseTargetedWatchedCommand('watched'), null);
+
+  // Greetings and help
+  const greetings = [
+    'hi', 'hello', 'hey', 'heya', 'yo', 'sup', 'wassup', "what's up", 'whats up',
+    'nigga', 'niga', 'hey nigga', 'sup nigga', 'yo nigga', 'bro', 'sup bro',
+    'help', 'commands', 'command', 'instructions', 'guide', 'how to use',
+    'what can you do', 'what do you do', 'how does this work',
+    'hi!', 'hello?', 'yo...', 'hey bot', 'sup dude!', 'nigga?!'
+  ];
+  for (const g of greetings) {
+    assert.strictEqual(isGreetingOrHelpMessage(g), true, `Expected "${g}" to be recognized as greeting or help`);
+  }
+  assert.strictEqual(isGreetingOrHelpMessage('https://instagram.com/reel/123'), false);
+  assert.strictEqual(isGreetingOrHelpMessage('30m'), false);
+  assert.strictEqual(isGreetingOrHelpMessage('watched'), false);
+
+  // Help message length fits within single-bubble 950 char threshold
+  const help = formatBotHelpMessage();
+  assert.ok(help.length <= 950, `formatBotHelpMessage exceeds 950 chars: ${help.length}`);
+  assert.ok(help.includes('Save & Reminders'));
+  assert.ok(help.includes('cancel'));
+  assert.ok(help.includes('vault'));
+  assert.ok(help.includes('code'));
+});
+
+test('MetaInstagramBotService - greeting and help queries return unified help message', async () => {
+  const service = new MetaInstagramBotService();
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  const { formatBotHelpMessage } = await import('../src/utils/reelMessages.ts');
+  const expectedHelp = formatBotHelpMessage();
+
+  // "hi"
+  await service.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        id: 'page_123',
+        time: Date.now(),
+        messaging: [{ sender: { id: 'sender_greeting_1' }, recipient: { id: 'page_123' }, timestamp: Date.now(), message: { mid: 'm1', text: 'hi' } }],
+      },
+    ],
+  });
+  assert.strictEqual(sentMessages.length, 1);
+  assert.strictEqual(sentMessages[0], expectedHelp);
+
+  // "nigga"
+  sentMessages.length = 0;
+  await service.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        id: 'page_123',
+        time: Date.now(),
+        messaging: [{ sender: { id: 'sender_greeting_1' }, recipient: { id: 'page_123' }, timestamp: Date.now(), message: { mid: 'm2', text: 'nigga' } }],
+      },
+    ],
+  });
+  assert.strictEqual(sentMessages.length, 1);
+  assert.strictEqual(sentMessages[0], expectedHelp);
+});
+
+test('MetaInstagramBotService - share debouncing unifies share-sheet attachment and duration text into one message', async () => {
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+
+  const service = new MetaInstagramBotService({ shareDebounceDelayMs: 60 });
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    // Event 1: Share-sheet attachment arrives with no duration
+    const payload1 = {
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_debounce_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'mid_att_1',
+                attachments: [
+                  {
+                    type: 'share',
+                    payload: {
+                      url: 'https://www.instagram.com/reel/DDebounce01/',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    // Event 2: Accompanying text arrives 15ms later
+    const payload2 = {
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_debounce_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'mid_txt_1',
+                text: '20 seconds',
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    await service.handleWebhookPayload(payload1);
+    // At this moment, Event 1 is buffered, so no prompt was sent yet!
+    assert.strictEqual(sentMessages.length, 0);
+
+    // Send Event 2 (duration) 15ms later (well within 60ms buffer)
+    await new Promise((r) => setTimeout(r, 15));
+    await service.handleWebhookPayload(payload2);
+
+    // Wait for debounce timer window to completely settle
+    await new Promise((r) => setTimeout(r, 80));
+
+    // Must have sent exactly 1 message combining addition confirmation + reminder confirmation
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].includes('Added to your Watch Later!'));
+    assert.ok(sentMessages[0].includes('Reminder set for: 20 seconds'));
+    assert.ok(!sentMessages[0].includes('When should I remind you to watch this?'));
+
+    // Check DB state: reel is saved with 20 second reminder
+    const saved = await Repository.getSavedItemByShortcode('DDebounce01', 'sender_debounce_1');
+    assert.ok(saved);
+    assert.strictEqual(saved.watch_status, 'watch_later');
+    assert.strictEqual(saved.reminder_interval_seconds, 20);
+  } finally {
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+  }
+});
+
+test('MetaInstagramBotService - cancel command removes recently added reel from Watch Later', async () => {
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+
+  const service = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    // 1. Share a reel
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_cancel_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_cancel_add',
+                text: 'https://www.instagram.com/reel/DCancelMe1/',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const itemBeforeCancel = await Repository.getSavedItemByShortcode('DCancelMe1', 'sender_cancel_1');
+    assert.ok(itemBeforeCancel);
+    assert.strictEqual(itemBeforeCancel.watch_status, 'watch_later');
+
+    // 2. User says "cancel"
+    sentMessages.length = 0;
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_cancel_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_cancel_cmd',
+                text: 'cancel',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].includes('Cancelled! Removed'));
+
+    // DB: item is completely deleted since is_saved_on_instagram === false
+    const itemAfterCancel = await Repository.getSavedItemByShortcode('DCancelMe1', 'sender_cancel_1');
+    assert.strictEqual(itemAfterCancel, null);
+  } finally {
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+  }
+});
+
+test('MetaInstagramBotService - cancel reminder clears reminder schedule while keeping item in Watch Later', async () => {
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+
+  const service = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    // 1. Share a reel with duration
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_rem_cancel_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_rem_add',
+                text: 'https://www.instagram.com/reel/DRemCancel1/ 30m',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const itemBefore = await Repository.getSavedItemByShortcode('DRemCancel1', 'sender_rem_cancel_1');
+    assert.ok(itemBefore);
+    assert.ok(itemBefore.next_reminder_at);
+
+    // 2. User says "cancel reminder"
+    sentMessages.length = 0;
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_rem_cancel_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_rem_cmd',
+                text: 'cancel reminder',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].includes('Reminder cancelled'));
+    assert.ok(sentMessages[0].includes('It will remain saved in your Watch Later list without alerts.'));
+
+    // DB: item is still in Watch Later, but next_reminder_at is null
+    const itemAfter = await Repository.getSavedItemByShortcode('DRemCancel1', 'sender_rem_cancel_1');
+    assert.ok(itemAfter);
+    assert.strictEqual(itemAfter.watch_status, 'watch_later');
+    assert.strictEqual(itemAfter.next_reminder_at, null);
+  } finally {
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+  }
+});

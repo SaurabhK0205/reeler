@@ -15,6 +15,11 @@ import {
 } from '../utils/mediaType.ts';
 import {
   parseWatchedStopCommand,
+  parseCancelCommand,
+  parseTargetedWatchedCommand,
+  isGreetingOrHelpMessage,
+  formatBotHelpMessage,
+  formatHumanReelLabel,
   extractPublicCreatorUsername,
   formatAddedToWatchLaterCreatorBlock,
   formatWatchedConfirmationMessage,
@@ -109,18 +114,54 @@ export class MetaInstagramBotService {
   private scheduledRetries = new Map<string, ReturnType<typeof setTimeout>>();
   private timezoneCommandSeq = 0;
   private lastCommittedTimezoneSeqBySender = new Map<string, number>();
+  private pendingSharePrompts = new Map<
+    string,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      reel: SavedReel;
+      delivery?: WebhookDeliveryContext;
+      addedHeading: string;
+      creatorLine: string;
+      defaultReminderFormatted: string;
+      senderTz: string;
+    }
+  >();
+  private recentDurationHints = new Map<
+    string,
+    {
+      duration: NonNullable<ReturnType<typeof parseDuration>>;
+      timestamp: number;
+    }
+  >();
+  private shareDebounceDelayMs: number;
   public adminUserId: string | null = null;
 
-  constructor(options?: { adminUserId?: string | null; retryDelaysMs?: number[] }) {
+  constructor(options?: {
+    adminUserId?: string | null;
+    retryDelaysMs?: number[];
+    shareDebounceDelayMs?: number;
+  }) {
     this.accessToken = process.env.META_PAGE_ACCESS_TOKEN || '';
     this.verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN || 'rea_instagram_saved_token';
     this.appSecret = process.env.META_APP_SECRET || '';
     this.retryDelaysMs = options?.retryDelaysMs ?? DEFAULT_WEBHOOK_RETRY_DELAYS_MS;
+    this.shareDebounceDelayMs =
+      options?.shareDebounceDelayMs !== undefined
+        ? options.shareDebounceDelayMs
+        : (process.env.NODE_ENV === 'test' ? 0 : 1200);
     this.adminUserId =
       options?.adminUserId ||
       process.env.ADMIN_SENDER_ID ||
       process.env.INSTAGRAM_ADMIN_SENDER_ID ||
       null;
+  }
+
+  clearTimersForTesting(): void {
+    for (const pending of this.pendingSharePrompts.values()) {
+      clearTimeout(pending.timer);
+    }
+    this.pendingSharePrompts.clear();
+    this.recentDurationHints.clear();
   }
 
   setAdminUserId(adminUserId: string | null): void {
@@ -568,6 +609,7 @@ export class MetaInstagramBotService {
     let reelUrl: string | null = null;
     let attachmentType: string | null = null;
     let attachmentTitle: string | null = null;
+    let hasShareAttachment = false;
     if (Array.isArray(attachments)) {
       for (const att of attachments) {
         const urlCandidate =
@@ -577,6 +619,7 @@ export class MetaInstagramBotService {
           null;
         if (urlCandidate) {
           reelUrl = urlCandidate;
+          hasShareAttachment = true;
           attachmentType = typeof att.type === 'string' ? att.type : null;
           attachmentTitle =
             typeof att.payload?.title === 'string' && att.payload.title.trim()
@@ -588,6 +631,7 @@ export class MetaInstagramBotService {
           const titleMatch = extractInstagramShortcodeAndPath(att.payload.title);
           if (titleMatch) {
             reelUrl = titleMatch.matchedText;
+            hasShareAttachment = true;
             attachmentType = typeof att.type === 'string' ? att.type : null;
             attachmentTitle = att.payload.title.trim();
             break;
@@ -656,7 +700,14 @@ export class MetaInstagramBotService {
         retryState,
       };
 
-      await this.processIncomingText(senderId, combinedText, attachmentType, attachmentTitle, delivery);
+      await this.processIncomingText(
+        senderId,
+        combinedText,
+        attachmentType,
+        attachmentTitle,
+        delivery,
+        hasShareAttachment
+      );
 
       if (delivery.stateMutated) {
         this.markWebhookMutationCommitted(opId);
@@ -763,7 +814,8 @@ export class MetaInstagramBotService {
     text: string,
     attachmentType?: string | null,
     attachmentTitle?: string | null,
-    delivery?: WebhookDeliveryContext
+    delivery?: WebhookDeliveryContext,
+    hasShareAttachment: boolean = false
   ): Promise<void> {
     console.log(`[MetaIG] Incoming DM from Instagram user ${senderId}: "${text}"`);
     const senderTz = await Repository.getSenderTimezone(senderId);
@@ -773,7 +825,15 @@ export class MetaInstagramBotService {
     if (mediaLink) {
       const { shortcode, pathType, matchedText } = mediaLink;
       const remaining = text.replace(matchedText, '').trim();
-      const customDuration = parseDuration(remaining, new Date(), senderTz);
+      let customDuration = parseDuration(remaining, new Date(), senderTz);
+
+      if (!customDuration && this.recentDurationHints.has(senderId)) {
+        const hint = this.recentDurationHints.get(senderId)!;
+        if (Date.now() - hint.timestamp < 3500) {
+          customDuration = hint.duration;
+        }
+        this.recentDurationHints.delete(senderId);
+      }
 
       // Fetch public metadata (probe /p/ first for post links, /reel/ first for reel/tv links)
       const preferredPath = pathType === 'p' ? 'p' : 'reel';
@@ -912,8 +972,8 @@ export class MetaInstagramBotService {
       }
 
       if (customDuration) {
-        // User provided a specific time along with the item!
-        let reply = `${addedHeading}${creatorLine}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done!`;
+        // User provided a specific time along with the item or right before it!
+        let reply = `${addedHeading}${creatorLine}\n\n⏰ Reminder set for: ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
@@ -930,12 +990,170 @@ export class MetaInstagramBotService {
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz London" or "tz IST") to set your local timezone.`;
         }
+
+        if (hasShareAttachment && this.shareDebounceDelayMs > 0) {
+          if (this.pendingSharePrompts.has(senderId)) {
+            clearTimeout(this.pendingSharePrompts.get(senderId)!.timer);
+          }
+          const promptReel = await Repository.getSavedItemByShortcode(shortcode, senderId);
+          if (promptReel) {
+            const timer = setTimeout(async () => {
+              this.pendingSharePrompts.delete(senderId);
+              await this.deliverReply(senderId, reply, delivery);
+            }, this.shareDebounceDelayMs);
+
+            this.pendingSharePrompts.set(senderId, {
+              timer,
+              reel: promptReel,
+              delivery,
+              addedHeading,
+              creatorLine,
+              defaultReminderFormatted: defaultTriggerStr,
+              senderTz,
+            });
+            return;
+          }
+        }
+
         await this.deliverReply(senderId, reply, delivery);
       }
       return;
     }
 
-    // 1. Mark as watched / stop command
+    // 0. Check if a share prompt is currently pending debounce for this sender
+    if (this.pendingSharePrompts.has(senderId)) {
+      const pending = this.pendingSharePrompts.get(senderId)!;
+      clearTimeout(pending.timer);
+      this.pendingSharePrompts.delete(senderId);
+
+      // Check if this incoming message is a duration expression (e.g. "20 seconds", "30m", "tomorrow 5pm")
+      const parsedDur = parseDuration(text, new Date(), senderTz);
+      if (parsedDur) {
+        await Repository.updateReminderSchedule(
+          pending.reel.id,
+          parsedDur.targetDate.toISOString(),
+          parsedDur.seconds
+        );
+        if (delivery) delivery.stateMutated = true;
+        let reply = `${pending.addedHeading}${pending.creatorLine}\n\n⏰ Reminder set for: ${parsedDur.label} (${parsedDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
+        if (senderTz === 'UTC') {
+          reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
+        }
+        await this.deliverReply(senderId, reply, delivery);
+        return;
+      }
+
+      // Check if this incoming message is a cancel command
+      const pendingCancel = parseCancelCommand(text);
+      if (pendingCancel?.isCancelAddition) {
+        const cancelled = await Repository.cancelRecentAdditionForSender(senderId);
+        if (delivery) delivery.stateMutated = true;
+        const reelLabel = cancelled ? formatHumanReelLabel(cancelled.cancelledReel, 40) : 'your reel';
+        await this.deliverReply(
+          senderId,
+          `❌ Cancelled! Removed ${reelLabel} from your Watch Later.`,
+          delivery
+        );
+        return;
+      }
+
+      // If neither duration nor cancel, flush the buffered prompt before proceeding with the current command
+      let promptReply =
+        `${pending.addedHeading}${pending.creatorLine}\n\n` +
+        `⏰ When should I remind you to watch this?\n` +
+        `Reply with a time (e.g. "30m", "2h", "tomorrow at 5pm", or "remind me in 5 days").\n\n` +
+        `⏳ If you don't reply within 10 mins, I'll automatically set a reminder for 10 hours from now (${pending.defaultReminderFormatted})!`;
+      if (senderTz === 'UTC') {
+        promptReply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" to set your local timezone.`;
+      }
+      await this.deliverReply(senderId, promptReply, delivery);
+    }
+
+    // 1. Cancel / Undo commands (e.g. "cancel", "undo", "cancel reminder", "clear @creator")
+    const cancelCmd = parseCancelCommand(text);
+    if (cancelCmd) {
+      if (cancelCmd.isCancelReminder) {
+        const result = await Repository.cancelReminderForSender(senderId, {
+          targetCreator: cancelCmd.targetCreator,
+        });
+        if (delivery) delivery.stateMutated = true;
+        if (result) {
+          const label = formatHumanReelLabel(result.updatedReel, 40);
+          await this.deliverReply(
+            senderId,
+            `⏰ Reminder cancelled for ${label}. It will remain saved in your Watch Later list without alerts.`,
+            delivery
+          );
+        } else {
+          await this.deliverReply(senderId, `ℹ️ No active reminder found to cancel.`, delivery);
+        }
+        return;
+      }
+
+      if (cancelCmd.isCancelAddition) {
+        if (cancelCmd.targetCreator) {
+          const result = await Repository.clearWatchLaterForCreator(senderId, cancelCmd.targetCreator);
+          if (delivery) delivery.stateMutated = true;
+          if (result.clearedReels.length > 0) {
+            await this.deliverReply(
+              senderId,
+              `❌ Cleared ${result.clearedReels.length} item(s) by @${cancelCmd.targetCreator} from your Watch Later.`,
+              delivery
+            );
+          } else {
+            await this.deliverReply(
+              senderId,
+              `ℹ️ No Watch Later items found from @${cancelCmd.targetCreator}.`,
+              delivery
+            );
+          }
+          return;
+        }
+
+        const result = await Repository.cancelRecentAdditionForSender(senderId);
+        if (delivery) delivery.stateMutated = true;
+        if (result) {
+          const label = formatHumanReelLabel(result.cancelledReel, 40);
+          await this.deliverReply(
+            senderId,
+            `❌ Cancelled! Removed ${label} from your Watch Later.`,
+            delivery
+          );
+        } else {
+          await this.deliverReply(senderId, `ℹ️ No recent item found in your Watch Later to cancel.`, delivery);
+        }
+        return;
+      }
+    }
+
+    // 1b. Targeted Watched command: e.g. "watched @creator", "done @creator"
+    const targetedWatched = parseTargetedWatchedCommand(text);
+    if (targetedWatched) {
+      const result = await Repository.markWatchedForCreator(senderId, targetedWatched.targetCreator);
+      if (delivery) delivery.stateMutated = true;
+      if (result.updatedReels.length > 0) {
+        await this.deliverReply(
+          senderId,
+          `✅ Marked ${result.updatedReels.length} item(s) by @${targetedWatched.targetCreator} as watched! Reminders stopped.`,
+          delivery
+        );
+      } else {
+        await this.deliverReply(
+          senderId,
+          `ℹ️ No Watch Later items found from @${targetedWatched.targetCreator}.`,
+          delivery
+        );
+      }
+      return;
+    }
+
+    // 1c. Greeting / Help / Instructions command (e.g. "hi", "hello", "hey", "sup", "help", "commands")
+    if (isGreetingOrHelpMessage(text)) {
+      await this.deliverReply(senderId, formatBotHelpMessage(), delivery);
+      return;
+    }
+
+    // 1d. Mark as watched / stop command
     // Handles single ("watched", "done", "stop") and bulk ("stop all", "watched all", "clear all", "unsub")
     const { isCommand, markAll } = parseWatchedStopCommand(text);
     if (isCommand) {
@@ -1121,6 +1339,10 @@ export class MetaInstagramBotService {
         }
         await this.deliverReply(senderId, reply, delivery);
       } else {
+        this.recentDurationHints.set(senderId, {
+          duration: customDuration,
+          timestamp: Date.now(),
+        });
         let reply = `⏰ Got it! Duration set to ${customDuration.label} (${customDuration.formattedTarget}). Share any Reel or Post to track it!`;
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <your city>" to use your local time.`;
@@ -1218,7 +1440,6 @@ export class MetaInstagramBotService {
     }
 
     // Default welcome / help reply
-    const helpMsg = `👋 Hi! Whenever you see a Reel or Post you want to track or watch later:\n1. Tap Share (airplane icon)\n2. Send it here!\n\nAdd a time like "30m" or "2h" to set custom reminders.\nType any creator's username (or "reels by @name" / "posts by @name") to view your tracked items!\nType "tz" to check or set your local timezone!\nType "vault" to browse your saved items on the web, or "code" to get a 6-digit login code for your laptop.`;
-    await this.deliverReply(senderId, helpMsg, delivery);
+    await this.deliverReply(senderId, formatBotHelpMessage(), delivery);
   }
 }

@@ -18,6 +18,121 @@ export interface WatchedStopCommand {
   markAll: boolean;
 }
 
+export interface CancelCommand {
+  isCancelAddition: boolean;
+  isCancelReminder: boolean;
+  targetCreator?: string;
+}
+
+/**
+ * Parses an inbound DM to determine if the user wants to cancel a recently added reel
+ * (sent by mistake), cancel a scheduled reminder alarm, or clear a specific creator.
+ */
+export function parseCancelCommand(text: string): CancelCommand | null {
+  const lower = String(text || '').toLowerCase().trim();
+  if (!lower) return null;
+
+  // Explicit bulk commands like "cancel reminders" or "stop reminders" or "cancel all" belong to bulk watch/stop
+  if (/^(?:cancel|stop|clear)\s+(?:all|everything|reminders)[!.]*$/i.test(lower)) {
+    return null;
+  }
+
+  // 1. Cancel reminder only: e.g. "cancel reminder", "stop reminder", "no reminder", "remove reminder"
+  const reminderOnlyMatch = lower.match(/^(?:cancel|stop|remove|no)\s+reminders?(?:\s+(?:for\s+)?@?([a-z0-9._]{1,30}))?[!.]*$/i);
+  if (reminderOnlyMatch) {
+    const targetCreator = reminderOnlyMatch[1] ? reminderOnlyMatch[1].replace(/^@+/, '').trim() : undefined;
+    return {
+      isCancelAddition: false,
+      isCancelReminder: true,
+      targetCreator: targetCreator || undefined,
+    };
+  }
+
+  // 2. Clear / remove / cancel by creator: e.g. "clear @ykittois", "remove @ykittois", "cancel @ykittois", "delete @ykittois"
+  const creatorMatch = lower.match(/^(?:clear|remove|delete|cancel)\s+@([a-z0-9._]{1,30})[!.]*$/i);
+  if (creatorMatch) {
+    return {
+      isCancelAddition: true,
+      isCancelReminder: false,
+      targetCreator: creatorMatch[1].toLowerCase(),
+    };
+  }
+
+  // 3. Cancel / Undo addition (e.g. sent by mistake): e.g. "cancel", "undo", "remove", "delete", "cancel that", "undo that", "remove that"
+  if (/^(?:cancel|undo|remove|delete)(?:\s+(?:that|it|reel|post|addition))?[!.]*$/i.test(lower)) {
+    return {
+      isCancelAddition: true,
+      isCancelReminder: false,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Parses targeted watched commands for a specific creator:
+ * e.g. "watched @creator", "done @creator", "mark @creator as watched"
+ */
+export function parseTargetedWatchedCommand(text: string): { targetCreator: string } | null {
+  const lower = String(text || '').toLowerCase().trim();
+  if (!lower) return null;
+
+  const match = lower.match(/^(?:watched|done|seen|finish|finished|mark)\s+@([a-z0-9._]{1,30})(?:\s+as\s+watched)?[!.]*$/i);
+  if (match) {
+    return { targetCreator: match[1].toLowerCase() };
+  }
+  return null;
+}
+
+/**
+ * Detects common casual greetings, help, and instruction queries.
+ */
+export function isGreetingOrHelpMessage(text: string): boolean {
+  const lower = String(text || '').toLowerCase().trim();
+  if (!lower) return false;
+
+  const cleaned = lower.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '');
+  if (!cleaned) return false;
+
+  if (
+    /^(?:hi|hello|hey|heya|yo|sup|wassup|what'?s\s+up|howdy|hola|greetings|gm|gn)[!.]*$/i.test(cleaned) ||
+    /^(?:hi|hello|hey|yo|sup|what'?s\s+up)\s+(?:bot|there|reeler|bro|dude|man|homie|mate|nigga|niga)[!.]*$/i.test(cleaned) ||
+    /^(?:nigga|niga|bro|dude|homie)[!.]*$/i.test(cleaned) ||
+    /^(?:help|commands?|menu|start|info|instructions?|guide|options?)[!.]*$/i.test(cleaned) ||
+    /^(?:how\s+to\s+use|what\s+can\s+you\s+do|what\s+do\s+you\s+do|how\s+does\s+this\s+work|how\s+it\s+works)[!.]*$/i.test(cleaned)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Returns the comprehensive user instructions and command reference for the bot.
+ * Fits within Instagram DM's 950-character single-bubble threshold.
+ */
+export function formatBotHelpMessage(): string {
+  return (
+    `👋 Welcome to Reeler — Your Reels & Posts Vault!\n\n` +
+    `📥 Save & Reminders\n` +
+    `• Share any Reel or Post here via the Share (airplane) button.\n` +
+    `• Add a time in the share text (e.g. "30s", "2h", "tomorrow 5pm") to set a reminder instantly!\n` +
+    `• Or reply with a time anytime (e.g. "1h", "snooze 2h").\n\n` +
+    `⏰ Manage Reminders & Watch Later\n` +
+    `• "watched" or "done" — Mark latest reminder as watched.\n` +
+    `• "cancel" or "undo" — Remove recently added item if sent by mistake.\n` +
+    `• "cancel reminder" — Stop alarms but keep item in Watch Later.\n` +
+    `• "clear @creator" / "watched @creator" — Manage items by creator.\n` +
+    `• "stop all" — Clear all active reminders.\n\n` +
+    `🔍 Search & Web Vault\n` +
+    `• "@creator" or "reels by @creator" — View your saved items.\n` +
+    `• "vault" — Open your private web vault.\n` +
+    `• "code" — Get a 6-digit login code for PC/laptop access.\n\n` +
+    `⚙️ Settings\n` +
+    `• "tz <city>" (e.g. "tz IST", "tz London") — Set your timezone.\n` +
+    `• "delete my data" — Wipe all your data and history.`
+  );
+}
+
 /**
  * Parses an inbound DM text command to determine whether the user is marking
  * a reel as watched / stopping reminders, and whether they requested clearing all active reminders.
@@ -43,11 +158,12 @@ export function parseWatchedStopCommand(text: string): WatchedStopCommand {
   }
 
   const isCommand =
-    /(?<![\w.@])(watched|done|seen|finish|finished|stop|cancel|halt|unsub|unsubscribe|quit)(?![\w]|(?:\.[a-z0-9_]))/i.test(
+    /(?<![\w.@])(watched|done|seen|finish|finished|stop|halt|unsub|unsubscribe|quit)(?![\w]|(?:\.[a-z0-9_]))/i.test(
       withoutMentions
     ) ||
     /^watch[!.\s]*$/i.test(withoutMentions) ||
     /(?<![\w.@])clear\s+(?:them\s+)?(?:all|everything|reminders?)(?![\w]|(?:\.[a-z0-9_]))/i.test(withoutMentions) ||
+    /(?<![\w.@])cancel\s+(?:them\s+)?(?:all|everything|reminders)(?![\w]|(?:\.[a-z0-9_]))/i.test(withoutMentions) ||
     /(?<![\w.@])mark\s+(?:them\s+)?(?:all|everything)(?![\w]|(?:\.[a-z0-9_]))/i.test(withoutMentions);
 
   if (!isCommand) {
