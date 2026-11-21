@@ -148,8 +148,8 @@ export function parseTargetedWatchedCommand(text: string): TargetedWatchedComman
   const rawArg = match[1].trim();
   const cleaned = rawArg.replace(/[.!?,;:~]+$/, '').trim();
 
-  // Bulk targets belong to parseWatchedStopCommand or search
-  if (/^(?:all|everything|reminders|posts?|reels?)$/i.test(cleaned)) {
+  // Bulk targets and conversational/temporal modifiers belong to parseWatchedStopCommand
+  if (/^(?:all|everything|reminders|posts?|reels?|now|already|today|pls|please|that|it|them|this)$/i.test(cleaned)) {
     return null;
   }
 
@@ -158,9 +158,9 @@ export function parseTargetedWatchedCommand(text: string): TargetedWatchedComman
     return { targetCreator };
   }
 
-  // If the user specified something starting with @ or looking like a creator query,
+  // If the user explicitly specified an invalid handle starting with @,
   // capture it as invalidCreatorTarget rather than dropping into unscoped single-watched command.
-  if (cleaned.startsWith('@') || /^[a-z0-9._-]+$/i.test(cleaned)) {
+  if (cleaned.startsWith('@')) {
     return { invalidCreatorTarget: rawArg };
   }
 
