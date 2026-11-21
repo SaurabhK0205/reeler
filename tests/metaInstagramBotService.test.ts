@@ -3464,6 +3464,9 @@ test('MetaInstagramBotService - consecutive shares flush prior pending prompt wi
       ],
     });
 
+    // Assert that the first prompt is still pending debounce before the second share
+    assert.strictEqual(sentMessages.length, 0);
+
     // Share Reel 2 immediately while Reel 1 is pending debounce
     await service.handleWebhookPayload({
       object: 'instagram',

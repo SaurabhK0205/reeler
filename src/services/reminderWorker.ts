@@ -30,7 +30,16 @@ export class ReminderWorker {
   private isDispatching = false;
   private isCheckingChoices = false;
   private isPollingInboundDMs = false;
+  private static readonly MAX_PENDING_CONFIRMATION_REPLIES = 50;
   private pendingAdminConfirmationReplies: string[] = [];
+
+  private enqueuePendingAdminConfirmationReply(reply: string) {
+    if (this.pendingAdminConfirmationReplies.length >= ReminderWorker.MAX_PENDING_CONFIRMATION_REPLIES) {
+      this.pendingAdminConfirmationReplies.shift();
+    }
+    this.pendingAdminConfirmationReplies.push(reply);
+  }
+
   private failedReelSuppression = new Map<string, number>();
   private deliveredPersistenceCheckpoints = new Map<
     string,
@@ -56,8 +65,17 @@ export class ReminderWorker {
     }
   ) {
     if (this.deliveredPersistenceCheckpoints.size >= 1000) {
-      const oldest = this.deliveredPersistenceCheckpoints.keys().next().value;
-      if (oldest) this.deliveredPersistenceCheckpoints.delete(oldest);
+      let evictKey: string | null = null;
+      for (const [k, c] of this.deliveredPersistenceCheckpoints.entries()) {
+        if (c.expectedNextReminderAt === null) {
+          evictKey = k;
+          break;
+        }
+      }
+      if (!evictKey) {
+        evictKey = this.deliveredPersistenceCheckpoints.keys().next().value ?? null;
+      }
+      if (evictKey) this.deliveredPersistenceCheckpoints.delete(evictKey);
     }
     this.deliveredPersistenceCheckpoints.set(key, {
       ...checkpoint,
@@ -155,16 +173,6 @@ export class ReminderWorker {
         this.adminThreadId = threadRes.data.threadId;
         this.adminUserId = threadRes.data.adminUserId;
         console.log(`[ReminderWorker] Connected to Admin DM thread: ${this.adminThreadId} (Admin User ID: ${this.adminUserId})`);
-      }
-
-      // Flush pending confirmation replies from prior transient DM failures
-      if (this.pendingAdminConfirmationReplies.length > 0 && this.adminUserId) {
-        const remaining: string[] = [];
-        for (const pendingReply of this.pendingAdminConfirmationReplies) {
-          const res = await this.actionClient.sendDirectMessage(this.adminUserId, pendingReply);
-          if (!res.success) remaining.push(pendingReply);
-        }
-        this.pendingAdminConfirmationReplies = remaining;
       }
 
       const messagesRes = await this.actionClient.getThreadMessages(this.adminThreadId);
@@ -319,7 +327,7 @@ export class ReminderWorker {
             const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reply);
             if (!sendResult.success) {
               console.error('[ReminderWorker] Failed to send admin error reply:', sendResult.error);
-              this.pendingAdminConfirmationReplies.push(reply);
+              this.enqueuePendingAdminConfirmationReply(reply);
             }
             return;
           }
@@ -335,7 +343,7 @@ export class ReminderWorker {
               const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reply);
               if (!sendResult.success) {
                 console.error('[ReminderWorker] Failed to send admin clear reply:', sendResult.error);
-                this.pendingAdminConfirmationReplies.push(reply);
+                this.enqueuePendingAdminConfirmationReply(reply);
               }
             } else {
               const cancelled = await Repository.cancelRecentAdditionForSender(this.adminUserId, {
@@ -347,7 +355,7 @@ export class ReminderWorker {
               const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reply);
               if (!sendResult.success) {
                 console.error('[ReminderWorker] Failed to send admin cancel reply:', sendResult.error);
-                this.pendingAdminConfirmationReplies.push(reply);
+                this.enqueuePendingAdminConfirmationReply(reply);
               }
             }
           } else if (cancelCmd.isCancelReminder) {
@@ -361,7 +369,7 @@ export class ReminderWorker {
             const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reply);
             if (!sendResult.success) {
               console.error('[ReminderWorker] Failed to send admin cancel reminder reply:', sendResult.error);
-              this.pendingAdminConfirmationReplies.push(reply);
+              this.enqueuePendingAdminConfirmationReply(reply);
             }
           }
         }
@@ -379,10 +387,34 @@ export class ReminderWorker {
           const sendResult = await this.actionClient.sendDirectMessage(this.adminUserId, reply);
           if (!sendResult.success) {
             console.error('[ReminderWorker] Failed to send admin watched reply:', sendResult.error);
-            this.pendingAdminConfirmationReplies.push(reply);
+            this.enqueuePendingAdminConfirmationReply(reply);
           }
         }
         return;
+      }
+    }
+
+    // Flush pending confirmation replies after processing current commands (bounded to at most 5 per poll, non-blocking)
+    if (this.pendingAdminConfirmationReplies.length > 0 && this.adminUserId) {
+      const batch = this.pendingAdminConfirmationReplies.splice(0, 5);
+      const retryQueue: string[] = [];
+      for (const pendingReply of batch) {
+        try {
+          const res = await this.actionClient.sendDirectMessage(this.adminUserId, pendingReply);
+          if (!res.success) {
+            retryQueue.push(pendingReply);
+          }
+        } catch (err: any) {
+          console.error('[ReminderWorker] Transport error flushing admin confirmation reply:', err?.message || err);
+          retryQueue.push(pendingReply);
+          break; // Stop retrying for this poll cycle on transport exception
+        }
+      }
+      if (retryQueue.length > 0) {
+        this.pendingAdminConfirmationReplies = [
+          ...retryQueue,
+          ...this.pendingAdminConfirmationReplies,
+        ].slice(0, ReminderWorker.MAX_PENDING_CONFIRMATION_REPLIES);
       }
     }
   }
@@ -406,10 +438,27 @@ export class ReminderWorker {
         }
       }
 
-      // Prune stale checkpoints older than 24 hours from original delivery
-      for (const [key, checkpoint] of this.deliveredPersistenceCheckpoints.entries()) {
+      const isSameInstant = (a: string | null | undefined, b: string | null | undefined): boolean => {
+        const normA = a ?? null;
+        const normB = b ?? null;
+        if (normA === null || normB === null) return normA === normB;
+        const timeA = new Date(normA).getTime();
+        const timeB = new Date(normB).getTime();
+        return !isNaN(timeA) && !isNaN(timeB) && timeA === timeB;
+      };
+
+      // Prune stale checkpoints older than 24 hours only if the reel's due schedule has changed or is no longer due
+      for (const [key, checkpoint] of Array.from(this.deliveredPersistenceCheckpoints.entries())) {
         if (now > checkpoint.deliveryTimestamp + 24 * 3600 * 1000) {
-          this.deliveredPersistenceCheckpoints.delete(key);
+          const fresh = await Repository.getSavedItemById(checkpoint.reelId).catch(() => null);
+          const isStillDue = fresh && fresh.watch_status === 'watch_later' &&
+            fresh.next_reminder_at &&
+            (checkpoint.expectedNextReminderAt === null
+              ? false
+              : isSameInstant(fresh.next_reminder_at, checkpoint.expectedNextReminderAt));
+          if (!isStillDue) {
+            this.deliveredPersistenceCheckpoints.delete(key);
+          }
         }
       }
 
@@ -422,8 +471,8 @@ export class ReminderWorker {
         try {
           const fresh = await Repository.getSavedItemById(checkpoint.reelId);
           const matchesExpectation = checkpoint.expectedNextReminderAt === null
-            ? fresh?.next_reminder_at === null
-            : fresh?.next_reminder_at === checkpoint.expectedNextReminderAt;
+            ? (fresh?.next_reminder_at ?? null) === null
+            : isSameInstant(fresh?.next_reminder_at, checkpoint.expectedNextReminderAt);
           if (!fresh || !matchesExpectation) {
             this.deliveredPersistenceCheckpoints.delete(key);
             continue;
