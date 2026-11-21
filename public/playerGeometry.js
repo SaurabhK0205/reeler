@@ -181,18 +181,11 @@ function () {
     // Pre-probe / fallback classification
     if (validThumb !== null) {
       const isNativeFourFive = validThumb >= 0.74 && validThumb <= 0.86;
-      if (isClips === true && !isNativeFourFive) {
+      if ((validThumb < 0.70 && isClips !== false) || (isClips === true && !isNativeFourFive && validThumb <= 1.08)) {
         return {
           isPillarboxedReel: true,
           effectiveEmbedRatio: 0.80,
           displayRatio: validThumb < 0.70 && validThumb >= 0.50 ? validThumb : 9 / 16,
-        };
-      }
-      if (isClips !== false && validThumb < 0.70) {
-        return {
-          isPillarboxedReel: true,
-          effectiveEmbedRatio: 0.80,
-          displayRatio: validThumb >= 0.50 ? validThumb : 9 / 16,
         };
       }
       if (isClips !== false || validThumb >= 0.70) {

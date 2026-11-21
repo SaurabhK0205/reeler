@@ -839,4 +839,24 @@ test('playerGeometry and app embed contracts: landscape alignment, square grid r
   const expectedSrc = `https://www.instagram.com/p/${encodeURIComponent(shortcode)}/embed/?cr=1&rd=${originParam}&rp=${pathParam}`;
   assert.ok(expectedSrc.includes('?cr=1&rd='), 'Embed URL must include cr=1 cross-origin parameter');
   assert.ok(expectedSrc.includes(encodeURIComponent('https://reeler-staging.onrender.com')));
+
+  // 6. Pre-probe fallback classification preserves landscape thumbnails (> 1.08)
+  const preProbeLandscapeReel = ReelerGeometry.classifyPostAspect({
+    embedRatio: null,
+    isClips: true,
+    thumbAspectRatio: 1.778,
+  });
+  assert.equal(preProbeLandscapeReel.isPillarboxedReel, false, 'Landscape thumbnail must preserve wide classification');
+  assert.equal(preProbeLandscapeReel.displayRatio, 1.778);
+  assert.equal(preProbeLandscapeReel.effectiveEmbedRatio, 1.778);
+
+  // 7. Explicit non-CLIPS post with low-ratio thumbnail must NOT be classified as pillarboxed reel
+  const preProbeLowRatioPost = ReelerGeometry.classifyPostAspect({
+    embedRatio: null,
+    isClips: false,
+    thumbAspectRatio: 0.5625,
+  });
+  assert.equal(preProbeLowRatioPost.isPillarboxedReel, false, 'Explicit FEED post must not be pillarboxed as a Reel');
+  assert.notEqual(preProbeLowRatioPost.displayRatio, 0.5625, 'FEED post must not preserve sub-0.70 ratio without 4:5 bounds');
+  assert.equal(preProbeLowRatioPost.displayRatio, 0.8, 'FEED post falls back to standard 4:5 feed envelope');
 });

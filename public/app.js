@@ -3804,12 +3804,14 @@ function mountFeedIframe(slide, reel) {
    */
   const finalizeAndReveal = (embedRatio, persist, settleDelayMs = 0, showFallback = false) => {
     if (settled || abortController.signal.aborted) return;
-    settled = true;
     delete iframe.dataset.probing;
     clearProbeUi();
 
     if (showFallback && !mounted && fallbackBox) {
-      cleanupListeners();
+      if (safetyTimer) {
+        clearTimeout(safetyTimer);
+        safetyTimer = null;
+      }
       if (focusPlayerBtn) {
         focusPlayerBtn.hidden = true;
         focusPlayerBtn.disabled = true;
@@ -3818,6 +3820,8 @@ function mountFeedIframe(slide, reel) {
       fallbackBox.hidden = false;
       return;
     }
+
+    settled = true;
 
     if (persist && typeof embedRatio === 'number') {
       persistAspectCacheEntry(shortcode, {
@@ -3878,9 +3882,38 @@ function mountFeedIframe(slide, reel) {
     // Any valid postMessage from Instagram confirms the frame is mounted
     mounted = true;
 
+    let recoveredFromFallback = false;
+    if (fallbackBox && !fallbackBox.hidden) {
+      fallbackBox.hidden = true;
+      iframe.hidden = false;
+      settled = false;
+      recoveredFromFallback = true;
+    }
+
     if (phase === 'cached') {
       finalizeAndReveal(cached.embedRatio, false, 40, false);
       return;
+    }
+
+    if (phase === 'aborted' || (recoveredFromFallback && !safetyTimer)) {
+      const currentW = Math.round(parseFloat(iframe.style.width) || iframe.offsetWidth || 0);
+      iframe.dataset.probing = '1';
+      if (safetyTimer) clearTimeout(safetyTimer);
+      safetyTimer = setTimeout(() => {
+        phase = 'aborted';
+        finalizeAndReveal(null, false, 0, false);
+      }, 3500);
+
+      if (h1 && currentW === ReelerGeometry.PROBE_WIDTH_2) {
+        phase = 'w2';
+      } else if (!h1 && currentW === ReelerGeometry.PROBE_WIDTH_1) {
+        phase = 'w1';
+      } else {
+        h1 = null;
+        phase = 'w1';
+        iframe.style.width = `${ReelerGeometry.PROBE_WIDTH_1}px`;
+        return;
+      }
     }
 
     if (phase === 'w1') {
@@ -3890,11 +3923,11 @@ function mountFeedIframe(slide, reel) {
         iframe.style.width = `${ReelerGeometry.PROBE_WIDTH_2}px`;
         if (safetyTimer) {
           clearTimeout(safetyTimer);
-          safetyTimer = setTimeout(() => {
-            phase = 'aborted';
-            finalizeAndReveal(null, false, 0, false);
-          }, 3500);
         }
+        safetyTimer = setTimeout(() => {
+          phase = 'aborted';
+          finalizeAndReveal(null, false, 0, false);
+        }, 3500);
       }
       return;
     }
@@ -3968,7 +4001,7 @@ function mountFeedIframe(slide, reel) {
     iframeBox.appendChild(iframe);
 
     safetyTimer = setTimeout(() => {
-      finalizeAndReveal(cached.embedRatio, false, 0, false);
+      finalizeAndReveal(cached.embedRatio, false, 0, !mounted);
     }, 2500);
   } else {
     iframe.dataset.probing = '1';
@@ -3980,7 +4013,7 @@ function mountFeedIframe(slide, reel) {
 
     safetyTimer = setTimeout(() => {
       phase = 'aborted';
-      finalizeAndReveal(null, false, 0, false);
+      finalizeAndReveal(null, false, 0, !mounted);
     }, 6500);
   }
 }
