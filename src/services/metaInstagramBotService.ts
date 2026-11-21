@@ -268,6 +268,16 @@ export class MetaInstagramBotService {
     this.recentDurationHints.set(senderId, { duration, timestamp: now });
   }
 
+  private takeRecentDurationHint(senderId: string): ReturnType<typeof parseDuration> {
+    const hint = this.recentDurationHints.get(senderId);
+    if (!hint) return null;
+    this.recentDurationHints.delete(senderId);
+    if (Date.now() - hint.timestamp < 3500) {
+      return hint.duration;
+    }
+    return null;
+  }
+
   setAdminUserId(adminUserId: string | null): void {
     this.adminUserId = adminUserId;
   }
@@ -950,13 +960,12 @@ export class MetaInstagramBotService {
           ? delivery.retryState.pinnedShareDuration
           : parseDuration(remaining, new Date(), senderTz);
 
-      if (!customDuration && this.recentDurationHints.has(senderId)) {
-        const hint = this.recentDurationHints.get(senderId)!;
-        if (Date.now() - hint.timestamp < 3500) {
-          customDuration = hint.duration;
+      if (!customDuration) {
+        const hint = this.takeRecentDurationHint(senderId);
+        if (hint) {
+          customDuration = hint;
           shareCtx.acceptedDuration = customDuration;
         }
-        this.recentDurationHints.delete(senderId);
       }
       if (delivery && delivery.retryState.pinnedShareDuration === undefined) {
         delivery.retryState.pinnedShareDuration = customDuration;
@@ -976,14 +985,15 @@ export class MetaInstagramBotService {
         if (delivery) {
           delivery.retryState.pinnedShareDuration = customDuration;
         }
-      } else if (!customDuration && this.recentDurationHints.has(senderId)) {
-        const hint = this.recentDurationHints.get(senderId)!;
-        customDuration = hint.duration;
-        shareCtx.acceptedDuration = customDuration;
-        if (delivery) {
-          delivery.retryState.pinnedShareDuration = customDuration;
+      } else if (!customDuration) {
+        const hint = this.takeRecentDurationHint(senderId);
+        if (hint) {
+          customDuration = hint;
+          shareCtx.acceptedDuration = customDuration;
+          if (delivery) {
+            delivery.retryState.pinnedShareDuration = customDuration;
+          }
         }
-        this.recentDurationHints.delete(senderId);
       }
 
       // Read-only metadata reuse from another row with the same shortcode if this sender has no row yet
@@ -1103,6 +1113,25 @@ export class MetaInstagramBotService {
         });
         shareCtx.savedReel = savedReel;
         shareCtx.saveCompleted = true;
+        if (!customDuration && shareCtx.acceptedDuration) {
+          customDuration = shareCtx.acceptedDuration;
+          if (delivery) {
+            delivery.retryState.pinnedShareDuration = customDuration;
+          }
+          if (savedReel) {
+            await Repository.updateReminderSchedule(
+              savedReel.id,
+              customDuration.targetDate.toISOString(),
+              customDuration.seconds,
+              {
+                expectedNextReminderAt: savedReel.next_reminder_at ?? null,
+                expectedIntervalSeconds: savedReel.reminder_interval_seconds ?? null,
+                expectedAwaitingReminderChoiceUntil: savedReel.awaiting_reminder_choice_until ?? null,
+                ...(savedReel.watch_status ? { expectedWatchStatus: savedReel.watch_status } : {}),
+              }
+            );
+          }
+        }
         if (delivery) {
           delivery.stateMutated = true;
           if (delivery.opId) {
@@ -1153,6 +1182,7 @@ export class MetaInstagramBotService {
 
         if (hasShareAttachment && this.shareDebounceDelayMs > 0) {
           await this.serializePromptOperation(senderId, async () => {
+            if (customDuration || shareCtx.acceptedDuration) return;
             if (this.pendingSharePrompts.has(senderId)) {
               await this.flushPendingSharePrompt(senderId);
             }
@@ -1160,13 +1190,17 @@ export class MetaInstagramBotService {
               ? { ...savedReel, creator }
               : await Repository.getSavedItemByShortcode(shortcode, senderId);
             if (promptReel) {
+              const currentItem = await Repository.getSavedItemByShortcode(shortcode, senderId);
+              if (currentItem && currentItem.next_reminder_at && !currentItem.awaiting_reminder_choice_until) {
+                return;
+              }
               const promptOpId = delivery?.opId;
               const promptRawMid = delivery?.rawMid;
               if (delivery) {
                 delivery.isDeferredReply = true;
               }
 
-              const shareId = `${senderId}_${Date.now()}_${Math.random()}`;
+              const shareId = shareCtx.shareId;
               const timer = setTimeout(async () => {
                 await this.flushPendingSharePrompt(senderId, shareId);
               }, this.shareDebounceDelayMs);
@@ -1220,6 +1254,8 @@ export class MetaInstagramBotService {
         );
         if (!applied) {
           // A newer reminder schedule or watch-status change already updated this Reel before this retry ran.
+          let reply = `${promptInfo.addedHeading}${promptInfo.creatorLine}\n\nℹ️ Your reel was saved to Watch Later, but its reminder schedule was updated by a newer command.`;
+          await this.deliverReply(senderId, reply, delivery);
           return;
         }
         delivery.stateMutated = true;
@@ -1272,7 +1308,7 @@ export class MetaInstagramBotService {
       const pendingCancel = parseCancelCommand(text);
 
       if (pendingCancel) {
-        if (pendingCancel.isCancelAddition && !pendingCancel.targetCreator) {
+        if (pendingCancel.isCancelAddition && !pendingCancel.targetCreator && !pendingCancel.invalidCreatorTarget) {
           // Only untargeted cancel shortcuts to recent addition deletion
           clearTimeout(pending.timer);
           this.pendingSharePrompts.delete(senderId);
@@ -1303,14 +1339,15 @@ export class MetaInstagramBotService {
         if (targetedWatched || isWatchedCmd || isCreatorQuery) {
           // Watched command, stop command, or creator search: flush prompt and fall through
           await this.flushPendingSharePrompt(senderId);
+        } else if (this.inFlightShares.has(senderId)) {
+          // An active share is currently being ingested for this sender.
+          // Flush the older share prompt so this duration applies to the incoming active share.
+          await this.flushPendingSharePrompt(senderId);
         } else {
           // Not a recognized command; now evaluate whether text is a duration expression
           const parsedDur = parseDuration(text, new Date(), senderTz);
           if (parsedDur) {
             clearTimeout(pending.timer);
-            if (this.pendingSharePrompts.get(senderId)?.shareId === pending.shareId) {
-              this.pendingSharePrompts.delete(senderId);
-            }
 
             let targetReel = pending.reel;
             if (delivery) {
@@ -1340,12 +1377,12 @@ export class MetaInstagramBotService {
                 ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
               }
             );
+            if (this.pendingSharePrompts.get(senderId)?.shareId === pending.shareId) {
+              this.pendingSharePrompts.delete(senderId);
+            }
             if (!applied) {
-              await this.deliverReply(
-                senderId,
-                `ℹ️ This reel's reminder or status was recently updated, so this reminder was not set.`,
-                delivery
-              );
+              let reply = `${pending.addedHeading}${pending.creatorLine}\n\nℹ️ Your reel was saved to Watch Later, but its reminder schedule was updated by a newer command.`;
+              await this.deliverReply(senderId, reply, delivery);
               return;
             }
             if (delivery) delivery.stateMutated = true;
@@ -1648,7 +1685,6 @@ export class MetaInstagramBotService {
       if (activeShare) {
         if (!activeShare.saveCompleted) {
           activeShare.acceptedDuration = customDuration;
-          this.recordRecentDurationHint(senderId, customDuration);
           if (delivery) delivery.stateMutated = true;
           let reply = `⏰ Got it! Duration set to ${customDuration.label} (${customDuration.formattedTarget}). Applying to your shared reel!`;
           if (senderTz === 'UTC') {

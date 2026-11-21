@@ -252,10 +252,12 @@ export class ReminderWorker {
       return;
     }
 
-    // Case 2: Text command (e.g. "done", "watched", "stop all")
+    // Case 2: Text command (e.g. "done", "watched", "stop all", "cancel")
     if (msg.text) {
+      const lower = msg.text.trim().toLowerCase();
+      const isLegacyCancel = /^(?:cancel|cancel\s+reminder)[!.]*$/i.test(lower);
       const { isCommand, markAll } = parseWatchedStopCommand(msg.text);
-      if (isCommand) {
+      if (isCommand || isLegacyCancel) {
         const { updatedReels, remainingCount, remainingReels } = await Repository.markWatchedForInstagramSender(
           this.adminUserId || '',
           { markAll, includeUnattributedFallback: true }
@@ -285,14 +287,17 @@ export class ReminderWorker {
 
       const now = Date.now();
       // Clean up expired entries in the suppression map
-      for (const [id, expireTime] of this.failedReelSuppression.entries()) {
+      for (const [key, expireTime] of this.failedReelSuppression.entries()) {
         if (now >= expireTime) {
-          this.failedReelSuppression.delete(id);
+          this.failedReelSuppression.delete(key);
         }
       }
 
-      // Filter out temporarily suppressed reels whose persistence failed
-      const eligibleReels = allDueReels.filter((r) => !this.failedReelSuppression.has(r.id));
+      // Filter out temporarily suppressed reminders whose persistence failed for the same due timestamp
+      const eligibleReels = allDueReels.filter((r) => {
+        const suppressionKey = `${r.id}:${r.next_reminder_at || ''}`;
+        return !this.failedReelSuppression.has(suppressionKey);
+      });
       if (eligibleReels.length === 0) return;
 
       // Limit batch size per dispatch tick to avoid unbounded execution latency
@@ -364,11 +369,13 @@ export class ReminderWorker {
           } catch (err: any) {
             console.error(`[ReminderWorker] Failed to record reminder for reel ${freshReel.shortcode}:`, err.message || err);
             // Suppress repeated sending in memory for 5 minutes if DB recording fails
+            // Key suppression by reel ID and the failed due timestamp so a newly scheduled reminder remains eligible
+            const suppressionKey = `${freshReel.id}:${freshReel.next_reminder_at || ''}`;
             if (this.failedReelSuppression.size >= 1000) {
               const firstKey = this.failedReelSuppression.keys().next().value;
               if (firstKey) this.failedReelSuppression.delete(firstKey);
             }
-            this.failedReelSuppression.set(freshReel.id, Date.now() + 5 * 60 * 1000);
+            this.failedReelSuppression.set(suppressionKey, Date.now() + 5 * 60 * 1000);
 
             // Attempt fallback persistence: clear due date for one-time reminders (nextDate === null),
             // or back off 5 minutes for recurring reminders

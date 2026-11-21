@@ -64,12 +64,12 @@ export function parseCancelCommand(text: string): CancelCommand | null {
 
   // Next, check single cancel reminder without "for": e.g. "cancel reminder", "stop reminder @ann", "no reminder"
   const reminderMatch = lower.match(
-    /^(?:cancel|stop|remove|no)\s+reminders?(?:\s+(@?[a-z0-9._]{1,30}))?[!.]*$/i
+    /^(?:cancel|stop|remove|no)\s+reminders?(?:\s+(.+?))?[!.]*$/i
   );
   if (reminderMatch) {
-    const rawArg = reminderMatch[1];
+    const rawArg = reminderMatch[1]?.trim();
     if (rawArg) {
-      const cleaned = rawArg.replace(/[.!?,;:]+$/, '');
+      const cleaned = rawArg.replace(/[.!?,;:~]+$/, '').trim();
       const targetCreator = extractCreatorQuery(cleaned);
       if (!targetCreator) {
         return {
@@ -236,9 +236,9 @@ export function parseWatchedStopCommand(text: string): WatchedStopCommand {
     return { isCommand: false, markAll: false };
   }
 
-  // Explicit scoped reminder cancellation requests (e.g. "stop reminders for @creator")
+  // Explicit scoped reminder cancellation requests (e.g. "stop reminders for @creator", "stop reminder @creator")
   // belong to cancel routing rather than bulk watch/stop.
-  if (/(?:cancel|stop|remove|no)\s+reminders?\s+for\s+/i.test(lower)) {
+  if (/(?:cancel|stop|remove|no)\s+reminders?(?:\s+for)?\s+/i.test(lower)) {
     return { isCommand: false, markAll: false };
   }
 
