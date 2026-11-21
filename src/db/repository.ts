@@ -2218,9 +2218,7 @@ export class Repository {
       if (targetCreator) {
         candidates = candidates.filter((r) => {
           const creator = memoryStore.creators.get(r.creator_id);
-          const u = String(creator?.username || '').toLowerCase();
-          const d = String(creator?.display_name || '').toLowerCase();
-          return u.includes(targetCreator) || d.includes(targetCreator);
+          return String(creator?.username || '').toLowerCase() === targetCreator;
         });
       }
       if (candidates.length === 0) return null;
@@ -2231,11 +2229,12 @@ export class Repository {
       const target = ordered[0];
       const now = new Date().toISOString();
 
-      if (target.is_saved_on_instagram === false) {
+      const stored = memoryStore.reels.get(target.id);
+      if (!stored) return null;
+      if (stored.is_saved_on_instagram === false) {
         memoryStore.reels.delete(target.id);
         return { cancelledReel: target, action: 'deleted' };
       } else {
-        const stored = memoryStore.reels.get(target.id)!;
         stored.watch_status = 'unwatched';
         stored.next_reminder_at = null;
         stored.awaiting_reminder_choice_until = null;
@@ -2248,62 +2247,76 @@ export class Repository {
     }
 
     const supabase = getSupabase();
-    const { data: candidates, error } = await supabase
+    let creatorIds: string[] | null = null;
+    if (targetCreator) {
+      const { data: creators, error: cErr } = await supabase
+        .from('creators')
+        .select('id, username')
+        .ilike('username', targetCreator.replace(/[_%]/g, '\\$&'));
+      if (cErr) throw new Error(`Failed to resolve creator: ${cErr.message}`);
+      creatorIds = (creators || [])
+        .filter((c: any) => String(c.username || '').toLowerCase() === targetCreator)
+        .map((c: any) => c.id);
+      if (creatorIds.length === 0) return null;
+    }
+
+    let query = supabase
       .from('saved_reels')
       .select('*, creator:creators(*)')
       .eq('instagram_sender_id', trimmedSender)
-      .eq('watch_status', 'watch_later')
+      .eq('watch_status', 'watch_later');
+
+    if (creatorIds) {
+      query = query.in('creator_id', creatorIds);
+    }
+
+    const { data: candidates, error } = await query
       .order('updated_at', { ascending: false })
       .order('last_reminded_at', { ascending: false, nullsFirst: false })
       .order('created_at', { ascending: false })
-      .limit(20);
+      .limit(10);
 
     if (error) {
       throw new Error(`Failed to fetch reel to cancel: ${error.message}`);
     }
     if (!candidates || candidates.length === 0) return null;
 
-    let filtered = candidates as SavedReel[];
-    if (targetCreator) {
-      filtered = filtered.filter((r) => {
-        const u = String(r.creator?.username || '').toLowerCase();
-        const d = String(r.creator?.display_name || '').toLowerCase();
-        return u.includes(targetCreator) || d.includes(targetCreator);
-      });
-      if (filtered.length === 0) return null;
-    }
-
-    const target = sortWatchLaterReelsMostRecentFirst(filtered)[0];
+    const target = sortWatchLaterReelsMostRecentFirst(candidates as SavedReel[])[0];
     const now = new Date().toISOString();
 
     if (target.is_saved_on_instagram === false) {
-      const { error: delErr } = await supabase
+      const { data: deletedRows, error: delErr } = await supabase
         .from('saved_reels')
         .delete()
         .eq('id', target.id)
-        .eq('instagram_sender_id', trimmedSender);
+        .eq('instagram_sender_id', trimmedSender)
+        .eq('is_saved_on_instagram', false)
+        .select('id');
       if (delErr) {
         throw new Error(`Failed to delete cancelled reel: ${delErr.message}`);
       }
-      return { cancelledReel: target, action: 'deleted' };
-    } else {
-      const { data: updated, error: upErr } = await supabase
-        .from('saved_reels')
-        .update({
-          watch_status: 'unwatched',
-          next_reminder_at: null,
-          awaiting_reminder_choice_until: null,
-          updated_at: now,
-        })
-        .eq('id', target.id)
-        .eq('instagram_sender_id', trimmedSender)
-        .select('*, creator:creators(*)')
-        .maybeSingle();
-      if (upErr) {
-        throw new Error(`Failed to revert cancelled reel: ${upErr.message}`);
+      if (deletedRows && deletedRows.length > 0) {
+        return { cancelledReel: target, action: 'deleted' };
       }
-      return { cancelledReel: (updated as SavedReel) || target, action: 'reverted' };
+      // If row was concurrently promoted to is_saved_on_instagram: true, fall through to revert
     }
+
+    const { data: updated, error: upErr } = await supabase
+      .from('saved_reels')
+      .update({
+        watch_status: 'unwatched',
+        next_reminder_at: null,
+        awaiting_reminder_choice_until: null,
+        updated_at: now,
+      })
+      .eq('id', target.id)
+      .eq('instagram_sender_id', trimmedSender)
+      .select('*, creator:creators(*)')
+      .maybeSingle();
+    if (upErr) {
+      throw new Error(`Failed to revert cancelled reel: ${upErr.message}`);
+    }
+    return { cancelledReel: (updated as SavedReel) || target, action: 'reverted' };
   }
 
   /**
@@ -2329,9 +2342,7 @@ export class Repository {
       if (targetCreator) {
         candidates = candidates.filter((r) => {
           const creator = memoryStore.creators.get(r.creator_id);
-          const u = String(creator?.username || '').toLowerCase();
-          const d = String(creator?.display_name || '').toLowerCase();
-          return u.includes(targetCreator) || d.includes(targetCreator);
+          return String(creator?.username || '').toLowerCase() === targetCreator;
         });
       }
       if (candidates.length === 0) return null;
@@ -2349,33 +2360,42 @@ export class Repository {
     }
 
     const supabase = getSupabase();
-    const { data: candidates, error } = await supabase
+    let creatorIds: string[] | null = null;
+    if (targetCreator) {
+      const { data: creators, error: cErr } = await supabase
+        .from('creators')
+        .select('id, username')
+        .ilike('username', targetCreator.replace(/[_%]/g, '\\$&'));
+      if (cErr) throw new Error(`Failed to resolve creator: ${cErr.message}`);
+      creatorIds = (creators || [])
+        .filter((c: any) => String(c.username || '').toLowerCase() === targetCreator)
+        .map((c: any) => c.id);
+      if (creatorIds.length === 0) return null;
+    }
+
+    let query = supabase
       .from('saved_reels')
       .select('*, creator:creators(*)')
       .eq('instagram_sender_id', trimmedSender)
       .eq('watch_status', 'watch_later')
-      .or('next_reminder_at.not.is.null,awaiting_reminder_choice_until.not.is.null')
+      .or('next_reminder_at.not.is.null,awaiting_reminder_choice_until.not.is.null');
+
+    if (creatorIds) {
+      query = query.in('creator_id', creatorIds);
+    }
+
+    const { data: candidates, error } = await query
       .order('updated_at', { ascending: false })
       .order('last_reminded_at', { ascending: false, nullsFirst: false })
       .order('created_at', { ascending: false })
-      .limit(20);
+      .limit(10);
 
     if (error) {
       throw new Error(`Failed to fetch reminder to cancel: ${error.message}`);
     }
     if (!candidates || candidates.length === 0) return null;
 
-    let filtered = candidates as SavedReel[];
-    if (targetCreator) {
-      filtered = filtered.filter((r) => {
-        const u = String(r.creator?.username || '').toLowerCase();
-        const d = String(r.creator?.display_name || '').toLowerCase();
-        return u.includes(targetCreator) || d.includes(targetCreator);
-      });
-      if (filtered.length === 0) return null;
-    }
-
-    const target = sortWatchLaterReelsMostRecentFirst(filtered)[0];
+    const target = sortWatchLaterReelsMostRecentFirst(candidates as SavedReel[])[0];
     const now = new Date().toISOString();
 
     const { data: updated, error: upErr } = await supabase
@@ -2412,9 +2432,7 @@ export class Repository {
       const candidates = Array.from(memoryStore.reels.values()).filter((r) => {
         if (r.instagram_sender_id !== trimmedSender || r.watch_status !== 'watch_later') return false;
         const creator = memoryStore.creators.get(r.creator_id);
-        const u = String(creator?.username || '').toLowerCase();
-        const d = String(creator?.display_name || '').toLowerCase();
-        return u.includes(handle) || d.includes(handle);
+        return String(creator?.username || '').toLowerCase() === handle;
       });
       const clearedReels: SavedReel[] = [];
       const now = new Date().toISOString();
@@ -2436,12 +2454,15 @@ export class Repository {
     const supabase = getSupabase();
     const { data: creators, error: cErr } = await supabase
       .from('creators')
-      .select('id, username, display_name')
-      .or(`username.ilike.%${handle}%,display_name.ilike.%${handle}%`);
+      .select('id, username')
+      .ilike('username', handle.replace(/[_%]/g, '\\$&'));
     if (cErr) {
       throw new Error(`Failed to resolve creator for clear: ${cErr.message}`);
     }
-    const creatorIds = (creators || []).map((c: any) => c.id).filter(Boolean);
+    const creatorIds = (creators || [])
+      .filter((c: any) => String(c.username || '').toLowerCase() === handle)
+      .map((c: any) => c.id)
+      .filter(Boolean);
     if (creatorIds.length === 0) return { clearedReels: [] };
 
     const { data: reels, error: rErr } = await supabase
@@ -2458,12 +2479,31 @@ export class Repository {
     const now = new Date().toISOString();
     const toDeleteIds = reels.filter((r) => r.is_saved_on_instagram === false).map((r) => r.id);
     const toRevertIds = reels.filter((r) => r.is_saved_on_instagram !== false).map((r) => r.id);
+    const clearedReels: SavedReel[] = [];
 
     if (toDeleteIds.length > 0) {
-      await supabase.from('saved_reels').delete().in('id', toDeleteIds).eq('instagram_sender_id', trimmedSender);
+      const { data: deleted, error: delErr } = await supabase
+        .from('saved_reels')
+        .delete()
+        .in('id', toDeleteIds)
+        .eq('instagram_sender_id', trimmedSender)
+        .eq('is_saved_on_instagram', false)
+        .select('id');
+      if (delErr) {
+        throw new Error(`Failed to delete bot-added reels: ${delErr.message}`);
+      }
+      const deletedIdSet = new Set((deleted || []).map((d: any) => d.id));
+      for (const r of reels) {
+        if (deletedIdSet.has(r.id)) {
+          clearedReels.push(r as SavedReel);
+        } else if (toDeleteIds.includes(r.id)) {
+          toRevertIds.push(r.id);
+        }
+      }
     }
+
     if (toRevertIds.length > 0) {
-      await supabase
+      const { data: reverted, error: revErr } = await supabase
         .from('saved_reels')
         .update({
           watch_status: 'unwatched',
@@ -2472,9 +2512,17 @@ export class Repository {
           updated_at: now,
         })
         .in('id', toRevertIds)
-        .eq('instagram_sender_id', trimmedSender);
+        .eq('instagram_sender_id', trimmedSender)
+        .select('*, creator:creators(*)');
+      if (revErr) {
+        throw new Error(`Failed to revert saved reels to unwatched: ${revErr.message}`);
+      }
+      if (reverted) {
+        clearedReels.push(...(reverted as SavedReel[]));
+      }
     }
-    return { clearedReels: reels as SavedReel[] };
+
+    return { clearedReels };
   }
 
   /**
@@ -2492,9 +2540,7 @@ export class Repository {
       const candidates = Array.from(memoryStore.reels.values()).filter((r) => {
         if (r.instagram_sender_id !== trimmedSender || r.watch_status !== 'watch_later') return false;
         const creator = memoryStore.creators.get(r.creator_id);
-        const u = String(creator?.username || '').toLowerCase();
-        const d = String(creator?.display_name || '').toLowerCase();
-        return u.includes(handle) || d.includes(handle);
+        return String(creator?.username || '').toLowerCase() === handle;
       });
       const updatedReels: SavedReel[] = [];
       const now = new Date().toISOString();
@@ -2511,12 +2557,15 @@ export class Repository {
     const supabase = getSupabase();
     const { data: creators, error: cErr } = await supabase
       .from('creators')
-      .select('id, username, display_name')
-      .or(`username.ilike.%${handle}%,display_name.ilike.%${handle}%`);
+      .select('id, username')
+      .ilike('username', handle.replace(/[_%]/g, '\\$&'));
     if (cErr) {
       throw new Error(`Failed to resolve creator for watch: ${cErr.message}`);
     }
-    const creatorIds = (creators || []).map((c: any) => c.id).filter(Boolean);
+    const creatorIds = (creators || [])
+      .filter((c: any) => String(c.username || '').toLowerCase() === handle)
+      .map((c: any) => c.id)
+      .filter(Boolean);
     if (creatorIds.length === 0) return { updatedReels: [] };
 
     const { data: reels, error: rErr } = await supabase
@@ -2532,7 +2581,7 @@ export class Repository {
 
     const now = new Date().toISOString();
     const reelIds = reels.map((r) => r.id);
-    await supabase
+    const { data: updated, error: upErr } = await supabase
       .from('saved_reels')
       .update({
         watch_status: 'watched',
@@ -2541,9 +2590,14 @@ export class Repository {
         updated_at: now,
       })
       .in('id', reelIds)
-      .eq('instagram_sender_id', trimmedSender);
+      .eq('instagram_sender_id', trimmedSender)
+      .select('*, creator:creators(*)');
 
-    return { updatedReels: reels as SavedReel[] };
+    if (upErr) {
+      throw new Error(`Failed to mark reels watched for creator: ${upErr.message}`);
+    }
+
+    return { updatedReels: (updated as SavedReel[]) || [] };
   }
 
   /**

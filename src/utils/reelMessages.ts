@@ -1,5 +1,6 @@
 import type { Creator, SavedMediaType, SavedReel } from '../types.ts';
 import type { CreatorMediaFilter } from './creatorQuery.ts';
+import { extractCreatorQuery } from './creatorQuery.ts';
 import { classifySavedMediaType } from './mediaType.ts';
 
 const INSTAGRAM_HANDLE_REGEX = /^[a-zA-Z0-9._]{1,30}$/;
@@ -38,24 +39,25 @@ export function parseCancelCommand(text: string): CancelCommand | null {
   }
 
   // 1. Cancel reminder only: e.g. "cancel reminder", "stop reminder", "no reminder", "remove reminder"
-  const reminderOnlyMatch = lower.match(/^(?:cancel|stop|remove|no)\s+reminders?(?:\s+(?:for\s+)?@?([a-z0-9._]{1,30}))?[!.]*$/i);
-  if (reminderOnlyMatch) {
-    const targetCreator = reminderOnlyMatch[1] ? reminderOnlyMatch[1].replace(/^@+/, '').trim() : undefined;
+  if (/^(?:cancel|stop|remove|no)\s+reminders?(?:\s+(?:for\s+)?(?:@?[a-z0-9._]{1,30}))?[!.]*$/i.test(lower)) {
+    const targetCreator = extractCreatorQuery(lower) || undefined;
     return {
       isCancelAddition: false,
       isCancelReminder: true,
-      targetCreator: targetCreator || undefined,
+      targetCreator,
     };
   }
 
   // 2. Clear / remove / cancel by creator: e.g. "clear @ykittois", "remove @ykittois", "cancel @ykittois", "delete @ykittois"
-  const creatorMatch = lower.match(/^(?:clear|remove|delete|cancel)\s+@([a-z0-9._]{1,30})[!.]*$/i);
-  if (creatorMatch) {
-    return {
-      isCancelAddition: true,
-      isCancelReminder: false,
-      targetCreator: creatorMatch[1].toLowerCase(),
-    };
+  if (/^(?:clear|remove|delete|cancel)\s+@?[a-z0-9._]{1,30}[!.]*$/i.test(lower)) {
+    const targetCreator = extractCreatorQuery(lower);
+    if (targetCreator) {
+      return {
+        isCancelAddition: true,
+        isCancelReminder: false,
+        targetCreator,
+      };
+    }
   }
 
   // 3. Cancel / Undo addition (e.g. sent by mistake): e.g. "cancel", "undo", "remove", "delete", "cancel that", "undo that", "remove that"
@@ -77,9 +79,11 @@ export function parseTargetedWatchedCommand(text: string): { targetCreator: stri
   const lower = String(text || '').toLowerCase().trim();
   if (!lower) return null;
 
-  const match = lower.match(/^(?:watched|done|seen|finish|finished|mark)\s+@([a-z0-9._]{1,30})(?:\s+as\s+watched)?[!.]*$/i);
-  if (match) {
-    return { targetCreator: match[1].toLowerCase() };
+  if (/^(?:watched|done|seen|finish|finished|mark)\s+@?[a-z0-9._]{1,30}(?:\s+as\s+watched)?[!.]*$/i.test(lower)) {
+    const targetCreator = extractCreatorQuery(lower);
+    if (targetCreator) {
+      return { targetCreator };
+    }
   }
   return null;
 }

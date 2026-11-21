@@ -80,6 +80,8 @@ interface WebhookRetryState {
   pinnedDurationTargetReel?: SavedReel | null;
   /** Preserves the initially parsed target timestamp & duration across internal retries. */
   pinnedDuration?: ReturnType<typeof parseDuration>;
+  /** Preserves the duration resolved for an inbound share across internal retries. */
+  pinnedShareDuration?: ReturnType<typeof parseDuration>;
   /** Preserves the exact Watch Later Reel IDs resolved on the initial watched/stop command across retries. */
   pinnedWatchedTargetIds?: string[];
   /** Monotonic sequence assigned on initial reception of a timezone-set command to block stale retries. */
@@ -93,6 +95,10 @@ interface WebhookDeliveryContext {
   retryState: WebhookRetryState;
   /** Tracks a newly issued OTP code so superseded OTP replies are discarded instead of replayed later. */
   issuedOtpCode?: string;
+  /** Set when reply delivery is deferred to a timer, so dispatch does not prematurely mark the mid complete. */
+  isDeferredReply?: boolean;
+  opId?: string;
+  rawMid?: string;
 }
 
 interface PendingWebhookReply {
@@ -120,10 +126,13 @@ export class MetaInstagramBotService {
       timer: ReturnType<typeof setTimeout>;
       reel: SavedReel;
       delivery?: WebhookDeliveryContext;
+      promptText: string;
       addedHeading: string;
       creatorLine: string;
       defaultReminderFormatted: string;
       senderTz: string;
+      opId?: string;
+      rawMid?: string;
     }
   >();
   private recentDurationHints = new Map<
@@ -698,6 +707,8 @@ export class MetaInstagramBotService {
         anyDeliveryFailed: false,
         unsentMessages: [],
         retryState,
+        opId,
+        rawMid,
       };
 
       await this.processIncomingText(
@@ -714,7 +725,9 @@ export class MetaInstagramBotService {
       }
 
       if (!delivery.anyDeliveryFailed) {
-        this.markWebhookMidCompleted(opId);
+        if (!delivery.isDeferredReply) {
+          this.markWebhookMidCompleted(opId);
+        }
       } else {
         if (delivery.stateMutated && delivery.unsentMessages.length > 0) {
           this.recordPendingWebhookReplies(opId, senderId, delivery.unsentMessages, delivery.issuedOtpCode);
@@ -825,7 +838,10 @@ export class MetaInstagramBotService {
     if (mediaLink) {
       const { shortcode, pathType, matchedText } = mediaLink;
       const remaining = text.replace(matchedText, '').trim();
-      let customDuration = parseDuration(remaining, new Date(), senderTz);
+      let customDuration =
+        delivery?.retryState?.pinnedShareDuration !== undefined
+          ? delivery.retryState.pinnedShareDuration
+          : parseDuration(remaining, new Date(), senderTz);
 
       if (!customDuration && this.recentDurationHints.has(senderId)) {
         const hint = this.recentDurationHints.get(senderId)!;
@@ -834,6 +850,9 @@ export class MetaInstagramBotService {
         }
         this.recentDurationHints.delete(senderId);
       }
+      if (delivery && delivery.retryState.pinnedShareDuration === undefined) {
+        delivery.retryState.pinnedShareDuration = customDuration;
+      }
 
       // Fetch public metadata (probe /p/ first for post links, /reel/ first for reel/tv links)
       const preferredPath = pathType === 'p' ? 'p' : 'reel';
@@ -841,6 +860,18 @@ export class MetaInstagramBotService {
         fetchReelMetadata(shortcode, undefined, preferredPath),
         Repository.getSavedItemByShortcode(shortcode, senderId),
       ]);
+
+      // If duration text arrived while metadata was fetching (Finding #2)
+      if (!customDuration && this.recentDurationHints.has(senderId)) {
+        const hint = this.recentDurationHints.get(senderId)!;
+        if (Date.now() - hint.timestamp < 3500) {
+          customDuration = hint.duration;
+          if (delivery) {
+            delivery.retryState.pinnedShareDuration = customDuration;
+          }
+        }
+        this.recentDurationHints.delete(senderId);
+      }
 
       // Read-only metadata reuse from another row with the same shortcode if this sender has no row yet
       const metadataFallbackItem = existingItem
@@ -993,23 +1024,54 @@ export class MetaInstagramBotService {
 
         if (hasShareAttachment && this.shareDebounceDelayMs > 0) {
           if (this.pendingSharePrompts.has(senderId)) {
-            clearTimeout(this.pendingSharePrompts.get(senderId)!.timer);
+            const existing = this.pendingSharePrompts.get(senderId)!;
+            clearTimeout(existing.timer);
+            this.pendingSharePrompts.delete(senderId);
+            const ok = await this.deliverReply(senderId, existing.promptText, existing.delivery);
+            if (ok && existing.opId) {
+              this.markWebhookMidCompleted(existing.opId);
+            }
           }
           const promptReel = await Repository.getSavedItemByShortcode(shortcode, senderId);
           if (promptReel) {
+            const promptOpId = delivery?.opId;
+            const promptRawMid = delivery?.rawMid;
+            if (delivery) {
+              delivery.isDeferredReply = true;
+            }
+
             const timer = setTimeout(async () => {
               this.pendingSharePrompts.delete(senderId);
-              await this.deliverReply(senderId, reply, delivery);
+              const ok = await this.deliverReply(senderId, reply, delivery);
+              if (ok) {
+                if (promptOpId) this.markWebhookMidCompleted(promptOpId);
+              } else if (promptOpId) {
+                this.recordPendingWebhookReplies(promptOpId, senderId, [reply]);
+                this.scheduleWebhookRetry(promptOpId, 0, () =>
+                  this.dispatchWebhookMessage(
+                    senderId,
+                    promptRawMid || promptOpId,
+                    '',
+                    undefined,
+                    'deferred_share_prompt_retry',
+                    1,
+                    promptOpId
+                  )
+                );
+              }
             }, this.shareDebounceDelayMs);
 
             this.pendingSharePrompts.set(senderId, {
               timer,
               reel: promptReel,
               delivery,
+              promptText: reply,
               addedHeading,
               creatorLine,
               defaultReminderFormatted: defaultTriggerStr,
               senderTz,
+              opId: promptOpId,
+              rawMid: promptRawMid,
             });
             return;
           }
@@ -1023,31 +1085,45 @@ export class MetaInstagramBotService {
     // 0. Check if a share prompt is currently pending debounce for this sender
     if (this.pendingSharePrompts.has(senderId)) {
       const pending = this.pendingSharePrompts.get(senderId)!;
-      clearTimeout(pending.timer);
-      this.pendingSharePrompts.delete(senderId);
-
-      // Check if this incoming message is a duration expression (e.g. "20 seconds", "30m", "tomorrow 5pm")
       const parsedDur = parseDuration(text, new Date(), senderTz);
+      const pendingCancel = parseCancelCommand(text);
+
       if (parsedDur) {
-        await Repository.updateReminderSchedule(
+        clearTimeout(pending.timer);
+        this.pendingSharePrompts.delete(senderId);
+
+        // Apply conditional schedule update to guard against concurrent watch-status mutation
+        const applied = await Repository.updateReminderSchedule(
           pending.reel.id,
           parsedDur.targetDate.toISOString(),
-          parsedDur.seconds
+          parsedDur.seconds,
+          {
+            expectedNextReminderAt: pending.reel.next_reminder_at ?? null,
+            expectedIntervalSeconds: pending.reel.reminder_interval_seconds ?? null,
+            ...(pending.reel.watch_status ? { expectedWatchStatus: pending.reel.watch_status } : {}),
+          }
         );
+        if (!applied) {
+          return;
+        }
         if (delivery) delivery.stateMutated = true;
+        if (pending.opId) this.markWebhookMidCompleted(pending.opId);
+
         let reply = `${pending.addedHeading}${pending.creatorLine}\n\n⏰ Reminder set for: ${parsedDur.label} (${parsedDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
         await this.deliverReply(senderId, reply, delivery);
         return;
-      }
+      } else if (pendingCancel?.isCancelAddition && !pendingCancel.targetCreator) {
+        // Only untargeted cancel shortcuts to recent addition deletion
+        clearTimeout(pending.timer);
+        this.pendingSharePrompts.delete(senderId);
 
-      // Check if this incoming message is a cancel command
-      const pendingCancel = parseCancelCommand(text);
-      if (pendingCancel?.isCancelAddition) {
         const cancelled = await Repository.cancelRecentAdditionForSender(senderId);
         if (delivery) delivery.stateMutated = true;
+        if (pending.opId) this.markWebhookMidCompleted(pending.opId);
+
         const reelLabel = cancelled ? formatHumanReelLabel(cancelled.cancelledReel, 40) : 'your reel';
         await this.deliverReply(
           senderId,
@@ -1055,18 +1131,15 @@ export class MetaInstagramBotService {
           delivery
         );
         return;
+      } else {
+        // Message is neither duration nor untargeted cancel; flush the buffered prompt before proceeding
+        clearTimeout(pending.timer);
+        this.pendingSharePrompts.delete(senderId);
+        const ok = await this.deliverReply(senderId, pending.promptText, pending.delivery);
+        if (ok && pending.opId) {
+          this.markWebhookMidCompleted(pending.opId);
+        }
       }
-
-      // If neither duration nor cancel, flush the buffered prompt before proceeding with the current command
-      let promptReply =
-        `${pending.addedHeading}${pending.creatorLine}\n\n` +
-        `⏰ When should I remind you to watch this?\n` +
-        `Reply with a time (e.g. "30m", "2h", "tomorrow at 5pm", or "remind me in 5 days").\n\n` +
-        `⏳ If you don't reply within 10 mins, I'll automatically set a reminder for 10 hours from now (${pending.defaultReminderFormatted})!`;
-      if (senderTz === 'UTC') {
-        promptReply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" to set your local timezone.`;
-      }
-      await this.deliverReply(senderId, promptReply, delivery);
     }
 
     // 1. Cancel / Undo commands (e.g. "cancel", "undo", "cancel reminder", "clear @creator")

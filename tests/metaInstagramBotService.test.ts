@@ -3171,3 +3171,129 @@ test('MetaInstagramBotService - cancel reminder clears reminder schedule while k
     Repository.resetMemoryStoreForTests();
   }
 });
+
+test('MetaInstagramBotService & Repository - creator commands use exact handle matching and avoid substring collisions', async () => {
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+
+  try {
+    const creatorAnn = await Repository.upsertCreator({
+      instagram_user_id: 'c_ann',
+      username: 'ann',
+      display_name: 'Ann Original',
+    });
+    const creatorAnna = await Repository.upsertCreator({
+      instagram_user_id: 'c_anna',
+      username: 'anna',
+      display_name: 'Anna Other',
+    });
+
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'media_ann_1',
+      shortcode: 'DShortAnn1',
+      reel_url: 'https://instagram.com/reel/DShortAnn1/',
+      creator_id: creatorAnn.id,
+      taken_at: '2026-11-20T10:00:00Z',
+      first_detected_at: '2026-11-20T10:00:00Z',
+      save_order_rank: 1,
+      instagram_sender_id: 'sender_handle_isolation',
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+    });
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'media_anna_1',
+      shortcode: 'DShortAnna1',
+      reel_url: 'https://instagram.com/reel/DShortAnna1/',
+      creator_id: creatorAnna.id,
+      taken_at: '2026-11-20T10:00:00Z',
+      first_detected_at: '2026-11-20T10:00:00Z',
+      save_order_rank: 2,
+      instagram_sender_id: 'sender_handle_isolation',
+      watch_status: 'watch_later',
+      is_saved_on_instagram: false,
+    });
+
+    // Clear only @ann
+    const clearResult = await Repository.clearWatchLaterForCreator('sender_handle_isolation', 'ann');
+    assert.strictEqual(clearResult.clearedReels.length, 1);
+    assert.strictEqual(clearResult.clearedReels[0].shortcode, 'DShortAnn1');
+
+    // Anna's reel must still be preserved in Watch Later
+    const annaReel = await Repository.getSavedItemByShortcode('DShortAnna1', 'sender_handle_isolation');
+    assert.ok(annaReel);
+    assert.strictEqual(annaReel.watch_status, 'watch_later');
+  } finally {
+    Repository.resetMemoryStoreForTests();
+  }
+});
+
+test('MetaInstagramBotService - consecutive shares flush prior pending prompt without dropping it', async () => {
+  const { Repository } = await import('../src/db/repository.ts');
+  Repository.resetMemoryStoreForTests();
+
+  const service = new MetaInstagramBotService({ shareDebounceDelayMs: 200 });
+  const sentMessages: string[] = [];
+  service.sendDirectMessage = async (_recipientId: string, text: string) => {
+    sentMessages.push(text);
+    return true;
+  };
+
+  try {
+    // Share Reel 1
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_consec_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_consec_1',
+                attachments: [{ type: 'share', payload: { url: 'https://instagram.com/reel/DConsec1/' } }],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    // Share Reel 2 immediately while Reel 1 is pending debounce
+    await service.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          id: 'page_123',
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: 'sender_consec_1' },
+              recipient: { id: 'page_123' },
+              timestamp: Date.now(),
+              message: {
+                mid: 'm_consec_2',
+                attachments: [{ type: 'share', payload: { url: 'https://instagram.com/reel/DConsec2/' } }],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    // Reel 1's prompt must have been flushed when Reel 2 arrived
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].includes('Added to your Watch Later!'));
+
+    // Wait for Reel 2 debounce to settle
+    await new Promise((r) => setTimeout(r, 250));
+
+    // Now Reel 2's prompt must also have been sent
+    assert.strictEqual(sentMessages.length, 2);
+  } finally {
+    service.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+  }
+});
