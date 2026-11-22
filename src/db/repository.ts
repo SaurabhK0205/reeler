@@ -2327,29 +2327,42 @@ export class Repository {
     }
 
     const supabase = getSupabase();
-    let query = supabase
-      .from('saved_reels')
-      .select('*, creator:creators(*)')
-      .eq('watch_status', 'watch_later');
-
     if (trimmedSender) {
-      query = query.eq('instagram_sender_id', trimmedSender);
-    } else if (allowUnattributedFallback) {
-      query = query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
-    } else {
+      const { data: senderData, error: senderError } = await supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .eq('watch_status', 'watch_later')
+        .eq('instagram_sender_id', trimmedSender)
+        .order('next_reminder_at', { ascending: true, nullsFirst: false })
+        .order('created_at', { ascending: false })
+        .limit(limit);
+
+      if (senderError) {
+        throw new Error(`Failed to fetch Watch Later queue for sender: ${senderError.message}`);
+      }
+      if (senderData && senderData.length > 0) {
+        return sortWatchLaterQueueReels(senderData as SavedReel[]);
+      }
+    }
+
+    if (!allowUnattributedFallback) {
       return [];
     }
 
-    const { data, error } = await query
+    const { data: fallbackData, error: fallbackError } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('watch_status', 'watch_later')
+      .or('instagram_sender_id.is.null,instagram_sender_id.eq.')
       .order('next_reminder_at', { ascending: true, nullsFirst: false })
       .order('created_at', { ascending: false })
       .limit(limit);
 
-    if (error) {
-      throw new Error(`Failed to fetch Watch Later queue for sender: ${error.message}`);
+    if (fallbackError) {
+      throw new Error(`Failed to fetch fallback Watch Later queue: ${fallbackError.message}`);
     }
 
-    return sortWatchLaterQueueReels((data || []) as SavedReel[]);
+    return sortWatchLaterQueueReels((fallbackData || []) as SavedReel[]);
   }
 
   static async recordReminderSent(

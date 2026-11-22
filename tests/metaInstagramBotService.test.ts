@@ -5434,6 +5434,22 @@ test('MetaInstagramBotService - queue command returns active Watch Later items f
       assert.strictEqual(replies.length, 1);
       assert.ok(replies[0].includes('Your Watch Later Queue (2 items):'), `Cmd: ${cmd}, Got: ${replies[0]}`);
     }
+
+    // Step 5: Verify unattributed fallback when sender has no items
+    const unattributed = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_unattributed_queue',
+      shortcode: 'UnattrQueue1',
+      reel_url: 'https://instagram.com/reel/UnattrQueue1/',
+      creator_id: creator1.id,
+      caption: 'Unattributed item in queue',
+      instagram_sender_id: null,
+      watch_status: 'watch_later',
+    });
+    const fallbackResults = await Repository.getActiveWatchLaterReelsForSender('brand_new_admin_sender', {
+      includeUnattributedFallback: true,
+    });
+    assert.strictEqual(fallbackResults.length, 1);
+    assert.strictEqual(fallbackResults[0].shortcode, 'UnattrQueue1');
   });
 });
 
