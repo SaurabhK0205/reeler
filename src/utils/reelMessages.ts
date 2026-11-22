@@ -231,9 +231,9 @@ export function parseTargetedReminderUpdateCommand(
   if (!lower) return null;
 
   // Pattern 1 (Duration first, creator after):
-  // e.g. "snooze 1h for @creator", "remind in 2h for @creator", "remind me in 2h about @creator"
+  // e.g. "snooze 1h for @creator", "remind in 2h for @creator", "remind me in 2h about @creator", "reschedule 2h for @creator"
   const p1 = lower.match(
-    /^(?:remind(?:\s+me)?|snooze|update(?:\s+reminders?)?)\s+(.+?)\s+(?:for|about|of|on)\s+(@?(?:\[|<)?[a-z0-9._]{1,30}(?:\]|>)?)$/i
+    /^(?:remind(?:\s+me)?|snooze|update(?:\s+reminders?)?|reschedule(?:\s+reminders?)?)\s+(.+?)\s+(?:for|about|of|on)\s+(@?\S+)$/i
   );
   if (p1) {
     const rawDur = p1[1].trim();
@@ -252,9 +252,9 @@ export function parseTargetedReminderUpdateCommand(
   }
 
   // Pattern 2 (Creator first, duration after):
-  // e.g. "remind @creator in 2h", "update reminder for @creator to 2h", "snooze @creator 1h"
+  // e.g. "remind @creator in 2h", "update reminder for @creator to 2h", "snooze @creator 1h", "reschedule @creator tomorrow"
   const p2 = lower.match(
-    /^(?:remind(?:\s+me)?(?:\s+(?:about|for|of))?|update(?:\s+reminders?(?:\s+(?:for|of|on))?)?|change(?:\s+reminders?(?:\s+(?:for|of|on))?)?|snooze(?:\s+reminders?(?:\s+(?:for|of|on))?)?)\s+(@?(?:\[|<)?[a-z0-9._]{1,30}(?:\]|>)?)\s+(?:(?:to|in|at|for)\s+)?(.+)$/i
+    /^(?:remind(?:\s+me)?(?:\s+(?:about|for|of))?|update(?:\s+reminders?(?:\s+(?:for|of|on))?)?|change(?:\s+reminders?(?:\s+(?:for|of|on))?)?|snooze(?:\s+reminders?(?:\s+(?:for|of|on))?)?|reschedule(?:\s+reminders?(?:\s+(?:for|of|on))?)?)\s+(@?\S+)\s+(?:(?:to|in|at|for)\s+)?(.+)$/i
   );
   if (p2) {
     const rawCreator = p2[1].trim();

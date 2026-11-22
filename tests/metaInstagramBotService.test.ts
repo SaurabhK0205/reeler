@@ -4768,6 +4768,35 @@ test('MetaInstagramBotService - Path B: creator-targeted reminder update command
   assert.strictEqual(replies.length, 1);
   assert.ok(replies[0].includes('⏰ Reminder updated for:'), `Got: ${replies[0]}`);
   assert.ok(replies[0].includes('warnerbrosindia'), `Got: ${replies[0]}`);
+
+  // 9. "reschedule @warnerbrosindia tomorrow"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'reschedule @warnerbrosindia tomorrow' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for:'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('warnerbrosindia'), `Got: ${replies[0]}`);
+
+  // 10. "reschedule 45m for @marvelstudios"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'reschedule 45m for @marvelstudios' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for: 45 minutes'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('marvelstudios'), `Got: ${replies[0]}`);
+
+  // 11. Malformed explicit creator target like "@bad-name" must not fall through to generic duration
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'update @bad-name tomorrow' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('Could not find a valid creator handle'), `Got: ${replies[0]}`);
 });
 
 test('MetaInstagramBotService prioritizes reshared item over older awaiting item when duration is replied', async () => {

@@ -133,7 +133,7 @@ export function parseDuration(
   let text = rawText
     .toLowerCase()
     .trim()
-    .replace(/^(?:remind\s+(?:me\s+)?(?:in\s+|at\s+|on\s+)?|snooze\s+(?:for\s+|in\s+)?|set\s+reminder\s+(?:for\s+)?|in\s+|on\s+|at\s+)/i, '')
+    .replace(/^(?:remind\s+(?:me\s+)?(?:in\s+|at\s+|on\s+)?|snooze\s+(?:for\s+|in\s+)?|reschedule\s+(?:for\s+|in\s+|to\s+)?|set\s+reminder\s+(?:for\s+)?|in\s+|on\s+|at\s+)/i, '')
     .trim();
 
   // 1. Relative units (e.g. 5s, 34 mins, 5. hours, 5 days, 2 weeks)
