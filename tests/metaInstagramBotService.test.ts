@@ -5627,4 +5627,50 @@ test('isScheduleBeyond24Hours - detects >24h durations and appends 24h window no
       else delete process.env.RENDER;
     }
   });
+
+  test('MetaInstagramBotService - redacts sensitive message text and webhook payloads in production logs', async () => {
+    const origEnv = process.env.NODE_ENV;
+    const origRender = process.env.RENDER;
+    process.env.NODE_ENV = 'production';
+    process.env.RENDER = 'true';
+
+    const capturedLogs: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: any[]) => {
+      capturedLogs.push(args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' '));
+    };
+
+    try {
+      const bot = new MetaInstagramBotService();
+      (bot as any).sendDirectMessage = async () => true;
+
+      const secretUserText = 'my secret confidential private reel note 12345';
+      const webhookPayload = {
+        object: 'instagram',
+        entry: [
+          {
+            messaging: [
+              {
+                sender: { id: 'sender_confidential_123' },
+                message: { text: secretUserText },
+              },
+            ],
+          },
+        ],
+      };
+
+      await bot.handleWebhookPayload(webhookPayload);
+
+      const allLogs = capturedLogs.join('\n');
+      assert.ok(!allLogs.includes(secretUserText), 'Raw confidential DM text must not appear in production logs');
+      assert.ok(allLogs.includes('[MetaIG] Webhook received event object="instagram"'), 'Must log redacted webhook event summary');
+      assert.ok(allLogs.includes('chars redacted]'), 'Must log character length redaction for incoming DM');
+    } finally {
+      console.log = origLog;
+      if (origEnv !== undefined) process.env.NODE_ENV = origEnv;
+      else delete process.env.NODE_ENV;
+      if (origRender !== undefined) process.env.RENDER = origRender;
+      else delete process.env.RENDER;
+    }
+  });
 });
