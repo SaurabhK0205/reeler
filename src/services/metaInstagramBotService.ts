@@ -1314,7 +1314,10 @@ export class MetaInstagramBotService {
       const validHandle = extractPublicCreatorUsername({ username: meta.username });
       const existingCreator = metadataSeed?.creator;
       const existingHandle = extractPublicCreatorUsername(existingCreator);
-      const mentionHandle = extractCreatorQuery(remaining) || extractCreatorQuery(text);
+      const explicitMentionMatch = remaining.match(/@[a-zA-Z0-9._]+/) || text.match(/@[a-zA-Z0-9._]+/);
+      const mentionHandle = explicitMentionMatch
+        ? extractCreatorQuery(explicitMentionMatch[0])
+        : null;
 
       let creator: NonNullable<typeof existingCreator>;
       if (!validHandle && !meta.displayName && existingCreator && !mentionHandle) {
