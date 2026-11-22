@@ -4,7 +4,7 @@ import { safeStringEqual } from '../middleware/security.ts';
 import { loadConfig } from '../config.ts';
 import { Repository, SenderReminderConflictError, SenderDeletionBarrierError } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
-import { parseDuration, formatTargetTime } from '../utils/duration.ts';
+import { parseDuration, formatTargetTime, isSameInstant } from '../utils/duration.ts';
 import { getTimeZoneSummary } from '../utils/timezone.ts';
 import { extractCreatorQueryWithFilter, extractCreatorQuery } from '../utils/creatorQuery.ts';
 import {
@@ -1013,10 +1013,10 @@ export class MetaInstagramBotService {
           if (
             !freshItem ||
             freshItem.watch_status !== 'watch_later' ||
-            (pending.isStatusReply && freshItem.next_reminder_at !== pending.expectedNextReminderAt) ||
+            (pending.isStatusReply && !isSameInstant(freshItem.next_reminder_at, pending.expectedNextReminderAt)) ||
             (!pending.isStatusReply && (
               !freshItem.awaiting_reminder_choice_until ||
-              freshItem.awaiting_reminder_choice_until !== pending.expectedAwaitingUntil ||
+              !isSameInstant(freshItem.awaiting_reminder_choice_until, pending.expectedAwaitingUntil) ||
               new Date(freshItem.awaiting_reminder_choice_until).getTime() <= Date.now()
             ))
           ) {

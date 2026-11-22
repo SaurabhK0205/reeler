@@ -466,3 +466,17 @@ export function parseDurationOrDateInput(input: unknown): Date | null {
   return new Date(timestamp);
 }
 
+/**
+ * Compares two ISO date/time strings by parsed millisecond instant rather than exact string equality,
+ * safely handling timezone offsets, sub-second precision, and null/undefined values.
+ */
+export function isSameInstant(a: string | null | undefined, b: string | null | undefined): boolean {
+  const normA = a ?? null;
+  const normB = b ?? null;
+  if (normA === null || normB === null) return normA === normB;
+  const timeA = new Date(normA).getTime();
+  const timeB = new Date(normB).getTime();
+  return !Number.isNaN(timeA) && !Number.isNaN(timeB) && timeA === timeB;
+}
+
+
