@@ -283,7 +283,7 @@ export class MetaInstagramBotService {
     shareDebounceDelayMs?: number;
   }) {
     this.accessToken = process.env.META_PAGE_ACCESS_TOKEN || '';
-    this.verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN || 'rea_instagram_saved_token';
+    this.verifyToken = (process.env.META_WEBHOOK_VERIFY_TOKEN || '').trim();
     this.appSecret = process.env.META_APP_SECRET || '';
     this.retryDelaysMs = options?.retryDelaysMs ?? DEFAULT_WEBHOOK_RETRY_DELAYS_MS;
     this.shareDebounceDelayMs =
@@ -683,15 +683,29 @@ export class MetaInstagramBotService {
 
   /**
    * Validates Meta Webhook Verification Challenge (GET /webhook) using constant-time comparison.
+   * Fails closed if META_WEBHOOK_VERIFY_TOKEN is unconfigured in hosted/production environments or tokens mismatch.
    */
   verifyWebhook(mode: string, token: string, challenge: string): string | null {
     if (mode !== 'subscribe' || typeof token !== 'string' || !token) {
       return null;
     }
-    const validTokens = process.env.META_WEBHOOK_VERIFY_TOKEN?.trim()
-      ? [this.verifyToken]
-      : [this.verifyToken, 'rea_instagram_saved_token', 'ig_reels_tracker_webhook_secret_2026'];
-    if (validTokens.some((candidate) => candidate && safeStringEqual(token, candidate))) {
+    const configuredToken = this.verifyToken || process.env.META_WEBHOOK_VERIFY_TOKEN?.trim();
+    if (!configuredToken) {
+      if (isHostedOrProductionEnvironment()) {
+        console.error(
+          '[MetaBot] Webhook verification rejected: META_WEBHOOK_VERIFY_TOKEN must be configured in hosted or production environments.'
+        );
+        return null;
+      }
+      // For local development only, permit local dev verify token
+      const devFallbackToken = 'rea_instagram_saved_token';
+      if (safeStringEqual(token, devFallbackToken)) {
+        return challenge;
+      }
+      return null;
+    }
+
+    if (safeStringEqual(token, configuredToken)) {
       return challenge;
     }
     return null;
