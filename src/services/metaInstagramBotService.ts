@@ -169,6 +169,7 @@ interface PendingWebhookReply {
   otpCode?: string;
   targetReelId?: string;
   expectedAwaitingUntil?: string | null;
+  isStatusReply?: boolean;
 }
 
 interface InFlightShareContext {
@@ -328,7 +329,8 @@ export class MetaInstagramBotService {
           [pending.promptText],
           undefined,
           pending.reel.id,
-          pending.reel.awaiting_reminder_choice_until
+          pending.reel.awaiting_reminder_choice_until,
+          pending.isAlreadyInWatchLater
         );
         this.scheduleWebhookRetry(pending.opId, 0, () =>
           this.dispatchWebhookMessage(
@@ -360,7 +362,8 @@ export class MetaInstagramBotService {
         [pending.promptText],
         undefined,
         pending.reel.id,
-        pending.reel.awaiting_reminder_choice_until
+        pending.reel.awaiting_reminder_choice_until,
+        pending.isAlreadyInWatchLater
       );
       this.scheduleWebhookRetry(pending.opId, 0, () =>
         this.dispatchWebhookMessage(
@@ -583,7 +586,8 @@ export class MetaInstagramBotService {
     messages: string[],
     otpCode?: string,
     targetReelId?: string,
-    expectedAwaitingUntil?: string | null
+    expectedAwaitingUntil?: string | null,
+    isStatusReply?: boolean
   ): void {
     const now = Date.now();
     if (this.pendingRepliesByMid.size >= WEBHOOK_PENDING_REPLY_MAX_ENTRIES) {
@@ -603,7 +607,9 @@ export class MetaInstagramBotService {
       messages,
       expiresAt: now + WEBHOOK_PENDING_REPLY_TTL_MS,
       ...(otpCode ? { otpCode } : {}),
-      ...(targetReelId ? { targetReelId, expectedAwaitingUntil } : {}),
+      ...(targetReelId
+        ? { targetReelId, expectedAwaitingUntil, ...(isStatusReply ? { isStatusReply: true } : {}) }
+        : {}),
     });
   }
 
@@ -996,9 +1002,11 @@ export class MetaInstagramBotService {
           if (
             !freshItem ||
             freshItem.watch_status !== 'watch_later' ||
-            !freshItem.awaiting_reminder_choice_until ||
-            freshItem.awaiting_reminder_choice_until !== pending.expectedAwaitingUntil ||
-            new Date(freshItem.awaiting_reminder_choice_until).getTime() <= Date.now()
+            (!pending.isStatusReply && (
+              !freshItem.awaiting_reminder_choice_until ||
+              freshItem.awaiting_reminder_choice_until !== pending.expectedAwaitingUntil ||
+              new Date(freshItem.awaiting_reminder_choice_until).getTime() <= Date.now()
+            ))
           ) {
             // Choice already settled, deadline expired, or item cancelled/watched; discard stale prompt replay.
             this.markWebhookMidCompleted(opId);
@@ -1027,7 +1035,8 @@ export class MetaInstagramBotService {
             remaining,
             pending.otpCode,
             pending.targetReelId,
-            pending.expectedAwaitingUntil
+            pending.expectedAwaitingUntil,
+            pending.isStatusReply
           );
           shouldScheduleRetry = true;
         }
@@ -2307,7 +2316,16 @@ export class MetaInstagramBotService {
         targetReel = delivery.retryState.pinnedDurationTargetReel;
       } else {
         const lastConfirmedId = this.lastConfirmedAdditionReelId.get(senderId);
-        let resolved = await Repository.getActiveAwaitingReelForSender(senderId);
+        let resolved: SavedReel | null = null;
+        if (lastConfirmedId && this.isRecentReshare(lastConfirmedId)) {
+          const candidate = await Repository.getSavedItemById(lastConfirmedId);
+          if (candidate && candidate.watch_status === 'watch_later' && candidate.instagram_sender_id === senderId) {
+            resolved = candidate;
+          }
+        }
+        if (!resolved) {
+          resolved = await Repository.getActiveAwaitingReelForSender(senderId);
+        }
         if (!resolved && lastConfirmedId) {
           const candidate = await Repository.getSavedItemById(lastConfirmedId);
           if (candidate && candidate.watch_status === 'watch_later' && candidate.instagram_sender_id === senderId) {

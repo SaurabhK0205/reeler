@@ -230,12 +230,6 @@ export function parseTargetedReminderUpdateCommand(
   const lower = String(text || '').toLowerCase().trim();
   if (!lower) return null;
 
-  // Standalone duration commands without any creator indicator should be handled by generic duration parser
-  const directDur = parseDuration(lower, refDate, senderTz);
-  if (directDur && !lower.includes('@') && !lower.includes('[') && !lower.includes('<')) {
-    return null;
-  }
-
   // Pattern 1 (Duration first, creator after):
   // e.g. "snooze 1h for @creator", "remind in 2h for @creator", "remind me in 2h about @creator"
   const p1 = lower.match(
