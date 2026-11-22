@@ -80,7 +80,7 @@
       <!-- Contextual Shortcuts & Import Guide Popover -->
       <section id="shortcuts-popover" class="shortcuts-popover" role="dialog" aria-modal="false" aria-labelledby="shortcuts-popover-title" hidden>
         <div class="shortcuts-popover-header">
-          <h2 id="shortcuts-popover-title" class="shortcuts-popover-title">Vault Shortcuts &amp; Import Guide</h2>
+          <h2 id="shortcuts-popover-title" class="shortcuts-popover-title">Vault &amp; Bot Guide</h2>
           <button type="button" id="shortcuts-close-btn" class="popover-close-btn" aria-label="Close shortcuts and guide">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <line x1="18" y1="6" x2="6" y2="18"></line>
@@ -89,39 +89,175 @@
           </button>
         </div>
 
+        <nav class="guide-tabs" role="tablist" aria-label="Guide sections">
+          <button type="button" class="guide-tab-btn active" id="guide-tab-import" role="tab" aria-selected="true" aria-controls="guide-panel-import">Import Archive</button>
+          <button type="button" class="guide-tab-btn" id="guide-tab-commands" role="tab" aria-selected="false" aria-controls="guide-panel-commands">Bot Commands</button>
+          <button type="button" class="guide-tab-btn" id="guide-tab-shortcuts" role="tab" aria-selected="false" aria-controls="guide-panel-shortcuts">Shortcuts</button>
+          <button type="button" class="guide-tab-btn" id="guide-tab-legal" role="tab" aria-selected="false" aria-controls="guide-panel-legal">Legal</button>
+        </nav>
+
         <div class="shortcuts-popover-body">
-          <div class="shortcuts-section">
-            <div class="shortcuts-section-title">Vault Catalog</div>
-            <ul class="shortcuts-list">
-              <li><span>Focus Search</span><span class="shortcut-keys"><kbd>/</kbd> or <kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd></span></li>
-              <li><span>Previous / Next Page</span><span class="shortcut-keys"><kbd>[</kbd> / <kbd>]</kbd></span></li>
-              <li><span>Toggle This Guide</span><span class="shortcut-keys"><kbd>?</kbd></span></li>
-            </ul>
+          <!-- Panel 1: Import Archive Guide -->
+          <div id="guide-panel-import" class="guide-panel" role="tabpanel" aria-labelledby="guide-tab-import">
+            <p class="guide-intro-text">
+              Export your official Instagram saved posts and reels, then import them directly into your isolated Reeler Vault. Re-import anytime to sync new saves additively without overwriting notes, watch statuses, or bot reminders.
+            </p>
+
+            <ol class="guide-steps-list">
+              <li class="guide-step-item">
+                <span class="guide-step-badge">1</span>
+                <div class="guide-step-body">
+                  <div class="guide-step-headline">Open Instagram Settings</div>
+                  <p class="guide-step-desc">Go to your Instagram Profile → ☰ Menu → <strong>Accounts Center</strong> → <strong>Your information and permissions</strong> (or <strong>Your activity</strong>).</p>
+                </div>
+              </li>
+              <li class="guide-step-item">
+                <span class="guide-step-badge">2</span>
+                <div class="guide-step-body">
+                  <div class="guide-step-headline">Request Information Download</div>
+                  <p class="guide-step-desc">Tap <strong>Download your information</strong> → <strong>Download or transfer information</strong>.</p>
+                </div>
+              </li>
+              <li class="guide-step-item">
+                <span class="guide-step-badge">3</span>
+                <div class="guide-step-body">
+                  <div class="guide-step-headline">Select Saved Posts Only</div>
+                  <p class="guide-step-desc">Select <strong>Some of your information</strong>, scroll down to find and check <strong>Saved</strong> (or Saved posts).</p>
+                </div>
+              </li>
+              <li class="guide-step-item">
+                <span class="guide-step-badge">4</span>
+                <div class="guide-step-body">
+                  <div class="guide-step-headline">Choose JSON Format</div>
+                  <p class="guide-step-desc">Destination: <strong>Download to device</strong>. Under Format, choose <strong>JSON</strong> <span class="guide-callout-inline">(⚠️ Must be JSON, not HTML)</span>. Set Date range to <strong>All time</strong>.</p>
+                </div>
+              </li>
+              <li class="guide-step-item">
+                <span class="guide-step-badge">5</span>
+                <div class="guide-step-body">
+                  <div class="guide-step-headline">Download &amp; Extract ZIP</div>
+                  <p class="guide-step-desc">When Meta generates the export, download and extract the ZIP file. Locate <code>saved_posts.json</code> inside <code>your_instagram_activity/saved/</code>.</p>
+                </div>
+              </li>
+              <li class="guide-step-item">
+                <span class="guide-step-badge">6</span>
+                <div class="guide-step-body">
+                  <div class="guide-step-headline">Upload to Reeler Vault</div>
+                  <p class="guide-step-desc">Click below to upload <code>saved_posts.json</code>. Your saved reels and posts will be indexed into your private vault.</p>
+                </div>
+              </li>
+            </ol>
+
+            <button type="button" id="popover-import-btn" class="nav-btn nav-btn-primary shortcuts-import-cta">Choose saved_posts.json</button>
           </div>
 
-          <div class="shortcuts-section">
-            <div class="shortcuts-section-title">Fullscreen Player</div>
-            <ul class="shortcuts-list">
-              <li><span>Previous / Next Reel</span><span class="shortcut-keys"><kbd>↑</kbd> <kbd>↓</kbd> or <kbd>k</kbd> <kbd>j</kbd></span></li>
-              <li><span>Mark Watched / Later</span><span class="shortcut-keys"><kbd>w</kbd> / <kbd>l</kbd></span></li>
-              <li><span>Copy Link / Close</span><span class="shortcut-keys"><kbd>c</kbd> / <kbd>Esc</kbd></span></li>
-            </ul>
+          <!-- Panel 2: Bot Commands -->
+          <div id="guide-panel-commands" class="guide-panel is-hidden" role="tabpanel" aria-labelledby="guide-tab-commands">
+            <p class="guide-intro-text">
+              Interact directly with Reeler Bot in your Instagram DMs to save reels, schedule reminders, and control your queue.
+            </p>
+
+            <div class="guide-command-group">
+              <div class="guide-command-card">
+                <div class="guide-command-header">
+                  <span class="guide-command-name">Save Reel or Post</span>
+                  <div class="guide-command-chips"><kbd>Share Reel</kbd> or <kbd>Paste Link</kbd></div>
+                </div>
+                <p class="guide-command-desc">Share any reel to the bot or send a link to save it and receive an immediate reminder prompt.</p>
+              </div>
+
+              <div class="guide-command-card">
+                <div class="guide-command-header">
+                  <span class="guide-command-name">Set Reminder</span>
+                  <div class="guide-command-chips"><kbd>5m</kbd> <kbd>2h</kbd> <kbd>tomorrow</kbd> <kbd>sat 9pm</kbd></div>
+                </div>
+                <p class="guide-command-desc">Reply with a relative time or day/time to schedule an Instagram DM reminder.</p>
+              </div>
+
+              <div class="guide-command-card">
+                <div class="guide-command-header">
+                  <span class="guide-command-name">Cancel / Undo Reminder</span>
+                  <div class="guide-command-chips"><kbd>cancel</kbd> <kbd>undo</kbd> <kbd>cancel @creator</kbd></div>
+                </div>
+                <p class="guide-command-desc">Cancel the reminder on your latest added reel or cancel upcoming reminders for a specific creator.</p>
+              </div>
+
+              <div class="guide-command-card">
+                <div class="guide-command-header">
+                  <span class="guide-command-name">Mark Watched</span>
+                  <div class="guide-command-chips"><kbd>watched</kbd> <kbd>done</kbd> <kbd>watched @creator</kbd></div>
+                </div>
+                <p class="guide-command-desc">Mark the latest reminded reel as watched, or mark all items from a creator as watched.</p>
+              </div>
+
+              <div class="guide-command-card">
+                <div class="guide-command-header">
+                  <span class="guide-command-name">Clear Creator Items</span>
+                  <div class="guide-command-chips"><kbd>clear @creator</kbd></div>
+                </div>
+                <p class="guide-command-desc">Remove all bot-saved items from a specified creator handle from your queue.</p>
+              </div>
+
+              <div class="guide-command-card">
+                <div class="guide-command-header">
+                  <span class="guide-command-name">Local Timezone</span>
+                  <div class="guide-command-chips"><kbd>tz London</kbd> <kbd>tz Tokyo</kbd> <kbd>tz New York</kbd></div>
+                </div>
+                <p class="guide-command-desc">Calibrate your reminder schedule to your local city/timezone.</p>
+              </div>
+
+              <div class="guide-command-card">
+                <div class="guide-command-header">
+                  <span class="guide-command-name">Vault Access Code</span>
+                  <div class="guide-command-chips"><kbd>code</kbd> or <kbd>vault</kbd></div>
+                </div>
+                <p class="guide-command-desc">Get a fresh 6-digit login PIN to unlock your vault on laptop/desktop, or a direct magic link.</p>
+              </div>
+            </div>
+
+            <a href="https://www.instagram.com/er_reel_er/" target="_blank" rel="noopener noreferrer" class="nav-btn nav-btn-secondary shortcuts-import-cta" style="text-decoration:none;display:flex;align-items:center;justify-content:center;gap:6px;">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+              Message @er_reel_er on Instagram
+            </a>
           </div>
 
-          <div class="shortcuts-section shortcuts-import-note">
-            <div class="shortcuts-section-title">Collections, Sync &amp; Playback</div>
-            <p class="shortcuts-note-copy"><strong>Saved on IG</strong> holds your Instagram archive from <code>saved_posts.json</code> (re-import exports anytime to sync newly saved posts and auto-promote matching bot items). <strong>Sent to Bot</strong> tracks reels and posts you DMed to the bot.</p>
-            <p class="shortcuts-note-copy">Posts without cached covers appear as monogram cards; if an embed prompts a login gate, use <strong>Open</strong> to view on Instagram.</p>
-            <button type="button" id="popover-import-btn" class="nav-btn nav-btn-secondary shortcuts-import-cta">Choose saved_posts.json</button>
+          <!-- Panel 3: Shortcuts -->
+          <div id="guide-panel-shortcuts" class="guide-panel is-hidden" role="tabpanel" aria-labelledby="guide-tab-shortcuts">
+            <div class="shortcuts-section">
+              <div class="shortcuts-section-title">Vault Catalog</div>
+              <ul class="shortcuts-list">
+                <li><span>Focus Search</span><span class="shortcut-keys"><kbd>/</kbd> or <kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd></span></li>
+                <li><span>Previous / Next Page</span><span class="shortcut-keys"><kbd>[</kbd> / <kbd>]</kbd></span></li>
+                <li><span>Toggle This Guide</span><span class="shortcut-keys"><kbd>?</kbd></span></li>
+              </ul>
+            </div>
+
+            <div class="shortcuts-section">
+              <div class="shortcuts-section-title">Fullscreen Player</div>
+              <ul class="shortcuts-list">
+                <li><span>Previous / Next Reel</span><span class="shortcut-keys"><kbd>↑</kbd> <kbd>↓</kbd> or <kbd>k</kbd> <kbd>j</kbd></span></li>
+                <li><span>Mark Watched / Later</span><span class="shortcut-keys"><kbd>w</kbd> / <kbd>l</kbd></span></li>
+                <li><span>Copy Link / Close</span><span class="shortcut-keys"><kbd>c</kbd> / <kbd>Esc</kbd></span></li>
+              </ul>
+            </div>
+
+            <div class="shortcuts-section shortcuts-import-note">
+              <div class="shortcuts-section-title">Collections, Sync &amp; Playback</div>
+              <p class="shortcuts-note-copy"><strong>Saved on IG</strong> holds your Instagram archive from <code>saved_posts.json</code>. <strong>Sent to Bot</strong> tracks reels and posts you DMed to the bot.</p>
+              <p class="shortcuts-note-copy">Posts without cached covers appear as monogram cards; if an embed prompts a login gate, use <strong>Open</strong> to view on Instagram.</p>
+            </div>
           </div>
 
-          <div class="shortcuts-section">
-            <div class="shortcuts-section-title">Compliance &amp; Legal</div>
-            <ul class="shortcuts-list">
-              <li><span>Privacy Policy</span><a href="/privacy" class="shortcuts-link" target="_blank" rel="noopener noreferrer">View Policy</a></li>
-              <li><span>Terms of Service</span><a href="/terms" class="shortcuts-link" target="_blank" rel="noopener noreferrer">View Terms</a></li>
-              <li><span>User Data Deletion</span><a href="/data-deletion" class="shortcuts-link" target="_blank" rel="noopener noreferrer">Instructions</a></li>
-            </ul>
+          <!-- Panel 4: Compliance & Legal -->
+          <div id="guide-panel-legal" class="guide-panel is-hidden" role="tabpanel" aria-labelledby="guide-tab-legal">
+            <div class="shortcuts-section">
+              <div class="shortcuts-section-title">Compliance &amp; Legal</div>
+              <ul class="shortcuts-list">
+                <li><span>Privacy Policy</span><a href="/privacy" class="shortcuts-link" target="_blank" rel="noopener noreferrer">View Policy</a></li>
+                <li><span>Terms of Service</span><a href="/terms" class="shortcuts-link" target="_blank" rel="noopener noreferrer">View Terms</a></li>
+                <li><span>User Data Deletion</span><a href="/data-deletion" class="shortcuts-link" target="_blank" rel="noopener noreferrer">Instructions</a></li>
+              </ul>
+            </div>
           </div>
         </div>
       </section>
