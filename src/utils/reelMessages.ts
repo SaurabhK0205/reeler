@@ -196,24 +196,24 @@ export function isGreetingOrHelpMessage(text: string): boolean {
  */
 export function formatBotHelpMessage(): string {
   return (
-    `👋 Welcome to Reeler — Your Reels & Posts Vault!\n\n` +
+    `👋 Welcome to Reeler! Your Reels & Posts Vault.\n\n` +
     `📥 Save & Reminders\n` +
-    `• Share any Reel or Post here via the Share (airplane) button.\n` +
-    `• Add a time in share text (e.g. "30s", "2h", "5pm") to set a reminder instantly!\n` +
+    `• Share any Reel or Post here with the Share button.\n` +
+    `• Add a time in your share text ("30s", "2h", "5pm") to set a reminder right away!\n` +
     `• Or reply with a time anytime (e.g. "1h", "snooze 2h").\n\n` +
     `⏰ Manage Reminders & Watch Later\n` +
-    `• "watched" or "done" — Mark latest reminder as watched.\n` +
-    `• "cancel" or "undo" — Remove recently added item if sent by mistake.\n` +
-    `• "cancel reminder" — Stop alarms but keep item in Watch Later.\n` +
-    `• "clear @[creator]" / "watched @[creator]" — Manage items by creator.\n` +
-    `• "stop all" — Mark all items as watched & clear active reminders.\n\n` +
+    `• "watched" or "done": Mark latest reminder as watched.\n` +
+    `• "cancel" or "undo": Remove recently added item if sent by mistake.\n` +
+    `• "cancel reminder": Stop alarms but keep item in Watch Later.\n` +
+    `• "clear @[creator]" / "watched @[creator]": Manage items by creator.\n` +
+    `• "stop all": Mark all items as watched & clear active reminders.\n\n` +
     `🔍 Search & Web Vault\n` +
-    `• "@[creator]" or "reels by @[creator]" — View your saved items.\n` +
-    `• "vault" — Open your private web vault.\n` +
-    `• "code" — Get a 6-digit login code for PC/laptop access.\n\n` +
+    `• "@[creator]" or "reels by @[creator]": View your saved items.\n` +
+    `• "vault": Open your private web vault.\n` +
+    `• "code": Get a 6-digit login code for PC/laptop access.\n\n` +
     `⚙️ Settings\n` +
-    `• "tz <city>" (e.g. "tz IST", "tz London") — Set timezone.\n` +
-    `• "delete my data" — Wipe all your data and history.`
+    `• "tz <city>" (e.g. "tz IST", "tz London"): Set your timezone.\n` +
+    `• "delete my data": Wipe all your data and history.`
   );
 }
 
@@ -418,7 +418,7 @@ export function formatDefaultReminderNotice(
   const targetText = creatorDisplay || formatHumanReelLabel(reel, 40);
 
   return (
-    `⏰ No reminder time received for ${targetText} — I've scheduled your reminder for ${defaultHours} hours from now (${targetStr}).\n\n` +
+    `⏰ No reminder time received for ${targetText}. I've scheduled your reminder for ${defaultHours} hours from now (${targetStr}).\n\n` +
     `Reply e.g. "2h" or "tomorrow 5pm" anytime to change it, or "watched" when done!`
   );
 }
@@ -487,12 +487,12 @@ export function formatCreatorSearchMessages(params: {
     const postsStr = totalPosts === 1 ? '1 saved post' : `${totalPosts} saved posts`;
     notFound =
       `🔍 No saved reels found for Creator: ${creatorLabel} yet.\n\n` +
-      `They do have ${postsStr} — reply "posts by ${cmdTarget}" to view ${totalPosts === 1 ? 'it' : 'them'}.`;
+      `They do have ${postsStr}. Reply "posts by ${cmdTarget}" to view ${totalPosts === 1 ? 'it' : 'them'}.`;
   } else if (mediaFilter === 'post' && totalReels > 0) {
     const reelsStr = totalReels === 1 ? '1 saved reel' : `${totalReels} saved reels`;
     notFound =
       `🔍 No saved posts found for Creator: ${creatorLabel} yet.\n\n` +
-      `They do have ${reelsStr} — reply "reels by ${cmdTarget}" to view ${totalReels === 1 ? 'it' : 'them'}.`;
+      `They do have ${reelsStr}. Reply "reels by ${cmdTarget}" to view ${totalReels === 1 ? 'it' : 'them'}.`;
   } else if (mediaFilter === 'reel') {
     notFound =
       `🔍 No saved reels found for Creator: ${creatorLabel} yet!\n\n` +

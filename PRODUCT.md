@@ -27,8 +27,8 @@ Native Instagram Saved folders do not support caption search, creator filtering,
 ## Operating Context
 
 - **Desktop & Mobile Web**: Hosted on Render (`https://reeler-staging.onrender.com`) and usable on desktop or mobile browsers via private vault links (`?key=...`) or 6-digit login codes (`code`).
-- **Instagram Direct Messages**: `@er_reel_er` handles incoming Reel/Post shares, natural-language reminder scheduling, timezone preferences, creator lookups, vault login codes, and permanent `delete my data` requests via Meta Graph API webhooks.
-- **Data Isolation & Scale**: Built on Supabase PostgreSQL with per-sender scoping (`(instagram_sender_id, shortcode)`), GIN full-text search, and bounded creator directories capable of handling thousands of saved items and creators cleanly.
+- **Instagram Direct Messages**: `@er_reel_er` handles incoming Reel and Post shares (`ig_post` and `ig_reel` share attachments), natural-language reminder scheduling, reshare duplicate detection with reminder updates, cancel/undo commands, creator-scoped management (`clear @[creator]`, `watched @[creator]`), timezone preferences, creator lookups, vault login codes, and permanent `delete my data` requests via Meta Graph API webhooks with zero AI-slop copy.
+- **Data Isolation & Scale**: Built on Supabase PostgreSQL with per-sender scoping (`(instagram_sender_id, shortcode)`), GIN full-text search, and bounded creator directories capable of handling thousands of saved items and creators cleanly. A consolidated `schema.sql` script is maintained at repository root for one-shot local and self-hosted database provisioning.
 
 ## Capabilities and Constraints
 
@@ -44,8 +44,8 @@ Native Instagram Saved folders do not support caption search, creator filtering,
 
 ## Evidence on Hand
 
-- Live Render deployment (`https://reeler-staging.onrender.com`) backed by Supabase PostgreSQL migrations `001` through `014` and Meta Messenger API webhooks for `@er_reel_er`.
-- 6 automated regression test suites (`npm test`) covering archive imports, Meta webhook bot flows, metadata resolution fallbacks, adaptive player geometry, vault auth/OTP, compliance pages, and timezone/duration parsing.
+- Live Render deployment (`https://reeler-staging.onrender.com`) backed by Supabase PostgreSQL migrations `001` through `016`, complete consolidated `schema.sql`, and Meta Messenger API webhooks for `@er_reel_er`.
+- 7 automated regression test suites (`npm test`) covering archive imports, Meta webhook bot flows, metadata resolution fallbacks, adaptive player geometry, vault auth/OTP, compliance pages, timezone/duration parsing, and security/idempotency.
 
 ## Product Principles
 

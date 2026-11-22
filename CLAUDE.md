@@ -114,18 +114,20 @@ src/
    - No database queries in `src/api/router.ts`.
 2. **Database operations belong exclusively in `src/db/repository.ts`.**
    - Never write raw Supabase `.from(...)` queries inside services or route handlers.
-3. **All database changes require a migration file in `supabase/migrations/`:**
+3. **All database changes require a migration file in `supabase/migrations/` AND keeping `schema.sql` updated:**
    - Format: `XXX_<name>.sql` (e.g. `007_user_preferences.sql`).
    - Push migrations using:
      ```bash
      /opt/homebrew/bin/supabase db push --remote
      ```
-   - Always update `src/types.ts` whenever database schema changes.
+   - Always update `src/types.ts` and the root `schema.sql` whenever database schema changes so local self-hosting scripts remain current.
 4. **Duration & Date Parsing:**
    - Always use `src/utils/duration.ts` (`parseDurationOrDateInput`).
    - Never write ad-hoc date/regex parsing in services or route handlers.
 5. **Instagram In-App DM UX Rules:**
    - **Creator Attribution & Native Mention UX**: Meta Graph API DMs in Instagram Mobile natively linkify clean `@username` mentions (e.g. `Creator: @username` or `⏰ Reminder set for @username:`) into tappable profile links. Do NOT append raw profile URLs (`https://www.instagram.com/<username>/` or `👤 Profile:` / `👤 Creator Profile:`) to DM messages. Raw profile URLs wrap across lines in mobile DMs, clutter messages, and trigger unwanted OpenGraph profile preview cards that conflict with or override Reel media card previews.
+   - **Bracketed Handle Guidance & Non-Linking Placeholders**: When showing example command copy in help prompts or UI badges, use `@[creator]` instead of bare `@creator` so Instagram's mobile client does not linkify the placeholder into a real third-party Instagram profile.
+   - **Human Copy Over AI Slop**: Keep bot messages natural, concise, and friendly. Avoid robotic AI dashes (`—` or `--`) in user-facing message strings.
    - **Canonical Media URLs & Type Isolation**: Preserve canonical `/p/` URLs for photo/carousel Posts and `/reel/` (or `/tv/`) URLs for Reels—never rewrite a `/p/` shortcode to `/reel/`. When a creator has both saved Reels and saved Posts, split creator-search DMs into separate `🎬 Latest Reels` and `🖼️ Latest Posts` sections and support explicit `"reels by @username"` / `"posts by @username"` filters.
    - **Human-Readable Reel Labels**: Never expose raw shortcodes (e.g. `Da1iWbSMAOz`) in user-facing DM copy or the frontend UI; identify items by creator handle, media type (`reel` vs `post`), caption snippet, save/send date, or `"your saved reel"` / `"that reel"` based on collection membership.
    - **Saved on IG vs Sent to Bot Integrity**: New DM webhook items MUST set `is_saved_on_instagram = false` and `saved_at = null` (category `'bot'`), preserve existing IG-saved flags/dates when a previously saved item is shared to the bot, never claim an item was bookmarked to Instagram Saved unless `saveMedia` succeeded (`savedOnIg === true`), support full triage/Watch Later/reminder parity on both categories, and automatically promote `'bot'` items (`false -> true`, backfilling archive `saved_at` while preserving `watch_status`, reminders, captions, and `instagram_sender_id`) when a subsequent `saved_posts.json` archive import includes matching shortcodes.
@@ -225,7 +227,7 @@ For implementation, debugging, refactoring, review, and migrations:
 * **Exposing raw Instagram shortcodes (`"ID: ..."`) in user-facing DM replies or UI copy instead of human-readable creator/caption labels**.
 * **Appending raw creator profile URLs (`https://www.instagram.com/<username>/`) to Instagram DM messages (use native `Creator: @username` mentions instead to avoid ugly URL wrapping and redundant OpenGraph profile cards)**.
 * **Reinventing date/duration parsing outside `src/utils/duration.ts`**.
-* **Altering database tables without a corresponding migration in `supabase/migrations/`**.
+* **Altering database tables without a corresponding migration in `supabase/migrations/` and updating the consolidated `schema.sql` in sync**.
 * **Modifying files in `/Users/thismac/rea/`**.
 * **Committing frontend changes (`public/`) without running at minimum `/impeccable critique`, `/impeccable polish`, and `/impeccable harden`**.
 * **Claiming a task or fix is verified without post-edit command/test evidence (per GRAVITAS)**.
