@@ -133,7 +133,7 @@ export function parseDuration(
   let text = rawText
     .toLowerCase()
     .trim()
-    .replace(/^(?:remind\s+(?:me\s+)?(?:in\s+|at\s+|on\s+)?|snooze\s+(?:for\s+|in\s+)?|set\s+reminder\s+(?:for\s+)?|in\s+|on\s+|at\s+)/i, '')
+    .replace(/^(?:remind\s+(?:me\s+)?(?:in\s+|at\s+|on\s+)?|snooze\s+(?:for\s+|in\s+)?|reschedule\s+(?:for\s+|in\s+|to\s+)?|set\s+reminder\s+(?:for\s+)?|in\s+|on\s+|at\s+)/i, '')
     .trim();
 
   // 1. Relative units (e.g. 5s, 34 mins, 5. hours, 5 days, 2 weeks)
@@ -465,4 +465,18 @@ export function parseDurationOrDateInput(input: unknown): Date | null {
 
   return new Date(timestamp);
 }
+
+/**
+ * Compares two ISO date/time strings by parsed millisecond instant rather than exact string equality,
+ * safely handling timezone offsets, sub-second precision, and null/undefined values.
+ */
+export function isSameInstant(a: string | null | undefined, b: string | null | undefined): boolean {
+  const normA = a ?? null;
+  const normB = b ?? null;
+  if (normA === null || normB === null) return normA === normB;
+  const timeA = new Date(normA).getTime();
+  const timeB = new Date(normB).getTime();
+  return !Number.isNaN(timeA) && !Number.isNaN(timeB) && timeA === timeB;
+}
+
 

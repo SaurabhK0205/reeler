@@ -12,6 +12,28 @@ import {
   formatBotHelpMessage,
 } from '../src/utils/reelMessages.ts';
 import { extractCreatorQueryWithFilter, extractCreatorQuery } from '../src/utils/creatorQuery.ts';
+import { isSameInstant, parseDuration } from '../src/utils/duration.ts';
+
+async function withIsolatedMemoryStore<T>(fn: () => Promise<T>): Promise<T> {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const prevAnon = process.env.SUPABASE_ANON_KEY;
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  delete process.env.SUPABASE_ANON_KEY;
+  Repository.resetMemoryStoreForTests();
+  try {
+    return await fn();
+  } finally {
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    else delete process.env.SUPABASE_URL;
+    if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+    else delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (prevAnon !== undefined) process.env.SUPABASE_ANON_KEY = prevAnon;
+    else delete process.env.SUPABASE_ANON_KEY;
+    Repository.resetMemoryStoreForTests();
+  }
+}
 
 test('MetaInstagramBotService - splitMessageIntoChunks handles short and empty text', () => {
   const service = new MetaInstagramBotService();
@@ -4072,7 +4094,11 @@ test('MetaInstagramBotService - reshares distinguish active Watch Later items ("
 
     assert.strictEqual(sentMessages.length, 1);
     assert.ok(sentMessages[0].text.includes('🎬 Already added to your Watch Later!'), `Got: ${sentMessages[0].text}`);
-    assert.ok(sentMessages[0].text.includes('When should I remind you to watch this?'));
+    assert.ok(
+      sentMessages[0].text.includes('No active reminder is set for this item') ||
+      sentMessages[0].text.includes('Reminder is currently set for:'),
+      `Got: ${sentMessages[0].text}`
+    );
 
     // Responding to the prompt with a time updates the reminder
     sentMessages.length = 0;
@@ -4474,4 +4500,782 @@ test('MetaInstagramBotService distinguishes existing users from first-time users
   assert.strictEqual(replies.length, 1);
   assert.ok(replies[0].includes("I didn't recognize that command"), `Expected unrecognized notice, got: ${replies[0]}`);
   assert.ok(!replies[0].includes('Welcome to Reeler! Your Reels & Posts Vault.'), 'Active user must not receive welcome greeting');
+});
+
+test('MetaInstagramBotService - Path A: reshares preserve scheduled reminder time, display current time, and allow duration updates', async () => {
+  await withIsolatedMemoryStore(async () => {
+  const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+  const replies: string[] = [];
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    replies.push(text);
+    return true;
+  };
+
+  const senderId = 'sender_path_a_test';
+  await Repository.setSenderTimezone(senderId, 'Asia/Kolkata');
+
+  const creator = await Repository.upsertCreator({
+    instagram_user_id: 'wb_india_123',
+    username: 'warnerbrosindia',
+    display_name: 'Warner Bros India',
+  });
+
+  const scheduledIso = new Date(Date.now() + 3600 * 1000 * 5).toISOString(); // 5 hours in future
+  const reel = await Repository.upsertSavedReel({
+    instagram_media_id: 'wb_post_dune_123',
+    shortcode: 'DuneWB123',
+    reel_url: 'https://www.instagram.com/p/DuneWB123/',
+    media_type: 'post',
+    creator_id: creator.id,
+    taken_at: new Date().toISOString(),
+    first_detected_at: new Date().toISOString(),
+    save_order_rank: 1,
+    watch_status: 'watch_later',
+    reminder_interval_seconds: 18000,
+    next_reminder_at: scheduledIso,
+    awaiting_reminder_choice_until: null,
+    instagram_sender_id: senderId,
+  });
+
+  // User reshares the exact post without duration in text
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: senderId },
+            message: {
+              text: 'https://www.instagram.com/p/DuneWB123/',
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('🖼️ Already added to your Watch Later!'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('warnerbrosindia'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('⏰ Reminder is currently set for:'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('Reply with a new time'), `Got: ${replies[0]}`);
+
+  // Crucial check: schedule MUST be preserved and not wiped or reset to 10h from now!
+  const reelAfterReshare = await Repository.getSavedItemById(reel!.id);
+  assert.strictEqual(reelAfterReshare?.next_reminder_at, scheduledIso);
+  assert.strictEqual(reelAfterReshare?.awaiting_reminder_choice_until, null);
+
+  // Now user replies with new duration "2h"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: senderId },
+            message: {
+              text: '2h',
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for: 2 hours'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('warnerbrosindia'), `Got: ${replies[0]}`);
+
+  const reelAfterUpdate = await Repository.getSavedItemById(reel!.id);
+  assert.strictEqual(reelAfterUpdate?.reminder_interval_seconds, 7200);
+  });
+});
+
+test('MetaInstagramBotService - Path A: reshares of item without active reminder inform user and allow setting one', async () => {
+  await withIsolatedMemoryStore(async () => {
+  const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+  const replies: string[] = [];
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    replies.push(text);
+    return true;
+  };
+
+  const senderId = 'sender_path_a_no_rem';
+  const creator = await Repository.upsertCreator({
+    instagram_user_id: 'creator_no_rem_1',
+    username: 'peaceful_creator',
+  });
+
+  const reel = await Repository.upsertSavedReel({
+    instagram_media_id: 'peaceful_post_1',
+    shortcode: 'Peaceful1',
+    reel_url: 'https://www.instagram.com/reel/Peaceful1/',
+    media_type: 'reel',
+    creator_id: creator.id,
+    taken_at: new Date().toISOString(),
+    first_detected_at: new Date().toISOString(),
+    save_order_rank: 1,
+    watch_status: 'watch_later',
+    next_reminder_at: null,
+    awaiting_reminder_choice_until: null,
+    instagram_sender_id: senderId,
+  });
+
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: senderId },
+            message: {
+              text: 'https://www.instagram.com/reel/Peaceful1/',
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('🎬 Already added to your Watch Later!'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('⏰ No active reminder is set for this item.'), `Got: ${replies[0]}`);
+
+  // User sets duration to "30m"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: senderId },
+            message: {
+              text: '30m',
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder set for') || replies[0].includes('⏰ Reminder updated for'), `Got: ${replies[0]}`);
+  const reelAfter = await Repository.getSavedItemById(reel!.id);
+  assert.strictEqual(reelAfter?.reminder_interval_seconds, 1800);
+  });
+});
+
+test('MetaInstagramBotService - Path B: creator-targeted reminder update commands', async () => {
+  await withIsolatedMemoryStore(async () => {
+  const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+  const replies: string[] = [];
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    replies.push(text);
+    return true;
+  };
+
+  const senderId = 'sender_path_b_test';
+  await Repository.setSenderTimezone(senderId, 'Asia/Kolkata');
+
+  const wbCreator = await Repository.upsertCreator({
+    instagram_user_id: 'wb_user_456',
+    username: 'warnerbrosindia',
+  });
+  const marvelCreator = await Repository.upsertCreator({
+    instagram_user_id: 'marvel_user_789',
+    username: 'marvelstudios',
+  });
+
+  const wbReel = await Repository.upsertSavedReel({
+    instagram_media_id: 'wb_reel_456',
+    shortcode: 'DWB456',
+    reel_url: 'https://www.instagram.com/reel/DWB456/',
+    creator_id: wbCreator.id,
+    taken_at: new Date().toISOString(),
+    first_detected_at: new Date().toISOString(),
+    save_order_rank: 1,
+    watch_status: 'watch_later',
+    instagram_sender_id: senderId,
+  });
+
+  const marvelReel = await Repository.upsertSavedReel({
+    instagram_media_id: 'marvel_reel_789',
+    shortcode: 'DMarvel789',
+    reel_url: 'https://www.instagram.com/reel/DMarvel789/',
+    creator_id: marvelCreator.id,
+    taken_at: new Date().toISOString(),
+    first_detected_at: new Date().toISOString(),
+    save_order_rank: 2,
+    watch_status: 'watch_later',
+    instagram_sender_id: senderId,
+  });
+
+  // 1. "remind @warnerbrosindia in 2h"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'remind @warnerbrosindia in 2h' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for: 2 hours'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('warnerbrosindia'), `Got: ${replies[0]}`);
+  const freshWb = await Repository.getSavedItemById(wbReel!.id);
+  assert.strictEqual(freshWb?.reminder_interval_seconds, 7200);
+
+  // 2. "update reminder for @[marvelstudios] to 4h"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'update reminder for @[marvelstudios] to 4h' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for: 4 hours'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('marvelstudios'), `Got: ${replies[0]}`);
+  const freshMarvel = await Repository.getSavedItemById(marvelReel!.id);
+  assert.strictEqual(freshMarvel?.reminder_interval_seconds, 14400);
+
+  // 3. "snooze @warnerbrosindia 1h"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'snooze @warnerbrosindia 1h' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for: 1 hour'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('warnerbrosindia'), `Got: ${replies[0]}`);
+
+  // 4. "snooze 30m for @marvelstudios"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'snooze 30m for @marvelstudios' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for: 30 minutes'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('marvelstudios'), `Got: ${replies[0]}`);
+
+  // 5. Creator not found in Watch Later
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'remind @nonexistent_user in 2h' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('Could not find an active Watch Later reel from @nonexistent_user'), `Got: ${replies[0]}`);
+
+  // 6. Invalid handle
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'remind @invalid..handle in 2h' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('Could not find a valid creator handle'), `Got: ${replies[0]}`);
+
+  // 7. Invalid duration
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'update reminder for @warnerbrosindia to not_a_time' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('Could not understand reminder time'), `Got: ${replies[0]}`);
+
+  // 8. Bare creator target with temporal token like "update warnerbrosindia tomorrow"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'update warnerbrosindia tomorrow' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for:'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('warnerbrosindia'), `Got: ${replies[0]}`);
+
+  // 9. "reschedule @warnerbrosindia tomorrow"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'reschedule @warnerbrosindia tomorrow' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for:'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('warnerbrosindia'), `Got: ${replies[0]}`);
+
+  // 10. "reschedule 45m for @marvelstudios"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'reschedule 45m for @marvelstudios' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for: 45 minutes'), `Got: ${replies[0]}`);
+  assert.ok(replies[0].includes('marvelstudios'), `Got: ${replies[0]}`);
+
+  // 11. Malformed explicit creator target like "@bad-name" must not fall through to generic duration
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'update @bad-name tomorrow' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('Could not find a valid creator handle'), `Got: ${replies[0]}`);
+
+  // 12. Unsigned temporal word "reschedule next monday" falls through to generic duration rather than targeting @next
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'reschedule next monday' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder set for') || replies[0].includes('⏰ Reminder updated for'), `Got: ${replies[0]}`);
+  assert.ok(!replies[0].includes('Could not find an active Watch Later reel from @next'), `Should not target @next, got: ${replies[0]}`);
+
+  // 13. Explicit "@next" targets the creator @next
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'reschedule @next tomorrow' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('Could not find an active Watch Later reel from @next'), `Got: ${replies[0]}`);
+  });
+});
+
+test('MetaInstagramBotService prioritizes reshared item over older awaiting item when duration is replied', async () => {
+  await withIsolatedMemoryStore(async () => {
+  const bot = new MetaInstagramBotService();
+  const senderId = 'sender_reshare_priority';
+  const replies: string[] = [];
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    replies.push(text);
+    return true;
+  };
+
+  // Creator 1 & Reel A (awaiting choice)
+  const creatorA = await Repository.upsertCreator({ instagram_user_id: 'ig_a', username: 'creator_a', display_name: 'Creator A' });
+  const itemA = await Repository.upsertSavedReel({
+    instagram_media_id: 'mid_a',
+    shortcode: 'ItemA_Shortcode',
+    reel_url: 'https://www.instagram.com/reel/ItemA_Shortcode/',
+    creator_id: creatorA.id,
+    caption: 'Reel A awaiting choice',
+    taken_at: '2026-11-20T10:00:00Z',
+    first_detected_at: '2026-11-20T10:00:00Z',
+    save_order_rank: 1,
+    watch_status: 'watch_later',
+    instagram_sender_id: senderId,
+    awaiting_reminder_choice_until: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+  });
+
+  // Creator 2 & Reel B (already scheduled in Watch Later)
+  const creatorB = await Repository.upsertCreator({ instagram_user_id: 'ig_b', username: 'creator_b', display_name: 'Creator B' });
+  const itemB = await Repository.upsertSavedReel({
+    instagram_media_id: 'mid_b',
+    shortcode: 'ItemB_Shortcode',
+    reel_url: 'https://www.instagram.com/reel/ItemB_Shortcode/',
+    creator_id: creatorB.id,
+    caption: 'Reel B already scheduled',
+    taken_at: '2026-11-20T11:00:00Z',
+    first_detected_at: '2026-11-20T11:00:00Z',
+    save_order_rank: 2,
+    watch_status: 'watch_later',
+    instagram_sender_id: senderId,
+    next_reminder_at: new Date(Date.now() + 5 * 3600 * 1000).toISOString(),
+    reminder_interval_seconds: 18000,
+  });
+
+  // User reshares Reel B
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          { sender: { id: senderId }, message: { text: 'https://www.instagram.com/reel/ItemB_Shortcode/' } },
+        ],
+      },
+    ],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('Already added to your Watch Later!'), `Got: ${replies[0]}`);
+
+  // User replies "2h" to update the reshared reel's reminder
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          { sender: { id: senderId }, message: { text: '2h' } },
+        ],
+      },
+    ],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for: 2 hours'), `Got: ${replies[0]}`);
+
+  // Reel B must be updated to 2h (7200s)
+  const freshB = await Repository.getSavedItemById(itemB!.id);
+  assert.strictEqual(freshB?.reminder_interval_seconds, 7200);
+
+  // Reel A must NOT be affected and still await its choice
+  const freshA = await Repository.getSavedItemById(itemA!.id);
+  assert.ok(freshA?.awaiting_reminder_choice_until !== null);
+  assert.strictEqual(freshA?.reminder_interval_seconds, undefined);
+  });
+});
+
+test('MetaInstagramBotService - attributes unattributed Watch Later items when user sends targeted update command', async () => {
+  await withIsolatedMemoryStore(async () => {
+  const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+  const replies: string[] = [];
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    replies.push(text);
+    return true;
+  };
+
+  const senderId = 'sender_unattributed_test';
+  await Repository.setSenderTimezone(senderId, 'Asia/Kolkata');
+
+  // Create an unattributed post (e.g. from an ig_post share where public metadata was unavailable)
+  const placeholderCreator = await Repository.upsertCreator({
+    instagram_user_id: 'creator_unattributed_18120410743994731',
+    username: 'Instagram Creator',
+    display_name: 'Instagram Creator',
+  });
+
+  const post = await Repository.upsertSavedReel({
+    instagram_media_id: `dm_${senderId}_18120410743994731`,
+    shortcode: '18120410743994731',
+    reel_url: 'https://www.instagram.com/p/18120410743994731/',
+    creator_id: placeholderCreator.id,
+    caption: 'Relive the journey before you experience the epic conclusion. #DuneMovie',
+    taken_at: new Date().toISOString(),
+    first_detected_at: new Date().toISOString(),
+    save_order_rank: 1,
+    watch_status: 'watch_later',
+    instagram_sender_id: senderId,
+    media_type: 'post',
+  });
+
+  // User sends "Update @warnerbrosindia tomorrow 10 am"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: senderId },
+            message: { text: 'Update @warnerbrosindia tomorrow 10 am' },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for: Tomorrow'), `Expected confirmation, got: ${replies[0]}`);
+  assert.ok(replies[0].includes('warnerbrosindia'), `Expected attribution to @warnerbrosindia, got: ${replies[0]}`);
+
+  // Database must now have the post re-attributed to warnerbrosindia
+  const freshPost = await Repository.getSavedItemById(post!.id);
+  assert.ok(freshPost, 'Post must exist');
+  assert.strictEqual(freshPost.creator?.username, 'warnerbrosindia');
+  assert.ok(freshPost.next_reminder_at !== null);
+  const expectedInstant = parseDuration('tomorrow 10 am', new Date(), 'Asia/Kolkata');
+  assert.ok(expectedInstant && isSameInstant(freshPost.next_reminder_at, expectedInstant.targetDate.toISOString()));
+
+  // Subsequent creator-scoped command like "watched @warnerbrosindia" must now find and mark it watched
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: senderId },
+            message: { text: 'watched @warnerbrosindia' },
+          },
+        ],
+      },
+    ],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('Marked 1 item(s) by @warnerbrosindia as watched'), `Got: ${replies[0]}`);
+  const watchedPost = await Repository.getSavedItemById(post!.id);
+  assert.strictEqual(watchedPost?.watch_status, 'watched');
+  });
+});
+
+test('MetaInstagramBotService - targeted update command flushes pending debounce share prompt', async (t) => {
+  await withIsolatedMemoryStore(async () => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 60 });
+    const replies: string[] = [];
+    bot.sendDirectMessage = async (_: string, text: string) => {
+      replies.push(text);
+      return true;
+    };
+
+    const senderId = 'sender_debounce_targeted_test';
+    await Repository.setSenderTimezone(senderId, 'Asia/Kolkata');
+
+    const creatorA = await Repository.upsertCreator({
+      instagram_user_id: 'creator_a',
+      username: 'creator_alpha',
+    });
+    const itemA = await Repository.upsertSavedReel({
+      instagram_media_id: 'dm_creator_a_1',
+      shortcode: 'ShortcodeA1',
+      reel_url: 'https://www.instagram.com/reel/ShortcodeA1/',
+      creator_id: creatorA.id,
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 1,
+      watch_status: 'watch_later',
+      instagram_sender_id: senderId,
+    });
+
+    // Step 1: Share a new reel with debounce active
+    t.mock.method(globalThis, 'fetch', async () => new Response('', { status: 404 }));
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: senderId },
+              message: {
+                attachments: [
+                  {
+                    type: 'share',
+                    payload: { url: 'https://www.instagram.com/reel/ShortcodeNew/' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    // Verify pendingSharePrompts contains an entry for sender before targeted update
+    assert.ok((bot as any).pendingSharePrompts.has(senderId));
+
+    // While debounce prompt is pending, user sends a targeted update command for creator_alpha
+    replies.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: senderId },
+              message: { text: 'update @creator_alpha 2h' },
+            },
+          ],
+        },
+      ],
+    });
+
+    // The targeted update should have been processed for creator_alpha, not hijacked by the pending share
+    assert.ok(replies.some((r) => r.includes('⏰ Reminder updated for: 2 hours') && r.includes('creator_alpha')), `Replies: ${JSON.stringify(replies)}`);
+
+    const freshA = await Repository.getSavedItemById(itemA!.id);
+    assert.strictEqual(freshA?.reminder_interval_seconds, 7200);
+
+    // The newly shared reel should not have received the 2-hour schedule
+    const newReel = await Repository.getSavedItemByShortcode('ShortcodeNew', senderId);
+    assert.notStrictEqual(newReel?.reminder_interval_seconds, 7200);
+
+    bot.clearTimersForTesting();
+  });
+});
+
+test('MetaInstagramBotService - targeted update attributes unattributed reel atomically with CAS schedule update', async () => {
+  await withIsolatedMemoryStore(async () => {
+    const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+    const replies: string[] = [];
+    bot.sendDirectMessage = async (_: string, text: string) => {
+      replies.push(text);
+      return true;
+    };
+
+    const senderId = 'sender_unattributed_target_test';
+    await Repository.setSenderTimezone(senderId, 'Asia/Kolkata');
+
+    // Create an unattributed item in Watch Later for this sender
+    const placeholderCreator = await Repository.upsertCreator({
+      instagram_user_id: 'creator_unattributed_media123',
+      username: 'creator_unattributed_media123',
+      display_name: 'Instagram Creator',
+    });
+    const unattributedItem = await Repository.upsertSavedReel({
+      instagram_media_id: 'media_dm_post_123',
+      shortcode: 'DunePost123',
+      reel_url: 'https://www.instagram.com/p/DunePost123/',
+      creator_id: placeholderCreator.id,
+      caption: 'Relive the journey before you experience the epic conclusion.',
+      taken_at: new Date().toISOString(),
+      first_detected_at: new Date().toISOString(),
+      save_order_rank: 1,
+      watch_status: 'watch_later',
+      instagram_sender_id: senderId,
+      next_reminder_at: new Date(Date.now() + 36000000).toISOString(),
+    });
+    assert.ok(unattributedItem);
+
+    // User sends "Update @warnerbrosindia tomorrow 10 am"
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            {
+              sender: { id: senderId },
+              message: { text: 'Update @warnerbrosindia tomorrow 10 am' },
+            },
+          ],
+        },
+      ],
+    });
+
+    // Bot should reply that reminder was updated for warnerbrosindia
+    assert.ok(
+      replies.some((r) => r.includes('Reminder updated for:') && r.includes('warnerbrosindia')),
+      `Expected success reply with warnerbrosindia. Got: ${JSON.stringify(replies)}`
+    );
+
+    // Item in database must now be attributed to warnerbrosindia
+    const updatedItem = await Repository.getSavedItemById(unattributedItem.id);
+    assert.strictEqual(updatedItem?.creator?.username, 'warnerbrosindia');
+    assert.strictEqual(updatedItem?.watch_status, 'watch_later');
+  });
+});
+
+test('Repository.updateReminderSchedule - atomically updates creator_id and preserves old creator if CAS fails', async () => {
+  await withIsolatedMemoryStore(async () => {
+    const oldCreator = await Repository.upsertCreator({
+      instagram_user_id: 'creator_old_cas',
+      username: 'old_creator',
+    });
+    const newCreator = await Repository.upsertCreator({
+      instagram_user_id: 'creator_new_cas',
+      username: 'new_creator',
+    });
+    const reel = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_cas_creator_test',
+      shortcode: 'CasReel1',
+      reel_url: 'https://instagram.com/reel/CasReel1/',
+      creator_id: oldCreator.id,
+      instagram_sender_id: 'cas_sender',
+      watch_status: 'watch_later',
+      next_reminder_at: '2026-11-21T12:00:00Z',
+    });
+    assert.ok(reel);
+
+    // CAS mismatch on expectedNextReminderAt: should return false and NOT update creator_id
+    const failedCas = await Repository.updateReminderSchedule(
+      reel.id,
+      '2026-11-21T18:00:00Z',
+      3600,
+      {
+        expectedNextReminderAt: '2026-11-21T10:00:00Z', // wrong timestamp
+        newCreatorId: newCreator.id,
+      }
+    );
+    assert.strictEqual(failedCas, false);
+
+    const unmodifiedReel = await Repository.getSavedItemById(reel.id);
+    assert.strictEqual(unmodifiedReel?.creator_id, oldCreator.id);
+
+    // Matching CAS: should return true and update creator_id atomically
+    const successCas = await Repository.updateReminderSchedule(
+      reel.id,
+      '2026-11-21T18:00:00Z',
+      3600,
+      {
+        expectedNextReminderAt: '2026-11-21T12:00:00Z',
+        newCreatorId: newCreator.id,
+      }
+    );
+    assert.strictEqual(successCas, true);
+
+    const modifiedReel = await Repository.getSavedItemById(reel.id);
+    assert.strictEqual(modifiedReel?.creator_id, newCreator.id);
+  });
+});
+
+test('MetaInstagramBotService - reminder confirmation retry captures committed next_reminder_at and redelivers unsent reply', async () => {
+  await withIsolatedMemoryStore(async () => {
+    const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+    const senderId = 'sender_confirmation_retry_test';
+    await Repository.setSenderTimezone(senderId, 'Asia/Kolkata');
+
+    const creator = await Repository.upsertCreator({
+      instagram_user_id: 'creator_retry_test',
+      username: 'retry_creator',
+    });
+    const item = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_retry_test',
+      shortcode: 'RetryReel1',
+      reel_url: 'https://instagram.com/reel/RetryReel1/',
+      creator_id: creator.id,
+      instagram_sender_id: senderId,
+      watch_status: 'watch_later',
+      next_reminder_at: '2026-11-21T12:00:00Z',
+      awaiting_reminder_choice_until: null,
+    });
+    assert.ok(item);
+
+    let attempt = 0;
+    const deliveredReplies: string[] = [];
+    bot.sendDirectMessage = async (_: string, text: string) => {
+      attempt++;
+      if (attempt === 1) {
+        // First attempt fails sending DM
+        return false;
+      }
+      deliveredReplies.push(text);
+      return true;
+    };
+
+    const opId = 'mid.duration_retry_test_1';
+    // Send duration command "2h"
+    await bot.dispatchWebhookMessage(
+      senderId,
+      opId,
+      '2h',
+      undefined,
+      'test_source',
+      0,
+      opId
+    );
+
+    // Initial attempt failed DM delivery, but committed reminder schedule
+    const updatedItem = await Repository.getSavedItemById(item.id);
+    assert.strictEqual(updatedItem?.reminder_interval_seconds, 7200);
+
+    // Internal retry executes for the pending reply
+    await bot.dispatchWebhookMessage(
+      senderId,
+      opId,
+      '2h',
+      undefined,
+      'internal_retry',
+      1,
+      opId
+    );
+
+    // The confirmation message should have been redelivered successfully, not discarded
+    assert.strictEqual(deliveredReplies.length, 1);
+    assert.ok(
+      deliveredReplies[0].includes('2 hours') &&
+        (deliveredReplies[0].includes('Reminder set for') || deliveredReplies[0].includes('Reminder updated for')),
+      `Delivered reply: ${deliveredReplies[0]}`
+    );
+  });
 });

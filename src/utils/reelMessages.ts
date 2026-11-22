@@ -1,6 +1,12 @@
 import type { Creator, SavedMediaType, SavedReel } from '../types.ts';
 import type { CreatorMediaFilter } from './creatorQuery.ts';
-import { extractCreatorQuery } from './creatorQuery.ts';
+import {
+  extractCreatorQuery,
+  isDurationShortcut,
+  isPlausibleInstagramHandle,
+  RESERVED_WORDS,
+} from './creatorQuery.ts';
+import { parseDuration } from './duration.ts';
 import { classifySavedMediaType } from './mediaType.ts';
 
 const INSTAGRAM_HANDLE_REGEX = /^[a-zA-Z0-9._]{1,30}$/;
@@ -167,6 +173,115 @@ export function parseTargetedWatchedCommand(text: string): TargetedWatchedComman
   return null;
 }
 
+export interface TargetedReminderUpdateCommand {
+  targetCreator?: string;
+  duration?: ReturnType<typeof parseDuration>;
+  durationText?: string;
+  invalidCreatorTarget?: string;
+  invalidDurationText?: string;
+}
+
+const PREPOSITIONS_SET = new Set([
+  'in', 'at', 'on', 'for', 'to', 'by', 'from', 'about', 'with', 'of', 'the', 'a', 'an',
+]);
+
+const MONTH_NAMES = new Set([
+  'january', 'february', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december',
+  'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'sept', 'oct', 'nov', 'dec',
+]);
+
+function cleanCreatorCandidate(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^[@<(\[]+/, '')
+    .replace(/[>)\]]+$/, '')
+    .trim()
+    .toLowerCase();
+}
+
+function resolveTargetCreatorCandidate(rawCreator: string): { targetCreator?: string; invalidCreatorTarget?: string } | null {
+  const trimmed = rawCreator.trim();
+  const hasCreatorSigil = trimmed.startsWith('@') || trimmed.startsWith('[') || trimmed.startsWith('<');
+  if (hasCreatorSigil) {
+    const extracted = extractCreatorQuery(trimmed);
+    if (!extracted) {
+      return { invalidCreatorTarget: trimmed };
+    }
+    return { targetCreator: extracted };
+  }
+
+  const cleaned = cleanCreatorCandidate(trimmed);
+  if (
+    PREPOSITIONS_SET.has(cleaned) ||
+    RESERVED_WORDS.has(cleaned) ||
+    MONTH_NAMES.has(cleaned) ||
+    isDurationShortcut(cleaned) ||
+    !isPlausibleInstagramHandle(cleaned)
+  ) {
+    return null;
+  }
+  return { targetCreator: cleaned };
+}
+
+/**
+ * Parses targeted reminder update / reschedule / snooze commands for a specific creator:
+ * e.g. "remind @creator in 2h", "remind @[creator] 2h", "update reminder for @creator to 2h",
+ * "update @creator 5pm", "snooze @creator 1h", "snooze 1h for @creator".
+ */
+export function parseTargetedReminderUpdateCommand(
+  text: string,
+  refDate: Date = new Date(),
+  senderTz?: string
+): TargetedReminderUpdateCommand | null {
+  const lower = String(text || '').toLowerCase().trim();
+  if (!lower) return null;
+
+  // Pattern 1 (Duration first, creator after):
+  // e.g. "snooze 1h for @creator", "remind in 2h for @creator", "remind me in 2h about @creator", "reschedule 2h for @creator"
+  const p1 = lower.match(
+    /^(?:remind(?:\s+me)?|snooze|update(?:\s+reminders?)?|reschedule(?:\s+reminders?)?)\s+(.+?)\s+(?:for|about|of|on)\s+(@?\S+)$/i
+  );
+  if (p1) {
+    const rawDur = p1[1].trim();
+    const rawCreator = p1[2].trim();
+    const candidate = resolveTargetCreatorCandidate(rawCreator);
+    if (candidate) {
+      if (candidate.invalidCreatorTarget) {
+        return { invalidCreatorTarget: candidate.invalidCreatorTarget, durationText: rawDur };
+      }
+      const dur = parseDuration(rawDur, refDate, senderTz);
+      if (!dur) {
+        return { targetCreator: candidate.targetCreator, invalidDurationText: rawDur };
+      }
+      return { targetCreator: candidate.targetCreator, duration: dur, durationText: rawDur };
+    }
+  }
+
+  // Pattern 2 (Creator first, duration after):
+  // e.g. "remind @creator in 2h", "update reminder for @creator to 2h", "snooze @creator 1h", "reschedule @creator tomorrow"
+  const p2 = lower.match(
+    /^(?:remind(?:\s+me)?(?:\s+(?:about|for|of))?|update(?:\s+reminders?(?:\s+(?:for|of|on))?)?|change(?:\s+reminders?(?:\s+(?:for|of|on))?)?|snooze(?:\s+reminders?(?:\s+(?:for|of|on))?)?|reschedule(?:\s+reminders?(?:\s+(?:for|of|on))?)?)\s+(@?\S+)\s+(?:(?:to|in|at|for)\s+)?(.+)$/i
+  );
+  if (p2) {
+    const rawCreator = p2[1].trim();
+    const rawDur = p2[2].trim().replace(/[.!?,;:~]+$/, '');
+    const candidate = resolveTargetCreatorCandidate(rawCreator);
+    if (candidate) {
+      if (candidate.invalidCreatorTarget) {
+        return { invalidCreatorTarget: candidate.invalidCreatorTarget, durationText: rawDur };
+      }
+      const dur = parseDuration(rawDur, refDate, senderTz);
+      if (!dur) {
+        return { targetCreator: candidate.targetCreator, invalidDurationText: rawDur };
+      }
+      return { targetCreator: candidate.targetCreator, duration: dur, durationText: rawDur };
+    }
+  }
+
+  return null;
+}
+
 /**
  * Detects common casual greetings, help, and instruction queries.
  */
@@ -204,8 +319,8 @@ export function formatBotHelpMessage(): string {
     `⏰ Manage Reminders & Watch Later\n` +
     `• "watched" or "done": Mark latest reminder as watched.\n` +
     `• "cancel" or "undo": Remove recently added item if sent by mistake.\n` +
-    `• "cancel reminder": Stop alarms but keep item in Watch Later.\n` +
-    `• "clear @[creator]" / "watched @[creator]": Manage items by creator.\n` +
+    `• "cancel reminder": Stop alerts but keep in Watch Later.\n` +
+    `• "update @[creator] 2h" / "watched @[creator]": Manage by creator.\n` +
     `• "stop all": Mark all items as watched & clear active reminders.\n\n` +
     `🔍 Search & Web Vault\n` +
     `• "@[creator]" or "reels by @[creator]": View your saved items.\n` +
@@ -307,6 +422,19 @@ export function extractPublicCreatorUsername(
     return null;
   }
   return raw;
+}
+
+/**
+ * Checks whether a creator reference is an unattributed placeholder (e.g. 'Instagram Creator')
+ * or lacks a valid public Instagram username.
+ */
+export function isPlaceholderCreator(
+  creator?: Pick<Creator, 'username' | 'display_name'> | null
+): boolean {
+  if (!creator) return true;
+  const externalId = String((creator as any).instagram_user_id || '').trim();
+  if (externalId.startsWith('creator_unattributed_')) return true;
+  return !extractPublicCreatorUsername(creator);
 }
 
 /**
