@@ -153,11 +153,9 @@ test('reelMessages - clickable creator profile URL & Reel preview priority', asy
   });
 
   const reelUrlIndex = reminderText.indexOf('https://www.instagram.com/reel/Dfi55BqRIxb/');
-  const profileUrlIndex = reminderText.indexOf('https://www.instagram.com/lookingforgame/');
   assert.ok(reelUrlIndex !== -1, 'Reminder must contain Reel URL');
-  assert.ok(profileUrlIndex !== -1, 'Reminder must contain clickable Creator Profile URL');
-  assert.ok(reelUrlIndex < profileUrlIndex, 'Reel URL MUST appear before Creator Profile URL to preserve Reel card preview');
-  assert.ok(reminderText.includes('@lookingforgame'));
+  assert.ok(!reminderText.includes('https://www.instagram.com/lookingforgame/'), 'Reminder must not contain raw profile URL to avoid duplicate preview cards');
+  assert.ok(reminderText.includes('Creator: @lookingforgame'), 'Reminder must contain clean Creator: @username for native tap support');
   assert.ok(reminderText.length <= 950, `Reminder length ${reminderText.length} exceeds safe DM limit`);
 
   const placeholderReminder = formatWatchLaterReminderMessage({
@@ -190,7 +188,7 @@ test('reelMessages - clickable creator profile URL & Reel preview priority', asy
     'today at 10:10:55 AM'
   );
   assert.ok(setReply.includes('@lookingforgame'));
-  assert.ok(setReply.includes('https://www.instagram.com/lookingforgame/'));
+  assert.ok(!setReply.includes('https://www.instagram.com/lookingforgame/'), 'Reminder set DM must omit raw profile URL');
 
   const searchCopy = formatCreatorSearchMessages({
     username: 'lookingforgame',
@@ -198,9 +196,10 @@ test('reelMessages - clickable creator profile URL & Reel preview priority', asy
     totalCount: 8,
     limit: 5,
   });
-  assert.ok(searchCopy.header.includes('https://www.instagram.com/lookingforgame/'));
-  assert.ok(searchCopy.footer.includes('https://www.instagram.com/lookingforgame/'));
-  assert.ok(searchCopy.notFound.includes('https://www.instagram.com/lookingforgame/'));
+  assert.ok(searchCopy.header.includes('Creator: @lookingforgame'));
+  assert.ok(!searchCopy.header.includes('https://www.instagram.com/lookingforgame/'), 'Search header must omit raw profile URL');
+  assert.ok(!searchCopy.footer.includes('https://www.instagram.com/lookingforgame/'), 'Search footer must omit raw profile URL');
+  assert.ok(!searchCopy.notFound.includes('https://www.instagram.com/lookingforgame/'), 'Search notFound must omit raw profile URL');
 });
 
 test('reelMessages - confirmation messages never expose shortcodes & split UTF-16 surrogates safely', async () => {
@@ -482,9 +481,9 @@ test('Repository + MetaInstagramBotService - marks most recently reminded reel i
     });
     assert.strictEqual(sentMessages.length, 4);
     assert.ok(sentMessages[3].text.includes('@lookingforgame'));
-    assert.ok(sentMessages[3].text.includes('https://www.instagram.com/lookingforgame/'));
+    assert.ok(!sentMessages[3].text.includes('https://www.instagram.com/lookingforgame/'));
 
-    // 5. Creator query DM includes clickable profile link cleanly
+    // 5. Creator query DM includes clean native @handle
     await bot.handleWebhookPayload({
       object: 'instagram',
       entry: [
@@ -499,7 +498,8 @@ test('Repository + MetaInstagramBotService - marks most recently reminded reel i
       ],
     });
     assert.ok(sentMessages.length >= 6);
-    assert.ok(sentMessages[4].text.includes('https://www.instagram.com/lookingforgame/'));
+    assert.ok(sentMessages[4].text.includes('Creator: @lookingforgame'));
+    assert.ok(!sentMessages[4].text.includes('https://www.instagram.com/lookingforgame/'));
     assert.strictEqual(sentMessages[5].text, 'https://www.instagram.com/reel/Dfi55BqRIxb/');
 
     Repository.resetMemoryStoreForTests();
@@ -868,12 +868,10 @@ test('MetaInstagramBotService isolates /p/ posts vs /reel/ reels across save, re
 
     assert.strictEqual(sentMessages.length, 3);
     const reminderText = sentMessages[2].text;
-    assert.ok(reminderText.includes('🖼️ @the_political_compass'), `Got: ${reminderText}`);
+    assert.ok(reminderText.includes('Creator: @the_political_compass'), `Got: ${reminderText}`);
     assert.ok(reminderText.includes('👉 View Post: https://www.instagram.com/p/DS1goOmjhUi/'), `Got: ${reminderText}`);
     assert.ok(!reminderText.includes('/reel/DS1goOmjhUi/'), `Must never rewrite /p/ to /reel/: ${reminderText}`);
-    const postUrlIdx = reminderText.indexOf('https://www.instagram.com/p/DS1goOmjhUi/');
-    const profileUrlIdx = reminderText.indexOf('https://www.instagram.com/the_political_compass/');
-    assert.ok(postUrlIdx > 0 && profileUrlIdx > postUrlIdx, 'Post URL must appear before creator profile URL');
+    assert.ok(!reminderText.includes('https://www.instagram.com/the_political_compass/'), 'Must not include raw profile URL');
 
     // 3. Mark watched and verify post-specific confirmation wording
     await bot.handleWebhookPayload({
