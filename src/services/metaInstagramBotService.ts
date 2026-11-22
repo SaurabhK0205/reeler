@@ -836,6 +836,29 @@ export class MetaInstagramBotService {
   }
 
   /**
+   * Attempts to query Meta's Graph API for a canonical permalink from an Instagram Media ID.
+   * If Graph API lacks permissions (e.g. arbitrary third-party posts), returns null to allow graceful fallback.
+   */
+  async resolveMediaPermalinkFromId(mediaId: string): Promise<string | null> {
+    if (!this.accessToken || !mediaId) return null;
+    try {
+      const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(mediaId)}?fields=permalink,shortcode&access_token=${encodeURIComponent(this.accessToken)}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+      if (!res.ok) return null;
+      const data = (await res.json()) as any;
+      if (typeof data?.permalink === 'string' && data.permalink.trim()) {
+        return data.permalink.trim();
+      }
+      if (typeof data?.shortcode === 'string' && data.shortcode.trim()) {
+        return `https://www.instagram.com/p/${data.shortcode.trim()}/`;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Dispatches a single normalized webhook message with in-flight claim tracking, 24h committed-mutation
    * deduplication, per-event operation IDs for mid-less events, internal post-200 retry scheduling,
    * pinned target context, and partial-reply replay.
@@ -888,8 +911,13 @@ export class MetaInstagramBotService {
           null;
         if (igPostMediaId) {
           hasShareAttachment = true;
-          const segment = attachmentType === 'ig_reel' ? 'reel' : 'p';
-          reelUrl = `https://www.instagram.com/${segment}/${igPostMediaId}/`;
+          const resolvedPermalink = await this.resolveMediaPermalinkFromId(igPostMediaId);
+          if (resolvedPermalink) {
+            reelUrl = resolvedPermalink;
+          } else {
+            const segment = attachmentType === 'ig_reel' ? 'reel' : 'p';
+            reelUrl = `https://www.instagram.com/${segment}/${igPostMediaId}/`;
+          }
           break;
         }
 
@@ -900,7 +928,12 @@ export class MetaInstagramBotService {
             : null;
         if (reelVideoId) {
           hasShareAttachment = true;
-          reelUrl = `https://www.instagram.com/reel/${reelVideoId}/`;
+          const resolvedPermalink = await this.resolveMediaPermalinkFromId(reelVideoId);
+          if (resolvedPermalink) {
+            reelUrl = resolvedPermalink;
+          } else {
+            reelUrl = `https://www.instagram.com/reel/${reelVideoId}/`;
+          }
           break;
         }
 

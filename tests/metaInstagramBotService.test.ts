@@ -5,7 +5,12 @@ import {
   isMetaMessagingWindowError,
 } from '../src/services/metaInstagramBotService.ts';
 import { Repository } from '../src/db/repository.ts';
-import { parseTargetedWatchedCommand, parseCancelCommand, formatBotHelpMessage } from '../src/utils/reelMessages.ts';
+import {
+  parseTargetedWatchedCommand,
+  parseCancelCommand,
+  parseWatchedStopCommand,
+  formatBotHelpMessage,
+} from '../src/utils/reelMessages.ts';
 import { extractCreatorQueryWithFilter, extractCreatorQuery } from '../src/utils/creatorQuery.ts';
 
 test('MetaInstagramBotService - splitMessageIntoChunks handles short and empty text', () => {
@@ -4269,6 +4274,36 @@ test('Creator query and command parsers accept bracketed @[username] syntax', ()
   assert.deepStrictEqual(targetedWatched, {
     targetCreator: 'oliver_stotts',
   });
+
+  // Verify parseWatchedStopCommand excludes bracketed creator handles like @[done]
+  assert.deepStrictEqual(parseWatchedStopCommand('reels by @[done]'), { isCommand: false, markAll: false });
+  assert.deepStrictEqual(parseWatchedStopCommand('done'), { isCommand: true, markAll: false });
+});
+
+test('MetaInstagramBotService - resolveMediaPermalinkFromId resolves canonical permalink or falls back gracefully', async (t) => {
+  const bot = new MetaInstagramBotService();
+  (bot as any).accessToken = 'test_token';
+
+  // 1. Graph API succeeds with permalink
+  t.mock.method(globalThis, 'fetch', async (url: string) => {
+    if (String(url).includes('18120410743994731')) {
+      return new Response(
+        JSON.stringify({
+          permalink: 'https://www.instagram.com/p/C-ResolvedShortcode/',
+          shortcode: 'C-ResolvedShortcode',
+        }),
+        { status: 200 }
+      );
+    }
+    return new Response(JSON.stringify({ error: { message: 'Unsupported get request' } }), { status: 400 });
+  });
+
+  const resolved = await bot.resolveMediaPermalinkFromId('18120410743994731');
+  assert.strictEqual(resolved, 'https://www.instagram.com/p/C-ResolvedShortcode/');
+
+  // 2. Graph API fails or returns 400 (e.g. third-party permissions)
+  const failed = await bot.resolveMediaPermalinkFromId('unauthorized_id');
+  assert.strictEqual(failed, null);
 });
 
 test('MetaInstagramBotService processes ig_post attachment format (payload.ig_post_media_id + CDN url)', async (t) => {
