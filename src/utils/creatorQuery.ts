@@ -60,7 +60,8 @@ export function extractCreatorQueryWithFilter(text: string): CreatorQueryResult 
   const cleaned = trimmed.replace(
     /(?:^|\s)@?(?:\[|<)([a-zA-Z0-9._]{1,30})(?:\]|>)(?=$|[\s,!?])/g,
     (match, handle) => {
-      const prefix = match.startsWith(' ') ? ' ' : '';
+      const leadingMatch = match.match(/^\s/);
+      const prefix = leadingMatch ? leadingMatch[0] : '';
       return `${prefix}@${handle}`;
     }
   );

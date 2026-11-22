@@ -231,7 +231,8 @@ export function parseWatchedStopCommand(text: string): WatchedStopCommand {
   const normalizedLower = lower.replace(
     /(?:^|\s)@?(?:\[|<)([a-z0-9._]{1,30})(?:\]|>)(?=$|[\s,!?])/g,
     (match, handle) => {
-      const prefix = match.startsWith(' ') ? ' ' : '';
+      const leadingMatch = match.match(/^\s/);
+      const prefix = leadingMatch ? leadingMatch[0] : '';
       return `${prefix}@${handle}`;
     }
   );
