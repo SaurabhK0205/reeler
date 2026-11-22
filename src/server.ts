@@ -5,7 +5,7 @@ import { loadConfig } from './config.ts';
 import { apiRouter } from './api/router.ts';
 import { ArchiveImportTimeoutError, Repository } from './db/repository.ts';
 import { ReminderWorker } from './services/reminderWorker.ts';
-import { vaultAuthMiddleware, resolveConfiguredVaultSecret } from './services/vaultAuthService.ts';
+import { vaultAuthMiddleware, resolveConfiguredVaultSecret, isHostedOrProductionEnvironment } from './services/vaultAuthService.ts';
 import { createRateLimiter, getClientIp, securityHeadersMiddleware } from './middleware/security.ts';
 
 // Server runtime defaults to UTC standard; user-specific timezones are dynamically resolved per session
@@ -386,9 +386,9 @@ if (isDirectExecution) {
     );
     process.exit(1);
   }
-  if (process.env.NODE_ENV === 'production' && !resolveConfiguredVaultSecret()) {
+  if (isHostedOrProductionEnvironment() && !resolveConfiguredVaultSecret()) {
     console.error(
-      '[Startup] FATAL: production requires a non-blank VAULT_SECRET or SUPABASE_SERVICE_ROLE_KEY to sign vault tokens.'
+      '[Startup] FATAL: Production and hosted environments require a non-blank VAULT_SECRET or SUPABASE_SERVICE_ROLE_KEY to sign vault tokens.'
     );
     process.exit(1);
   }
