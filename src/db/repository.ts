@@ -751,6 +751,39 @@ export function sortWatchLaterReelsMostRecentFirst(reels: SavedReel[]): SavedRee
   });
 }
 
+/**
+ * Orders active Watch Later reels for queue display:
+ * Soonest upcoming reminders first, followed by items without active reminders (newest additions first).
+ */
+export function sortWatchLaterQueueReels(reels: SavedReel[]): SavedReel[] {
+  return [...reels].sort((a, b) => {
+    const timeA = a.next_reminder_at ? parseTimestampMs(a.next_reminder_at) : null;
+    const timeB = b.next_reminder_at ? parseTimestampMs(b.next_reminder_at) : null;
+
+    if (timeA !== null && timeB !== null) {
+      if (timeA !== timeB) return timeA - timeB;
+    } else if (timeA !== null) {
+      return -1;
+    } else if (timeB !== null) {
+      return 1;
+    }
+
+    const createdB = Math.max(
+      parseTimestampMs(b.created_at),
+      parseTimestampMs(b.taken_at),
+      parseTimestampMs(b.updated_at)
+    );
+    const createdA = Math.max(
+      parseTimestampMs(a.created_at),
+      parseTimestampMs(a.taken_at),
+      parseTimestampMs(a.updated_at)
+    );
+    if (createdB !== createdA) return createdB - createdA;
+
+    return String(a.id).localeCompare(String(b.id));
+  });
+}
+
 const memoryStore = new InMemoryStore();
 
 function resolveDateRange(preset?: DateFilterPreset, customStart?: string, customEnd?: string) {
@@ -2255,6 +2288,81 @@ export class Repository {
       return null;
     }
     return sortWatchLaterReelsMostRecentFirst(fallbackCandidates as SavedReel[])[0] || null;
+  }
+
+  /**
+   * Fetches all active Watch Later reels for an Instagram sender,
+   * sorted with soonest upcoming reminders first, followed by items without active reminders.
+   */
+  static async getActiveWatchLaterReelsForSender(
+    senderId: string,
+    options?: { limit?: number; includeUnattributedFallback?: boolean }
+  ): Promise<SavedReel[]> {
+    const trimmedSender = String(senderId || '').trim();
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    const limit = Math.max(1, Math.min(options?.limit ?? 50, 100));
+
+    if (!trimmedSender && !allowUnattributedFallback) {
+      return [];
+    }
+
+    if (!isSupabaseConfigured()) {
+      const activeWatchLater = Array.from(memoryStore.reels.values()).filter(
+        (r) => r.watch_status === 'watch_later'
+      );
+      let candidates = trimmedSender
+        ? activeWatchLater.filter((r) => r.instagram_sender_id === trimmedSender)
+        : [];
+
+      if (allowUnattributedFallback && candidates.length === 0) {
+        candidates = activeWatchLater.filter((r) => !r.instagram_sender_id);
+      }
+
+      const attached = candidates.map((r) => ({
+        ...r,
+        creator: memoryStore.creators.get(r.creator_id) || r.creator,
+      }));
+
+      return sortWatchLaterQueueReels(attached).slice(0, limit);
+    }
+
+    const supabase = getSupabase();
+    if (trimmedSender) {
+      const { data: senderData, error: senderError } = await supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .eq('watch_status', 'watch_later')
+        .eq('instagram_sender_id', trimmedSender)
+        .order('next_reminder_at', { ascending: true, nullsFirst: false })
+        .order('created_at', { ascending: false })
+        .limit(limit);
+
+      if (senderError) {
+        throw new Error(`Failed to fetch Watch Later queue for sender: ${senderError.message}`);
+      }
+      if (senderData && senderData.length > 0) {
+        return sortWatchLaterQueueReels(senderData as SavedReel[]);
+      }
+    }
+
+    if (!allowUnattributedFallback) {
+      return [];
+    }
+
+    const { data: fallbackData, error: fallbackError } = await supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('watch_status', 'watch_later')
+      .or('instagram_sender_id.is.null,instagram_sender_id.eq.')
+      .order('next_reminder_at', { ascending: true, nullsFirst: false })
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (fallbackError) {
+      throw new Error(`Failed to fetch fallback Watch Later queue: ${fallbackError.message}`);
+    }
+
+    return sortWatchLaterQueueReels((fallbackData || []) as SavedReel[]);
   }
 
   static async recordReminderSent(

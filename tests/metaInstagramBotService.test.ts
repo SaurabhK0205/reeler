@@ -10,6 +10,10 @@ import {
   parseCancelCommand,
   parseWatchedStopCommand,
   formatBotHelpMessage,
+  parseQueueCommand,
+  formatWatchLaterQueueMessage,
+  isScheduleBeyond24Hours,
+  format24HourWindowNotice,
 } from '../src/utils/reelMessages.ts';
 import { extractCreatorQueryWithFilter, extractCreatorQuery } from '../src/utils/creatorQuery.ts';
 import { isSameInstant, parseDuration } from '../src/utils/duration.ts';
@@ -5276,6 +5280,233 @@ test('MetaInstagramBotService - reminder confirmation retry captures committed n
       deliveredReplies[0].includes('2 hours') &&
         (deliveredReplies[0].includes('Reminder set for') || deliveredReplies[0].includes('Reminder updated for')),
       `Delivered reply: ${deliveredReplies[0]}`
+    );
+  });
+});
+
+test('parseQueueCommand - parses queue, reminders, list, and upcoming variations cleanly', () => {
+  assert.strictEqual(parseQueueCommand('queue'), true);
+  assert.strictEqual(parseQueueCommand('my queue'), true);
+  assert.strictEqual(parseQueueCommand('show queue'), true);
+  assert.strictEqual(parseQueueCommand('view queue'), true);
+  assert.strictEqual(parseQueueCommand('check queue'), true);
+  assert.strictEqual(parseQueueCommand('reminders'), true);
+  assert.strictEqual(parseQueueCommand('my reminders'), true);
+  assert.strictEqual(parseQueueCommand('all reminders'), true);
+  assert.strictEqual(parseQueueCommand('list'), true);
+  assert.strictEqual(parseQueueCommand('list reminders'), true);
+  assert.strictEqual(parseQueueCommand('upcoming'), true);
+  assert.strictEqual(parseQueueCommand('upcoming reminders'), true);
+  assert.strictEqual(parseQueueCommand("what's in my queue"), true);
+  assert.strictEqual(parseQueueCommand('what is in my queue'), true);
+  assert.strictEqual(parseQueueCommand('what reminders do i have'), true);
+
+  // Negative tests
+  assert.strictEqual(parseQueueCommand(''), false);
+  assert.strictEqual(parseQueueCommand('queue 2h'), false);
+  assert.strictEqual(parseQueueCommand('@warnerbrosindia'), false);
+  assert.strictEqual(parseQueueCommand('update @warnerbrosindia 2h'), false);
+  assert.strictEqual(parseQueueCommand('watched'), false);
+  assert.strictEqual(parseQueueCommand('stop all'), false);
+  assert.strictEqual(parseQueueCommand('tz London'), false);
+  assert.strictEqual(parseQueueCommand('vault'), false);
+});
+
+test('formatWatchLaterQueueMessage - formats empty state and populated queue with schedules', () => {
+  // 1. Empty state
+  const emptyMsg = formatWatchLaterQueueMessage([]);
+  assert.ok(emptyMsg.includes('Your Watch Later queue is empty!'));
+  assert.ok(emptyMsg.includes('Share any Reel or Post here'));
+
+  // 2. Populated items
+  const now = new Date('2026-11-22T10:00:00Z');
+  const items = [
+    {
+      id: 'item_1',
+      instagram_media_id: 'm1',
+      shortcode: 'SC1',
+      reel_url: 'https://instagram.com/reel/SC1/',
+      creator: { username: 'warnerbrosindia', display_name: 'Warner Bros India' },
+      caption: 'Relive the journey before you experience the epic conclusion.',
+      media_type: 'post' as const,
+      watch_status: 'watch_later' as const,
+      next_reminder_at: new Date('2026-11-22T14:30:00Z').toISOString(), // 4.5 hours in future (today at 8:00 PM IST)
+    },
+    {
+      id: 'item_2',
+      instagram_media_id: 'm2',
+      shortcode: 'SC2',
+      reel_url: 'https://instagram.com/reel/SC2/',
+      creator: { username: 'marvelstudios', display_name: 'Marvel Studios' },
+      caption: 'Avengers assemble for the newest trailer.',
+      media_type: 'reel' as const,
+      watch_status: 'watch_later' as const,
+      next_reminder_at: new Date('2026-11-21T10:00:00Z').toISOString(), // Past date -> Due now!
+    },
+    {
+      id: 'item_3',
+      instagram_media_id: 'm3',
+      shortcode: 'SC3',
+      reel_url: 'https://instagram.com/reel/SC3/',
+      creator: { username: 'peaceful_creator', display_name: 'Peaceful Creator' },
+      caption: 'Morning meditation routine',
+      media_type: 'reel' as const,
+      watch_status: 'watch_later' as const,
+      next_reminder_at: null, // No active reminder
+    },
+  ];
+
+  const queueMsg = formatWatchLaterQueueMessage(items as any, 'Asia/Kolkata', now);
+  assert.ok(queueMsg.includes('Your Watch Later Queue (3 items):'));
+  assert.ok(queueMsg.includes('@warnerbrosindia'));
+  assert.ok(queueMsg.includes('@marvelstudios'));
+  assert.ok(queueMsg.includes('Due now!'));
+  assert.ok(queueMsg.includes('No active reminder set'));
+  assert.ok(queueMsg.includes('Quick actions:'));
+});
+
+test('MetaInstagramBotService - queue command returns active Watch Later items for sender', async () => {
+  await withIsolatedMemoryStore(async () => {
+    const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+    const replies: string[] = [];
+    bot.sendDirectMessage = async (_: string, text: string) => {
+      replies.push(text);
+      return true;
+    };
+
+    const senderId = 'sender_queue_test_user';
+    await Repository.setSenderTimezone(senderId, 'Asia/Kolkata');
+
+    // Step 1: User sends "queue" when empty
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'queue' } }] }],
+    });
+    assert.strictEqual(replies.length, 1);
+    assert.ok(replies[0].includes('Your Watch Later queue is empty!'), `Got: ${replies[0]}`);
+
+    // Step 2: Add 2 items to Watch Later
+    const creator1 = await Repository.upsertCreator({ instagram_user_id: 'wb_user', username: 'warnerbrosindia' });
+    const creator2 = await Repository.upsertCreator({ instagram_user_id: 'marvel_user', username: 'marvelstudios' });
+
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_wb_queue',
+      shortcode: 'WBQueue1',
+      reel_url: 'https://instagram.com/p/WBQueue1/',
+      creator_id: creator1.id,
+      caption: 'Dune Part Two return to cinemas',
+      instagram_sender_id: senderId,
+      watch_status: 'watch_later',
+      next_reminder_at: new Date(Date.now() + 36000000).toISOString(),
+    });
+
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_marvel_queue',
+      shortcode: 'MarvelQueue1',
+      reel_url: 'https://instagram.com/reel/MarvelQueue1/',
+      creator_id: creator2.id,
+      caption: 'Avengers assemble',
+      instagram_sender_id: senderId,
+      watch_status: 'watch_later',
+      next_reminder_at: null,
+    });
+
+    // Step 3: User sends "reminders"
+    replies.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'reminders' } }] }],
+    });
+
+    assert.strictEqual(replies.length, 1);
+    assert.ok(replies[0].includes('Your Watch Later Queue (2 items):'), `Got: ${replies[0]}`);
+    assert.ok(replies[0].includes('warnerbrosindia'), `Got: ${replies[0]}`);
+    assert.ok(replies[0].includes('marvelstudios'), `Got: ${replies[0]}`);
+    assert.ok(replies[0].includes('No active reminder set'), `Got: ${replies[0]}`);
+
+    // Step 4: Natural aliases like "my queue", "upcoming", "list"
+    for (const cmd of ['my queue', 'upcoming', 'list']) {
+      replies.length = 0;
+      await bot.handleWebhookPayload({
+        object: 'instagram',
+        entry: [{ messaging: [{ sender: { id: senderId }, message: { text: cmd } }] }],
+      });
+      assert.strictEqual(replies.length, 1);
+      assert.ok(replies[0].includes('Your Watch Later Queue (2 items):'), `Cmd: ${cmd}, Got: ${replies[0]}`);
+    }
+
+    // Step 5: Verify unattributed fallback when sender has no items
+    const unattributed = await Repository.upsertSavedReel({
+      instagram_media_id: 'm_unattributed_queue',
+      shortcode: 'UnattrQueue1',
+      reel_url: 'https://instagram.com/reel/UnattrQueue1/',
+      creator_id: creator1.id,
+      caption: 'Unattributed item in queue',
+      instagram_sender_id: null,
+      watch_status: 'watch_later',
+    });
+    const fallbackResults = await Repository.getActiveWatchLaterReelsForSender('brand_new_admin_sender', {
+      includeUnattributedFallback: true,
+    });
+    assert.strictEqual(fallbackResults.length, 1);
+    assert.strictEqual(fallbackResults[0].shortcode, 'UnattrQueue1');
+  });
+});
+
+test('isScheduleBeyond24Hours - detects >24h durations and appends 24h window notice to reminder confirmations', async () => {
+  await withIsolatedMemoryStore(async () => {
+    const now = new Date('2026-11-22T10:00:00Z');
+    const within24h = new Date('2026-11-22T18:00:00Z'); // 8h
+    const beyond24h = new Date('2026-11-25T10:00:00Z'); // 3 days
+
+    assert.strictEqual(isScheduleBeyond24Hours(within24h, now), false);
+    assert.strictEqual(isScheduleBeyond24Hours(beyond24h, now), true);
+
+    const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+    const replies: string[] = [];
+    bot.sendDirectMessage = async (_: string, text: string) => {
+      replies.push(text);
+      return true;
+    };
+
+    const senderId = 'sender_24h_notice_user';
+    await Repository.setSenderTimezone(senderId, 'Asia/Kolkata');
+
+    const creator = await Repository.upsertCreator({ instagram_user_id: 'wb_24h', username: 'warnerbrosindia' });
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_wb_24h',
+      shortcode: 'WB24h1',
+      reel_url: 'https://instagram.com/p/WB24h1/',
+      creator_id: creator.id,
+      caption: 'Dune Part Two',
+      instagram_sender_id: senderId,
+      watch_status: 'watch_later',
+    });
+
+    // Schedule reminder for 5 days: should include 24h window notice
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'update @warnerbrosindia in 5 days' } }] }],
+    });
+
+    assert.strictEqual(replies.length, 1);
+    assert.ok(replies[0].includes('⏰ Reminder updated for: 5 days'), `Got: ${replies[0]}`);
+    assert.ok(
+      replies[0].includes('Instagram limits automated DMs to 24 hours'),
+      `Expected 24h window notice, got: ${replies[0]}`
+    );
+
+    // Schedule reminder for untargeted duration (e.g. "in 3 days")
+    replies.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'in 3 days' } }] }],
+    });
+    assert.strictEqual(replies.length, 1);
+    assert.ok(replies[0].includes('3 days'), `Got: ${replies[0]}`);
+    assert.ok(
+      replies[0].includes('Instagram limits automated DMs to 24 hours'),
+      `Expected 24h window notice, got: ${replies[0]}`
     );
   });
 });

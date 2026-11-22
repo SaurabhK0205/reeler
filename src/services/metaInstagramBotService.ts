@@ -28,6 +28,10 @@ import {
   formatCreatorDisplayLabel,
   formatCreatorSearchMessages,
   formatSenderConflictRejectionMessage,
+  parseQueueCommand,
+  formatWatchLaterQueueMessage,
+  isScheduleBeyond24Hours,
+  format24HourWindowNotice,
 } from '../utils/reelMessages.ts';
 
 /**
@@ -1534,6 +1538,9 @@ export class MetaInstagramBotService {
         // User provided a specific time along with the item or right before it!
         const reminderActionLabel = isAlreadyInWatchLater ? 'Reminder updated for:' : 'Reminder set for:';
         let reply = `${addedHeading}${creatorLine}\n\n⏰ ${reminderActionLabel} ${customDuration.label} (${customDuration.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
+        if (isScheduleBeyond24Hours(customDuration.targetDate)) {
+          reply += `\n\n${format24HourWindowNotice()}`;
+        }
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
@@ -1703,6 +1710,9 @@ export class MetaInstagramBotService {
 
         const reminderActionLabel = promptInfo.isAlreadyInWatchLater ? 'Reminder updated for:' : 'Reminder set for:';
         let reply = `${promptInfo.addedHeading}${promptInfo.creatorLine}\n\n⏰ ${reminderActionLabel} ${effectiveDur.label} (${effectiveDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
+        if (isScheduleBeyond24Hours(effectiveDur.targetDate)) {
+          reply += `\n\n${format24HourWindowNotice()}`;
+        }
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
@@ -1746,7 +1756,14 @@ export class MetaInstagramBotService {
         if (delivery.retryState.pinnedTargetedCreator) {
           this.recordReshareInteraction(targetReel.id);
         }
-        let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget, delivery.retryState.pinnedDurationUpdatesReshare);
+        const isBeyond24 = isScheduleBeyond24Hours(effectiveDur.targetDate);
+        let reply = formatReminderSetMessage(
+          targetReel,
+          effectiveDur.label,
+          effectiveDur.formattedTarget,
+          delivery.retryState.pinnedDurationUpdatesReshare,
+          isBeyond24
+        );
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
@@ -1811,8 +1828,9 @@ export class MetaInstagramBotService {
         const { isCommand: isWatchedCmd } = parseWatchedStopCommand(text);
         const isCreatorQuery = Boolean(extractCreatorQuery(text));
         const targetedReminderUpdate = parseTargetedReminderUpdateCommand(text, new Date(), senderTz);
-        if (targetedWatched || isWatchedCmd || isCreatorQuery || targetedReminderUpdate) {
-          // Watched command, stop command, creator search, or targeted reminder update: flush prompt and fall through
+        const isQueueCmd = parseQueueCommand(text);
+        if (targetedWatched || isWatchedCmd || isCreatorQuery || targetedReminderUpdate || isQueueCmd) {
+          // Watched command, stop command, creator search, targeted reminder update, or queue command: flush prompt and fall through
           await this.flushPendingSharePrompt(senderId);
         } else if (this.inFlightShares.has(senderId)) {
           // An active share is currently being ingested for this sender.
@@ -1870,6 +1888,9 @@ export class MetaInstagramBotService {
 
             const reminderActionLabel = pending.isAlreadyInWatchLater ? 'Reminder updated for:' : 'Reminder set for:';
             let reply = `${pending.addedHeading}${pending.creatorLine}\n\n⏰ ${reminderActionLabel} ${effectiveDur.label} (${effectiveDur.formattedTarget})\n\nReply "watched" when done, or reply "cancel" to undo!`;
+            if (isScheduleBeyond24Hours(effectiveDur.targetDate)) {
+              reply += `\n\n${format24HourWindowNotice()}`;
+            }
             if (senderTz === 'UTC') {
               reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
             }
@@ -2037,7 +2058,18 @@ export class MetaInstagramBotService {
       return;
     }
 
-    // 1d. Mark as watched / stop command
+    // 1d. Watch Later Queue / Reminders command (e.g. "queue", "reminders", "my queue", "list", "upcoming")
+    if (parseQueueCommand(text)) {
+      const isSenderAdmin = Boolean(this.adminUserId && senderId === this.adminUserId);
+      const queueItems = await Repository.getActiveWatchLaterReelsForSender(senderId, {
+        includeUnattributedFallback: isSenderAdmin,
+      });
+      const reply = formatWatchLaterQueueMessage(queueItems, senderTz);
+      await this.deliverReply(senderId, reply, delivery);
+      return;
+    }
+
+    // 1e. Mark as watched / stop command
     // Handles single ("watched", "done", "stop") and bulk ("stop all", "watched all", "clear all", "unsub")
     const { isCommand, markAll } = parseWatchedStopCommand(text);
     if (isCommand) {
@@ -2250,7 +2282,8 @@ export class MetaInstagramBotService {
               delivery.retryState.expectedNextReminderAt = effectiveDur.targetDate.toISOString();
               delivery.retryState.pinnedDurationUpdatesReshare = true;
             }
-            let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget, true);
+            const isBeyond24 = isScheduleBeyond24Hours(effectiveDur.targetDate);
+            let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget, true, isBeyond24);
             if (senderTz === 'UTC') {
               reply += `\n\n💡 Tip: Times are currently shown in UTC. Reply e.g. "tz New York" or "tz IST" to set your local time!`;
             }
@@ -2377,7 +2410,14 @@ export class MetaInstagramBotService {
                 if (pending.opId) this.markWebhookMidCompleted(pending.opId);
               }
             }
-            let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget);
+            const isBeyond24 = isScheduleBeyond24Hours(customDuration.targetDate);
+            let reply = formatReminderSetMessage(
+              targetReel,
+              customDuration.label,
+              customDuration.formattedTarget,
+              false,
+              isBeyond24
+            );
             if (senderTz === 'UTC') {
               reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <your city>" to use your local time.`;
             }
@@ -2453,7 +2493,8 @@ export class MetaInstagramBotService {
           delivery.retryState.expectedNextReminderAt = nextDate;
           delivery.retryState.pinnedDurationUpdatesReshare = true;
         }
-        let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget, updatesReshare);
+        const isBeyond24 = isScheduleBeyond24Hours(customDuration.targetDate);
+        let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget, updatesReshare, isBeyond24);
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are currently shown in UTC. Reply e.g. "tz New York" or "tz IST" to set your local time!`;
         }
@@ -2462,6 +2503,9 @@ export class MetaInstagramBotService {
         this.recordRecentDurationHint(senderId, customDuration);
         if (delivery) delivery.stateMutated = true;
         let reply = `⏰ Got it! Duration set to ${customDuration.label} (${customDuration.formattedTarget}). Share any Reel or Post to track it!`;
+        if (isScheduleBeyond24Hours(customDuration.targetDate)) {
+          reply += `\n\n${format24HourWindowNotice()}`;
+        }
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <your city>" to use your local time.`;
         }
