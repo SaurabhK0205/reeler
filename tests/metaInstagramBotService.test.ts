@@ -87,6 +87,51 @@ test('MetaInstagramBotService - splitMessageIntoChunks handles unbroken string w
   }
 });
 
+test('MetaInstagramBotService - splitMessageIntoChunks preserves UTF-16 surrogate pairs without splitting', () => {
+  const service = new MetaInstagramBotService();
+
+  function hasUnpairedSurrogates(str: string): boolean {
+    for (let i = 0; i < str.length; i++) {
+      const code = str.charCodeAt(i);
+      if (code >= 0xD800 && code <= 0xDBFF) {
+        if (i + 1 >= str.length) return true;
+        const next = str.charCodeAt(i + 1);
+        if (next < 0xDC00 || next > 0xDFFF) return true;
+        i++;
+      } else if (code >= 0xDC00 && code <= 0xDFFF) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // 1. Unbroken string where split boundary lands directly between high and low surrogate
+  // '1234' is 4 chars. '🚀' is 2 chars (high + low surrogate).
+  // With maxLen = 5, char 4 is high surrogate, char 5 is low surrogate.
+  const strWithEmojiAtBoundary = '1234' + '🚀';
+  const chunks1 = service.splitMessageIntoChunks(strWithEmojiAtBoundary, 5);
+  assert.strictEqual(chunks1.length, 2);
+  assert.strictEqual(chunks1[0], '1234');
+  assert.strictEqual(chunks1[1], '🚀');
+  assert.ok(!hasUnpairedSurrogates(chunks1[0]));
+  assert.ok(!hasUnpairedSurrogates(chunks1[1]));
+
+  // 2. Continuous 950-character block ending with multiple emoji surrogates
+  const prefix = 'A'.repeat(949);
+  const emoji = '🔥';
+  const suffix = 'B'.repeat(20);
+  const text = `${prefix}${emoji}${suffix}`;
+
+  const chunks2 = service.splitMessageIntoChunks(text, 950);
+  assert.ok(chunks2.length >= 2);
+  for (const chunk of chunks2) {
+    assert.ok(chunk.length <= 950, `Chunk length ${chunk.length} exceeds 950`);
+    assert.ok(!hasUnpairedSurrogates(chunk), `Chunk contains orphaned surrogate: ${chunk.slice(-10)}`);
+  }
+  assert.strictEqual(chunks2[0], prefix);
+  assert.ok(chunks2[1].startsWith(emoji));
+});
+
 test('extractCreatorQuery - extracts handles accurately including underscores and actions', async () => {
   const { extractCreatorQuery } = await import('../src/utils/creatorQuery.ts');
 

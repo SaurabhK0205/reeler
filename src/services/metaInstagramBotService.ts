@@ -833,6 +833,18 @@ export class MetaInstagramBotService {
         splitIdx = maxLen;
       }
 
+      // Guard against splitting a UTF-16 surrogate pair across chunk boundaries
+      if (splitIdx > 0 && splitIdx < remaining.length) {
+        const prevCode = remaining.charCodeAt(splitIdx - 1);
+        const currCode = remaining.charCodeAt(splitIdx);
+        if (prevCode >= 0xD800 && prevCode <= 0xDBFF && currCode >= 0xDC00 && currCode <= 0xDFFF) {
+          splitIdx--;
+        }
+      }
+      if (splitIdx <= 0) {
+        splitIdx = (remaining.length >= 2 && remaining.charCodeAt(0) >= 0xD800 && remaining.charCodeAt(0) <= 0xDBFF) ? 2 : 1;
+      }
+
       const chunk = remaining.slice(0, splitIdx).trim();
       if (chunk) {
         result.push(chunk);
