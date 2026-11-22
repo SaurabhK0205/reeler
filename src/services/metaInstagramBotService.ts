@@ -2061,10 +2061,13 @@ export class MetaInstagramBotService {
     // 1d. Watch Later Queue / Reminders command (e.g. "queue", "reminders", "my queue", "list", "upcoming")
     if (parseQueueCommand(text)) {
       const isSenderAdmin = Boolean(this.adminUserId && senderId === this.adminUserId);
+      const now = new Date();
       const queueItems = await Repository.getActiveWatchLaterReelsForSender(senderId, {
         includeUnattributedFallback: isSenderAdmin,
+        upcomingOnly: true,
+        now,
       });
-      const reply = formatWatchLaterQueueMessage(queueItems, senderTz);
+      const reply = formatWatchLaterQueueMessage(queueItems, senderTz, now);
       await this.deliverReply(senderId, reply, delivery);
       return;
     }

@@ -2292,14 +2292,23 @@ export class Repository {
 
   /**
    * Fetches all active Watch Later reels for an Instagram sender,
-   * sorted with soonest upcoming reminders first, followed by items without active reminders.
+   * Fetches active Watch Later reels for a specific Instagram sender,
+   * sorted with soonest upcoming reminders first. By default, restricts to upcoming future reminders.
    */
   static async getActiveWatchLaterReelsForSender(
     senderId: string,
-    options?: { limit?: number; includeUnattributedFallback?: boolean }
+    options?: {
+      limit?: number;
+      includeUnattributedFallback?: boolean;
+      upcomingOnly?: boolean;
+      now?: Date;
+    }
   ): Promise<SavedReel[]> {
     const trimmedSender = String(senderId || '').trim();
     const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    const upcomingOnly = options?.upcomingOnly ?? true;
+    const now = options?.now ?? new Date();
+    const nowIso = now.toISOString();
     const limit = Math.max(1, Math.min(options?.limit ?? 50, 100));
 
     if (!trimmedSender && !allowUnattributedFallback) {
@@ -2307,9 +2316,15 @@ export class Repository {
     }
 
     if (!isSupabaseConfigured()) {
-      const activeWatchLater = Array.from(memoryStore.reels.values()).filter(
-        (r) => r.watch_status === 'watch_later'
-      );
+      const activeWatchLater = Array.from(memoryStore.reels.values()).filter((r) => {
+        if (r.watch_status !== 'watch_later') return false;
+        if (upcomingOnly) {
+          if (!r.next_reminder_at) return false;
+          const reminderMs = new Date(r.next_reminder_at).getTime();
+          if (Number.isNaN(reminderMs) || reminderMs <= now.getTime()) return false;
+        }
+        return true;
+      });
       let candidates = trimmedSender
         ? activeWatchLater.filter((r) => r.instagram_sender_id === trimmedSender)
         : [];
@@ -2328,11 +2343,17 @@ export class Repository {
 
     const supabase = getSupabase();
     if (trimmedSender) {
-      const { data: senderData, error: senderError } = await supabase
+      let query = supabase
         .from('saved_reels')
         .select('*, creator:creators(*)')
         .eq('watch_status', 'watch_later')
-        .eq('instagram_sender_id', trimmedSender)
+        .eq('instagram_sender_id', trimmedSender);
+
+      if (upcomingOnly) {
+        query = query.not('next_reminder_at', 'is', null).gt('next_reminder_at', nowIso);
+      }
+
+      const { data: senderData, error: senderError } = await query
         .order('next_reminder_at', { ascending: true, nullsFirst: false })
         .order('created_at', { ascending: false })
         .limit(limit);
@@ -2349,11 +2370,17 @@ export class Repository {
       return [];
     }
 
-    const { data: fallbackData, error: fallbackError } = await supabase
+    let fallbackQuery = supabase
       .from('saved_reels')
       .select('*, creator:creators(*)')
       .eq('watch_status', 'watch_later')
-      .or('instagram_sender_id.is.null,instagram_sender_id.eq.')
+      .or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+
+    if (upcomingOnly) {
+      fallbackQuery = fallbackQuery.not('next_reminder_at', 'is', null).gt('next_reminder_at', nowIso);
+    }
+
+    const { data: fallbackData, error: fallbackError } = await fallbackQuery
       .order('next_reminder_at', { ascending: true, nullsFirst: false })
       .order('created_at', { ascending: false })
       .limit(limit);

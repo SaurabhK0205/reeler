@@ -5312,13 +5312,14 @@ test('parseQueueCommand - parses queue, reminders, list, and upcoming variations
   assert.strictEqual(parseQueueCommand('vault'), false);
 });
 
-test('formatWatchLaterQueueMessage - formats empty state and populated queue with schedules', () => {
+test('formatWatchLaterQueueMessage - filters out passed or unreminded items and formats future upcoming schedules', () => {
   // 1. Empty state
   const emptyMsg = formatWatchLaterQueueMessage([]);
-  assert.ok(emptyMsg.includes('Your Watch Later queue is empty!'));
+  assert.ok(emptyMsg.includes('You have no upcoming reminders scheduled!'));
   assert.ok(emptyMsg.includes('Share any Reel or Post here'));
+  assert.ok(emptyMsg.includes('Type "vault" to view all your saved items.'));
 
-  // 2. Populated items
+  // 2. Populated items with mixed schedules (future, past, null)
   const now = new Date('2026-11-22T10:00:00Z');
   const items = [
     {
@@ -5330,7 +5331,7 @@ test('formatWatchLaterQueueMessage - formats empty state and populated queue wit
       caption: 'Relive the journey before you experience the epic conclusion.',
       media_type: 'post' as const,
       watch_status: 'watch_later' as const,
-      next_reminder_at: new Date('2026-11-22T14:30:00Z').toISOString(), // 4.5 hours in future (today at 8:00 PM IST)
+      next_reminder_at: new Date('2026-11-22T14:30:00Z').toISOString(), // Future (today at 8:00 PM IST)
     },
     {
       id: 'item_2',
@@ -5341,7 +5342,7 @@ test('formatWatchLaterQueueMessage - formats empty state and populated queue wit
       caption: 'Avengers assemble for the newest trailer.',
       media_type: 'reel' as const,
       watch_status: 'watch_later' as const,
-      next_reminder_at: new Date('2026-11-21T10:00:00Z').toISOString(), // Past date -> Due now!
+      next_reminder_at: new Date('2026-11-21T10:00:00Z').toISOString(), // Past date (already passed)
     },
     {
       id: 'item_3',
@@ -5357,11 +5358,12 @@ test('formatWatchLaterQueueMessage - formats empty state and populated queue wit
   ];
 
   const queueMsg = formatWatchLaterQueueMessage(items as any, 'Asia/Kolkata', now);
-  assert.ok(queueMsg.includes('Your Watch Later Queue (3 items):'));
+  assert.ok(queueMsg.includes('Your Upcoming Reminders (1 item):'), `Got: ${queueMsg}`);
   assert.ok(queueMsg.includes('@warnerbrosindia'));
-  assert.ok(queueMsg.includes('@marvelstudios'));
-  assert.ok(queueMsg.includes('Due now!'));
-  assert.ok(queueMsg.includes('No active reminder set'));
+  assert.ok(!queueMsg.includes('@marvelstudios'), 'Past reminders must not appear in upcoming queue');
+  assert.ok(!queueMsg.includes('@peaceful_creator'), 'Items without active reminders must not appear in upcoming queue');
+  assert.ok(!queueMsg.includes('Due now!'), 'Must not display "Due now!" in upcoming queue');
+  assert.ok(!queueMsg.includes('No active reminder set'), 'Must not display "No active reminder set" in upcoming queue');
   assert.ok(queueMsg.includes('Quick actions:'));
 });
 
@@ -5383,11 +5385,12 @@ test('MetaInstagramBotService - queue command returns active Watch Later items f
       entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'queue' } }] }],
     });
     assert.strictEqual(replies.length, 1);
-    assert.ok(replies[0].includes('Your Watch Later queue is empty!'), `Got: ${replies[0]}`);
+    assert.ok(replies[0].includes('You have no upcoming reminders scheduled!'), `Got: ${replies[0]}`);
 
-    // Step 2: Add 2 items to Watch Later
+    // Step 2: Add 3 items to Watch Later: 1 future upcoming, 1 without reminder, 1 past reminder
     const creator1 = await Repository.upsertCreator({ instagram_user_id: 'wb_user', username: 'warnerbrosindia' });
     const creator2 = await Repository.upsertCreator({ instagram_user_id: 'marvel_user', username: 'marvelstudios' });
+    const creator3 = await Repository.upsertCreator({ instagram_user_id: 'dc_user', username: 'dcofficial' });
 
     await Repository.upsertSavedReel({
       instagram_media_id: 'm_wb_queue',
@@ -5397,7 +5400,7 @@ test('MetaInstagramBotService - queue command returns active Watch Later items f
       caption: 'Dune Part Two return to cinemas',
       instagram_sender_id: senderId,
       watch_status: 'watch_later',
-      next_reminder_at: new Date(Date.now() + 36000000).toISOString(),
+      next_reminder_at: new Date(Date.now() + 36000000).toISOString(), // Future
     });
 
     await Repository.upsertSavedReel({
@@ -5408,10 +5411,21 @@ test('MetaInstagramBotService - queue command returns active Watch Later items f
       caption: 'Avengers assemble',
       instagram_sender_id: senderId,
       watch_status: 'watch_later',
-      next_reminder_at: null,
+      next_reminder_at: null, // No active reminder
     });
 
-    // Step 3: User sends "reminders"
+    await Repository.upsertSavedReel({
+      instagram_media_id: 'm_dc_queue',
+      shortcode: 'DCQueue1',
+      reel_url: 'https://instagram.com/reel/DCQueue1/',
+      creator_id: creator3.id,
+      caption: 'The Batman Part II',
+      instagram_sender_id: senderId,
+      watch_status: 'watch_later',
+      next_reminder_at: new Date(Date.now() - 3600000).toISOString(), // Past (already passed)
+    });
+
+    // Step 3: User sends "reminders": only future upcoming item is returned
     replies.length = 0;
     await bot.handleWebhookPayload({
       object: 'instagram',
@@ -5419,10 +5433,10 @@ test('MetaInstagramBotService - queue command returns active Watch Later items f
     });
 
     assert.strictEqual(replies.length, 1);
-    assert.ok(replies[0].includes('Your Watch Later Queue (2 items):'), `Got: ${replies[0]}`);
+    assert.ok(replies[0].includes('Your Upcoming Reminders (1 item):'), `Got: ${replies[0]}`);
     assert.ok(replies[0].includes('warnerbrosindia'), `Got: ${replies[0]}`);
-    assert.ok(replies[0].includes('marvelstudios'), `Got: ${replies[0]}`);
-    assert.ok(replies[0].includes('No active reminder set'), `Got: ${replies[0]}`);
+    assert.ok(!replies[0].includes('marvelstudios'), `Unreminded items must not appear in queue, got: ${replies[0]}`);
+    assert.ok(!replies[0].includes('dcofficial'), `Past reminders must not appear in queue, got: ${replies[0]}`);
 
     // Step 4: Natural aliases like "my queue", "upcoming", "list"
     for (const cmd of ['my queue', 'upcoming', 'list']) {
@@ -5432,10 +5446,17 @@ test('MetaInstagramBotService - queue command returns active Watch Later items f
         entry: [{ messaging: [{ sender: { id: senderId }, message: { text: cmd } }] }],
       });
       assert.strictEqual(replies.length, 1);
-      assert.ok(replies[0].includes('Your Watch Later Queue (2 items):'), `Cmd: ${cmd}, Got: ${replies[0]}`);
+      assert.ok(replies[0].includes('Your Upcoming Reminders (1 item):'), `Cmd: ${cmd}, Got: ${replies[0]}`);
     }
 
-    // Step 5: Verify unattributed fallback when sender has no items
+    // Step 5: Verify Repository.getActiveWatchLaterReelsForSender options & unattributed fallback
+    const upcomingOnlyResults = await Repository.getActiveWatchLaterReelsForSender(senderId, { upcomingOnly: true });
+    assert.strictEqual(upcomingOnlyResults.length, 1);
+    assert.strictEqual(upcomingOnlyResults[0].shortcode, 'WBQueue1');
+
+    const allQueueResults = await Repository.getActiveWatchLaterReelsForSender(senderId, { upcomingOnly: false });
+    assert.strictEqual(allQueueResults.length, 3);
+
     const unattributed = await Repository.upsertSavedReel({
       instagram_media_id: 'm_unattributed_queue',
       shortcode: 'UnattrQueue1',
@@ -5444,9 +5465,11 @@ test('MetaInstagramBotService - queue command returns active Watch Later items f
       caption: 'Unattributed item in queue',
       instagram_sender_id: null,
       watch_status: 'watch_later',
+      next_reminder_at: new Date(Date.now() + 72000000).toISOString(),
     });
     const fallbackResults = await Repository.getActiveWatchLaterReelsForSender('brand_new_admin_sender', {
       includeUnattributedFallback: true,
+      upcomingOnly: true,
     });
     assert.strictEqual(fallbackResults.length, 1);
     assert.strictEqual(fallbackResults[0].shortcode, 'UnattrQueue1');
