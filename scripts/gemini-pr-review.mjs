@@ -96,43 +96,86 @@ Provide a clear, formatted GitHub Markdown review:
 (List specific actionable findings with file paths, or state "No critical issues detected. Production standards satisfied." if clean.)
 `;
 
-async function runReview() {
-  const modelName = 'gemini-2.5-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
-
-  console.log(`Sending PR #${PR_NUMBER} diff (${diff.length} bytes) to Gemini API (${modelName})...`);
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { text: systemPrompt },
-            { text: `\n\n--- GIT DIFF FOR PULL REQUEST #${PR_NUMBER} ---\n\n${truncatedDiff}` }
-          ]
+async function getAvailableModels(apiKey) {
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data?.models)) {
+        const supported = data.models
+          .filter((m) => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+          .map((m) => m.name.replace(/^models\//, ''));
+        if (supported.length > 0) {
+          console.log(`Discovered ${supported.length} available Gemini models from API:`, supported.slice(0, 5).join(', '));
+          const flashModels = supported.filter((m) => m.includes('flash'));
+          const otherModels = supported.filter((m) => !m.includes('flash'));
+          return [...flashModels, ...otherModels];
         }
-      ],
-      generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 2048,
       }
-    })
-  });
+    } else {
+      console.warn(`Could not list models (${res.status}):`, await res.text());
+    }
+  } catch (err) {
+    console.warn('Could not query model list, falling back to static list:', err.message || err);
+  }
+  return ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+}
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`Gemini API error (${response.status}):`, errorText);
-    process.exit(1);
+async function runReview() {
+  const candidateModels = await getAvailableModels(GEMINI_API_KEY);
+
+  let reviewBody = null;
+  let lastError = null;
+
+  for (const modelName of candidateModels) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
+    console.log(`Sending PR #${PR_NUMBER} diff (${diff.length} bytes) to Gemini API (${modelName})...`);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(15000),
+        body: JSON.stringify({
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { text: systemPrompt },
+                { text: `\n\n--- GIT DIFF FOR PULL REQUEST #${PR_NUMBER} ---\n\n${truncatedDiff}` }
+              ]
+            }
+          ],
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 2048,
+          }
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.warn(`Gemini API error with model ${modelName} (${response.status}):`, errorText);
+        lastError = errorText;
+        continue;
+      }
+
+      const data = await response.json();
+      reviewBody = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (reviewBody) {
+        console.log(`Review successfully generated using model ${modelName}.`);
+        break;
+      }
+    } catch (err) {
+      console.warn(`Request failed with model ${modelName}:`, err.message || err);
+      lastError = String(err.message || err);
+    }
   }
 
-  const data = await response.json();
-  const reviewBody = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
   if (!reviewBody) {
-    console.error('No response text received from Gemini API.');
+    console.error('Failed to generate review with any candidate Gemini model. Last error:', lastError);
     process.exit(1);
   }
 

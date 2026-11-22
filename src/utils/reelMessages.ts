@@ -864,37 +864,36 @@ export function formatSenderConflictRejectionMessage(mediaType?: SavedMediaType 
 
 /**
  * Formats a user-facing list of active Watch Later items and their reminder schedules.
+ * Filters exclusively to upcoming reminders (future next_reminder_at).
  */
 export function formatWatchLaterQueueMessage(
   reels: SavedReel[],
   timeZone?: string,
   now: Date = new Date()
 ): string {
-  if (reels.length === 0) {
+  // Defense-in-depth: only include items with an active future reminder
+  const upcoming = reels.filter((reel) => {
+    if (!reel.next_reminder_at) return false;
+    const reminderDate = new Date(reel.next_reminder_at);
+    return !Number.isNaN(reminderDate.getTime()) && reminderDate.getTime() > now.getTime();
+  });
+
+  if (upcoming.length === 0) {
     return (
-      `📋 Your Watch Later queue is empty!\n\n` +
-      `Share any Reel or Post here to save it and set a reminder.`
+      `📋 You have no upcoming reminders scheduled!\n\n` +
+      `Share any Reel or Post here to save it and set a reminder, or type "update @[creator] [time]" to schedule one.\n\n` +
+      `Type "vault" to view all your saved items.`
     );
   }
 
   const MAX_DISPLAY = 5;
-  const count = reels.length;
-  const header = `📋 Your Watch Later Queue (${count} item${count === 1 ? '' : 's'}):\n`;
+  const count = upcoming.length;
+  const header = `📋 Your Upcoming Reminders (${count} item${count === 1 ? '' : 's'}):\n`;
 
-  const items = reels.slice(0, MAX_DISPLAY).map((reel, index) => {
+  const items = upcoming.slice(0, MAX_DISPLAY).map((reel, index) => {
     const targetLabel = formatHumanReelLabel(reel, 35);
-
-    let scheduleText: string;
-    if (reel.next_reminder_at) {
-      const reminderDate = new Date(reel.next_reminder_at);
-      if (reminderDate.getTime() <= now.getTime()) {
-        scheduleText = 'Due now!';
-      } else {
-        scheduleText = formatTargetTime(reminderDate, now, timeZone);
-      }
-    } else {
-      scheduleText = 'No active reminder set';
-    }
+    const reminderDate = new Date(reel.next_reminder_at!);
+    const scheduleText = formatTargetTime(reminderDate, now, timeZone);
 
     return `${index + 1}. ${targetLabel}\n   ⏰ ${scheduleText}`;
   });
@@ -903,7 +902,7 @@ export function formatWatchLaterQueueMessage(
 
   if (count > MAX_DISPLAY) {
     const remaining = count - MAX_DISPLAY;
-    message += `\n\n...and ${remaining} more item${remaining === 1 ? '' : 's'} in your queue.`;
+    message += `\n\n...and ${remaining} more upcoming reminder${remaining === 1 ? '' : 's'}.`;
   }
 
   message +=
