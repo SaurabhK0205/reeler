@@ -91,13 +91,13 @@ Open `http://localhost:3000`. Once Supabase is configured in `.env`, you can run
 
 ## Database Setup
 
-Reeler connects to database storage through the Supabase client (`@supabase/supabase-js`) using `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`. You can host your database on [Supabase Cloud](https://supabase.com), on a self-hosted Supabase instance (Docker / PostgREST), or locally via the Supabase CLI (`npx supabase start`).
+Reeler connects to database storage through the Supabase client (`@supabase/supabase-js`) using `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`. You can host your database on [Supabase Cloud](https://supabase.com), on a self-hosted Supabase instance (Docker / PostgREST), or locally via the Supabase CLI (`npx supabase init` once, then `npx supabase start`).
 
 ### One-Shot Database Setup (`schema.sql`)
 A complete, self-contained SQL script is maintained in [`schema.sql`](schema.sql). It provisions the entire database schema (tables, 24 performance indexes, full-text search, and RLS policies):
 
 - **Supabase Cloud / Self-Hosted Dashboard**: Paste and run [`schema.sql`](schema.sql) in the Supabase SQL Editor.
-- **Local CLI**: Run `psql -U postgres -d <your-db> -f schema.sql` or use the Supabase CLI (`npx supabase db reset`).
+- **Local CLI**: Run `psql -h 127.0.0.1 -p 54322 -U postgres -d postgres -f schema.sql` (connecting to local Supabase at port 54322) or use the Supabase CLI (`npx supabase db reset`).
 
 > **Repository Invariant**: Whenever a new migration is created or any change is made to the database schema, `schema.sql` MUST be updated in sync so local and self-hosted environments always match the latest schema.
 
