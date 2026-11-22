@@ -260,7 +260,7 @@ export function parseTargetedReminderUpdateCommand(
   // Pattern 2 (Creator first, duration after):
   // e.g. "remind @creator in 2h", "update reminder for @creator to 2h", "snooze @creator 1h"
   const p2 = lower.match(
-    /^(?:remind(?:\s+me)?(?:\s+(?:about|for|of))?|update(?:\s+reminders?(?:\s+(?:for|of|on))?)?|change(?:\s+reminders?(?:\s+(?:for|of|on))?)?|snooze(?:\s+reminders?(?:\s+(?:for|of|on))?)?)\s+(@?(?:\[|<)?[a-z0-9._]{1,30}(?:\]|>)?)\s+(?:to|in|at|for)?\s*(.+)$/i
+    /^(?:remind(?:\s+me)?(?:\s+(?:about|for|of))?|update(?:\s+reminders?(?:\s+(?:for|of|on))?)?|change(?:\s+reminders?(?:\s+(?:for|of|on))?)?|snooze(?:\s+reminders?(?:\s+(?:for|of|on))?)?)\s+(@?(?:\[|<)?[a-z0-9._]{1,30}(?:\]|>)?)\s+(?:(?:to|in|at|for)\s+)?(.+)$/i
   );
   if (p2) {
     const rawCreator = p2[1].trim();

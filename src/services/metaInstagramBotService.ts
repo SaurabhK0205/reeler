@@ -1393,6 +1393,8 @@ export class MetaInstagramBotService {
             awaiting_reminder_choice_until: awaitingUntil,
             is_saved_on_instagram: isSavedOnInstagram,
             instagram_sender_id: senderId,
+          }, {
+            preserveExistingSchedule: Boolean(isAlreadyInWatchLater && !customDuration),
           });
           if (savedReel && delivery) {
             delivery.retryState.savedReelId = savedReel.id;

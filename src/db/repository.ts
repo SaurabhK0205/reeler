@@ -234,14 +234,16 @@ class InMemoryStore {
       existing.thumbnail_url = data.thumbnail_url ?? existing.thumbnail_url;
       existing.save_order_rank = data.save_order_rank;
       if (data.watch_status) existing.watch_status = data.watch_status;
-      if (data.next_reminder_at !== undefined) existing.next_reminder_at = data.next_reminder_at;
-      if (data.awaiting_reminder_choice_until !== undefined) existing.awaiting_reminder_choice_until = data.awaiting_reminder_choice_until;
-      if (data.reminder_interval_hours !== undefined && data.reminder_interval_hours !== null) {
-        existing.reminder_interval_hours = data.reminder_interval_hours;
-      }
-      if (data.reminder_interval_seconds !== undefined && data.reminder_interval_seconds !== null) {
-        existing.reminder_interval_seconds = data.reminder_interval_seconds;
-        existing.reminder_interval_hours = Math.round(data.reminder_interval_seconds / 3600);
+      if (!options?.preserveExistingSchedule) {
+        if (data.next_reminder_at !== undefined) existing.next_reminder_at = data.next_reminder_at;
+        if (data.awaiting_reminder_choice_until !== undefined) existing.awaiting_reminder_choice_until = data.awaiting_reminder_choice_until;
+        if (data.reminder_interval_hours !== undefined && data.reminder_interval_hours !== null) {
+          existing.reminder_interval_hours = data.reminder_interval_hours;
+        }
+        if (data.reminder_interval_seconds !== undefined && data.reminder_interval_seconds !== null) {
+          existing.reminder_interval_seconds = data.reminder_interval_seconds;
+          existing.reminder_interval_hours = Math.round(data.reminder_interval_seconds / 3600);
+        }
       }
       if (data.saved_at !== undefined && data.saved_at !== null) {
         if (existing.saved_at == null || shouldBackfillSavedAt(existing, data.saved_at)) {
@@ -961,7 +963,7 @@ export class Repository {
     awaiting_reminder_choice_until?: string | null;
     is_saved_on_instagram?: boolean;
     instagram_sender_id?: string | null;
-  }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean }): Promise<SavedReel | null> {
+  }, options?: { ignoreDuplicates?: boolean; skipReturn?: boolean; preserveExistingSchedule?: boolean }): Promise<SavedReel | null> {
     const sender = String(data.instagram_sender_id || '').trim();
     if (sender && Repository.isSenderInRecentDeletion(sender)) {
       console.warn(`[Repository] Rejecting reel upsert for sender ${sender} due to active deletion window`);
@@ -1083,12 +1085,14 @@ export class Repository {
         thumbnail_url: data.thumbnail_url ?? existing.thumbnail_url,
         save_order_rank: data.save_order_rank,
         duration_seconds: data.duration_seconds,
-        reminder_interval_hours: Math.round(intervalSeconds / 3600),
-        reminder_interval_seconds: intervalSeconds,
-        next_reminder_at: data.next_reminder_at,
-        awaiting_reminder_choice_until: data.awaiting_reminder_choice_until ?? null,
         updated_at: nowIso,
       };
+      if (!options?.preserveExistingSchedule) {
+        updatePayload.reminder_interval_hours = Math.round(intervalSeconds / 3600);
+        updatePayload.reminder_interval_seconds = intervalSeconds;
+        updatePayload.next_reminder_at = data.next_reminder_at;
+        updatePayload.awaiting_reminder_choice_until = data.awaiting_reminder_choice_until ?? null;
+      }
       if (data.watch_status) {
         updatePayload.watch_status = data.watch_status;
       }
