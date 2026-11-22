@@ -532,4 +532,18 @@ test('Targeted Reminder Update Commands - parses creator handles and durations r
   assert.ok(invDur);
   assert.strictEqual(invDur.targetCreator, 'warnerbrosindia');
   assert.strictEqual(invDur.invalidDurationText, 'non_duration');
+
+  // Explicit handle with reserved word name (@done) must be accepted as creator
+  const cDone = parseTargetedReminderUpdateCommand('update @done 2h', ref, tz);
+  assert.ok(cDone);
+  assert.strictEqual(cDone.targetCreator, 'done');
+  assert.strictEqual(cDone.duration?.seconds, 7200);
+
+  const cDone2 = parseTargetedReminderUpdateCommand('snooze 2h for @done', ref, tz);
+  assert.ok(cDone2);
+  assert.strictEqual(cDone2.targetCreator, 'done');
+
+  // Unsigned conversational words must return null
+  assert.strictEqual(parseTargetedReminderUpdateCommand('update done 2h', ref, tz), null);
+  assert.strictEqual(parseTargetedReminderUpdateCommand('snooze done 1h', ref, tz), null);
 });

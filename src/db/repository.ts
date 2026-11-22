@@ -2756,12 +2756,14 @@ export class Repository {
     const { data: creatorRows, error: cErr } = await supabase
       .from('creators')
       .select('id, username, display_name')
-      .ilike('username', handle);
+      .ilike('username', handle.replace(/[_%]/g, '\\$&'));
     if (cErr) {
       throw new Error(`Failed to find creator for handle ${handle}: ${cErr.message}`);
     }
-    if (!creatorRows || creatorRows.length === 0) return null;
-    const creatorIds = creatorRows.map((c) => c.id);
+    const creatorIds = (creatorRows || [])
+      .filter((c: any) => String(c.username || '').toLowerCase() === handle)
+      .map((c: any) => c.id);
+    if (creatorIds.length === 0) return null;
 
     let query = supabase
       .from('saved_reels')

@@ -194,6 +194,29 @@ function cleanCreatorCandidate(raw: string): string {
     .toLowerCase();
 }
 
+function resolveTargetCreatorCandidate(rawCreator: string): { targetCreator?: string; invalidCreatorTarget?: string } | null {
+  const trimmed = rawCreator.trim();
+  const hasCreatorSigil = trimmed.startsWith('@') || trimmed.startsWith('[') || trimmed.startsWith('<');
+  if (hasCreatorSigil) {
+    const extracted = extractCreatorQuery(trimmed);
+    if (!extracted) {
+      return { invalidCreatorTarget: trimmed };
+    }
+    return { targetCreator: extracted };
+  }
+
+  const cleaned = cleanCreatorCandidate(trimmed);
+  if (
+    PREPOSITIONS_SET.has(cleaned) ||
+    RESERVED_WORDS.has(cleaned) ||
+    isDurationShortcut(cleaned) ||
+    !isPlausibleInstagramHandle(cleaned)
+  ) {
+    return null;
+  }
+  return { targetCreator: cleaned };
+}
+
 /**
  * Parses targeted reminder update / reschedule / snooze commands for a specific creator:
  * e.g. "remind @creator in 2h", "remind @[creator] 2h", "update reminder for @creator to 2h",
@@ -221,21 +244,16 @@ export function parseTargetedReminderUpdateCommand(
   if (p1) {
     const rawDur = p1[1].trim();
     const rawCreator = p1[2].trim();
-    const cleanedCreator = cleanCreatorCandidate(rawCreator);
-    const hasCreatorSigil = rawCreator.startsWith('@') || rawCreator.startsWith('[') || rawCreator.startsWith('<');
-
-    if (hasCreatorSigil || (!PREPOSITIONS_SET.has(cleanedCreator) && !RESERVED_WORDS.has(cleanedCreator) && !isDurationShortcut(cleanedCreator))) {
-      if (!isPlausibleInstagramHandle(cleanedCreator)) {
-        if (hasCreatorSigil) {
-          return { invalidCreatorTarget: rawCreator, durationText: rawDur };
-        }
-      } else {
-        const dur = parseDuration(rawDur, refDate, senderTz);
-        if (!dur) {
-          return { targetCreator: cleanedCreator, invalidDurationText: rawDur };
-        }
-        return { targetCreator: cleanedCreator, duration: dur, durationText: rawDur };
+    const candidate = resolveTargetCreatorCandidate(rawCreator);
+    if (candidate) {
+      if (candidate.invalidCreatorTarget) {
+        return { invalidCreatorTarget: candidate.invalidCreatorTarget, durationText: rawDur };
       }
+      const dur = parseDuration(rawDur, refDate, senderTz);
+      if (!dur) {
+        return { targetCreator: candidate.targetCreator, invalidDurationText: rawDur };
+      }
+      return { targetCreator: candidate.targetCreator, duration: dur, durationText: rawDur };
     }
   }
 
@@ -247,21 +265,17 @@ export function parseTargetedReminderUpdateCommand(
   if (p2) {
     const rawCreator = p2[1].trim();
     const rawDur = p2[2].trim().replace(/[.!?,;:~]+$/, '');
-    const cleanedCreator = cleanCreatorCandidate(rawCreator);
-    const hasCreatorSigil = rawCreator.startsWith('@') || rawCreator.startsWith('[') || rawCreator.startsWith('<');
-
-    if (PREPOSITIONS_SET.has(cleanedCreator) || RESERVED_WORDS.has(cleanedCreator) || isDurationShortcut(cleanedCreator) || !isPlausibleInstagramHandle(cleanedCreator)) {
-      if (hasCreatorSigil) {
-        return { invalidCreatorTarget: rawCreator, durationText: rawDur };
+    const candidate = resolveTargetCreatorCandidate(rawCreator);
+    if (candidate) {
+      if (candidate.invalidCreatorTarget) {
+        return { invalidCreatorTarget: candidate.invalidCreatorTarget, durationText: rawDur };
       }
-      return null;
+      const dur = parseDuration(rawDur, refDate, senderTz);
+      if (!dur) {
+        return { targetCreator: candidate.targetCreator, invalidDurationText: rawDur };
+      }
+      return { targetCreator: candidate.targetCreator, duration: dur, durationText: rawDur };
     }
-
-    const dur = parseDuration(rawDur, refDate, senderTz);
-    if (!dur) {
-      return { targetCreator: cleanedCreator, invalidDurationText: rawDur };
-    }
-    return { targetCreator: cleanedCreator, duration: dur, durationText: rawDur };
   }
 
   return null;
