@@ -146,6 +146,8 @@ interface WebhookRetryState {
   pinnedIsAlreadyInWatchLater?: boolean;
   /** Preserves targeted creator handle for creator-scoped reminder updates across retries. */
   pinnedTargetedCreator?: string;
+  /** Preserves pending creator attribution to commit atomically with reminder schedule across retries. */
+  pinnedPendingNewCreator?: Creator;
   /** Monotonic sequence assigned on initial reception of a timezone-set command to block stale retries. */
   timezoneCommandSeq?: number;
 }
@@ -1046,7 +1048,8 @@ export class MetaInstagramBotService {
             pending.otpCode,
             pending.targetReelId,
             pending.expectedAwaitingUntil,
-            pending.isStatusReply
+            pending.isStatusReply,
+            pending.expectedNextReminderAt
           );
           shouldScheduleRetry = true;
         }
@@ -1095,7 +1098,16 @@ export class MetaInstagramBotService {
         }
       } else {
         if (delivery.stateMutated && delivery.unsentMessages.length > 0) {
-          this.recordPendingWebhookReplies(opId, senderId, delivery.unsentMessages, delivery.issuedOtpCode);
+          this.recordPendingWebhookReplies(
+            opId,
+            senderId,
+            delivery.unsentMessages,
+            delivery.issuedOtpCode,
+            delivery.retryState.pinnedDurationTargetReel?.id,
+            delivery.retryState.expectedAwaitingReminderChoiceUntil,
+            delivery.retryState.pinnedDurationUpdatesReshare,
+            delivery.retryState.expectedNextReminderAt
+          );
         }
         // The route already returned 200 EVENT_RECEIVED before dispatch, so Meta will not redeliver
         // this event; schedule a bounded internal retry preserving the opId and mutation checkpoint.
@@ -1307,7 +1319,7 @@ export class MetaInstagramBotService {
         const resolvedHandle = validHandle || existingHandle || mentionHandle;
         const matchesExistingHandle =
           Boolean(resolvedHandle && existingHandle && resolvedHandle.toLowerCase() === existingHandle.toLowerCase());
-        const reuseExistingCreatorId = matchesExistingHandle || (!validHandle && Boolean(existingCreator));
+        const reuseExistingCreatorId = matchesExistingHandle || (!validHandle && !mentionHandle && Boolean(existingCreator));
         const creatorExternalId = reuseExistingCreatorId
           ? existingCreator!.instagram_user_id
           : resolvedHandle
@@ -1687,6 +1699,7 @@ export class MetaInstagramBotService {
       const parsedDur = parseDuration(text, new Date(), senderTz);
       const effectiveDur = delivery.retryState.pinnedDuration || parsedDur;
       if (effectiveDur) {
+        const pendingCreator = delivery.retryState.pinnedPendingNewCreator;
         const applied = await Repository.updateReminderSchedule(
           targetReel.id,
           effectiveDur.targetDate.toISOString(),
@@ -1696,11 +1709,16 @@ export class MetaInstagramBotService {
             expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
             expectedAwaitingReminderChoiceUntil: targetReel.awaiting_reminder_choice_until ?? null,
             ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
+            ...(pendingCreator ? { newCreatorId: pendingCreator.id } : {}),
           }
         );
         if (!applied) {
           // A newer reminder schedule or watch-status change already updated this Reel before this retry ran.
           return;
+        }
+        if (pendingCreator) {
+          targetReel.creator_id = pendingCreator.id;
+          targetReel.creator = pendingCreator;
         }
         delivery.stateMutated = true;
         if (delivery.retryState.pinnedTargetedCreator) {
@@ -2172,11 +2190,16 @@ export class MetaInstagramBotService {
             delivery.retryState.pinnedDuration = targetedUpdate.duration;
             delivery.retryState.pinnedDurationUpdatesReshare = true;
             delivery.retryState.pinnedTargetedCreator = targetedUpdate.targetCreator;
+            if ((targetReel as any).pendingNewCreator) {
+              delivery.retryState.pinnedPendingNewCreator = (targetReel as any).pendingNewCreator;
+            }
           }
         }
 
         if (targetReel) {
           const effectiveDur = delivery?.retryState?.pinnedDuration || targetedUpdate.duration;
+          const pendingCreator =
+            (targetReel as any).pendingNewCreator || delivery?.retryState?.pinnedPendingNewCreator;
           const applied = await Repository.updateReminderSchedule(
             targetReel.id,
             effectiveDur.targetDate.toISOString(),
@@ -2186,9 +2209,14 @@ export class MetaInstagramBotService {
               expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
               expectedAwaitingReminderChoiceUntil: targetReel.awaiting_reminder_choice_until ?? null,
               ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
+              ...(pendingCreator ? { newCreatorId: pendingCreator.id } : {}),
             }
           );
           if (applied) {
+            if (pendingCreator) {
+              targetReel.creator_id = pendingCreator.id;
+              targetReel.creator = pendingCreator;
+            }
             this.recordLastConfirmedAddition(senderId, targetReel.id);
             this.recordReshareInteraction(targetReel.id);
             if (delivery) delivery.stateMutated = true;

@@ -1168,7 +1168,8 @@ export class Repository {
           let retryQuery = supabase
             .from('saved_reels')
             .update(retryPayload)
-            .eq('id', existing.id);
+            .eq('id', existing.id)
+            .eq('watch_status', currentState.watch_status);
           if (senderOwnershipGuard) {
             retryQuery = retryQuery.or(senderOwnershipGuard);
           } else {
@@ -2042,6 +2043,7 @@ export class Repository {
       expectedUpdatedAt?: string | null;
       expectedWatchStatus?: WatchStatus;
       expectedAwaitingReminderChoiceUntil?: string | null;
+      newCreatorId?: string;
     }
   ): Promise<boolean> {
     const now = new Date().toISOString();
@@ -2090,6 +2092,9 @@ export class Repository {
       reel.watch_status = 'watch_later';
       reel.awaiting_reminder_choice_until = null;
       reel.updated_at = now;
+      if (options?.newCreatorId) {
+        reel.creator_id = options.newCreatorId;
+      }
       if (intervalSeconds) {
         reel.reminder_interval_seconds = intervalSeconds;
         reel.reminder_interval_hours = Math.round(intervalSeconds / 3600);
@@ -2104,6 +2109,9 @@ export class Repository {
       awaiting_reminder_choice_until: null,
       updated_at: now,
     };
+    if (options?.newCreatorId) {
+      updatePayload.creator_id = options.newCreatorId;
+    }
     if (intervalSeconds) {
       updatePayload.reminder_interval_seconds = intervalSeconds;
       updatePayload.reminder_interval_hours = Math.round(intervalSeconds / 3600);
@@ -2844,12 +2852,10 @@ export class Repository {
               display_name: handle,
               profile_picture_url: null,
             });
-            await Repository.updateReelCreator(matched.id, newCreator.id);
             return {
               ...matched,
-              creator_id: newCreator.id,
-              creator: newCreator,
-            };
+              pendingNewCreator: newCreator,
+            } as any;
           }
         }
       }
@@ -2939,12 +2945,10 @@ export class Repository {
             display_name: handle,
             profile_picture_url: null,
           });
-          await Repository.updateReelCreator(matched.id, newCreator.id);
           return {
             ...matched,
-            creator_id: newCreator.id,
-            creator: newCreator,
-          };
+            pendingNewCreator: newCreator,
+          } as any;
         }
       }
     }
