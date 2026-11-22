@@ -5532,4 +5532,54 @@ test('isScheduleBeyond24Hours - detects >24h durations and appends 24h window no
       `Expected 24h window notice, got: ${replies[0]}`
     );
   });
+
+  test('MetaInstagramBotService - verifyWebhook validates tokens and fails closed in hosted environments', () => {
+    const origVerifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN;
+    const origEnv = process.env.NODE_ENV;
+    const origRender = process.env.RENDER;
+
+    try {
+      // 1. Configured token match
+      process.env.META_WEBHOOK_VERIFY_TOKEN = 'my_super_secret_verify_token';
+      delete process.env.RENDER;
+      process.env.NODE_ENV = 'test';
+      const bot = new MetaInstagramBotService();
+
+      assert.strictEqual(
+        bot.verifyWebhook('subscribe', 'my_super_secret_verify_token', 'challenge_123'),
+        'challenge_123'
+      );
+      assert.strictEqual(
+        bot.verifyWebhook('subscribe', 'wrong_token', 'challenge_123'),
+        null
+      );
+      assert.strictEqual(
+        bot.verifyWebhook('not_subscribe', 'my_super_secret_verify_token', 'challenge_123'),
+        null
+      );
+
+      // 2. Hosted/Production environment with UNCONFIGURED verify token: MUST FAIL CLOSED
+      delete process.env.META_WEBHOOK_VERIFY_TOKEN;
+      process.env.RENDER = 'true';
+      const hostedBot = new MetaInstagramBotService();
+
+      assert.strictEqual(
+        hostedBot.verifyWebhook('subscribe', 'rea_instagram_saved_token', 'challenge_123'),
+        null,
+        'Must reject dev fallback token in hosted environments'
+      );
+      assert.strictEqual(
+        hostedBot.verifyWebhook('subscribe', 'ig_reels_tracker_webhook_secret_2026', 'challenge_123'),
+        null,
+        'Must reject legacy hardcoded token in hosted environments'
+      );
+    } finally {
+      if (origVerifyToken !== undefined) process.env.META_WEBHOOK_VERIFY_TOKEN = origVerifyToken;
+      else delete process.env.META_WEBHOOK_VERIFY_TOKEN;
+      if (origEnv !== undefined) process.env.NODE_ENV = origEnv;
+      else delete process.env.NODE_ENV;
+      if (origRender !== undefined) process.env.RENDER = origRender;
+      else delete process.env.RENDER;
+    }
+  });
 });
