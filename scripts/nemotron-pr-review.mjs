@@ -98,40 +98,49 @@ async function runReview() {
   console.log(`Sending PR #${PR_NUMBER} diff (${diff.length} bytes) to NVIDIA NIM (${modelName})...`);
 
   let reviewBody = null;
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${NVIDIA_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      signal: AbortSignal.timeout(30000),
-      body: JSON.stringify({
-        model: modelName,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: `--- GIT DIFF FOR PULL REQUEST #${PR_NUMBER} ---\n\n${truncatedDiff}` }
-        ],
-        temperature: 0.1,
-        max_tokens: 2048
-      })
-    });
+  let lastError = null;
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.warn(`NVIDIA API error with model ${modelName} (${response.status}):`, errorText);
-      throw new Error(`NVIDIA API error ${response.status}: ${errorText}`);
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      if (attempt > 1) {
+        console.log(`Retrying Nemotron review (attempt ${attempt}/2)...`);
+      }
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${NVIDIA_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        signal: AbortSignal.timeout(75000),
+        body: JSON.stringify({
+          model: modelName,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: `--- GIT DIFF FOR PULL REQUEST #${PR_NUMBER} ---\n\n${truncatedDiff}` }
+          ],
+          temperature: 0.1,
+          max_tokens: 2048
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.warn(`NVIDIA API error with model ${modelName} (${response.status}):`, errorText);
+        lastError = errorText;
+        continue;
+      }
+
+      const data = await response.json();
+      reviewBody = data?.choices?.[0]?.message?.content;
+      if (reviewBody) break;
+    } catch (err) {
+      console.warn(`Nemotron request attempt ${attempt} failed:`, err.message || err);
+      lastError = err.message || err;
     }
-
-    const data = await response.json();
-    reviewBody = data?.choices?.[0]?.message?.content;
-  } catch (err) {
-    console.error(`Request failed with model ${modelName}:`, err.message || err);
-    process.exit(1);
   }
 
   if (!reviewBody) {
-    console.error('Failed to generate review with NVIDIA Nemotron model.');
+    console.error('Failed to generate review with NVIDIA Nemotron model. Last error:', lastError);
     process.exit(1);
   }
 
