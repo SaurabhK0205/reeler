@@ -2150,7 +2150,7 @@ export class MetaInstagramBotService {
     // 2. Personal Vault / Web library link request (e.g. "vault", "library", "web", "dashboard", "link")
     if (['vault', 'library', 'web', 'dashboard', 'link', 'my vault'].includes(normalizedText)) {
       const isSenderAdmin = Boolean(this.adminUserId && senderId === this.adminUserId);
-      const userKey = isSenderAdmin ? getAdminVaultKey() : generateUserVaultKey(senderId);
+      const userKey = isSenderAdmin ? getAdminVaultKey() : generateUserVaultKey(senderId, Date.now());
       const baseUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || 'https://reeler-staging.onrender.com';
       const vaultUrl = `${baseUrl.replace(/\/+$/, '')}/?key=${userKey}`;
 
