@@ -4,7 +4,7 @@ import { safeStringEqual } from '../middleware/security.ts';
 import { loadConfig } from '../config.ts';
 import { Repository, SenderReminderConflictError, SenderDeletionBarrierError } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
-import { parseDuration, formatTargetTime } from '../utils/duration.ts';
+import { parseDuration, formatTargetTime, isSameInstant } from '../utils/duration.ts';
 import { getTimeZoneSummary } from '../utils/timezone.ts';
 import { extractCreatorQueryWithFilter, extractCreatorQuery } from '../utils/creatorQuery.ts';
 import {
@@ -144,6 +144,10 @@ interface WebhookRetryState {
   pinnedCancelTargetReelId?: string;
   /** Preserves whether an inbound share was already active in Watch Later across retries. */
   pinnedIsAlreadyInWatchLater?: boolean;
+  /** Preserves targeted creator handle for creator-scoped reminder updates across retries. */
+  pinnedTargetedCreator?: string;
+  /** Preserves pending creator attribution to commit atomically with reminder schedule across retries. */
+  pinnedPendingNewCreator?: Creator;
   /** Monotonic sequence assigned on initial reception of a timezone-set command to block stale retries. */
   timezoneCommandSeq?: number;
 }
@@ -169,6 +173,7 @@ interface PendingWebhookReply {
   otpCode?: string;
   targetReelId?: string;
   expectedAwaitingUntil?: string | null;
+  expectedNextReminderAt?: string | null;
   isStatusReply?: boolean;
 }
 
@@ -363,7 +368,8 @@ export class MetaInstagramBotService {
         undefined,
         pending.reel.id,
         pending.reel.awaiting_reminder_choice_until,
-        pending.isAlreadyInWatchLater
+        pending.isAlreadyInWatchLater,
+        pending.reel.next_reminder_at
       );
       this.scheduleWebhookRetry(pending.opId, 0, () =>
         this.dispatchWebhookMessage(
@@ -587,7 +593,8 @@ export class MetaInstagramBotService {
     otpCode?: string,
     targetReelId?: string,
     expectedAwaitingUntil?: string | null,
-    isStatusReply?: boolean
+    isStatusReply?: boolean,
+    expectedNextReminderAt?: string | null
   ): void {
     const now = Date.now();
     if (this.pendingRepliesByMid.size >= WEBHOOK_PENDING_REPLY_MAX_ENTRIES) {
@@ -608,7 +615,11 @@ export class MetaInstagramBotService {
       expiresAt: now + WEBHOOK_PENDING_REPLY_TTL_MS,
       ...(otpCode ? { otpCode } : {}),
       ...(targetReelId
-        ? { targetReelId, expectedAwaitingUntil, ...(isStatusReply ? { isStatusReply: true } : {}) }
+        ? {
+            targetReelId,
+            expectedAwaitingUntil,
+            ...(isStatusReply ? { isStatusReply: true, expectedNextReminderAt } : {}),
+          }
         : {}),
     });
   }
@@ -1002,13 +1013,14 @@ export class MetaInstagramBotService {
           if (
             !freshItem ||
             freshItem.watch_status !== 'watch_later' ||
+            (pending.isStatusReply && !isSameInstant(freshItem.next_reminder_at, pending.expectedNextReminderAt)) ||
             (!pending.isStatusReply && (
               !freshItem.awaiting_reminder_choice_until ||
-              freshItem.awaiting_reminder_choice_until !== pending.expectedAwaitingUntil ||
+              !isSameInstant(freshItem.awaiting_reminder_choice_until, pending.expectedAwaitingUntil) ||
               new Date(freshItem.awaiting_reminder_choice_until).getTime() <= Date.now()
             ))
           ) {
-            // Choice already settled, deadline expired, or item cancelled/watched; discard stale prompt replay.
+            // Choice already settled, deadline expired, status superseded, or item cancelled/watched; discard stale prompt replay.
             this.markWebhookMidCompleted(opId);
             return;
           }
@@ -1036,7 +1048,8 @@ export class MetaInstagramBotService {
             pending.otpCode,
             pending.targetReelId,
             pending.expectedAwaitingUntil,
-            pending.isStatusReply
+            pending.isStatusReply,
+            pending.expectedNextReminderAt
           );
           shouldScheduleRetry = true;
         }
@@ -1085,7 +1098,20 @@ export class MetaInstagramBotService {
         }
       } else {
         if (delivery.stateMutated && delivery.unsentMessages.length > 0) {
-          this.recordPendingWebhookReplies(opId, senderId, delivery.unsentMessages, delivery.issuedOtpCode);
+          const isStatusReply = Boolean(
+            delivery.retryState.expectedNextReminderAt ||
+            delivery.retryState.pinnedDurationUpdatesReshare
+          );
+          this.recordPendingWebhookReplies(
+            opId,
+            senderId,
+            delivery.unsentMessages,
+            delivery.issuedOtpCode,
+            delivery.retryState.pinnedDurationTargetReel?.id,
+            isStatusReply ? null : delivery.retryState.expectedAwaitingReminderChoiceUntil,
+            isStatusReply,
+            delivery.retryState.expectedNextReminderAt
+          );
         }
         // The route already returned 200 EVENT_RECEIVED before dispatch, so Meta will not redeliver
         // this event; schedule a bounded internal retry preserving the opId and mutation checkpoint.
@@ -1288,15 +1314,20 @@ export class MetaInstagramBotService {
       const validHandle = extractPublicCreatorUsername({ username: meta.username });
       const existingCreator = metadataSeed?.creator;
       const existingHandle = extractPublicCreatorUsername(existingCreator);
+      const explicitMentionMatch =
+        remaining.match(/(?:^|\s)@([a-zA-Z0-9._]+)/) || text.match(/(?:^|\s)@([a-zA-Z0-9._]+)/);
+      const mentionHandle = explicitMentionMatch
+        ? extractCreatorQuery(`@${explicitMentionMatch[1]}`)
+        : null;
 
       let creator: NonNullable<typeof existingCreator>;
-      if (!validHandle && !meta.displayName && existingCreator) {
+      if (!validHandle && !meta.displayName && existingCreator && !mentionHandle) {
         creator = existingCreator;
       } else {
-        const resolvedHandle = validHandle || existingHandle;
+        const resolvedHandle = validHandle || existingHandle || mentionHandle;
         const matchesExistingHandle =
           Boolean(resolvedHandle && existingHandle && resolvedHandle.toLowerCase() === existingHandle.toLowerCase());
-        const reuseExistingCreatorId = matchesExistingHandle || (!validHandle && Boolean(existingCreator));
+        const reuseExistingCreatorId = matchesExistingHandle || (!validHandle && !mentionHandle && Boolean(existingCreator));
         const creatorExternalId = reuseExistingCreatorId
           ? existingCreator!.instagram_user_id
           : resolvedHandle
@@ -1465,6 +1496,11 @@ export class MetaInstagramBotService {
         }
         if (delivery) {
           delivery.stateMutated = true;
+          if (savedReel) {
+            delivery.retryState.pinnedDurationTargetReel = savedReel;
+            delivery.retryState.expectedNextReminderAt = savedReel.next_reminder_at ?? null;
+            delivery.retryState.pinnedDurationUpdatesReshare = true;
+          }
           if (delivery.opId) {
             this.markWebhookMutationCommitted(delivery.opId);
           }
@@ -1504,7 +1540,7 @@ export class MetaInstagramBotService {
           this.recordLastConfirmedAddition(senderId, savedReel.id);
           this.recordReshareInteraction(savedReel.id);
         }
-        const activeNextReminder = existingItem?.next_reminder_at ?? savedReel?.next_reminder_at;
+        const activeNextReminder = savedReel ? savedReel.next_reminder_at : existingItem?.next_reminder_at;
         let reply = `${addedHeading}${creatorLine}\n\n`;
         if (activeNextReminder) {
           const scheduledTimeStr = formatTargetTime(new Date(activeNextReminder), new Date(), senderTz);
@@ -1657,6 +1693,9 @@ export class MetaInstagramBotService {
           this.pendingSharePrompts.delete(senderId);
         }
         delivery.stateMutated = true;
+        delivery.retryState.pinnedDurationTargetReel = targetReel;
+        delivery.retryState.expectedNextReminderAt = effectiveDur.targetDate.toISOString();
+        delivery.retryState.pinnedDurationUpdatesReshare = true;
         if (promptInfo.opId) this.markWebhookMidCompleted(promptInfo.opId);
 
         const reminderActionLabel = promptInfo.isAlreadyInWatchLater ? 'Reminder updated for:' : 'Reminder set for:';
@@ -1676,6 +1715,7 @@ export class MetaInstagramBotService {
       const parsedDur = parseDuration(text, new Date(), senderTz);
       const effectiveDur = delivery.retryState.pinnedDuration || parsedDur;
       if (effectiveDur) {
+        const pendingCreator = delivery.retryState.pinnedPendingNewCreator;
         const applied = await Repository.updateReminderSchedule(
           targetReel.id,
           effectiveDur.targetDate.toISOString(),
@@ -1685,13 +1725,24 @@ export class MetaInstagramBotService {
             expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
             expectedAwaitingReminderChoiceUntil: targetReel.awaiting_reminder_choice_until ?? null,
             ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
+            ...(pendingCreator ? { newCreatorId: pendingCreator.id } : {}),
           }
         );
         if (!applied) {
           // A newer reminder schedule or watch-status change already updated this Reel before this retry ran.
           return;
         }
+        if (pendingCreator) {
+          targetReel.creator_id = pendingCreator.id;
+          targetReel.creator = pendingCreator;
+        }
         delivery.stateMutated = true;
+        delivery.retryState.pinnedDurationTargetReel = targetReel;
+        delivery.retryState.expectedNextReminderAt = effectiveDur.targetDate.toISOString();
+        delivery.retryState.pinnedDurationUpdatesReshare = true;
+        if (delivery.retryState.pinnedTargetedCreator) {
+          this.recordReshareInteraction(targetReel.id);
+        }
         let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget, delivery.retryState.pinnedDurationUpdatesReshare);
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
@@ -1756,8 +1807,9 @@ export class MetaInstagramBotService {
         const targetedWatched = parseTargetedWatchedCommand(text);
         const { isCommand: isWatchedCmd } = parseWatchedStopCommand(text);
         const isCreatorQuery = Boolean(extractCreatorQuery(text));
-        if (targetedWatched || isWatchedCmd || isCreatorQuery) {
-          // Watched command, stop command, or creator search: flush prompt and fall through
+        const targetedReminderUpdate = parseTargetedReminderUpdateCommand(text, new Date(), senderTz);
+        if (targetedWatched || isWatchedCmd || isCreatorQuery || targetedReminderUpdate) {
+          // Watched command, stop command, creator search, or targeted reminder update: flush prompt and fall through
           await this.flushPendingSharePrompt(senderId);
         } else if (this.inFlightShares.has(senderId)) {
           // An active share is currently being ingested for this sender.
@@ -1805,7 +1857,12 @@ export class MetaInstagramBotService {
               await this.deliverReply(senderId, reply, delivery);
               return;
             }
-            if (delivery) delivery.stateMutated = true;
+            if (delivery) {
+              delivery.stateMutated = true;
+              delivery.retryState.pinnedDurationTargetReel = targetReel;
+              delivery.retryState.expectedNextReminderAt = effectiveDur.targetDate.toISOString();
+              delivery.retryState.pinnedDurationUpdatesReshare = true;
+            }
             if (pending.opId) this.markWebhookMidCompleted(pending.opId);
 
             const reminderActionLabel = pending.isAlreadyInWatchLater ? 'Reminder updated for:' : 'Reminder set for:';
@@ -2145,17 +2202,27 @@ export class MetaInstagramBotService {
           targetReel = await Repository.getActiveWatchLaterReelForCreator(
             senderId,
             targetedUpdate.targetCreator,
-            { includeUnattributedFallback: isSenderAdmin }
+            {
+              includeUnattributedFallback: isSenderAdmin,
+              fallbackToUnattributedItem: true,
+              preferredReelId: this.lastConfirmedAdditionReelId.get(senderId),
+            }
           );
           if (targetReel && delivery) {
             delivery.retryState.pinnedDurationTargetReel = targetReel;
             delivery.retryState.pinnedDuration = targetedUpdate.duration;
             delivery.retryState.pinnedDurationUpdatesReshare = true;
+            delivery.retryState.pinnedTargetedCreator = targetedUpdate.targetCreator;
+            if ((targetReel as any).pendingNewCreator) {
+              delivery.retryState.pinnedPendingNewCreator = (targetReel as any).pendingNewCreator;
+            }
           }
         }
 
         if (targetReel) {
           const effectiveDur = delivery?.retryState?.pinnedDuration || targetedUpdate.duration;
+          const pendingCreator =
+            (targetReel as any).pendingNewCreator || delivery?.retryState?.pinnedPendingNewCreator;
           const applied = await Repository.updateReminderSchedule(
             targetReel.id,
             effectiveDur.targetDate.toISOString(),
@@ -2165,12 +2232,21 @@ export class MetaInstagramBotService {
               expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
               expectedAwaitingReminderChoiceUntil: targetReel.awaiting_reminder_choice_until ?? null,
               ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
+              ...(pendingCreator ? { newCreatorId: pendingCreator.id } : {}),
             }
           );
           if (applied) {
-            this.recordLastConfirmedAddition(senderId, targetReel.id);
+            if (pendingCreator) {
+              targetReel.creator_id = pendingCreator.id;
+              targetReel.creator = pendingCreator;
+            }
             this.recordReshareInteraction(targetReel.id);
-            if (delivery) delivery.stateMutated = true;
+            if (delivery) {
+              delivery.stateMutated = true;
+              delivery.retryState.pinnedDurationTargetReel = targetReel;
+              delivery.retryState.expectedNextReminderAt = effectiveDur.targetDate.toISOString();
+              delivery.retryState.pinnedDurationUpdatesReshare = true;
+            }
             let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget, true);
             if (senderTz === 'UTC') {
               reply += `\n\n💡 Tip: Times are currently shown in UTC. Reply e.g. "tz New York" or "tz IST" to set your local time!`;
@@ -2284,7 +2360,12 @@ export class MetaInstagramBotService {
             }
           );
           if (applied) {
-            if (delivery) delivery.stateMutated = true;
+            if (delivery) {
+              delivery.stateMutated = true;
+              delivery.retryState.pinnedDurationTargetReel = targetReel;
+              delivery.retryState.expectedNextReminderAt = nextDate;
+              delivery.retryState.pinnedDurationUpdatesReshare = true;
+            }
             if (this.pendingSharePrompts.has(senderId)) {
               const pending = this.pendingSharePrompts.get(senderId)!;
               if (pending.reel.id === targetReel.id || (activeShare && pending.shareId === activeShare.shareId)) {
@@ -2363,7 +2444,12 @@ export class MetaInstagramBotService {
           return;
         }
         this.recentReshareReelIds.delete(targetReel.id);
-        if (delivery) delivery.stateMutated = true;
+        if (delivery) {
+          delivery.stateMutated = true;
+          delivery.retryState.pinnedDurationTargetReel = targetReel;
+          delivery.retryState.expectedNextReminderAt = nextDate;
+          delivery.retryState.pinnedDurationUpdatesReshare = true;
+        }
         let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget, updatesReshare);
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are currently shown in UTC. Reply e.g. "tz New York" or "tz IST" to set your local time!`;

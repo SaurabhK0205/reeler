@@ -10,6 +10,7 @@ import type {
   BatchReelsResult
 } from '../types.ts';
 import { classifySavedMediaType } from '../utils/mediaType.ts';
+import { isPlaceholderCreator } from '../utils/reelMessages.ts';
 import { resolveTimeZone } from '../utils/timezone.ts';
 import { getSupabase, isSupabaseConfigured } from './client.ts';
 
@@ -233,8 +234,11 @@ class InMemoryStore {
       existing.caption = data.caption ?? existing.caption;
       existing.thumbnail_url = data.thumbnail_url ?? existing.thumbnail_url;
       existing.save_order_rank = data.save_order_rank;
+      const shouldPreserveSchedule = Boolean(
+        options?.preserveExistingSchedule && existing.watch_status === 'watch_later'
+      );
       if (data.watch_status) existing.watch_status = data.watch_status;
-      if (!options?.preserveExistingSchedule) {
+      if (!shouldPreserveSchedule) {
         if (data.next_reminder_at !== undefined) existing.next_reminder_at = data.next_reminder_at;
         if (data.awaiting_reminder_choice_until !== undefined) existing.awaiting_reminder_choice_until = data.awaiting_reminder_choice_until;
         if (data.reminder_interval_hours !== undefined && data.reminder_interval_hours !== null) {
@@ -1087,7 +1091,10 @@ export class Repository {
         duration_seconds: data.duration_seconds,
         updated_at: nowIso,
       };
-      if (!options?.preserveExistingSchedule) {
+      const shouldPreserveSchedule = Boolean(
+        options?.preserveExistingSchedule && existing.watch_status === 'watch_later'
+      );
+      if (!shouldPreserveSchedule) {
         updatePayload.reminder_interval_hours = Math.round(intervalSeconds / 3600);
         updatePayload.reminder_interval_seconds = intervalSeconds;
         updatePayload.next_reminder_at = data.next_reminder_at;
@@ -1119,6 +1126,9 @@ export class Repository {
         .from('saved_reels')
         .update(updatePayload)
         .eq('id', existing.id);
+      if (shouldPreserveSchedule) {
+        updateQuery = updateQuery.eq('watch_status', 'watch_later');
+      }
       if (senderOwnershipGuard) {
         updateQuery = updateQuery.or(senderOwnershipGuard);
       } else {
@@ -1145,6 +1155,32 @@ export class Repository {
         }
         if (currentState && isConflictingActiveSenderReminder(currentState as SavedReel, incomingSender)) {
           throw new SenderReminderConflictError(data.shortcode);
+        }
+        if (shouldPreserveSchedule && currentState && currentState.watch_status !== 'watch_later') {
+          // Row was concurrently marked watched/unwatched; commit new schedule rather than leaving Watch Later without schedule
+          const retryPayload = {
+            ...updatePayload,
+            reminder_interval_hours: Math.round(intervalSeconds / 3600),
+            reminder_interval_seconds: intervalSeconds,
+            next_reminder_at: data.next_reminder_at,
+            awaiting_reminder_choice_until: data.awaiting_reminder_choice_until ?? null,
+          };
+          let retryQuery = supabase
+            .from('saved_reels')
+            .update(retryPayload)
+            .eq('id', existing.id)
+            .eq('watch_status', currentState.watch_status);
+          if (senderOwnershipGuard) {
+            retryQuery = retryQuery.or(senderOwnershipGuard);
+          } else {
+            retryQuery = retryQuery.is('instagram_sender_id', null);
+          }
+          const { data: retriedRow, error: retryErr } = await retryQuery
+            .select(options?.skipReturn ? 'id' : '*, creator:creators(*)')
+            .maybeSingle();
+          if (!retryErr && retriedRow) {
+            return retriedRow as SavedReel;
+          }
         }
         throw new Error('Supabase upsertSavedReel update failed: no record updated');
       }
@@ -2007,6 +2043,7 @@ export class Repository {
       expectedUpdatedAt?: string | null;
       expectedWatchStatus?: WatchStatus;
       expectedAwaitingReminderChoiceUntil?: string | null;
+      newCreatorId?: string;
     }
   ): Promise<boolean> {
     const now = new Date().toISOString();
@@ -2055,6 +2092,9 @@ export class Repository {
       reel.watch_status = 'watch_later';
       reel.awaiting_reminder_choice_until = null;
       reel.updated_at = now;
+      if (options?.newCreatorId) {
+        reel.creator_id = options.newCreatorId;
+      }
       if (intervalSeconds) {
         reel.reminder_interval_seconds = intervalSeconds;
         reel.reminder_interval_hours = Math.round(intervalSeconds / 3600);
@@ -2069,6 +2109,9 @@ export class Repository {
       awaiting_reminder_choice_until: null,
       updated_at: now,
     };
+    if (options?.newCreatorId) {
+      updatePayload.creator_id = options.newCreatorId;
+    }
     if (intervalSeconds) {
       updatePayload.reminder_interval_seconds = intervalSeconds;
       updatePayload.reminder_interval_hours = Math.round(intervalSeconds / 3600);
@@ -2715,13 +2758,45 @@ export class Repository {
   }
 
   /**
+   * Updates the creator_id of a saved reel (e.g. attributing an unattributed post to a user-provided creator handle).
+   */
+  static async updateReelCreator(reelId: string, creatorId: string): Promise<boolean> {
+    const trimmedReelId = String(reelId || '').trim();
+    const trimmedCreatorId = String(creatorId || '').trim();
+    if (!trimmedReelId || !trimmedCreatorId) return false;
+
+    if (!isSupabaseConfigured()) {
+      const reel = memoryStore.reels.get(trimmedReelId);
+      if (!reel) return false;
+      reel.creator_id = trimmedCreatorId;
+      reel.updated_at = new Date().toISOString();
+      return true;
+    }
+
+    const supabase = getSupabase();
+    const { error } = await supabase
+      .from('saved_reels')
+      .update({ creator_id: trimmedCreatorId, updated_at: new Date().toISOString() })
+      .eq('id', trimmedReelId);
+    if (error) {
+      console.warn(`[Repository] Failed to update creator for reel ${trimmedReelId}: ${error.message}`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * Retrieves the most recently reminded/updated active Watch Later reel for a specific creator
-   * scoped to an Instagram sender (with optional unattributed admin fallback).
+   * scoped to an Instagram sender (with optional unattributed admin fallback and unattributed item matching).
    */
   static async getActiveWatchLaterReelForCreator(
     senderId: string,
     creatorHandle: string,
-    options?: { includeUnattributedFallback?: boolean }
+    options?: {
+      includeUnattributedFallback?: boolean;
+      fallbackToUnattributedItem?: boolean;
+      preferredReelId?: string;
+    }
   ): Promise<SavedReel | null> {
     const trimmedSender = String(senderId || '').trim();
     const handle = String(creatorHandle || '')
@@ -2748,12 +2823,44 @@ export class Repository {
           return String(creator?.username || '').toLowerCase() === handle;
         });
       }
-      if (candidates.length === 0) return null;
+      if (candidates.length > 0) {
+        const ordered = sortWatchLaterReelsMostRecentFirst(
+          candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) || r.creator }))
+        );
+        return ordered[0] || null;
+      }
 
-      const ordered = sortWatchLaterReelsMostRecentFirst(
-        candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) || r.creator }))
-      );
-      return ordered[0] || null;
+      // If requested, check if the sender has an active Watch Later item with placeholder/unattributed creator
+      if (options?.fallbackToUnattributedItem && trimmedSender) {
+        const unattributed = Array.from(memoryStore.reels.values()).filter((r) => {
+          if (r.watch_status !== 'watch_later') return false;
+          if (r.instagram_sender_id !== trimmedSender) return false;
+          const creator = memoryStore.creators.get(r.creator_id) || r.creator;
+          return isPlaceholderCreator(creator);
+        });
+        if (unattributed.length > 0) {
+          const matched =
+            (options.preferredReelId && unattributed.find((r) => r.id === options.preferredReelId)) ||
+            unattributed.find((r) => String(r.caption || '').toLowerCase().includes(handle)) ||
+            sortWatchLaterReelsMostRecentFirst(
+              unattributed.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) || r.creator }))
+            )[0];
+          if (matched) {
+            const newCreator = await Repository.upsertCreator({
+              instagram_user_id: `creator_${handle}`,
+              username: handle,
+              display_name: handle,
+              profile_picture_url: null,
+            });
+            return {
+              ...matched,
+              pendingNewCreator: newCreator,
+            } as any;
+          }
+        }
+      }
+
+      return null;
     }
 
     const supabase = getSupabase();
@@ -2767,31 +2874,33 @@ export class Repository {
     const creatorIds = (creatorRows || [])
       .filter((c: any) => String(c.username || '').toLowerCase() === handle)
       .map((c: any) => c.id);
-    if (creatorIds.length === 0) return null;
 
-    let query = supabase
-      .from('saved_reels')
-      .select('*, creator:creators(*)')
-      .eq('watch_status', 'watch_later')
-      .in('creator_id', creatorIds);
+    if (creatorIds.length > 0) {
+      let query = supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .eq('watch_status', 'watch_later')
+        .in('creator_id', creatorIds);
 
-    if (trimmedSender) {
-      query = query.eq('instagram_sender_id', trimmedSender);
-    } else if (allowUnattributedFallback) {
-      query = query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
-    } else {
-      return null;
-    }
+      if (trimmedSender) {
+        query = query.eq('instagram_sender_id', trimmedSender);
+      } else if (allowUnattributedFallback) {
+        query = query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+      } else {
+        return null;
+      }
 
-    const { data: reels, error: rErr } = await query
-      .order('updated_at', { ascending: false })
-      .order('last_reminded_at', { ascending: false, nullsFirst: false })
-      .order('created_at', { ascending: false })
-      .limit(10);
-    if (rErr) {
-      throw new Error(`Failed to fetch active reel for creator ${handle}: ${rErr.message}`);
-    }
-    if (!reels || reels.length === 0) {
+      const { data: reels, error: rErr } = await query
+        .order('updated_at', { ascending: false })
+        .order('last_reminded_at', { ascending: false, nullsFirst: false })
+        .order('created_at', { ascending: false })
+        .limit(10);
+      if (rErr) {
+        throw new Error(`Failed to fetch active reel for creator ${handle}: ${rErr.message}`);
+      }
+      if (reels && reels.length > 0) {
+        return sortWatchLaterReelsMostRecentFirst(reels as SavedReel[])[0] || null;
+      }
       if (trimmedSender && allowUnattributedFallback) {
         const { data: fbReels, error: fbErr } = await supabase
           .from('saved_reels')
@@ -2808,9 +2917,43 @@ export class Repository {
           return sortWatchLaterReelsMostRecentFirst(fbReels as SavedReel[])[0] || null;
         }
       }
-      return null;
     }
-    return sortWatchLaterReelsMostRecentFirst(reels as SavedReel[])[0] || null;
+
+    // If requested, check if sender has an active Watch Later item with placeholder/unattributed creator
+    if (options?.fallbackToUnattributedItem && trimmedSender) {
+      const { data: senderActiveReels, error: saErr } = await supabase
+        .from('saved_reels')
+        .select('*, creator:creators(*)')
+        .eq('watch_status', 'watch_later')
+        .eq('instagram_sender_id', trimmedSender)
+        .order('updated_at', { ascending: false })
+        .order('last_reminded_at', { ascending: false, nullsFirst: false })
+        .order('created_at', { ascending: false });
+      if (saErr) {
+        throw new Error(`Failed to fetch active reels for unattributed fallback: ${saErr.message}`);
+      }
+      const unattributed = (senderActiveReels || []).filter((r: any) => isPlaceholderCreator(r.creator));
+      if (unattributed.length > 0) {
+        const matched =
+          (options.preferredReelId && unattributed.find((r: any) => r.id === options.preferredReelId)) ||
+          unattributed.find((r: any) => String(r.caption || '').toLowerCase().includes(handle)) ||
+          sortWatchLaterReelsMostRecentFirst(unattributed as SavedReel[])[0];
+        if (matched) {
+          const newCreator = await Repository.upsertCreator({
+            instagram_user_id: `creator_${handle}`,
+            username: handle,
+            display_name: handle,
+            profile_picture_url: null,
+          });
+          return {
+            ...matched,
+            pendingNewCreator: newCreator,
+          } as any;
+        }
+      }
+    }
+
+    return null;
   }
 
   /**

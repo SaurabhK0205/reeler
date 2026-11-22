@@ -543,7 +543,15 @@ test('Targeted Reminder Update Commands - parses creator handles and durations r
   assert.ok(cDone2);
   assert.strictEqual(cDone2.targetCreator, 'done');
 
-  // Unsigned conversational words must return null
+  // Unsigned conversational words and month names must return null
   assert.strictEqual(parseTargetedReminderUpdateCommand('update done 2h', ref, tz), null);
   assert.strictEqual(parseTargetedReminderUpdateCommand('snooze done 1h', ref, tz), null);
+  assert.strictEqual(parseTargetedReminderUpdateCommand('remind me november 25', ref, tz), null);
+  assert.strictEqual(parseTargetedReminderUpdateCommand('remind me nov 25', ref, tz), null);
+
+  // Explicit @handle for month names must be supported
+  const cNov = parseTargetedReminderUpdateCommand('remind @november in 2h', ref, tz);
+  assert.ok(cNov);
+  assert.strictEqual(cNov.targetCreator, 'november');
+  assert.strictEqual(cNov.duration?.seconds, 7200);
 });
