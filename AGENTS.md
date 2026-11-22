@@ -71,15 +71,19 @@ Follow GRAVITAS invariants for implementation, debugging, refactoring, review, a
 5. **Database & Schema Invariant**: All schema changes require a migration in `supabase/migrations/`, an update to `src/types.ts`, and updating the complete consolidated `schema.sql` at repository root so developers can self-host or spin up local databases in one shot. Always keep `schema.sql` synchronized whenever creating or modifying migrations.
 6. **Instagram UX**: Standardize on clean native `@username` mentions (e.g. `Creator: @username` or `⏰ Reminder set for @username:`). Never append raw profile URLs (`https://www.instagram.com/<username>/`) to DM confirmations or reminders to avoid chat clutter and conflicting OpenGraph preview cards. Never leak raw shortcodes in user-facing DMs or UI, and treat `"watched"` as single-latest-reel unless `"stop all"` / `"watched all"` is requested.
 7. **Workspace Isolation**: Work strictly within `/Users/thismac/projects/instagram-saved-reels/`. Do not touch `/Users/thismac/rea/`.
-8. **CodeRabbit Review Gate (MANDATORY & BLOCKING)**:
+8. **Automated Quality Gates & Code Review Gates (MANDATORY & BLOCKING)**:
    - **NEVER merge a Pull Request immediately.**
-   - **ALWAYS wait for CodeRabbit AI review to run and complete** on the current head commit of every opened PR before merging.
-   - **NEVER merge while CodeRabbit findings remain open, in-progress, or unaddressed.**
-   - Whenever CodeRabbit comments or points out any issues (bugs, regressions, security, edge cases, architecture, or code improvements):
-     1. Inspect each finding thoroughly.
-     2. For valid findings: implement fixes on the topic branch, verify tests (`npm test`), and push.
-     3. For invalid findings or false positives: provide an evidence-based explanation and documented reasoning in the review reply.
-     4. Reply to each CodeRabbit review comment thread explaining the resolution citing the commit.
-     5. Resolve every review thread using GitHub GraphQL `resolveReviewThread` after verifying the fix, or after posting the evidence-based explanation for an invalid finding or false positive.
-   - **Incremental Re-Checks Must Complete (CRITICAL)**: Whenever a fix commit is pushed to address review feedback, CodeRabbit automatically triggers an incremental re-review (indicated by the `review in progress` state in its PR comment). You **MUST NEVER merge while a re-check or incremental review is running**. You must wait for the re-check to finish completely—confirming that the in-progress state is cleared, the final review report is posted, all pre-merge checks pass, and zero new findings or open threads remain. Only merge when re-checking is 100% complete and everything is positive.
-   - **No tight polling loops**: Never run tight sleep loops polling GitHub or CodeRabbit status.
+   - **Gemini Principal Code Reviewer (Primary Gate)**: The custom Gemini reviewer (`.github/workflows/gemini-code-review.yml`) runs on every pull request. It dynamically queries Google AI Studio, evaluates the git diff, and enforces:
+     1. Zero AI slop: concise, direct copy (<950 character single-bubble ceiling) and no em-dashes (`—`).
+     2. Concurrency & CAS: atomic conditional updates on reminder choice and schedule transitions.
+     3. Store Parity: 100% behavioral parity between `InMemoryStore` (tests) and Supabase PostgREST (production).
+     4. Schema Parity: migrations in `supabase/migrations/` must match root `schema.sql`.
+     5. Input sanitization & security.
+     The PR must receive a clean `Verdict: APPROVE` before merging.
+   - **Qodo PR-Agent**: Runs automated review and handles on-demand `/review` and `/ask` comment commands.
+   - **CodeRabbit**: Operates under `.coderabbit.yaml`. Note that under CodeRabbit's open-source plan, repositories with fewer than 10 stars or PRs targeting non-default branches (`staging`) report `SKIPPED` in GitHub Actions. To trigger a review on demand, comment `@coderabbitai review` on the PR. If CodeRabbit runs and raises findings, address valid points, reply to the thread, and resolve before merging.
+   - **No tight polling loops**: Never run tight sleep loops in the terminal polling GitHub Actions status. Always use asynchronous timers.
+9. **Watch Later Queue & Reminder Invariants**:
+   - `queue`, `reminders`, and `upcoming` commands must return exclusively active future upcoming reminders (`next_reminder_at > now`). Items with null or passed reminder timestamps must never be included.
+   - Reminders scheduled for >24 hours out must append the 24-hour Meta messaging window advisory.
+   - Creator reschedule commands (`update @[creator] [time]`) must dynamically attribute matching unattributed feed posts (`ig_post`).
