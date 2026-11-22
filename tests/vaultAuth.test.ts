@@ -4,12 +4,14 @@ import {
   generateUserVaultKey,
   verifyVaultKey,
   getAdminVaultKey,
+  getVaultSecret,
   vaultAuthMiddleware,
   createOtp,
   verifyOtp,
   clearOtpsForTesting,
   clearOtpRateLimitsForTesting,
   requestOtpForUsername,
+  isHostedOrProductionEnvironment,
 } from '../src/services/vaultAuthService.ts';
 
 test('VaultAuthService - generateUserVaultKey produces URL-safe deterministic keys', () => {
@@ -149,6 +151,70 @@ test('VaultAuthService - vaultAuthMiddleware enforces authentication in producti
     else process.env.NODE_ENV = origEnv;
     if (origVaultSecret === undefined) delete process.env.VAULT_SECRET;
     else process.env.VAULT_SECRET = origVaultSecret;
+  }
+});
+
+test('VaultAuthService - isHostedOrProductionEnvironment detects staged or hosted platforms and fails closed', () => {
+  const envKeys = ['NODE_ENV', 'APP_ENV', 'RENDER', 'FLY_APP_NAME', 'HEROKU_APP_ID', 'RAILWAY_ENVIRONMENT', 'VERCEL', 'VAULT_SECRET', 'SUPABASE_SERVICE_ROLE_KEY'];
+  const snapshot: Record<string, string | undefined> = {};
+  for (const k of envKeys) snapshot[k] = process.env[k];
+
+  try {
+    for (const k of envKeys) delete process.env[k];
+
+    // Clean local development
+    process.env.NODE_ENV = 'development';
+    assert.equal(isHostedOrProductionEnvironment(), false);
+
+    // Staging or production NODE_ENV
+    process.env.NODE_ENV = 'staging';
+    assert.equal(isHostedOrProductionEnvironment(), true);
+
+    process.env.NODE_ENV = 'production';
+    assert.equal(isHostedOrProductionEnvironment(), true);
+
+    // Hosted platform flags
+    process.env.NODE_ENV = 'development';
+    process.env.RENDER = 'true';
+    assert.equal(isHostedOrProductionEnvironment(), true);
+    delete process.env.RENDER;
+
+    process.env.FLY_APP_NAME = 'reeler-fly';
+    assert.equal(isHostedOrProductionEnvironment(), true);
+    delete process.env.FLY_APP_NAME;
+
+    // Fail closed in hosted/staging environment without vault secret
+    process.env.NODE_ENV = 'staging';
+    assert.throws(
+      () => getVaultSecret(),
+      /Production and hosted environments require a non-blank VAULT_SECRET/,
+      'Must throw when vault secret is absent in staged/hosted environments'
+    );
+
+    // vaultAuthMiddleware must reject unauthenticated requests in hosted environments
+    let statusSent = 0;
+    let jsonSent: any = null;
+    const req: any = { path: '/reels', headers: {}, query: {} };
+    const res: any = {
+      status: (code: number) => {
+        statusSent = code;
+        return {
+          json: (body: any) => {
+            jsonSent = body;
+          },
+        };
+      },
+    };
+    vaultAuthMiddleware(req, res, () => {
+      assert.fail('Must not permit unauthenticated bypass when hosted flag is active');
+    });
+    assert.equal(statusSent, 401);
+    assert.equal(jsonSent?.code, 'VAULT_KEY_REQUIRED');
+  } finally {
+    for (const k of envKeys) {
+      if (snapshot[k] === undefined) delete process.env[k];
+      else process.env[k] = snapshot[k];
+    }
   }
 });
 
