@@ -4562,6 +4562,48 @@ export class Repository {
   }
 
   /**
+   * Checks whether an Instagram sender ID has previous activity (saved items or stored preferences),
+   * distinguishing returning users from first-time users.
+   */
+  static async hasSenderActivity(senderId: string): Promise<boolean> {
+    const trimmed = String(senderId || '').trim();
+    if (!trimmed) return false;
+
+    if (!isSupabaseConfigured()) {
+      if (Repository.senderTimezones.has(trimmed) || memoryStore.latestAdditionReelIdBySender.has(trimmed)) {
+        return true;
+      }
+      for (const r of memoryStore.reels.values()) {
+        if (r.instagram_sender_id === trimmed) return true;
+      }
+      return false;
+    }
+
+    try {
+      const supabase = getSupabase();
+      const { data, error } = await supabase
+        .from('saved_reels')
+        .select('id')
+        .eq('instagram_sender_id', trimmed)
+        .limit(1);
+
+      if (!error && Array.isArray(data) && data.length > 0) {
+        return true;
+      }
+
+      const { data: prefData } = await supabase
+        .from('sender_preferences')
+        .select('sender_id')
+        .eq('sender_id', trimmed)
+        .limit(1);
+
+      return Array.isArray(prefData) && prefData.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Persists the preferred timezone for an Instagram sender ID.
    * Resolves common abbreviations (e.g. IST, EST, PST, London) to canonical IANA names.
    */

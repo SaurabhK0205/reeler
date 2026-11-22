@@ -347,7 +347,7 @@ export class ReminderWorker {
       if (cancelCmd) {
         if (this.adminUserId) {
           if (cancelCmd.invalidCreatorTarget) {
-            const example = cancelCmd.isCancelAddition ? 'clear @creator' : 'cancel reminder for @creator';
+            const example = cancelCmd.isCancelAddition ? 'clear @[creator]' : 'cancel reminder for @[creator]';
             const rawTarget = cancelCmd.invalidCreatorTarget;
             const shownTarget = rawTarget.length > 100 ? `${rawTarget.slice(0, 100)}...` : rawTarget;
             const reply = `ℹ️ Could not find a valid creator handle in "${shownTarget}". Reply e.g. "${example}".`;

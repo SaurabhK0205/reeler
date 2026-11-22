@@ -56,8 +56,18 @@ export function extractCreatorQueryWithFilter(text: string): CreatorQueryResult 
   const trimmed = String(text || '').trim();
   if (!trimmed) return null;
 
+  // Normalize bracketed placeholder syntax like @[username], @<username>, [username] -> @username
+  const cleaned = trimmed.replace(
+    /(?:^|\s)@?(?:\[|<)([a-zA-Z0-9._]{1,30})(?:\]|>)(?=$|[\s,!?])/g,
+    (match, handle) => {
+      const leadingMatch = match.match(/^\s/);
+      const prefix = leadingMatch ? leadingMatch[0] : '';
+      return `${prefix}@${handle}`;
+    }
+  );
+
   // 1a. Explicit typed prefix or suffix with @mention
-  const typedAtPrefix = trimmed.match(
+  const typedAtPrefix = cleaned.match(
     /^(?:(?:show|get|fetch|find)\s+)?(reels?|posts?)\s+(?:by|of|from)\s+@([a-zA-Z0-9._]{1,30})$/i
   );
   if (typedAtPrefix) {
@@ -67,7 +77,7 @@ export function extractCreatorQueryWithFilter(text: string): CreatorQueryResult 
       : null;
   }
 
-  const typedAtSuffix = trimmed.match(/^@([a-zA-Z0-9._]{1,30})\s+(reels?|posts?)$/i);
+  const typedAtSuffix = cleaned.match(/^@([a-zA-Z0-9._]{1,30})\s+(reels?|posts?)$/i);
   if (typedAtSuffix) {
     const candidate = typedAtSuffix[1].toLowerCase();
     return isPlausibleInstagramHandle(candidate)
@@ -76,11 +86,11 @@ export function extractCreatorQueryWithFilter(text: string): CreatorQueryResult 
   }
 
   // 1b. General @ mention anywhere in message (e.g. "@who.bhartiiiii", "show me posts by @who.bhartiiiii")
-  const atMatch = trimmed.match(/(?:^|\s)@([a-zA-Z0-9._]{1,30})(?=$|[\s,!?])/);
+  const atMatch = cleaned.match(/(?:^|\s)@([a-zA-Z0-9._]{1,30})(?=$|[\s,!?])/);
   if (atMatch) {
     const candidate = atMatch[1].toLowerCase();
     if (!isPlausibleInstagramHandle(candidate)) return null;
-    const contextWithoutMention = trimmed.replace(atMatch[0], ' ').trim();
+    const contextWithoutMention = cleaned.replace(atMatch[0], ' ').trim();
     const mentionsReels = /\breels?\b/i.test(contextWithoutMention);
     const mentionsPosts = /\bposts?\b/i.test(contextWithoutMention);
     let mediaFilter: CreatorMediaFilter = 'all';
@@ -90,7 +100,7 @@ export function extractCreatorQueryWithFilter(text: string): CreatorQueryResult 
   }
 
   // 2. Command phrases without @
-  const typedPrefixMatch = trimmed.match(
+  const typedPrefixMatch = cleaned.match(
     /^(?:(?:show|get|fetch|find)\s+)?(reels?|posts?)\s+(?:by|of|from)\s+([a-zA-Z0-9._]{2,30})$/i
   );
   if (typedPrefixMatch) {
@@ -106,7 +116,7 @@ export function extractCreatorQueryWithFilter(text: string): CreatorQueryResult 
     return { username: candidate, mediaFilter: keywordToMediaFilter(typedPrefixMatch[1]) };
   }
 
-  const typedSuffixMatch = trimmed.match(/^([a-zA-Z0-9._]{2,30})\s+(reels?|posts?)$/i);
+  const typedSuffixMatch = cleaned.match(/^([a-zA-Z0-9._]{2,30})\s+(reels?|posts?)$/i);
   if (typedSuffixMatch) {
     const candidate = typedSuffixMatch[1].toLowerCase();
     const isReserved = candidate !== 'done' && RESERVED_WORDS.has(candidate);
@@ -120,7 +130,7 @@ export function extractCreatorQueryWithFilter(text: string): CreatorQueryResult 
     return { username: candidate, mediaFilter: keywordToMediaFilter(typedSuffixMatch[2]) };
   }
 
-  const untypedPhraseMatch = trimmed.match(
+  const untypedPhraseMatch = cleaned.match(
     /^(?:show|get|fetch|find|creator)\s+([a-zA-Z0-9._]{2,30})$/i
   );
   if (untypedPhraseMatch) {
@@ -135,7 +145,7 @@ export function extractCreatorQueryWithFilter(text: string): CreatorQueryResult 
     return { username: candidate, mediaFilter: 'all' };
   }
 
-  const lower = trimmed.toLowerCase();
+  const lower = cleaned.toLowerCase();
   if (RESERVED_WORDS.has(lower) || isDurationShortcut(lower)) {
     return null;
   }
