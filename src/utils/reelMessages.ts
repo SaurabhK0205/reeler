@@ -6,7 +6,7 @@ import {
   isPlausibleInstagramHandle,
   RESERVED_WORDS,
 } from './creatorQuery.ts';
-import { parseDuration } from './duration.ts';
+import { parseDuration, formatTargetTime } from './duration.ts';
 import { classifySavedMediaType } from './mediaType.ts';
 
 const INSTAGRAM_HANDLE_REGEX = /^[a-zA-Z0-9._]{1,30}$/;
@@ -313,15 +313,16 @@ export function formatBotHelpMessage(): string {
   return (
     `👋 Welcome to Reeler! Your Reels & Posts Vault.\n\n` +
     `📥 Save & Reminders\n` +
-    `• Share any Reel or Post here with the Share button.\n` +
-    `• Add a time in your share text ("30s", "2h", "5pm") to set a reminder right away!\n` +
+    `• Share any Reel or Post here to save it.\n` +
+    `• Add a time in share text ("30s", "2h", "5pm") to set a reminder!\n` +
     `• Or reply with a time anytime (e.g. "1h", "snooze 2h").\n\n` +
     `⏰ Manage Reminders & Watch Later\n` +
+    `• "queue" or "reminders": View your upcoming items.\n` +
     `• "watched" or "done": Mark latest reminder as watched.\n` +
-    `• "cancel" or "undo": Remove recently added item if sent by mistake.\n` +
+    `• "cancel" or "undo": Remove recent item sent by mistake.\n` +
     `• "cancel reminder": Stop alerts but keep in Watch Later.\n` +
     `• "update @[creator] 2h" / "watched @[creator]": Manage by creator.\n` +
-    `• "stop all": Mark all items as watched & clear active reminders.\n\n` +
+    `• "stop all": Mark all as watched & clear reminders.\n\n` +
     `🔍 Search & Web Vault\n` +
     `• "@[creator]" or "reels by @[creator]": View your saved items.\n` +
     `• "vault": Open your private web vault.\n` +
@@ -329,6 +330,26 @@ export function formatBotHelpMessage(): string {
     `⚙️ Settings\n` +
     `• "tz <city>" (e.g. "tz IST", "tz London"): Set your timezone.\n` +
     `• "delete my data": Wipe all your data and history.`
+  );
+}
+
+/**
+ * Determines whether an inbound DM text is a request to view the Watch Later queue or upcoming reminders.
+ */
+export function parseQueueCommand(text: string): boolean {
+  const lower = String(text || '').toLowerCase().trim();
+  if (!lower) return false;
+
+  // Reject creator queries or targeted commands (e.g. "@creator", "reels by @creator", "queue for @creator")
+  if (lower.includes('@')) return false;
+
+  return (
+    /^(?:(?:my|show|view|the|get|check|all|active)\s+)?(?:queue|reminders?|upcoming(?:\s+(?:reels?|posts?|reminders?|items?))?|list(?:\s+(?:reels?|posts?|reminders?|items?))?)$/i.test(
+      lower
+    ) ||
+    /^(?:what(?:'s|\s+is)?\s+(?:in\s+)?(?:my\s+)?(?:queue|reminders?)|what\s+reminders(?:\s+do\s+i\s+have)?)$/i.test(
+      lower
+    )
   );
 }
 
@@ -513,6 +534,21 @@ export function formatAddedToWatchLaterCreatorBlock(
 }
 
 /**
+ * Returns true if the target date is scheduled more than 24 hours in the future.
+ */
+export function isScheduleBeyond24Hours(targetDate: Date | string, now: Date = new Date()): boolean {
+  const targetMs = typeof targetDate === 'string' ? new Date(targetDate).getTime() : targetDate.getTime();
+  return !Number.isNaN(targetMs) && targetMs - now.getTime() > 24 * 3600 * 1000;
+}
+
+/**
+ * Friendly notice regarding Instagram's 24-hour standard messaging policy for long-term reminders.
+ */
+export function format24HourWindowNotice(): string {
+  return `💡 Note: Instagram limits automated DMs to 24 hours from your last chat. Say "hi" or type "queue" anytime to check your items!`;
+}
+
+/**
  * Formats the reminder confirmation DM with creator attribution, clickable profile URL (when available),
  * and human-readable reel or post context (never shortcodes).
  */
@@ -520,7 +556,8 @@ export function formatReminderSetMessage(
   reel: Pick<SavedReel, 'caption' | 'creator' | 'media_type' | 'reel_url' | 'is_saved_on_instagram'>,
   durationLabel: string,
   formattedTarget: string,
-  updatesReshare = false
+  updatesReshare = false,
+  isBeyond24Hours = false
 ): string {
   const creatorDisplay = formatCreatorDisplayLabel(reel.creator, { includeProfileUrl: false });
   const targetText = creatorDisplay || formatHumanReelLabel(reel, 40);
@@ -528,10 +565,11 @@ export function formatReminderSetMessage(
     ? `⏰ Reminder updated for: ${durationLabel} (${formattedTarget})!\nFor: ${targetText}`
     : `⏰ Reminder set for ${targetText}: ${durationLabel} (${formattedTarget})!`;
 
-  return (
-    heading +
-    `\n\nReply "watched" when done.`
-  );
+  let msg = heading + `\n\nReply "watched" when done.`;
+  if (isBeyond24Hours) {
+    msg += `\n\n${format24HourWindowNotice()}`;
+  }
+  return msg;
 }
 
 /**
@@ -822,4 +860,57 @@ export function formatSenderConflictRejectionMessage(mediaType?: SavedMediaType 
     `⚠️ Unable to schedule Watch Later for that ${noun} because it already has an active reminder. ` +
     `Its existing reminder schedule was left unchanged.`
   );
+}
+
+/**
+ * Formats a user-facing list of active Watch Later items and their reminder schedules.
+ */
+export function formatWatchLaterQueueMessage(
+  reels: SavedReel[],
+  timeZone?: string,
+  now: Date = new Date()
+): string {
+  if (reels.length === 0) {
+    return (
+      `📋 Your Watch Later queue is empty!\n\n` +
+      `Share any Reel or Post here to save it and set a reminder.`
+    );
+  }
+
+  const MAX_DISPLAY = 5;
+  const count = reels.length;
+  const header = `📋 Your Watch Later Queue (${count} item${count === 1 ? '' : 's'}):\n`;
+
+  const items = reels.slice(0, MAX_DISPLAY).map((reel, index) => {
+    const targetLabel = formatHumanReelLabel(reel, 35);
+
+    let scheduleText: string;
+    if (reel.next_reminder_at) {
+      const reminderDate = new Date(reel.next_reminder_at);
+      if (reminderDate.getTime() <= now.getTime()) {
+        scheduleText = 'Due now!';
+      } else {
+        scheduleText = formatTargetTime(reminderDate, now, timeZone);
+      }
+    } else {
+      scheduleText = 'No active reminder set';
+    }
+
+    return `${index + 1}. ${targetLabel}\n   ⏰ ${scheduleText}`;
+  });
+
+  let message = `${header}\n${items.join('\n\n')}`;
+
+  if (count > MAX_DISPLAY) {
+    const remaining = count - MAX_DISPLAY;
+    message += `\n\n...and ${remaining} more item${remaining === 1 ? '' : 's'} in your queue.`;
+  }
+
+  message +=
+    `\n\n💡 Quick actions:\n` +
+    `• "update @[creator] 2h" to reschedule\n` +
+    `• "watched" or "watched @[creator]" when done\n` +
+    `• "vault" to open your web vault`;
+
+  return message;
 }
