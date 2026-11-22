@@ -17,6 +17,7 @@ import {
   parseWatchedStopCommand,
   parseCancelCommand,
   parseTargetedWatchedCommand,
+  parseTargetedReminderUpdateCommand,
   isGreetingOrHelpMessage,
   formatBotHelpMessage,
   formatHumanReelLabel,
@@ -24,6 +25,7 @@ import {
   formatAddedToWatchLaterCreatorBlock,
   formatWatchedConfirmationMessage,
   formatReminderSetMessage,
+  formatCreatorDisplayLabel,
   formatCreatorSearchMessages,
   formatSenderConflictRejectionMessage,
 } from '../utils/reelMessages.ts';
@@ -194,6 +196,20 @@ export class MetaInstagramBotService {
   private static readonly MAX_RECENT_ADDITIONS = 1000;
   private lastConfirmedAdditionReelId = new Map<string, string>();
   private reshareChoiceDeadlines = new Map<string, number>();
+  private recentReshareReelIds = new Map<string, number>();
+
+  private recordReshareInteraction(reelId: string): void {
+    if (this.recentReshareReelIds.size >= MetaInstagramBotService.MAX_RECENT_ADDITIONS) {
+      const oldest = this.recentReshareReelIds.keys().next().value;
+      if (oldest !== undefined) this.recentReshareReelIds.delete(oldest);
+    }
+    this.recentReshareReelIds.set(reelId, Date.now() + 10 * 60 * 1000);
+  }
+
+  private isRecentReshare(reelId: string): boolean {
+    const expiresAt = this.recentReshareReelIds.get(reelId);
+    return Boolean(expiresAt && expiresAt > Date.now());
+  }
 
   private recordShareChoice(reel: SavedReel, isReshare: boolean): void {
     this.reshareChoiceDeadlines.delete(reel.id);
@@ -279,6 +295,7 @@ export class MetaInstagramBotService {
     this.recentDurationHints.clear();
     this.lastConfirmedAdditionReelId.clear();
     this.reshareChoiceDeadlines.clear();
+    this.recentReshareReelIds.clear();
   }
 
   private async flushPendingSharePrompt(senderId: string, expectedShareId?: string): Promise<void> {
@@ -1333,8 +1350,17 @@ export class MetaInstagramBotService {
         }
       }
 
-      const nextReminder = customDuration ? customDuration.targetDate.toISOString() : null;
-      const awaitingUntil = customDuration ? null : new Date(Date.now() + 10 * 60 * 1000).toISOString();
+      const nextReminder = customDuration
+        ? customDuration.targetDate.toISOString()
+        : (isAlreadyInWatchLater && existingItem ? (existingItem.next_reminder_at ?? null) : null);
+      const reminderIntervalSeconds = customDuration
+        ? customDuration.seconds
+        : (isAlreadyInWatchLater && existingItem ? (existingItem.reminder_interval_seconds ?? null) : null);
+      const awaitingUntil = customDuration
+        ? null
+        : (isAlreadyInWatchLater && existingItem
+            ? (existingItem.awaiting_reminder_choice_until ?? null)
+            : new Date(Date.now() + 10 * 60 * 1000).toISOString());
 
       let savedReel: SavedReel | null = null;
       try {
@@ -1362,7 +1388,7 @@ export class MetaInstagramBotService {
             first_detected_at: firstDetectedAt,
             save_order_rank: saveOrderRank,
             watch_status: 'watch_later',
-            reminder_interval_seconds: customDuration ? customDuration.seconds : null,
+            reminder_interval_seconds: reminderIntervalSeconds,
             next_reminder_at: nextReminder,
             awaiting_reminder_choice_until: awaitingUntil,
             is_saved_on_instagram: isSavedOnInstagram,
@@ -1462,9 +1488,68 @@ export class MetaInstagramBotService {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
         await this.deliverReply(senderId, reply, delivery);
+      } else if (isAlreadyInWatchLater) {
+        if (savedReel) {
+          this.recordLastConfirmedAddition(senderId, savedReel.id);
+          this.recordReshareInteraction(savedReel.id);
+        }
+        const activeNextReminder = existingItem?.next_reminder_at ?? savedReel?.next_reminder_at;
+        let reply = `${addedHeading}${creatorLine}\n\n`;
+        if (activeNextReminder) {
+          const scheduledTimeStr = formatTargetTime(new Date(activeNextReminder), new Date(), senderTz);
+          reply += `⏰ Reminder is currently set for: ${scheduledTimeStr}.\n\nReply with a new time (e.g. "30m", "2h", "tomorrow at 5pm") to update it, or "watched" when done!`;
+        } else {
+          reply += `⏰ No active reminder is set for this item.\n\nReply with a time (e.g. "30m", "2h", "tomorrow at 5pm") to set one, or "watched" when done!`;
+        }
+        if (senderTz === 'UTC') {
+          reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz London" or "tz IST") to set your local timezone.`;
+        }
+
+        if (this.pendingSharePrompts.has(senderId)) {
+          await this.flushPendingSharePrompt(senderId);
+        }
+
+        if (hasShareAttachment && this.shareDebounceDelayMs > 0) {
+          await this.serializePromptOperation(senderId, async () => {
+            if (customDuration || shareCtx.acceptedDuration) return;
+            const promptReel = savedReel
+              ? { ...savedReel, creator }
+              : await Repository.getSavedItemByShortcode(shortcode, senderId);
+            if (promptReel) {
+              const promptOpId = delivery?.opId;
+              const promptRawMid = delivery?.rawMid;
+              if (delivery) {
+                delivery.isDeferredReply = true;
+              }
+
+              const shareId = shareCtx.shareId;
+              const timer = setTimeout(async () => {
+                await this.flushPendingSharePrompt(senderId, shareId);
+              }, this.shareDebounceDelayMs);
+
+              this.pendingSharePrompts.set(senderId, {
+                timer,
+                reel: promptReel,
+                delivery,
+                promptText: reply,
+                addedHeading,
+                creatorLine,
+                defaultReminderFormatted: '',
+                senderTz,
+                opId: promptOpId,
+                rawMid: promptRawMid,
+                shareId,
+                isAlreadyInWatchLater: true,
+              });
+            }
+          });
+          return;
+        }
+
+        await this.deliverReply(senderId, reply, delivery);
       } else {
         // No time provided; wait up to 10 minutes for user choice before defaulting to 10 hours
-        if (savedReel) this.recordShareChoice(savedReel, isAlreadyInWatchLater);
+        if (savedReel) this.recordShareChoice(savedReel, false);
         const defaultTriggerDate = new Date(Date.now() + (10 * 60 + 10 * 3600) * 1000);
         const defaultTriggerStr = formatTargetTime(defaultTriggerDate, new Date(), senderTz);
         const promptQuestion = mediaType === 'post'
@@ -1513,7 +1598,7 @@ export class MetaInstagramBotService {
                 opId: promptOpId,
                 rawMid: promptRawMid,
                 shareId,
-                isAlreadyInWatchLater,
+                isAlreadyInWatchLater: false,
               });
             }
           });
@@ -2022,6 +2107,85 @@ export class MetaInstagramBotService {
       return;
     }
 
+    // 2b. Creator-targeted reminder update command (e.g. "remind @creator in 2h", "update reminder for @[creator] to 5pm", "snooze @creator 1h")
+    const targetedUpdate = parseTargetedReminderUpdateCommand(text, new Date(), senderTz);
+    if (targetedUpdate) {
+      if (targetedUpdate.invalidCreatorTarget) {
+        await this.deliverReply(
+          senderId,
+          `ℹ️ Could not find a valid creator handle in "${targetedUpdate.invalidCreatorTarget}". Reply e.g. "update reminder for @[creator] to 2h".`,
+          delivery
+        );
+        return;
+      }
+      if (targetedUpdate.invalidDurationText) {
+        await this.deliverReply(
+          senderId,
+          `ℹ️ Could not understand reminder time "${targetedUpdate.invalidDurationText}". Reply with a valid time (e.g. "30m", "2h", "tomorrow at 5pm").`,
+          delivery
+        );
+        return;
+      }
+
+      if (targetedUpdate.targetCreator && targetedUpdate.duration) {
+        const isSenderAdmin = Boolean(this.adminUserId && senderId === this.adminUserId);
+        let targetReel: SavedReel | null = delivery?.retryState?.pinnedDurationTargetReel ?? null;
+        if (!targetReel) {
+          targetReel = await Repository.getActiveWatchLaterReelForCreator(
+            senderId,
+            targetedUpdate.targetCreator,
+            { includeUnattributedFallback: isSenderAdmin }
+          );
+          if (targetReel && delivery) {
+            delivery.retryState.pinnedDurationTargetReel = targetReel;
+            delivery.retryState.pinnedDuration = targetedUpdate.duration;
+            delivery.retryState.pinnedDurationUpdatesReshare = true;
+          }
+        }
+
+        if (targetReel) {
+          const effectiveDur = delivery?.retryState?.pinnedDuration || targetedUpdate.duration;
+          const applied = await Repository.updateReminderSchedule(
+            targetReel.id,
+            effectiveDur.targetDate.toISOString(),
+            effectiveDur.seconds,
+            {
+              expectedNextReminderAt: targetReel.next_reminder_at ?? null,
+              expectedIntervalSeconds: targetReel.reminder_interval_seconds ?? null,
+              expectedAwaitingReminderChoiceUntil: targetReel.awaiting_reminder_choice_until ?? null,
+              ...(targetReel.watch_status ? { expectedWatchStatus: targetReel.watch_status } : {}),
+            }
+          );
+          if (applied) {
+            this.recordLastConfirmedAddition(senderId, targetReel.id);
+            this.recordReshareInteraction(targetReel.id);
+            if (delivery) delivery.stateMutated = true;
+            let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget, true);
+            if (senderTz === 'UTC') {
+              reply += `\n\n💡 Tip: Times are currently shown in UTC. Reply e.g. "tz New York" or "tz IST" to set your local time!`;
+            }
+            await this.deliverReply(senderId, reply, delivery);
+            return;
+          } else {
+            const creatorDisplay = formatCreatorDisplayLabel(targetReel.creator, { includeProfileUrl: false }) || `@${targetedUpdate.targetCreator}`;
+            await this.deliverReply(
+              senderId,
+              `ℹ️ Reminder schedule for ${creatorDisplay} was updated by a newer command.`,
+              delivery
+            );
+            return;
+          }
+        } else {
+          await this.deliverReply(
+            senderId,
+            `ℹ️ Could not find an active Watch Later reel from @${targetedUpdate.targetCreator}. Share a reel from @${targetedUpdate.targetCreator} first to set a reminder!`,
+            delivery
+          );
+          return;
+        }
+      }
+    }
+
     // 3. Custom duration command (e.g. "5s", "remind me in 5 days", "tomorrow at 5pm", "12 nov", etc.)
     const customDuration =
       delivery && delivery.retryState.pinnedDuration !== undefined
@@ -2140,9 +2304,17 @@ export class MetaInstagramBotService {
         // retargets a newer Reel saved after the first attempt failed.
         targetReel = delivery.retryState.pinnedDurationTargetReel;
       } else {
-        const resolved =
-          (await Repository.getActiveAwaitingReelForSender(senderId)) ||
-          (await Repository.getLastReelForInstagramSender(senderId));
+        const lastConfirmedId = this.lastConfirmedAdditionReelId.get(senderId);
+        let resolved = await Repository.getActiveAwaitingReelForSender(senderId);
+        if (!resolved && lastConfirmedId) {
+          const candidate = await Repository.getSavedItemById(lastConfirmedId);
+          if (candidate && candidate.watch_status === 'watch_later' && candidate.instagram_sender_id === senderId) {
+            resolved = candidate;
+          }
+        }
+        if (!resolved) {
+          resolved = await Repository.getLastReelForInstagramSender(senderId);
+        }
         targetReel = resolved ? { ...resolved } : null;
         if (delivery) {
           delivery.retryState.pinnedDurationTargetReel = targetReel;
@@ -2150,7 +2322,7 @@ export class MetaInstagramBotService {
       }
 
       if (targetReel) {
-        const updatesReshare = this.isAwaitingReshareChoice(targetReel);
+        const updatesReshare = this.isRecentReshare(targetReel.id) || this.isAwaitingReshareChoice(targetReel);
         if (delivery) delivery.retryState.pinnedDurationUpdatesReshare = updatesReshare;
         const nextDate = customDuration.targetDate.toISOString();
         const applied = await Repository.updateReminderSchedule(
@@ -2170,6 +2342,7 @@ export class MetaInstagramBotService {
           // A newer reminder schedule or watch-status change already updated this Reel before this retry ran.
           return;
         }
+        this.recentReshareReelIds.delete(targetReel.id);
         if (delivery) delivery.stateMutated = true;
         let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget, updatesReshare);
         if (senderTz === 'UTC') {

@@ -16,7 +16,8 @@ Built on Meta's official Messenger API for Instagram (`graph.facebook.com/v21.0/
 | DM Command | What It Does |
 |---|---|
 | Share a Reel or Post | Adds the item to your Watch Later queue and prompts for a reminder time (10-minute reply window; defaults to 10 hours if no reply). Supports both Reel video (`ig_reel`) and Feed Post (`ig_post`) share attachments as well as direct link URLs. |
-| Re-sharing an existing item | If you send a Reel or Post already in your Watch Later list, the bot lets you know it is already saved and offers to update your reminder schedule. |
+| Re-sharing an existing item (Path A) | Resharing an item already in Watch Later preserves your existing reminder schedule, displays the currently scheduled time (or notes if none is active), and primes active context so replying with a new duration updates it without resetting. |
+| `remind @[creator] in 2h`, `update reminder for @[creator] to 5pm`, `snooze @[creator] 1h` (Path B) | Directly sets, reschedules, or snoozes the reminder for an active Watch Later item from that specific creator. |
 | `30m`, `2h`, `tomorrow at 5pm` | Sets, reschedules, or snoozes your reminder on the latest item. Supports natural duration phrases, relative times, and exact dates. |
 | `watched` or `done` | Marks your latest reminded item as watched and cancels active reminders for it. |
 | `stop all` or `clear all` | Marks all active Watch Later items as watched and stops all scheduled alarms. |

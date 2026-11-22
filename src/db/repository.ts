@@ -2711,6 +2711,103 @@ export class Repository {
   }
 
   /**
+   * Retrieves the most recently reminded/updated active Watch Later reel for a specific creator
+   * scoped to an Instagram sender (with optional unattributed admin fallback).
+   */
+  static async getActiveWatchLaterReelForCreator(
+    senderId: string,
+    creatorHandle: string,
+    options?: { includeUnattributedFallback?: boolean }
+  ): Promise<SavedReel | null> {
+    const trimmedSender = String(senderId || '').trim();
+    const handle = String(creatorHandle || '')
+      .trim()
+      .replace(/^[@<(\[]+/, '')
+      .replace(/[>)\]]+$/, '')
+      .trim()
+      .toLowerCase();
+    const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
+    if ((!trimmedSender && !allowUnattributedFallback) || !handle) return null;
+
+    if (!isSupabaseConfigured()) {
+      let candidates = Array.from(memoryStore.reels.values()).filter((r) => {
+        if (r.watch_status !== 'watch_later') return false;
+        if (r.instagram_sender_id !== trimmedSender) return false;
+        const creator = memoryStore.creators.get(r.creator_id);
+        return String(creator?.username || '').toLowerCase() === handle;
+      });
+      if (allowUnattributedFallback && candidates.length === 0) {
+        candidates = Array.from(memoryStore.reels.values()).filter((r) => {
+          if (r.watch_status !== 'watch_later') return false;
+          if (r.instagram_sender_id) return false;
+          const creator = memoryStore.creators.get(r.creator_id);
+          return String(creator?.username || '').toLowerCase() === handle;
+        });
+      }
+      if (candidates.length === 0) return null;
+
+      const ordered = sortWatchLaterReelsMostRecentFirst(
+        candidates.map((r) => ({ ...r, creator: memoryStore.creators.get(r.creator_id) || r.creator }))
+      );
+      return ordered[0] || null;
+    }
+
+    const supabase = getSupabase();
+    const { data: creatorRows, error: cErr } = await supabase
+      .from('creators')
+      .select('id, username, display_name')
+      .ilike('username', handle);
+    if (cErr) {
+      throw new Error(`Failed to find creator for handle ${handle}: ${cErr.message}`);
+    }
+    if (!creatorRows || creatorRows.length === 0) return null;
+    const creatorIds = creatorRows.map((c) => c.id);
+
+    let query = supabase
+      .from('saved_reels')
+      .select('*, creator:creators(*)')
+      .eq('watch_status', 'watch_later')
+      .in('creator_id', creatorIds);
+
+    if (trimmedSender) {
+      query = query.eq('instagram_sender_id', trimmedSender);
+    } else if (allowUnattributedFallback) {
+      query = query.or('instagram_sender_id.is.null,instagram_sender_id.eq.');
+    } else {
+      return null;
+    }
+
+    const { data: reels, error: rErr } = await query
+      .order('updated_at', { ascending: false })
+      .order('last_reminded_at', { ascending: false, nullsFirst: false })
+      .order('created_at', { ascending: false })
+      .limit(10);
+    if (rErr) {
+      throw new Error(`Failed to fetch active reel for creator ${handle}: ${rErr.message}`);
+    }
+    if (!reels || reels.length === 0) {
+      if (trimmedSender && allowUnattributedFallback) {
+        const { data: fbReels, error: fbErr } = await supabase
+          .from('saved_reels')
+          .select('*, creator:creators(*)')
+          .eq('watch_status', 'watch_later')
+          .in('creator_id', creatorIds)
+          .or('instagram_sender_id.is.null,instagram_sender_id.eq.')
+          .order('updated_at', { ascending: false })
+          .order('last_reminded_at', { ascending: false, nullsFirst: false })
+          .order('created_at', { ascending: false })
+          .limit(10);
+        if (fbErr) throw new Error(`Failed to fetch fallback reel for creator ${handle}: ${fbErr.message}`);
+        if (fbReels && fbReels.length > 0) {
+          return sortWatchLaterReelsMostRecentFirst(fbReels as SavedReel[])[0] || null;
+        }
+      }
+      return null;
+    }
+    return sortWatchLaterReelsMostRecentFirst(reels as SavedReel[])[0] || null;
+  }
+
+  /**
    * Clears Watch Later reels from a specific creator for an Instagram sender.
    * If sent directly to the bot, rows are deleted; if from IG Saved, status reverts to unwatched.
    */

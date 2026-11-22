@@ -12,7 +12,7 @@ export interface CreatorQueryResult {
 }
 
 // Common non-creator keywords that should never be interpreted as bare creator usernames
-const RESERVED_WORDS = new Set([
+export const RESERVED_WORDS = new Set([
   'hi', 'hello', 'hey', 'yo', 'hola', 'sup', 'gm', 'gn',
   'help', 'start', 'menu', 'info', 'ping', 'test', 'status', 'reels', 'reel', 'posts', 'post', 'all', 'list',
   'vault', 'library', 'web', 'dashboard', 'link', 'code', 'otp', 'login', 'passcode',
@@ -23,11 +23,11 @@ const RESERVED_WORDS = new Set([
   'yes', 'no', 'ok', 'okay', 'yep', 'nope', 'thanks', 'thank you', 'ty',
 ]);
 
-function isDurationShortcut(lower: string): boolean {
-  return /^\d+(?:s|sec|secs|m|min|mins|h|hr|hrs|hour|hours|d|day|days)?$/i.test(lower);
+export function isDurationShortcut(lower: string): boolean {
+  return /^\d+(?:s|sec|secs|m|min|mins|h|hr|hrs|hour|hours|d|day|days|w|weeks?|mo|months?)?$/i.test(lower);
 }
 
-function isPlausibleInstagramHandle(handle: string): boolean {
+export function isPlausibleInstagramHandle(handle: string): boolean {
   if (!/^[a-zA-Z0-9._]{1,30}$/.test(handle)) return false;
   if (!/[a-zA-Z0-9]/.test(handle)) return false;
   if (handle.includes('..') || handle.startsWith('.') || handle.endsWith('.')) return false;

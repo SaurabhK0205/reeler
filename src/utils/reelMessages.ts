@@ -1,6 +1,12 @@
 import type { Creator, SavedMediaType, SavedReel } from '../types.ts';
 import type { CreatorMediaFilter } from './creatorQuery.ts';
-import { extractCreatorQuery } from './creatorQuery.ts';
+import {
+  extractCreatorQuery,
+  isDurationShortcut,
+  isPlausibleInstagramHandle,
+  RESERVED_WORDS,
+} from './creatorQuery.ts';
+import { parseDuration } from './duration.ts';
 import { classifySavedMediaType } from './mediaType.ts';
 
 const INSTAGRAM_HANDLE_REGEX = /^[a-zA-Z0-9._]{1,30}$/;
@@ -167,6 +173,100 @@ export function parseTargetedWatchedCommand(text: string): TargetedWatchedComman
   return null;
 }
 
+export interface TargetedReminderUpdateCommand {
+  targetCreator?: string;
+  duration?: ReturnType<typeof parseDuration>;
+  durationText?: string;
+  invalidCreatorTarget?: string;
+  invalidDurationText?: string;
+}
+
+const PREPOSITIONS_SET = new Set([
+  'in', 'at', 'on', 'for', 'to', 'by', 'from', 'about', 'with', 'of', 'the', 'a', 'an',
+]);
+
+function cleanCreatorCandidate(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^[@<(\[]+/, '')
+    .replace(/[>)\]]+$/, '')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Parses targeted reminder update / reschedule / snooze commands for a specific creator:
+ * e.g. "remind @creator in 2h", "remind @[creator] 2h", "update reminder for @creator to 2h",
+ * "update @creator 5pm", "snooze @creator 1h", "snooze 1h for @creator".
+ */
+export function parseTargetedReminderUpdateCommand(
+  text: string,
+  refDate: Date = new Date(),
+  senderTz?: string
+): TargetedReminderUpdateCommand | null {
+  const lower = String(text || '').toLowerCase().trim();
+  if (!lower) return null;
+
+  // Standalone duration commands without any creator indicator should be handled by generic duration parser
+  const directDur = parseDuration(lower, refDate, senderTz);
+  if (directDur && !lower.includes('@') && !lower.includes('[') && !lower.includes('<')) {
+    return null;
+  }
+
+  // Pattern 1 (Duration first, creator after):
+  // e.g. "snooze 1h for @creator", "remind in 2h for @creator", "remind me in 2h about @creator"
+  const p1 = lower.match(
+    /^(?:remind(?:\s+me)?|snooze|update(?:\s+reminders?)?)\s+(.+?)\s+(?:for|about|of|on)\s+(@?(?:\[|<)?[a-z0-9._]{1,30}(?:\]|>)?)$/i
+  );
+  if (p1) {
+    const rawDur = p1[1].trim();
+    const rawCreator = p1[2].trim();
+    const cleanedCreator = cleanCreatorCandidate(rawCreator);
+    const hasCreatorSigil = rawCreator.startsWith('@') || rawCreator.startsWith('[') || rawCreator.startsWith('<');
+
+    if (hasCreatorSigil || (!PREPOSITIONS_SET.has(cleanedCreator) && !RESERVED_WORDS.has(cleanedCreator) && !isDurationShortcut(cleanedCreator))) {
+      if (!isPlausibleInstagramHandle(cleanedCreator)) {
+        if (hasCreatorSigil) {
+          return { invalidCreatorTarget: rawCreator, durationText: rawDur };
+        }
+      } else {
+        const dur = parseDuration(rawDur, refDate, senderTz);
+        if (!dur) {
+          return { targetCreator: cleanedCreator, invalidDurationText: rawDur };
+        }
+        return { targetCreator: cleanedCreator, duration: dur, durationText: rawDur };
+      }
+    }
+  }
+
+  // Pattern 2 (Creator first, duration after):
+  // e.g. "remind @creator in 2h", "update reminder for @creator to 2h", "snooze @creator 1h"
+  const p2 = lower.match(
+    /^(?:remind(?:\s+me)?(?:\s+(?:about|for|of))?|update(?:\s+reminders?(?:\s+(?:for|of|on))?)?|change(?:\s+reminders?(?:\s+(?:for|of|on))?)?|snooze(?:\s+reminders?(?:\s+(?:for|of|on))?)?)\s+(@?(?:\[|<)?[a-z0-9._]{1,30}(?:\]|>)?)\s+(?:to|in|at|for)?\s*(.+)$/i
+  );
+  if (p2) {
+    const rawCreator = p2[1].trim();
+    const rawDur = p2[2].trim().replace(/[.!?,;:~]+$/, '');
+    const cleanedCreator = cleanCreatorCandidate(rawCreator);
+    const hasCreatorSigil = rawCreator.startsWith('@') || rawCreator.startsWith('[') || rawCreator.startsWith('<');
+
+    if (PREPOSITIONS_SET.has(cleanedCreator) || RESERVED_WORDS.has(cleanedCreator) || isDurationShortcut(cleanedCreator) || !isPlausibleInstagramHandle(cleanedCreator)) {
+      if (hasCreatorSigil) {
+        return { invalidCreatorTarget: rawCreator, durationText: rawDur };
+      }
+      return null;
+    }
+
+    const dur = parseDuration(rawDur, refDate, senderTz);
+    if (!dur) {
+      return { targetCreator: cleanedCreator, invalidDurationText: rawDur };
+    }
+    return { targetCreator: cleanedCreator, duration: dur, durationText: rawDur };
+  }
+
+  return null;
+}
+
 /**
  * Detects common casual greetings, help, and instruction queries.
  */
@@ -204,8 +304,8 @@ export function formatBotHelpMessage(): string {
     `⏰ Manage Reminders & Watch Later\n` +
     `• "watched" or "done": Mark latest reminder as watched.\n` +
     `• "cancel" or "undo": Remove recently added item if sent by mistake.\n` +
-    `• "cancel reminder": Stop alarms but keep item in Watch Later.\n` +
-    `• "clear @[creator]" / "watched @[creator]": Manage items by creator.\n` +
+    `• "cancel reminder": Stop alerts but keep in Watch Later.\n` +
+    `• "update @[creator] 2h" / "watched @[creator]": Manage by creator.\n` +
     `• "stop all": Mark all items as watched & clear active reminders.\n\n` +
     `🔍 Search & Web Vault\n` +
     `• "@[creator]" or "reels by @[creator]": View your saved items.\n` +

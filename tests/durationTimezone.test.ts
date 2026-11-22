@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseDuration, formatTargetTime } from '../src/utils/duration.ts';
+import { parseTargetedReminderUpdateCommand } from '../src/utils/reelMessages.ts';
 import { resolveTimeZone, getTimeZoneSummary, getTimeZoneAbbreviation } from '../src/utils/timezone.ts';
 import { Repository, SenderDeletionBarrierError } from '../src/db/repository.ts';
 import { MetaInstagramBotService } from '../src/services/metaInstagramBotService.ts';
@@ -454,4 +455,81 @@ test('Repository - overlapping deletions keep barrier active until all deletions
 
   // Now active count is 0 and fresh cooldown is active
   assert.strictEqual(Repository.isSenderInRecentDeletion(senderId), true);
+});
+
+test('Targeted Reminder Update Commands - parses creator handles and durations reliably', () => {
+  const ref = new Date('2026-11-22T10:00:00.000Z');
+  const tz = 'Asia/Kolkata';
+
+  // Pattern 1 & 2 valid variants
+  const c1 = parseTargetedReminderUpdateCommand('remind @warnerbrosindia in 2h', ref, tz);
+  assert.ok(c1);
+  assert.strictEqual(c1.targetCreator, 'warnerbrosindia');
+  assert.strictEqual(c1.duration?.seconds, 7200);
+
+  const c2 = parseTargetedReminderUpdateCommand('remind @[warnerbrosindia] 2h', ref, tz);
+  assert.ok(c2);
+  assert.strictEqual(c2.targetCreator, 'warnerbrosindia');
+  assert.strictEqual(c2.duration?.seconds, 7200);
+
+  const c3 = parseTargetedReminderUpdateCommand('remind @<warnerbrosindia> in 2h', ref, tz);
+  assert.ok(c3);
+  assert.strictEqual(c3.targetCreator, 'warnerbrosindia');
+
+  const c4 = parseTargetedReminderUpdateCommand('remind me about @warnerbrosindia tomorrow at 5pm', ref, tz);
+  assert.ok(c4);
+  assert.strictEqual(c4.targetCreator, 'warnerbrosindia');
+  assert.ok(c4.duration);
+
+  const c5 = parseTargetedReminderUpdateCommand('update reminder for @warnerbrosindia to 2h', ref, tz);
+  assert.ok(c5);
+  assert.strictEqual(c5.targetCreator, 'warnerbrosindia');
+  assert.strictEqual(c5.duration?.seconds, 7200);
+
+  const c6 = parseTargetedReminderUpdateCommand('update @warnerbrosindia 5pm', ref, tz);
+  assert.ok(c6);
+  assert.strictEqual(c6.targetCreator, 'warnerbrosindia');
+  assert.ok(c6.duration);
+
+  const c7 = parseTargetedReminderUpdateCommand('change reminder for @[warnerbrosindia] to 3h', ref, tz);
+  assert.ok(c7);
+  assert.strictEqual(c7.targetCreator, 'warnerbrosindia');
+  assert.strictEqual(c7.duration?.seconds, 10800);
+
+  const c8 = parseTargetedReminderUpdateCommand('snooze @warnerbrosindia 1h', ref, tz);
+  assert.ok(c8);
+  assert.strictEqual(c8.targetCreator, 'warnerbrosindia');
+  assert.strictEqual(c8.duration?.seconds, 3600);
+
+  const c9 = parseTargetedReminderUpdateCommand('snooze @[warnerbrosindia] for 30m', ref, tz);
+  assert.ok(c9);
+  assert.strictEqual(c9.targetCreator, 'warnerbrosindia');
+  assert.strictEqual(c9.duration?.seconds, 1800);
+
+  const c10 = parseTargetedReminderUpdateCommand('snooze 1h for @warnerbrosindia', ref, tz);
+  assert.ok(c10);
+  assert.strictEqual(c10.targetCreator, 'warnerbrosindia');
+  assert.strictEqual(c10.duration?.seconds, 3600);
+
+  const c11 = parseTargetedReminderUpdateCommand('remind in 2h for @warnerbrosindia', ref, tz);
+  assert.ok(c11);
+  assert.strictEqual(c11.targetCreator, 'warnerbrosindia');
+  assert.strictEqual(c11.duration?.seconds, 7200);
+
+  // Untargeted duration expressions must return null so generic duration handler handles them
+  assert.strictEqual(parseTargetedReminderUpdateCommand('remind me in 2h', ref, tz), null);
+  assert.strictEqual(parseTargetedReminderUpdateCommand('snooze 1h', ref, tz), null);
+  assert.strictEqual(parseTargetedReminderUpdateCommand('2h', ref, tz), null);
+  assert.strictEqual(parseTargetedReminderUpdateCommand('tomorrow at 5pm', ref, tz), null);
+
+  // Invalid creator target
+  const invCreator = parseTargetedReminderUpdateCommand('remind @invalid..handle in 2h', ref, tz);
+  assert.ok(invCreator);
+  assert.strictEqual(invCreator.invalidCreatorTarget, '@invalid..handle');
+
+  // Invalid duration text
+  const invDur = parseTargetedReminderUpdateCommand('update reminder for @warnerbrosindia to non_duration', ref, tz);
+  assert.ok(invDur);
+  assert.strictEqual(invDur.targetCreator, 'warnerbrosindia');
+  assert.strictEqual(invDur.invalidDurationText, 'non_duration');
 });
