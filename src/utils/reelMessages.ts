@@ -93,7 +93,7 @@ export function parseCancelCommand(text: string): CancelCommand | null {
 
   // 2. Clear / remove / cancel by creator: e.g. "clear @ykittois", "clear ykittois", "remove @ann", "delete ann"
   const clearMatch = lower.match(
-    /^(?:clear|remove|delete|cancel)\s+(@[a-z0-9._]{1,30}|[a-z0-9._]{1,30})[,.!?:;~]*$/i
+    /^(?:clear|remove|delete|cancel)\s+(@?(?:\[|<)?[a-z0-9._]{1,30}(?:\]|>)?)[,.!?:;~]*$/i
   );
   if (clearMatch) {
     const rawArg = clearMatch[1].trim().replace(/[.!?,;:~]+$/, '');
@@ -205,10 +205,10 @@ export function formatBotHelpMessage(): string {
     `• "watched" or "done" — Mark latest reminder as watched.\n` +
     `• "cancel" or "undo" — Remove recently added item if sent by mistake.\n` +
     `• "cancel reminder" — Stop alarms but keep item in Watch Later.\n` +
-    `• "clear @creator" / "watched @creator" — Manage items by creator.\n` +
+    `• "clear @[creator]" / "watched @[creator]" — Manage items by creator.\n` +
     `• "stop all" — Mark all items as watched & clear active reminders.\n\n` +
     `🔍 Search & Web Vault\n` +
-    `• "@creator" or "reels by @creator" — View your saved items.\n` +
+    `• "@[creator]" or "reels by @[creator]" — View your saved items.\n` +
     `• "vault" — Open your private web vault.\n` +
     `• "code" — Get a 6-digit login code for PC/laptop access.\n\n` +
     `⚙️ Settings\n` +
@@ -227,28 +227,38 @@ export function parseWatchedStopCommand(text: string): WatchedStopCommand {
     return { isCommand: false, markAll: false };
   }
 
+  // Normalize bracketed handle syntax like @[username], @<username>, [username] -> @username
+  const normalizedLower = lower.replace(
+    /(?:^|\s)@?(?:\[|<)([a-z0-9._]{1,30})(?:\]|>)(?=$|[\s,!?])/g,
+    (match, handle) => {
+      const leadingMatch = match.match(/^\s/);
+      const prefix = leadingMatch ? leadingMatch[0] : '';
+      return `${prefix}@${handle}`;
+    }
+  );
+
   // Explicit creator-lookup messages (e.g. "@stop.motion", "reels by @done", "posts by @done", "done posts", "show @done")
   // must route to creator search rather than being misread as watch/stop commands.
   if (
-    /^(?:(?:show|get|fetch|find)\s+)?(?:(?:reels?|posts?)\s+(?:by|of|from)|show|get|fetch|find|creator)\s+@?[a-z0-9._]+$/i.test(lower) ||
-    /^@?[a-z0-9._]+\s+(?:reels?|posts?)$/i.test(lower)
+    /^(?:(?:show|get|fetch|find)\s+)?(?:(?:reels?|posts?)\s+(?:by|of|from)|show|get|fetch|find|creator)\s+@?[a-z0-9._]+$/i.test(normalizedLower) ||
+    /^@?[a-z0-9._]+\s+(?:reels?|posts?)$/i.test(normalizedLower)
   ) {
     return { isCommand: false, markAll: false };
   }
 
-  // Explicit scoped reminder cancellation requests (e.g. "stop reminders for @creator", "stop reminder @creator")
+  // Explicit scoped reminder cancellation requests (e.g. "stop reminders for @[creator]", "stop reminder @[creator]")
   // belong to cancel routing rather than bulk watch/stop.
-  if (/(?:cancel|stop|remove|no)\s+reminders?(?:\s+for)?\s+/i.test(lower)) {
+  if (/(?:cancel|stop|remove|no)\s+reminders?(?:\s+for)?\s+/i.test(normalizedLower)) {
     return { isCommand: false, markAll: false };
   }
 
-  // Explicit targeted watched commands with creator mentions (e.g. "watched @ann", "done @creator")
+  // Explicit targeted watched commands with creator mentions (e.g. "watched @ann", "done @[creator]")
   // belong to parseTargetedWatchedCommand rather than unscoped single-item watch marking.
-  if (/(?:watched|done|seen|finish|finished|mark)\s+@/i.test(lower)) {
+  if (/(?:watched|done|seen|finish|finished|mark)\s+@/i.test(normalizedLower)) {
     return { isCommand: false, markAll: false };
   }
 
-  const withoutMentions = lower.replace(/(?:^|\s)@[a-z0-9._]+/g, ' ').trim();
+  const withoutMentions = normalizedLower.replace(/(?:^|\s)@[a-z0-9._]+/g, ' ').trim();
   if (!withoutMentions) {
     return { isCommand: false, markAll: false };
   }
