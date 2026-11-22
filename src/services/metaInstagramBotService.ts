@@ -318,9 +318,11 @@ export class MetaInstagramBotService {
       if (
         !freshItem ||
         freshItem.watch_status !== 'watch_later' ||
+        ((pending.reel.next_reminder_at || pending.isAlreadyInWatchLater) &&
+          !isSameInstant(freshItem.next_reminder_at, pending.reel.next_reminder_at)) ||
         (pending.reel.awaiting_reminder_choice_until &&
           (!freshItem.awaiting_reminder_choice_until ||
-            freshItem.awaiting_reminder_choice_until !== pending.reel.awaiting_reminder_choice_until ||
+            !isSameInstant(freshItem.awaiting_reminder_choice_until, pending.reel.awaiting_reminder_choice_until) ||
             new Date(freshItem.awaiting_reminder_choice_until).getTime() <= Date.now()))
       ) {
         isStillPending = false;
@@ -335,7 +337,8 @@ export class MetaInstagramBotService {
           undefined,
           pending.reel.id,
           pending.reel.awaiting_reminder_choice_until,
-          pending.isAlreadyInWatchLater
+          pending.isAlreadyInWatchLater,
+          pending.reel.next_reminder_at
         );
         this.scheduleWebhookRetry(pending.opId, 0, () =>
           this.dispatchWebhookMessage(
