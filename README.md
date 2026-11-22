@@ -97,7 +97,7 @@ Reeler connects to database storage through the Supabase client (`@supabase/supa
 A complete, self-contained SQL script is maintained in [`schema.sql`](schema.sql). It provisions the entire database schema (tables, 24 performance indexes, full-text search, and RLS policies):
 
 - **Supabase Cloud / Self-Hosted Dashboard**: Paste and run [`schema.sql`](schema.sql) in the Supabase SQL Editor.
-- **Local CLI**: Run `psql -h 127.0.0.1 -p 54322 -U postgres -d postgres -f schema.sql` (connecting to local Supabase at port 54322) or use the Supabase CLI (`npx supabase db reset`).
+- **Local CLI**: Run `psql -h 127.0.0.1 -p 54322 -U postgres -d postgres -f schema.sql` (connecting to local Supabase at port 54322) or use the Supabase CLI (`npx supabase db reset`). Note: `db reset` recreates the local database and discards existing data, so use it only for disposable local testing.
 
 > **Repository Invariant**: Whenever a new migration is created or any change is made to the database schema, `schema.sql` MUST be updated in sync so local and self-hosted environments always match the latest schema.
 
