@@ -97,42 +97,63 @@ Provide a clear, formatted GitHub Markdown review:
 `;
 
 async function runReview() {
-  const modelName = 'gemini-2.5-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
+  const candidateModels = [
+    'gemini-3.8-flash',
+    'gemini-2.0-flash',
+    'gemini-1.5-flash',
+    'gemini-2.5-flash',
+    'gemini-1.5-pro',
+  ];
 
-  console.log(`Sending PR #${PR_NUMBER} diff (${diff.length} bytes) to Gemini API (${modelName})...`);
+  let reviewBody = null;
+  let lastError = null;
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { text: systemPrompt },
-            { text: `\n\n--- GIT DIFF FOR PULL REQUEST #${PR_NUMBER} ---\n\n${truncatedDiff}` }
-          ]
-        }
-      ],
-      generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 2048,
+  for (const modelName of candidateModels) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
+    console.log(`Sending PR #${PR_NUMBER} diff (${diff.length} bytes) to Gemini API (${modelName})...`);
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { text: systemPrompt },
+                { text: `\n\n--- GIT DIFF FOR PULL REQUEST #${PR_NUMBER} ---\n\n${truncatedDiff}` }
+              ]
+            }
+          ],
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 2048,
+          }
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.warn(`Gemini API error with model ${modelName} (${response.status}):`, errorText);
+        lastError = errorText;
+        continue;
       }
-    })
-  });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`Gemini API error (${response.status}):`, errorText);
-    process.exit(1);
+      const data = await response.json();
+      reviewBody = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (reviewBody) {
+        console.log(`Review successfully generated using model ${modelName}.`);
+        break;
+      }
+    } catch (err) {
+      console.warn(`Request failed with model ${modelName}:`, err.message || err);
+      lastError = String(err.message || err);
+    }
   }
 
-  const data = await response.json();
-  const reviewBody = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
   if (!reviewBody) {
-    console.error('No response text received from Gemini API.');
+    console.error('Failed to generate review with any candidate Gemini model. Last error:', lastError);
     process.exit(1);
   }
 
