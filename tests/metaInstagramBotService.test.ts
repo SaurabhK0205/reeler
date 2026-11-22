@@ -5,8 +5,8 @@ import {
   isMetaMessagingWindowError,
 } from '../src/services/metaInstagramBotService.ts';
 import { Repository } from '../src/db/repository.ts';
-import { parseTargetedWatchedCommand, parseCancelCommand } from '../src/utils/reelMessages.ts';
-import { extractCreatorQueryWithFilter } from '../src/utils/creatorQuery.ts';
+import { parseTargetedWatchedCommand, parseCancelCommand, formatBotHelpMessage } from '../src/utils/reelMessages.ts';
+import { extractCreatorQueryWithFilter, extractCreatorQuery } from '../src/utils/creatorQuery.ts';
 
 test('MetaInstagramBotService - splitMessageIntoChunks handles short and empty text', () => {
   const service = new MetaInstagramBotService();
@@ -4234,4 +4234,209 @@ test('MetaInstagramBotService retains reshare wording after an attachment prompt
   assert.match(await replyWithTime('2h'), /Reminder updated for: 2 hours/);
   assert.strictEqual((await Repository.getSavedItemByShortcode('DFlushedReshare', senderId))?.reminder_interval_seconds, 7200);
   assert.match(await replyWithTime('3h'), /Reminder set for/);
+});
+
+test('formatBotHelpMessage uses non-linking @[creator] placeholders and fits within Instagram DM limits', () => {
+  const helpMsg = formatBotHelpMessage();
+  assert.ok(!helpMsg.includes('@creator'), 'Help message must not contain live @creator mention');
+  assert.ok(helpMsg.includes('@[creator]'), 'Help message should use non-mentionable @[creator] placeholder');
+  assert.ok(helpMsg.length <= 950, `Help message length ${helpMsg.length} exceeds 950-character single-bubble threshold`);
+});
+
+test('Creator query and command parsers accept bracketed @[username] syntax', () => {
+  assert.strictEqual(extractCreatorQuery('@[oliver_stotts]'), 'oliver_stotts');
+  assert.strictEqual(extractCreatorQuery('@<oliver_stotts>'), 'oliver_stotts');
+  assert.deepStrictEqual(extractCreatorQueryWithFilter('reels by @[oliver_stotts]'), {
+    username: 'oliver_stotts',
+    mediaFilter: 'reel',
+  });
+
+  const cancelAddition = parseCancelCommand('clear @[oliver_stotts]');
+  assert.deepStrictEqual(cancelAddition, {
+    isCancelAddition: true,
+    isCancelReminder: false,
+    targetCreator: 'oliver_stotts',
+  });
+
+  const cancelReminder = parseCancelCommand('cancel reminder for @[oliver_stotts]');
+  assert.deepStrictEqual(cancelReminder, {
+    isCancelAddition: false,
+    isCancelReminder: true,
+    targetCreator: 'oliver_stotts',
+  });
+
+  const targetedWatched = parseTargetedWatchedCommand('watched @[oliver_stotts]');
+  assert.deepStrictEqual(targetedWatched, {
+    targetCreator: 'oliver_stotts',
+  });
+});
+
+test('MetaInstagramBotService processes ig_post attachment format (payload.ig_post_media_id + CDN url)', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  Repository.resetMemoryStoreForTests();
+  const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 60 });
+  t.mock.method(globalThis, 'fetch', async () => new Response('', { status: 404 }));
+  t.after(() => {
+    bot.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+  });
+
+  const senderId = 'sender_ig_post_user';
+  const replies: string[] = [];
+  let receivePrompt: ((text: string) => void) | undefined;
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    replies.push(text);
+    receivePrompt?.(text);
+    return true;
+  };
+
+  const promptPromise = new Promise<string>((resolve) => { receivePrompt = resolve; });
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: senderId },
+            message: {
+              attachments: [
+                {
+                  type: 'ig_post',
+                  payload: {
+                    ig_post_media_id: '18120410743994731',
+                    title: 'Relive the journey before you experience the epic conclusion. Dune: Part One & Two return to cinemas.',
+                    url: 'https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=18120410743994731&signature=mock_sig',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  t.mock.timers.tick(60);
+  const prompt = await promptPromise;
+  assert.ok(
+    prompt.includes('Added post to your Watch Later!') || prompt.includes('Added to your Watch Later!'),
+    `Got unexpected prompt: ${prompt}`
+  );
+  assert.ok(prompt.includes('When should I remind you to'));
+
+  const saved = await Repository.getSavedItemByShortcode('18120410743994731', senderId);
+  assert.ok(saved, 'Post must be saved in database');
+  assert.strictEqual(saved.media_type, 'post');
+  assert.strictEqual(saved.caption, 'Relive the journey before you experience the epic conclusion. Dune: Part One & Two return to cinemas.');
+  assert.strictEqual(saved.thumbnail_url, 'https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=18120410743994731&signature=mock_sig');
+});
+
+test('MetaInstagramBotService rejects unresolvable share attachments with friendly notice rather than welcome message', async (t) => {
+  Repository.resetMemoryStoreForTests();
+  const bot = new MetaInstagramBotService();
+  t.after(() => {
+    Repository.resetMemoryStoreForTests();
+  });
+
+  const senderId = 'sender_unresolvable_share';
+  const replies: string[] = [];
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    replies.push(text);
+    return true;
+  };
+
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: senderId },
+            message: {
+              attachments: [
+                {
+                  type: 'share',
+                  payload: {
+                    unsupported_field: true,
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes("I couldn't access that shared item"), `Expected access error, got: ${replies[0]}`);
+  assert.ok(!replies[0].includes('Welcome to Reeler'), 'Must not send welcome message on broken share');
+});
+
+test('MetaInstagramBotService distinguishes existing users from first-time users on unrecognized input', async (t) => {
+  Repository.resetMemoryStoreForTests();
+  const bot = new MetaInstagramBotService();
+  t.after(() => {
+    Repository.resetMemoryStoreForTests();
+  });
+
+  const replies: string[] = [];
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    replies.push(text);
+    return true;
+  };
+
+  // 1. First-time user sending unrecognized text gets full welcome/help instructions
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: 'brand_new_sender' },
+            message: { text: 'random unrecognized message' },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('Welcome to Reeler — Your Reels & Posts Vault!'), `Expected welcome, got: ${replies[0]}`);
+  replies.length = 0;
+
+  // 2. Active user with saved item sending unrecognized text gets concise command reminder
+  const creator = await Repository.upsertCreator({
+    instagram_user_id: 'creator_active',
+    username: 'active_creator',
+    display_name: 'Active Creator',
+  });
+  await Repository.upsertSavedReel({
+    instagram_media_id: 'dm_active_sender_D123',
+    shortcode: 'DActive123',
+    reel_url: 'https://www.instagram.com/reel/DActive123/',
+    creator_id: creator.id,
+    taken_at: new Date().toISOString(),
+    first_detected_at: new Date().toISOString(),
+    save_order_rank: 1,
+    instagram_sender_id: 'active_sender',
+  });
+
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: 'active_sender' },
+            message: { text: 'random unrecognized message' },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes("I didn't recognize that command"), `Expected unrecognized notice, got: ${replies[0]}`);
+  assert.ok(!replies[0].includes('Welcome to Reeler — Your Reels & Posts Vault!'), 'Active user must not receive welcome greeting');
 });

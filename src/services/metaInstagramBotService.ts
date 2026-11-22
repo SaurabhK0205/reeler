@@ -853,33 +853,68 @@ export class MetaInstagramBotService {
     let reelUrl: string | null = null;
     let attachmentType: string | null = null;
     let attachmentTitle: string | null = null;
+    let attachmentThumbnailUrl: string | null = null;
     let hasShareAttachment = false;
     if (Array.isArray(attachments)) {
       for (const att of attachments) {
+        attachmentType = typeof att?.type === 'string' ? att.type.trim() : null;
+        attachmentTitle =
+          typeof att?.payload?.title === 'string' && att.payload.title.trim()
+            ? att.payload.title.trim()
+            : null;
+
         const urlCandidate =
           (typeof att?.payload?.url === 'string' && att.payload.url.trim()) ||
           (typeof att?.payload?.target?.url === 'string' && att.payload.target.url.trim()) ||
           (typeof att?.payload?.reel_url === 'string' && att.payload.reel_url.trim()) ||
           null;
+
         if (urlCandidate) {
-          reelUrl = urlCandidate;
           hasShareAttachment = true;
-          attachmentType = typeof att.type === 'string' ? att.type : null;
-          attachmentTitle =
-            typeof att.payload?.title === 'string' && att.payload.title.trim()
-              ? att.payload.title.trim()
-              : null;
-          break;
-        }
-        if (typeof att?.payload?.title === 'string' && att.payload.title.trim()) {
-          const titleMatch = extractInstagramShortcodeAndPath(att.payload.title);
-          if (titleMatch) {
-            reelUrl = titleMatch.matchedText;
-            hasShareAttachment = true;
-            attachmentType = typeof att.type === 'string' ? att.type : null;
-            attachmentTitle = att.payload.title.trim();
+          const directMatch = extractInstagramShortcodeAndPath(urlCandidate);
+          if (directMatch) {
+            reelUrl = directMatch.matchedText;
             break;
           }
+          if (/lookaside\.fbsbx\.com|cdninstagram\.com|fbcdn\.net/i.test(urlCandidate)) {
+            attachmentThumbnailUrl = urlCandidate;
+          }
+        }
+
+        // Meta dedicated ig_post attachment format (payload.ig_post_media_id)
+        const igPostMediaId =
+          (typeof att?.payload?.ig_post_media_id === 'string' && att.payload.ig_post_media_id.trim()) ||
+          (typeof att?.payload?.media_id === 'string' && att.payload.media_id.trim()) ||
+          null;
+        if (igPostMediaId) {
+          hasShareAttachment = true;
+          const segment = attachmentType === 'ig_reel' ? 'reel' : 'p';
+          reelUrl = `https://www.instagram.com/${segment}/${igPostMediaId}/`;
+          break;
+        }
+
+        // Meta dedicated ig_reel attachment format (payload.reel_video_id)
+        const reelVideoId =
+          typeof att?.payload?.reel_video_id === 'string' && att.payload.reel_video_id.trim()
+            ? att.payload.reel_video_id.trim()
+            : null;
+        if (reelVideoId) {
+          hasShareAttachment = true;
+          reelUrl = `https://www.instagram.com/reel/${reelVideoId}/`;
+          break;
+        }
+
+        if (attachmentTitle) {
+          const titleMatch = extractInstagramShortcodeAndPath(attachmentTitle);
+          if (titleMatch) {
+            hasShareAttachment = true;
+            reelUrl = titleMatch.matchedText;
+            break;
+          }
+        }
+
+        if (att?.type === 'share' || att?.type === 'ig_post' || att?.type === 'ig_reel') {
+          hasShareAttachment = true;
         }
       }
     }
@@ -889,7 +924,7 @@ export class MetaInstagramBotService {
     // so internal retries still retain an isolated mutation and pending-reply checkpoint.
     const opId = existingOpId || this.normalizeWebhookMid(rawMid) || `event_${crypto.randomUUID()}`;
 
-    if (!combinedText && !this.pendingRepliesByMid.has(opId)) return;
+    if (!combinedText && !hasShareAttachment && !this.pendingRepliesByMid.has(opId)) return;
     if (!this.claimWebhookMid(opId)) {
       return;
     }
@@ -977,7 +1012,8 @@ export class MetaInstagramBotService {
         attachmentType,
         attachmentTitle,
         delivery,
-        hasShareAttachment
+        hasShareAttachment,
+        attachmentThumbnailUrl
       );
 
       if (delivery.stateMutated) {
@@ -1088,13 +1124,25 @@ export class MetaInstagramBotService {
     attachmentType?: string | null,
     attachmentTitle?: string | null,
     delivery?: WebhookDeliveryContext,
-    hasShareAttachment: boolean = false
+    hasShareAttachment: boolean = false,
+    attachmentThumbnailUrl?: string | null
   ): Promise<void> {
     console.log(`[MetaIG] Incoming DM from Instagram user ${senderId}: "${text}"`);
     const senderTz = await Repository.getSenderTimezone(senderId);
 
     // Check for Reel or Post URL
     const mediaLink = extractInstagramShortcodeAndPath(text);
+    if (!mediaLink && hasShareAttachment) {
+      console.warn(
+        `[MetaIG] Inbound share attachment from ${senderId} had no resolvable media link (text="${text}", attachmentType="${attachmentType}")`
+      );
+      await this.deliverReply(
+        senderId,
+        `ℹ️ I couldn't access that shared item. Make sure it's a public Reel or Post!`,
+        delivery
+      );
+      return;
+    }
     if (mediaLink) {
       const currentShareId = `share_${senderId}_${Date.now()}_${Math.random()}`;
       const shareCtx: InFlightShareContext = {
@@ -1214,6 +1262,7 @@ export class MetaInstagramBotService {
         null;
       const thumbnailUrl =
         meta.thumbnailUrl ||
+        attachmentThumbnailUrl ||
         existingItem?.thumbnail_url ||
         metadataFallbackItem?.thumbnail_url ||
         null;
@@ -1645,11 +1694,11 @@ export class MetaInstagramBotService {
       }
     }
 
-    // 1. Cancel / Undo commands (e.g. "cancel", "undo", "cancel reminder", "clear @creator")
+    // 1. Cancel / Undo commands (e.g. "cancel", "undo", "cancel reminder", "clear @[creator]")
     const cancelCmd = parseCancelCommand(text);
     if (cancelCmd) {
       if (cancelCmd.invalidCreatorTarget) {
-        const example = cancelCmd.isCancelAddition ? 'clear @creator' : 'cancel reminder for @creator';
+        const example = cancelCmd.isCancelAddition ? 'clear @[creator]' : 'cancel reminder for @[creator]';
         await this.deliverReply(
           senderId,
           `ℹ️ Could not find a valid creator handle in "${cancelCmd.invalidCreatorTarget}". Reply e.g. "${example}".`,
@@ -1748,13 +1797,13 @@ export class MetaInstagramBotService {
       }
     }
 
-    // 1b. Targeted Watched command: e.g. "watched @creator", "done @creator"
+    // 1b. Targeted Watched command: e.g. "watched @[creator]", "done @[creator]"
     const targetedWatched = parseTargetedWatchedCommand(text);
     if (targetedWatched) {
       if (targetedWatched.invalidCreatorTarget) {
         await this.deliverReply(
           senderId,
-          `ℹ️ Could not find a valid creator username in "${targetedWatched.invalidCreatorTarget}". To mark items by creator, use e.g. "watched @creator".`,
+          `ℹ️ Could not find a valid creator username in "${targetedWatched.invalidCreatorTarget}". To mark items by creator, use e.g. "watched @[creator]".`,
           delivery
         );
         return;
@@ -2193,7 +2242,17 @@ export class MetaInstagramBotService {
       return;
     }
 
-    // Default welcome / help reply
-    await this.deliverReply(senderId, formatBotHelpMessage(), delivery);
+    // Default fallback: if the sender is an existing active user, give a concise unrecognized command notice.
+    // If they are brand new, introduce the bot with the full instructions.
+    const isExistingUser = await Repository.hasSenderActivity(senderId);
+    if (isExistingUser) {
+      await this.deliverReply(
+        senderId,
+        `ℹ️ I didn't recognize that command. Reply "help" to see available commands, or share a Reel or Post anytime!`,
+        delivery
+      );
+    } else {
+      await this.deliverReply(senderId, formatBotHelpMessage(), delivery);
+    }
   }
 }

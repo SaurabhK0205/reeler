@@ -93,7 +93,7 @@ export function parseCancelCommand(text: string): CancelCommand | null {
 
   // 2. Clear / remove / cancel by creator: e.g. "clear @ykittois", "clear ykittois", "remove @ann", "delete ann"
   const clearMatch = lower.match(
-    /^(?:clear|remove|delete|cancel)\s+(@[a-z0-9._]{1,30}|[a-z0-9._]{1,30})[,.!?:;~]*$/i
+    /^(?:clear|remove|delete|cancel)\s+(@?(?:\[|<)?[a-z0-9._]{1,30}(?:\]|>)?)[,.!?:;~]*$/i
   );
   if (clearMatch) {
     const rawArg = clearMatch[1].trim().replace(/[.!?,;:~]+$/, '');
@@ -205,10 +205,10 @@ export function formatBotHelpMessage(): string {
     `• "watched" or "done" — Mark latest reminder as watched.\n` +
     `• "cancel" or "undo" — Remove recently added item if sent by mistake.\n` +
     `• "cancel reminder" — Stop alarms but keep item in Watch Later.\n` +
-    `• "clear @creator" / "watched @creator" — Manage items by creator.\n` +
+    `• "clear @[creator]" / "watched @[creator]" — Manage items by creator.\n` +
     `• "stop all" — Mark all items as watched & clear active reminders.\n\n` +
     `🔍 Search & Web Vault\n` +
-    `• "@creator" or "reels by @creator" — View your saved items.\n` +
+    `• "@[creator]" or "reels by @[creator]" — View your saved items.\n` +
     `• "vault" — Open your private web vault.\n` +
     `• "code" — Get a 6-digit login code for PC/laptop access.\n\n` +
     `⚙️ Settings\n` +
