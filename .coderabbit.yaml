@@ -7,7 +7,7 @@
 language: "en-US"
 early_access: false
 
-tone_instructions: "Be helpful, pragmatic, and constructive. Focus on high-impact architectural issues, real bugs, and critical security concerns. Avoid nitpicking formatting, comments, or non-blocking edge cases."
+tone_instructions: "Be concise, technical, and rigorous. Enforce production-grade engineering standards and actively flag AI-generated boilerplate or slop. Reject em-dashes (—) in code, copy, and reviews. Flag speculative abstractions, unnecessary wrappers, sycophantic comments, and unverified assumptions. Focus on race conditions, atomic CAS correctness, database parity between Supabase and test mock stores, injection prevention, and memory leaks."
 
 reviews:
   profile: "chill"
@@ -60,16 +60,18 @@ reviews:
     - path: "src/services/**"
       instructions: |
         - RELIABILITY & ERROR BOUNDARIES: No uncaught promise rejections or unhandled errors that could crash the Node runtime.
+        - ZERO AI SLOP IN BOT COPY: Ban em-dashes (`—`), robot apologies, conversational boilerplate, and robotic AI phrasing in all user-facing copy. Phrasing must remain natural, direct, concise, and human. Help menu must remain strictly under 950 characters for reliable single-bubble delivery.
         - INSTAGRAM DM UX: Standardize on clean native `@username` mentions (e.g. `Creator: @username` or `⏰ Reminder set for @username:`). Do not append raw profile URLs (`https://www.instagram.com/<username>/`) to DM confirmations or reminders, as raw profile URLs clutter mobile chats and trigger unwanted OpenGraph preview cards. Short `"watched"`/`"stop"` confirmations intentionally omit creator cards. In reminders containing a Reel URL, keep the Reel URL cleanly formatted.
         - HUMAN-READABLE COPY: Direct message replies MUST NEVER expose raw database IDs or Instagram shortcodes (e.g. `Da1iWbSMAOz`) to end users; describe reels using creator handles and/or truncated captions (falling back to `"your saved reel"`).
         - PAYLOAD LIMITS: Instagram Graph API has a strict 1000-character ceiling per direct message. Validate that message formatting and reel lists strictly truncate and remain safely below 1000 characters under all permutations.
         - BACKGROUND WORKERS: Scrutinize polling intervals, timer cancellations, and memory retention in `ReminderWorker`. Ensure Sets/Maps do not grow unbounded over months of continuous operation.
-        - RACE CONDITIONS: Check for race conditions in reminder scheduling and awaiting choice expiration windows.
+        - RACE CONDITIONS & ATOMIC CAS: Check for race conditions in reminder scheduling and awaiting choice expiration windows. CAS locks must never be bypassed.
 
     # 3. Database Layer & Repository
     - path: "src/db/**"
       instructions: |
         - INJECTION DEFENSE: All database queries must be strictly parameterized via the Supabase query builder. String concatenation in queries is strictly forbidden.
+        - STORE PARITY: When querying `InMemoryStore` for test suites, the filtering, sorting, and fallback semantics MUST strictly mirror the production Supabase queries. Flag any divergence between mock store and PostgreSQL query logic.
         - PERFORMANCE & INDEXES: Every query filtering or sorting on columns (e.g. `creator_id`, `watch_status`, `instagram_sender_id`, `next_reminder_at`, `awaiting_reminder_choice_until`, `created_at`) must align with database indexes.
         - QUERY EFFICIENCY: Reject N+1 query patterns. Consolidate multi-row operations using `.in()` or bulk operations rather than loops of sequential single-row queries.
         - DATA CONSISTENCY: Ensure `updated_at` timestamps are always refreshed on record updates.
@@ -82,8 +84,9 @@ reviews:
         - DETERMINISM: Utility functions must be pure, deterministic, and handle malformed, empty, or unexpected input safely without throwing unhandled exceptions.
 
     # 5. Database Schema & Migrations
-    - path: "supabase/migrations/**"
+    - path: "{supabase/migrations/**,schema.sql}"
       instructions: |
+        - SCHEMA.SQL RULE: Every migration in `supabase/migrations/` MUST have its table/column additions mirrored in root `schema.sql` within the same pull request.
         - MIGRATION STANDARDS: Every schema change must follow the sequential numbering convention (`XXX_<description>.sql`).
         - IDEMPOTENCY: Migrations must be safely executable and idempotent where applicable (`IF NOT EXISTS`, `ON CONFLICT`).
         - REFERENTIAL INTEGRITY: Every foreign key relation must have an explicit `ON DELETE` behavior defined (e.g. `CASCADE` or `SET NULL`).

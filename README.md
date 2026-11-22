@@ -119,16 +119,34 @@ SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
 
 Set the following environment variables in your deployment environment (e.g. Render using [`render.yaml`](render.yaml)):
 
-- `META_PAGE_ACCESS_TOKEN` — Page access token for the Facebook Page linked to your Instagram Professional account
-- `META_APP_SECRET` — Meta App Secret used to verify `X-Hub-Signature-256` on incoming webhooks
-- `META_WEBHOOK_VERIFY_TOKEN` — Custom verification token configured in Meta Webhooks dashboard
-- `APP_URL` — Public base URL used for vault links (falls back to `RENDER_EXTERNAL_URL`)
-- `METADATA_PROXY_URL` / `METADATA_PROXY_TOKEN` *(optional)* — HTTPS relay (such as a Cloudflare Worker) for fetching public OpenGraph metadata when cloud IPs encounter Instagram login walls
+- `META_PAGE_ACCESS_TOKEN`: Page access token for the Facebook Page linked to your Instagram Professional account
+- `META_APP_SECRET`: Meta App Secret used to verify `X-Hub-Signature-256` on incoming webhooks
+- `META_WEBHOOK_VERIFY_TOKEN`: Custom verification token configured in Meta Webhooks dashboard
+- `APP_URL`: Public base URL used for vault links (falls back to `RENDER_EXTERNAL_URL`)
+- `METADATA_PROXY_URL` / `METADATA_PROXY_TOKEN` *(optional)*: HTTPS relay (such as a Cloudflare Worker) for fetching public OpenGraph metadata when cloud IPs encounter Instagram login walls
 
 Endpoints exposed by the server:
-- `GET` / `POST /api/instagram/webhook` (alias: `/webhook`) — Meta webhook verification and DM event handler
-- `GET /api/health` — Service health, database mode, and Meta bot readiness check
-- `GET /privacy`, `GET /terms`, `GET /data-deletion` — Compliance pages required for Meta App Review
+- `GET` / `POST /api/instagram/webhook` (alias: `/webhook`): Meta webhook verification and DM event handler
+- `GET /api/health`: Service health, database mode, and Meta bot readiness check
+- `GET /privacy`, `GET /terms`, `GET /data-deletion`: Compliance pages required for Meta App Review
+
+---
+
+## Automated Code Review & Quality Gates
+
+Reeler enforces a three-tier quality gate to ensure production-grade reliability and prevent AI slop:
+
+1. **Pre-Push Local Suite**: Run `npm test` before committing. All 24 test suites must pass cleanly.
+2. **CodeRabbit Review**: Configured in `.coderabbit.yaml` to flag race conditions, missing CAS locks, and database query parity. Free for public/open-source repositories.
+3. **Open-Source PR Review Actions**:
+   - **Gemini Principal Code Reviewer** (`.github/workflows/gemini-code-review.yml`): Runs `scripts/gemini-pr-review.mjs` against PR diffs using Google Gemini. Flags anti-slop violations, CAS lock bypasses, Supabase vs in-memory mock divergence, and schema parity.
+   - **Qodo PR-Agent** (`.github/workflows/pr-agent.yml`): Runs the open-source PR-Agent for automated code review, PR analysis, and interactive `/review` or `/ask` comments.
+
+To enable the Gemini reviewer and PR-Agent:
+1. Go to **Settings** > **Secrets and variables** > **Actions** in your GitHub repository.
+2. Click **New repository secret**.
+3. Name: `GEMINI_API_KEY`, Value: Your Google AI Studio API key (from [aistudio.google.dev](https://aistudio.google.dev)).
+*(If `GEMINI_API_KEY` is not configured, both workflows gracefully skip without failing CI).*
 
 ---
 
