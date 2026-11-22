@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { generateUserVaultKey, getAdminVaultKey, createOtp, isOtpActive, OtpCapacityError } from './vaultAuthService.ts';
+import { generateUserVaultKey, getAdminVaultKey, createOtp, isOtpActive, OtpCapacityError, isHostedOrProductionEnvironment } from './vaultAuthService.ts';
 import { safeStringEqual } from '../middleware/security.ts';
 import { loadConfig } from '../config.ts';
 import { Repository, SenderReminderConflictError, SenderDeletionBarrierError } from '../db/repository.ts';
@@ -451,10 +451,10 @@ export class MetaInstagramBotService {
    */
   verifySignature(rawBody: Buffer | string | undefined, signatureHeader?: string): boolean {
     if (!this.appSecret) {
-      // Insecure bypass is strictly opt-in and forbidden in production
-      const allowInsecure = process.env.ALLOW_INSECURE_WEBHOOK === 'true' && process.env.NODE_ENV !== 'production';
+      // Insecure bypass is strictly opt-in and forbidden in production or hosted environments
+      const allowInsecure = process.env.ALLOW_INSECURE_WEBHOOK === 'true' && !isHostedOrProductionEnvironment();
       if (allowInsecure) {
-        console.warn('[MetaBot] WARNING: Webhook signature verification bypassed via ALLOW_INSECURE_WEBHOOK=true in non-production.');
+        console.warn('[MetaBot] WARNING: Webhook signature verification bypassed via ALLOW_INSECURE_WEBHOOK=true in local development.');
         return true;
       }
       console.error('[MetaBot] Webhook rejected: META_APP_SECRET is not configured. Set META_APP_SECRET or explicit ALLOW_INSECURE_WEBHOOK=true for local dev.');

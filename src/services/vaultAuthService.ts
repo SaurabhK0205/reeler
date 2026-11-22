@@ -381,17 +381,43 @@ export function resolveConfiguredVaultSecret(): string | null {
 }
 
 /**
+ * Detects whether the current process is running in a hosted, production, or staged environment
+ * where unauthenticated access bypasses and default insecure secrets MUST be strictly forbidden.
+ */
+export function isHostedOrProductionEnvironment(): boolean {
+  const nodeEnv = (process.env.NODE_ENV || '').trim().toLowerCase();
+  const appEnv = (process.env.APP_ENV || '').trim().toLowerCase();
+
+  if (nodeEnv === 'production' || nodeEnv === 'staging' || appEnv === 'production' || appEnv === 'staging') {
+    return true;
+  }
+
+  return Boolean(
+    process.env.RENDER ||
+    process.env.RENDER_EXTERNAL_URL ||
+    process.env.FLY_APP_NAME ||
+    process.env.HEROKU_APP_ID ||
+    process.env.DYNO ||
+    process.env.RAILWAY_ENVIRONMENT ||
+    process.env.VERCEL ||
+    process.env.AWS_EXECUTION_ENV ||
+    process.env.ECS_CONTAINER_METADATA_URI ||
+    process.env.KUBERNETES_SERVICE_HOST
+  );
+}
+
+/**
  * Resolves the server secret used to sign and verify zero-login vault tokens.
- * Fails closed in production if neither VAULT_SECRET nor SUPABASE_SERVICE_ROLE_KEY is configured.
+ * Fails closed in production and hosted environments if neither VAULT_SECRET nor SUPABASE_SERVICE_ROLE_KEY is configured.
  */
 export function getVaultSecret(): string {
   const configuredSecret = resolveConfiguredVaultSecret();
   if (configuredSecret) {
     return configuredSecret;
   }
-  if (process.env.NODE_ENV === 'production') {
+  if (isHostedOrProductionEnvironment()) {
     throw new Error(
-      'Production requires a non-blank VAULT_SECRET or SUPABASE_SERVICE_ROLE_KEY to sign vault tokens.'
+      'Production and hosted environments require a non-blank VAULT_SECRET or SUPABASE_SERVICE_ROLE_KEY to sign vault tokens.'
     );
   }
   return 'reeler-default-vault-secret-do-not-use-in-production';
@@ -557,18 +583,20 @@ export function vaultAuthMiddleware(req: Request, res: Response, next: NextFunct
     return;
   }
 
-  // If running locally in development without a key, permit admin fallback for zero-friction local testing
-  const isProduction = process.env.NODE_ENV === 'production';
-  if (!isProduction) {
-    req.vaultUser = { role: 'admin' };
-    return next();
+  // In hosted, staged, or production environments, missing or invalid keys MUST always return 401
+  const isStrictEnv = isHostedOrProductionEnvironment();
+  if (isStrictEnv) {
+    res.status(401).json({
+      error: 'UNAUTHORIZED',
+      code: 'VAULT_KEY_REQUIRED',
+      message: 'To access your private vault, send a reel or message "vault" to our Instagram bot to receive your access key.',
+    });
+    return;
   }
 
-  res.status(401).json({
-    error: 'UNAUTHORIZED',
-    code: 'VAULT_KEY_REQUIRED',
-    message: 'To access your private vault, send a reel or message "vault" to our Instagram bot to receive your access key.',
-  });
+  // If running locally in development without a key, permit admin fallback for zero-friction local testing
+  req.vaultUser = { role: 'admin' };
+  return next();
 }
 
 /**
