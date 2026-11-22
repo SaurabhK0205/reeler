@@ -5176,3 +5176,73 @@ test('Repository.updateReminderSchedule - atomically updates creator_id and pres
   const modifiedReel = await Repository.getSavedItemById(reel.id);
   assert.strictEqual(modifiedReel?.creator_id, newCreator.id);
 });
+
+test('MetaInstagramBotService - reminder confirmation retry captures committed next_reminder_at and redelivers unsent reply', async () => {
+  Repository.resetMemoryStoreForTests();
+  const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+  const senderId = 'sender_confirmation_retry_test';
+  await Repository.setSenderTimezone(senderId, 'Asia/Kolkata');
+
+  const creator = await Repository.upsertCreator({
+    instagram_user_id: 'creator_retry_test',
+    username: 'retry_creator',
+  });
+  const item = await Repository.upsertSavedReel({
+    instagram_media_id: 'm_retry_test',
+    shortcode: 'RetryReel1',
+    reel_url: 'https://instagram.com/reel/RetryReel1/',
+    creator_id: creator.id,
+    instagram_sender_id: senderId,
+    watch_status: 'watch_later',
+    next_reminder_at: '2026-11-21T12:00:00Z',
+    awaiting_reminder_choice_until: null,
+  });
+  assert.ok(item);
+
+  let attempt = 0;
+  const deliveredReplies: string[] = [];
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    attempt++;
+    if (attempt === 1) {
+      // First attempt fails sending DM
+      return false;
+    }
+    deliveredReplies.push(text);
+    return true;
+  };
+
+  const opId = 'mid.duration_retry_test_1';
+  // Send duration command "2h"
+  await bot.dispatchWebhookMessage(
+    senderId,
+    opId,
+    '2h',
+    undefined,
+    'test_source',
+    0,
+    opId
+  );
+
+  // Initial attempt failed DM delivery, but committed reminder schedule
+  const updatedItem = await Repository.getSavedItemById(item.id);
+  assert.strictEqual(updatedItem?.reminder_interval_seconds, 7200);
+
+  // Internal retry executes for the pending reply
+  await bot.dispatchWebhookMessage(
+    senderId,
+    opId,
+    '2h',
+    undefined,
+    'internal_retry',
+    1,
+    opId
+  );
+
+  // The confirmation message should have been redelivered successfully, not discarded
+  assert.strictEqual(deliveredReplies.length, 1);
+  assert.ok(
+    deliveredReplies[0].includes('2 hours') &&
+      (deliveredReplies[0].includes('Reminder set for') || deliveredReplies[0].includes('Reminder updated for')),
+    `Delivered reply: ${deliveredReplies[0]}`
+  );
+});

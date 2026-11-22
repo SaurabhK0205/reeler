@@ -1098,14 +1098,18 @@ export class MetaInstagramBotService {
         }
       } else {
         if (delivery.stateMutated && delivery.unsentMessages.length > 0) {
+          const isStatusReply = Boolean(
+            delivery.retryState.expectedNextReminderAt ||
+            delivery.retryState.pinnedDurationUpdatesReshare
+          );
           this.recordPendingWebhookReplies(
             opId,
             senderId,
             delivery.unsentMessages,
             delivery.issuedOtpCode,
             delivery.retryState.pinnedDurationTargetReel?.id,
-            delivery.retryState.expectedAwaitingReminderChoiceUntil,
-            delivery.retryState.pinnedDurationUpdatesReshare,
+            isStatusReply ? null : delivery.retryState.expectedAwaitingReminderChoiceUntil,
+            isStatusReply,
             delivery.retryState.expectedNextReminderAt
           );
         }
@@ -1680,6 +1684,9 @@ export class MetaInstagramBotService {
           this.pendingSharePrompts.delete(senderId);
         }
         delivery.stateMutated = true;
+        delivery.retryState.pinnedDurationTargetReel = targetReel;
+        delivery.retryState.expectedNextReminderAt = effectiveDur.targetDate.toISOString();
+        delivery.retryState.pinnedDurationUpdatesReshare = true;
         if (promptInfo.opId) this.markWebhookMidCompleted(promptInfo.opId);
 
         const reminderActionLabel = promptInfo.isAlreadyInWatchLater ? 'Reminder updated for:' : 'Reminder set for:';
@@ -1721,6 +1728,9 @@ export class MetaInstagramBotService {
           targetReel.creator = pendingCreator;
         }
         delivery.stateMutated = true;
+        delivery.retryState.pinnedDurationTargetReel = targetReel;
+        delivery.retryState.expectedNextReminderAt = effectiveDur.targetDate.toISOString();
+        delivery.retryState.pinnedDurationUpdatesReshare = true;
         if (delivery.retryState.pinnedTargetedCreator) {
           this.recordLastConfirmedAddition(senderId, targetReel.id);
           this.recordReshareInteraction(targetReel.id);
@@ -1839,7 +1849,12 @@ export class MetaInstagramBotService {
               await this.deliverReply(senderId, reply, delivery);
               return;
             }
-            if (delivery) delivery.stateMutated = true;
+            if (delivery) {
+              delivery.stateMutated = true;
+              delivery.retryState.pinnedDurationTargetReel = targetReel;
+              delivery.retryState.expectedNextReminderAt = effectiveDur.targetDate.toISOString();
+              delivery.retryState.pinnedDurationUpdatesReshare = true;
+            }
             if (pending.opId) this.markWebhookMidCompleted(pending.opId);
 
             const reminderActionLabel = pending.isAlreadyInWatchLater ? 'Reminder updated for:' : 'Reminder set for:';
@@ -2219,7 +2234,12 @@ export class MetaInstagramBotService {
             }
             this.recordLastConfirmedAddition(senderId, targetReel.id);
             this.recordReshareInteraction(targetReel.id);
-            if (delivery) delivery.stateMutated = true;
+            if (delivery) {
+              delivery.stateMutated = true;
+              delivery.retryState.pinnedDurationTargetReel = targetReel;
+              delivery.retryState.expectedNextReminderAt = effectiveDur.targetDate.toISOString();
+              delivery.retryState.pinnedDurationUpdatesReshare = true;
+            }
             let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget, true);
             if (senderTz === 'UTC') {
               reply += `\n\n💡 Tip: Times are currently shown in UTC. Reply e.g. "tz New York" or "tz IST" to set your local time!`;
@@ -2333,7 +2353,12 @@ export class MetaInstagramBotService {
             }
           );
           if (applied) {
-            if (delivery) delivery.stateMutated = true;
+            if (delivery) {
+              delivery.stateMutated = true;
+              delivery.retryState.pinnedDurationTargetReel = targetReel;
+              delivery.retryState.expectedNextReminderAt = nextDate;
+              delivery.retryState.pinnedDurationUpdatesReshare = true;
+            }
             if (this.pendingSharePrompts.has(senderId)) {
               const pending = this.pendingSharePrompts.get(senderId)!;
               if (pending.reel.id === targetReel.id || (activeShare && pending.shareId === activeShare.shareId)) {
@@ -2412,7 +2437,12 @@ export class MetaInstagramBotService {
           return;
         }
         this.recentReshareReelIds.delete(targetReel.id);
-        if (delivery) delivery.stateMutated = true;
+        if (delivery) {
+          delivery.stateMutated = true;
+          delivery.retryState.pinnedDurationTargetReel = targetReel;
+          delivery.retryState.expectedNextReminderAt = nextDate;
+          delivery.retryState.pinnedDurationUpdatesReshare = true;
+        }
         let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget, updatesReshare);
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are currently shown in UTC. Reply e.g. "tz New York" or "tz IST" to set your local time!`;
