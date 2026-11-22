@@ -46,6 +46,7 @@ jobs:
           OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
           config.model: "gemini/gemini-2.0-flash"
           config.fallback_models: '["gemini/gemini-1.5-flash", "gemini/gemini-1.5-pro"]'
+          config.custom_model_max_tokens: "32000"
           github_action_config.auto_review: "true"
           github_action_config.auto_describe: "false"
           github_action_config.auto_improve: "false"
