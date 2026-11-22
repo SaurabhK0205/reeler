@@ -136,12 +136,12 @@ Endpoints exposed by the server:
 
 ## Automated Code Review & Quality Gates
 
-Reeler enforces a three-tier quality gate to guarantee senior engineering standards, protect database parity, and eliminate AI slop:
+Reeler enforces a multi-tier automated quality gate to guarantee senior engineering standards, protect database parity, and eliminate AI slop:
 
 ### 1. Pre-Push Local Suite
 Run `npm test` before committing. All 24 test suites / 64 tests must pass cleanly.
 
-### 2. Gemini Principal Code Reviewer (`.github/workflows/gemini-code-review.yml`)
+### 2. Gemini Principal Code Reviewer (`.github/workflows/ai-code-review.yml`)
 - Zero-dependency Node.js script (`scripts/gemini-pr-review.mjs`) executing on every PR event (`opened`, `reopened`, `ready_for_review`, `synchronize`).
 - **Dynamic Model Discovery**: Queries Google AI Studio's Model API (`https://generativelanguage.googleapis.com/v1beta/models`) to automatically detect active models (`gemini-flash-lite-latest`, `gemini-2.0-flash`, `gemini-2.5-flash`), with 15-second request timeouts and fallback resilience.
 - **Strict Invariant Audits**:
@@ -150,14 +150,22 @@ Run `npm test` before committing. All 24 test suites / 64 tests must pass cleanl
   - `Store Parity`: Asserts that `InMemoryStore` logic in tests is behaviorally identical to Supabase PostgREST queries in production.
   - `Schema Parity`: Verifies that any database change in `supabase/migrations/` is synchronized in root `schema.sql`.
 
-### 3. Qodo PR-Agent (`.github/workflows/pr-agent.yml` & `.pr_agent.toml`)
+### 3. NVIDIA Nemotron 3 Ultra 550B Deep Reasoning Auditor (`.github/workflows/ai-code-review.yml`)
+- High-capacity reasoning auditor (`scripts/nemotron-pr-review.mjs`) running on NVIDIA's OpenAI-compatible NIM endpoint (`https://integrate.api.nvidia.com/v1`).
+- Leverages the **550-billion-parameter MoE architecture** (with 55B active parameters per token, Mamba-2 state space, and NVFP4 quantization) and native chain-of-thought reasoning tokens to detect:
+  - Deep concurrency race conditions and non-atomic state updates.
+  - Subtly breaking API signature changes and unintended default parameter behaviors.
+  - Inconsistencies between test stores and live production database queries.
+  - Meta 24-hour window compliance and fail-closed state machines.
+
+### 4. Qodo PR-Agent (`.github/workflows/pr-agent.yml` & `.pr_agent.toml`)
 - Open-source PR review and conversational review bot (`qodo-ai/pr-agent@main`).
 - Automatically analyzes code changes on pull request creation and responds to interactive PR commands in comments:
   - `/review`: Request an on-demand code review.
   - `/ask <question>`: Ask a question about the changes in the PR.
 - Configured with custom token budgets and decoupled concurrency so comment commands never cancel active PR workflows.
 
-### 4. CodeRabbit (`.coderabbit.yaml`)
+### 5. CodeRabbit (`.coderabbit.yaml`)
 - Configured with custom path rules and tone instructions enforcing atomic CAS locks, Supabase query parity, and single-bubble copy constraints.
 - **Why CodeRabbit shows `SKIPPED` in GitHub Actions**:
   - **10-Star Policy Threshold**: Under CodeRabbit's current open-source plan, repositories with fewer than 10 stars do not receive unmetered automatic background reviews on every push.
@@ -165,11 +173,12 @@ Run `npm test` before committing. All 24 test suites / 64 tests must pass cleanl
   - **Manual Triggering**: To run CodeRabbit on any PR, comment `@coderabbitai review` directly on the pull request (allows up to 1 review per hour on the free tier).
 
 ### Secret Setup
-To power the Gemini Principal Reviewer and Qodo PR-Agent:
+To power the automated review pipeline:
 1. Navigate to **Settings** > **Secrets and variables** > **Actions** in GitHub.
-2. Under the **Secrets** tab (not Variables), click **New repository secret**.
-3. Name: `GEMINI_API_KEY`, Value: Your Google AI Studio API key (from [aistudio.google.com](https://aistudio.google.com)).
-*(If `GEMINI_API_KEY` is absent, the workflows gracefully skip without breaking CI).*
+2. Under the **Secrets** tab (not Variables), configure:
+   - `GEMINI_API_KEY`: Google AI Studio API key (from [aistudio.google.com](https://aistudio.google.com)).
+   - `NVIDIA_API_KEY`: NVIDIA NIM API key (from [build.nvidia.com](https://build.nvidia.com)).
+*(If either key is absent, the corresponding workflow step gracefully skips without failing CI).*
 
 ---
 
