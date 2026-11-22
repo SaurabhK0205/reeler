@@ -4797,6 +4797,25 @@ test('MetaInstagramBotService - Path B: creator-targeted reminder update command
   });
   assert.strictEqual(replies.length, 1);
   assert.ok(replies[0].includes('Could not find a valid creator handle'), `Got: ${replies[0]}`);
+
+  // 12. Unsigned temporal word "reschedule next monday" falls through to generic duration rather than targeting @next
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'reschedule next monday' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder set for') || replies[0].includes('⏰ Reminder updated for'), `Got: ${replies[0]}`);
+  assert.ok(!replies[0].includes('Could not find an active Watch Later reel from @next'), `Should not target @next, got: ${replies[0]}`);
+
+  // 13. Explicit "@next" targets the creator @next
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'reschedule @next tomorrow' } }] }],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('Could not find an active Watch Later reel from @next'), `Got: ${replies[0]}`);
 });
 
 test('MetaInstagramBotService prioritizes reshared item over older awaiting item when duration is replied', async () => {

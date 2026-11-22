@@ -20,6 +20,7 @@ export const RESERVED_WORDS = new Set([
   'reminder', 'reminders',
   'watched', 'done', 'seen', 'finish', 'finished', 'stop', 'cancel', 'halt', 'unsub', 'unsubscribe', 'quit', 'clear',
   'today', 'tomorrow', 'tonight', 'sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday',
+  'next', 'coming', 'morning', 'afternoon', 'evening', 'night', 'prev', 'previous',
   'yes', 'no', 'ok', 'okay', 'yep', 'nope', 'thanks', 'thank you', 'ty',
 ]);
 
