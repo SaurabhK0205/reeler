@@ -96,13 +96,35 @@ Provide a clear, formatted GitHub Markdown review:
 (List specific actionable findings with file paths, or state "No critical issues detected. Production standards satisfied." if clean.)
 `;
 
+async function getAvailableModels(apiKey) {
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data?.models)) {
+        const supported = data.models
+          .filter((m) => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+          .map((m) => m.name.replace(/^models\//, ''));
+        if (supported.length > 0) {
+          console.log(`Discovered ${supported.length} available Gemini models from API:`, supported.slice(0, 5).join(', '));
+          const flashModels = supported.filter((m) => m.includes('flash'));
+          const otherModels = supported.filter((m) => !m.includes('flash'));
+          return [...flashModels, ...otherModels];
+        }
+      }
+    } else {
+      console.warn(`Could not list models (${res.status}):`, await res.text());
+    }
+  } catch (err) {
+    console.warn('Could not query model list, falling back to static list:', err.message || err);
+  }
+  return ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+}
+
 async function runReview() {
-  const candidateModels = [
-    'gemini-2.0-flash',
-    'gemini-1.5-flash',
-    'gemini-1.5-pro',
-    'gemini-2.5-flash',
-  ];
+  const candidateModels = await getAvailableModels(GEMINI_API_KEY);
 
   let reviewBody = null;
   let lastError = null;
