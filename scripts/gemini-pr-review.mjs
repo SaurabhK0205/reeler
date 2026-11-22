@@ -98,11 +98,10 @@ Provide a clear, formatted GitHub Markdown review:
 
 async function runReview() {
   const candidateModels = [
-    'gemini-3.8-flash',
     'gemini-2.0-flash',
     'gemini-1.5-flash',
-    'gemini-2.5-flash',
     'gemini-1.5-pro',
+    'gemini-2.5-flash',
   ];
 
   let reviewBody = null;
@@ -116,6 +115,7 @@ async function runReview() {
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(15000),
         body: JSON.stringify({
           contents: [
             {

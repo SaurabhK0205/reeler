@@ -7,7 +7,7 @@
 language: "en-US"
 early_access: false
 
-tone_instructions: "Be concise, technical, and rigorous. Enforce production-grade engineering standards and actively flag AI-generated boilerplate or slop. Reject em-dashes (—) in code, copy, and reviews. Flag speculative abstractions, unnecessary wrappers, sycophantic comments, and unverified assumptions. Focus on race conditions, atomic CAS correctness, database parity between Supabase and test mock stores, injection prevention, and memory leaks."
+tone_instructions: "Be concise, technical, and rigorous. Flag AI slop and boilerplate. Reject em-dashes (—). Focus on race conditions, atomic CAS correctness, Supabase and test store parity, injection security, and memory bounds."
 
 reviews:
   profile: "chill"
