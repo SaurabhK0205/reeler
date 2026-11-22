@@ -773,9 +773,13 @@ export class MetaInstagramBotService {
           });
           data = (await res.json()) as any;
           if (res.ok) {
-            console.log(
-              `[MetaIG] DM delivered to ${recipientId} via HUMAN_AGENT tag: "${chunk.slice(0, 40)}..."`
-            );
+            if (isHostedOrProductionEnvironment()) {
+              console.log(`[MetaIG] DM delivered to ${recipientId} via HUMAN_AGENT tag (${chunk.length} chars)`);
+            } else {
+              console.log(
+                `[MetaIG] DM delivered to ${recipientId} via HUMAN_AGENT tag: "${chunk.slice(0, 40)}..."`
+              );
+            }
           } else {
             console.error(
               `[MetaIG] HUMAN_AGENT tag fallback failed (requires Meta App Review approval for the Human Agent feature):`,
@@ -790,7 +794,11 @@ export class MetaInstagramBotService {
           // Stop sending subsequent chunks on failure to avoid out-of-order partial messages
           break;
         } else {
-          console.log(`[MetaIG] DM sent to ${recipientId}: "${chunk.slice(0, 40)}..."`);
+          if (isHostedOrProductionEnvironment()) {
+            console.log(`[MetaIG] DM sent to ${recipientId} (${chunk.length} chars)`);
+          } else {
+            console.log(`[MetaIG] DM sent to ${recipientId}: "${chunk.slice(0, 40)}..."`);
+          }
         }
       } catch (e: any) {
         console.error('[MetaIG] Error calling Meta messages API:', e.message);
@@ -1177,7 +1185,12 @@ export class MetaInstagramBotService {
    * Handles incoming webhook event payload from Meta Graph API
    */
   async handleWebhookPayload(body: any): Promise<void> {
-    console.log('[MetaIG] Webhook received body:', JSON.stringify(body, null, 2));
+    if (isHostedOrProductionEnvironment()) {
+      const entryCount = Array.isArray(body?.entry) ? body.entry.length : 0;
+      console.log(`[MetaIG] Webhook received event object="${body?.object || 'unknown'}" entries=${entryCount}`);
+    } else {
+      console.log('[MetaIG] Webhook received body:', JSON.stringify(body, null, 2));
+    }
 
     // Official Meta Graph API Webhook format (handles both 'instagram' and 'page' objects)
     if ((body.object === 'instagram' || body.object === 'page') && Array.isArray(body.entry)) {
@@ -1245,14 +1258,19 @@ export class MetaInstagramBotService {
     hasShareAttachment: boolean = false,
     attachmentThumbnailUrl?: string | null
   ): Promise<void> {
-    console.log(`[MetaIG] Incoming DM from Instagram user ${senderId}: "${text}"`);
+    if (isHostedOrProductionEnvironment()) {
+      console.log(`[MetaIG] Incoming DM from Instagram user ${senderId}: [${text ? text.length : 0} chars redacted]`);
+    } else {
+      console.log(`[MetaIG] Incoming DM from Instagram user ${senderId}: "${text}"`);
+    }
     const senderTz = await Repository.getSenderTimezone(senderId);
 
     // Check for Reel or Post URL
     const mediaLink = extractInstagramShortcodeAndPath(text);
     if (!mediaLink && hasShareAttachment) {
+      const loggedText = isHostedOrProductionEnvironment() ? '[REDACTED]' : text;
       console.warn(
-        `[MetaIG] Inbound share attachment from ${senderId} had no resolvable media link (text="${text}", attachmentType="${attachmentType}")`
+        `[MetaIG] Inbound share attachment from ${senderId} had no resolvable media link (text="${loggedText}", attachmentType="${attachmentType}")`
       );
       await this.deliverReply(
         senderId,
