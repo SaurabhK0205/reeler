@@ -69,7 +69,7 @@ Follow GRAVITAS invariants for implementation, debugging, refactoring, review, a
 3. **Secrets**: Never commit `.env`, credentials, or access tokens.
 4. **Architecture**: Endpoints call services; services call repository (`src/db/repository.ts`). No raw database calls in endpoints.
 5. **Database & Schema Invariant**: All schema changes require a migration in `supabase/migrations/`, an update to `src/types.ts`, and updating the complete consolidated `schema.sql` at repository root so developers can self-host or spin up local databases in one shot. Always keep `schema.sql` synchronized whenever creating or modifying migrations.
-6. **Instagram UX**: Include clickable creator profile links (`https://www.instagram.com/<username>/` paired with `@<username>`) when a valid Instagram handle exists (placing Reel URLs before profile URLs in reminders to preserve video card previews), never leak raw shortcodes in user-facing DMs or UI, and treat `"watched"` as single-latest-reel unless `"stop all"` / `"watched all"` is requested.
+6. **Instagram UX**: Standardize on clean native `@username` mentions (e.g. `Creator: @username` or `⏰ Reminder set for @username:`). Never append raw profile URLs (`https://www.instagram.com/<username>/`) to DM confirmations or reminders to avoid chat clutter and conflicting OpenGraph preview cards. Never leak raw shortcodes in user-facing DMs or UI, and treat `"watched"` as single-latest-reel unless `"stop all"` / `"watched all"` is requested.
 7. **Workspace Isolation**: Work strictly within `/Users/thismac/projects/instagram-saved-reels/`. Do not touch `/Users/thismac/rea/`.
 8. **CodeRabbit Review Gate (MANDATORY & BLOCKING)**:
    - **NEVER merge a Pull Request immediately.**
