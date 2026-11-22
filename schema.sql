@@ -185,9 +185,27 @@ ALTER TABLE public.creators ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.saved_reels ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.sender_preferences ENABLE ROW LEVEL SECURITY;
 
-REVOKE ALL ON public.creators FROM anon, authenticated;
-REVOKE ALL ON public.saved_reels FROM anon, authenticated;
-REVOKE ALL ON public.sender_preferences FROM anon, authenticated;
+REVOKE ALL ON FUNCTION public.search_reels(TEXT) FROM PUBLIC;
 
-REVOKE ALL ON FUNCTION public.search_reels(TEXT) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.search_reels(TEXT) TO service_role;
+-- Conditionally revoke direct table and function access from Supabase client roles if present,
+-- allowing schema.sql to execute cleanly on both vanilla PostgreSQL and Supabase environments.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    REVOKE ALL ON public.creators FROM anon;
+    REVOKE ALL ON public.saved_reels FROM anon;
+    REVOKE ALL ON public.sender_preferences FROM anon;
+    REVOKE ALL ON FUNCTION public.search_reels(TEXT) FROM anon;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    REVOKE ALL ON public.creators FROM authenticated;
+    REVOKE ALL ON public.saved_reels FROM authenticated;
+    REVOKE ALL ON public.sender_preferences FROM authenticated;
+    REVOKE ALL ON FUNCTION public.search_reels(TEXT) FROM authenticated;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    GRANT EXECUTE ON FUNCTION public.search_reels(TEXT) TO service_role;
+  END IF;
+END $$;

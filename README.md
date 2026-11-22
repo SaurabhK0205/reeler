@@ -77,7 +77,7 @@ If you leave `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` empty, the server au
 npm start
 ```
 
-Open `http://localhost:3000`. Once Supabase or PostgreSQL is configured, you can run `npm run seed` before `npm start` to populate sample items.
+Open `http://localhost:3000`. Once Supabase is configured in `.env`, you can run `npm run seed` before `npm start` to populate sample items.
 
 ### 3. Available scripts
 - `npm start` — Run the server (`src/server.ts`)
@@ -85,31 +85,31 @@ Open `http://localhost:3000`. Once Supabase or PostgreSQL is configured, you can
 - `npm test` — Run all 7 regression test suites (24 tests covering archive import, Meta bot webhooks, adaptive player, vault auth, compliance pages, duration/timezone, and security/idempotency)
 - `npm run import` — Import an Instagram `saved_posts.json` export from the CLI
 - `npm run recover-posts` — Repair legacy `/reel/` URLs that are actually `/p/` posts
-- `npm run seed` — Populate sample data into a configured Supabase/PostgreSQL database
+- `npm run seed` — Populate sample data into a configured Supabase database
 
 ---
 
 ## Database Setup
 
-Reeler supports both direct PostgreSQL instances (local or self-hosted) and Supabase cloud projects.
+Reeler connects to database storage through the Supabase client (`@supabase/supabase-js`) using `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`. You can host your database on [Supabase Cloud](https://supabase.com), on a self-hosted Supabase instance (Docker / PostgREST), or locally via the Supabase CLI (`npx supabase start`).
 
-### Option A: Local PostgreSQL or Self-Hosted Database (One-Shot Setup)
-A complete, self-contained database script is maintained in [`schema.sql`](schema.sql). You can provision your entire database in a single command:
+### One-Shot Database Setup (`schema.sql`)
+A complete, self-contained SQL script is maintained in [`schema.sql`](schema.sql). It provisions the entire database schema (tables, 24 performance indexes, full-text search, and RLS policies):
 
-```bash
-psql -U postgres -d reeler -f schema.sql
-```
+- **Supabase Cloud / Self-Hosted Dashboard**: Paste and run [`schema.sql`](schema.sql) in the Supabase SQL Editor.
+- **Local CLI**: Run `psql -U postgres -d <your-db> -f schema.sql` or use the Supabase CLI (`npx supabase db reset`).
 
 > **Repository Invariant**: Whenever a new migration is created or any change is made to the database schema, `schema.sql` MUST be updated in sync so local and self-hosted environments always match the latest schema.
 
-### Option B: Supabase Cloud
-1. Create a project at [supabase.com](https://supabase.com).
-2. Either execute `schema.sql` in the Supabase SQL Editor, or apply migrations in [`supabase/migrations/`](supabase/migrations/) in order (`001_initial_schema.sql` through `016_saved_reels_sender_watch_order_index.sql`).
-3. Copy your Project URL and `service_role` key into `.env`:
-   ```env
-   SUPABASE_URL=https://your-project-id.supabase.co
-   SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
-   ```
+### Incremental Migrations
+Alternatively, apply the migrations in [`supabase/migrations/`](supabase/migrations/) sequentially (`001_initial_schema.sql` through `016_saved_reels_sender_watch_order_index.sql`).
+
+### Configure `.env`
+Copy your Project API URL and `service_role` key into `.env`:
+```env
+SUPABASE_URL=https://your-project-id.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
+```
 
 ---
 
