@@ -20,7 +20,8 @@ Built on Meta's official Messenger API for Instagram (`graph.facebook.com/v21.0/
 | `remind @[creator] in 2h`, `update reminder for @[creator] to 5pm`, `snooze @[creator] 1h` (Path B) | Directly sets, reschedules, or snoozes the reminder for an active Watch Later item from that specific creator. |
 | `30m`, `2h`, `tomorrow at 5pm` | Sets, reschedules, or snoozes your reminder on the latest item. Supports natural duration phrases, relative times, and exact dates. |
 | `watched` or `done` | Marks your latest reminded item as watched and cancels active reminders for it. |
-| `queue` or `reminders` | Lists your active Watch Later items and upcoming reminder schedules ordered by soonest alert time. |
+| `queue`, `reminders`, `upcoming` | Lists active future upcoming reminders only (ordered by soonest alert time). Excludes past-due or unreminded items to keep your queue focused. |
+| `update @[creator] [time]`, `update [time]` | Reschedules or sets a reminder on an item by creator handle or latest active item (e.g. `update @warnerbrosindia tomorrow 10 am`, `update 2h`). Automatically attributes unattributed feed posts if matched. |
 | `stop all` or `clear all` | Marks all active Watch Later items as watched and stops all scheduled alarms. |
 | `cancel` or `undo` | Removes a recently added item from your Watch Later if you sent it by mistake. |
 | `cancel reminder` | Stops reminder alerts on your latest item while keeping it safely saved in Watch Later. |
@@ -35,7 +36,8 @@ Built on Meta's official Messenger API for Instagram (`graph.facebook.com/v21.0/
 #### Human Conversational UX & Safe Mentions
 - **Tappable Profiles**: Bot confirmations format creator handles as native `@username` mentions, allowing users to tap straight to creator profiles inside Instagram without messy raw URLs.
 - **Bracketed Placeholders (`@[creator]`)**: Guidance copy and command templates use `@[creator]` syntax so Instagram mobile clients do not linkify placeholder examples into real third-party accounts.
-- **Natural Copy**: Responses use concise, human phrasing without robotic AI formatting or em-dashes.
+- **24-Hour Policy Window Awareness**: When a reminder is scheduled beyond 24 hours (e.g. 3 days, 1 week), the bot appends a transparent advisory reminding the user that Meta limits automated DMs to 24 hours from the last user message, and suggests checking `queue` or `vault` if the window closes before the alert.
+- **Natural Copy**: Responses use concise, human phrasing without robotic AI formatting or em-dashes (<950 characters single-bubble limit).
 
 ---
 
@@ -134,19 +136,40 @@ Endpoints exposed by the server:
 
 ## Automated Code Review & Quality Gates
 
-Reeler enforces a three-tier quality gate to ensure production-grade reliability and prevent AI slop:
+Reeler enforces a three-tier quality gate to guarantee senior engineering standards, protect database parity, and eliminate AI slop:
 
-1. **Pre-Push Local Suite**: Run `npm test` before committing. All 24 test suites must pass cleanly.
-2. **CodeRabbit Review**: Configured in `.coderabbit.yaml` to flag race conditions, missing CAS locks, and database query parity. Free for public/open-source repositories.
-3. **Open-Source PR Review Actions**:
-   - **Gemini Principal Code Reviewer** (`.github/workflows/gemini-code-review.yml`): Runs `scripts/gemini-pr-review.mjs` against PR diffs using Google Gemini. Flags anti-slop violations, CAS lock bypasses, Supabase vs in-memory mock divergence, and schema parity.
-   - **Qodo PR-Agent** (`.github/workflows/pr-agent.yml`): Runs the open-source PR-Agent for automated code review, PR analysis, and interactive `/review` or `/ask` comments.
+### 1. Pre-Push Local Suite
+Run `npm test` before committing. All 24 test suites / 64 tests must pass cleanly.
 
-To enable the Gemini reviewer and PR-Agent:
-1. Go to **Settings** > **Secrets and variables** > **Actions** in your GitHub repository.
-2. Click **New repository secret**.
-3. Name: `GEMINI_API_KEY`, Value: Your Google AI Studio API key (from [aistudio.google.dev](https://aistudio.google.dev)).
-*(If `GEMINI_API_KEY` is not configured, both workflows gracefully skip without failing CI).*
+### 2. Gemini Principal Code Reviewer (`.github/workflows/gemini-code-review.yml`)
+- Zero-dependency Node.js script (`scripts/gemini-pr-review.mjs`) executing on every PR event (`opened`, `reopened`, `ready_for_review`, `synchronize`).
+- **Dynamic Model Discovery**: Queries Google AI Studio's Model API (`https://generativelanguage.googleapis.com/v1beta/models`) to automatically detect active models (`gemini-flash-lite-latest`, `gemini-2.0-flash`, `gemini-2.5-flash`), with 15-second request timeouts and fallback resilience.
+- **Strict Invariant Audits**:
+  - `Anti-AI-slop`: Enforces direct, natural copy (<950 characters single-bubble limit) and rejects em-dashes (`—`) or decorative punctuation.
+  - `Concurrency & CAS`: Verifies atomic Compare-And-Swap locks on all state transitions (reminders, choices).
+  - `Store Parity`: Asserts that `InMemoryStore` logic in tests is behaviorally identical to Supabase PostgREST queries in production.
+  - `Schema Parity`: Verifies that any database change in `supabase/migrations/` is synchronized in root `schema.sql`.
+
+### 3. Qodo PR-Agent (`.github/workflows/pr-agent.yml` & `.pr_agent.toml`)
+- Open-source PR review and conversational review bot (`qodo-ai/pr-agent@main`).
+- Automatically analyzes code changes on pull request creation and responds to interactive PR commands in comments:
+  - `/review`: Request an on-demand code review.
+  - `/ask <question>`: Ask a question about the changes in the PR.
+- Configured with custom token budgets and decoupled concurrency so comment commands never cancel active PR workflows.
+
+### 4. CodeRabbit (`.coderabbit.yaml`)
+- Configured with custom path rules and tone instructions enforcing atomic CAS locks, Supabase query parity, and single-bubble copy constraints.
+- **Why CodeRabbit shows `SKIPPED` in GitHub Actions**:
+  - **10-Star Policy Threshold**: Under CodeRabbit's current open-source plan, repositories with fewer than 10 stars do not receive unmetered automatic background reviews on every push.
+  - **Target Branch Filtering**: Auto-reviews default to the repository's primary branch (`main`). On PRs targeting `staging`, CodeRabbit marks its check run as `SKIPPED`.
+  - **Manual Triggering**: To run CodeRabbit on any PR, comment `@coderabbitai review` directly on the pull request (allows up to 1 review per hour on the free tier).
+
+### Secret Setup
+To power the Gemini Principal Reviewer and Qodo PR-Agent:
+1. Navigate to **Settings** > **Secrets and variables** > **Actions** in GitHub.
+2. Under the **Secrets** tab (not Variables), click **New repository secret**.
+3. Name: `GEMINI_API_KEY`, Value: Your Google AI Studio API key (from [aistudio.google.com](https://aistudio.google.com)).
+*(If `GEMINI_API_KEY` is absent, the workflows gracefully skip without breaking CI).*
 
 ---
 
