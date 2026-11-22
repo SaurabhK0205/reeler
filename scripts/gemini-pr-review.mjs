@@ -179,6 +179,9 @@ async function runReview() {
     process.exit(1);
   }
 
+  // Sanitize any stray em-dashes if generated
+  reviewBody = reviewBody.replace(/—/g, ' - ');
+
   console.log('Review generated successfully. Posting comment to GitHub PR...');
 
   // Post comment to PR
