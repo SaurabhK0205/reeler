@@ -20,6 +20,7 @@ Built on Meta's official Messenger API for Instagram (`graph.facebook.com/v21.0/
 | `remind @[creator] in 2h`, `update reminder for @[creator] to 5pm`, `snooze @[creator] 1h` (Path B) | Directly sets, reschedules, or snoozes the reminder for an active Watch Later item from that specific creator. |
 | `30m`, `2h`, `tomorrow at 5pm` | Sets, reschedules, or snoozes your reminder on the latest item. Supports natural duration phrases, relative times, and exact dates. |
 | `watched` or `done` | Marks your latest reminded item as watched and cancels active reminders for it. |
+| `queue` or `reminders` | Lists your active Watch Later items and upcoming reminder schedules ordered by soonest alert time. |
 | `stop all` or `clear all` | Marks all active Watch Later items as watched and stops all scheduled alarms. |
 | `cancel` or `undo` | Removes a recently added item from your Watch Later if you sent it by mistake. |
 | `cancel reminder` | Stops reminder alerts on your latest item while keeping it safely saved in Watch Later. |
