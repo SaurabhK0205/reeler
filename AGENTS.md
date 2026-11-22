@@ -73,12 +73,13 @@ Follow GRAVITAS invariants for implementation, debugging, refactoring, review, a
 7. **Workspace Isolation**: Work strictly within `/Users/thismac/projects/instagram-saved-reels/`. Do not touch `/Users/thismac/rea/`.
 8. **Automated Quality Gates & Code Review Gates (MANDATORY & BLOCKING)**:
    - **NEVER merge a Pull Request immediately.**
-   - **Gemini Principal Code Reviewer (Primary Gate)**: The custom Gemini reviewer (`.github/workflows/gemini-code-review.yml`) runs on every pull request. It dynamically queries Google AI Studio, evaluates the git diff, and enforces:
+   - **Gemini Principal Code Reviewer & NVIDIA Nemotron 3 Ultra 550B Deep Reasoning Auditor (`.github/workflows/ai-code-review.yml`)**: Run on every pull request to enforce senior engineering standards:
      1. Zero AI slop: concise, direct copy (<950 character single-bubble ceiling) and no em-dashes (`—`).
      2. Concurrency & CAS: atomic conditional updates on reminder choice and schedule transitions.
      3. Store Parity: 100% behavioral parity between `InMemoryStore` (tests) and Supabase PostgREST (production).
      4. Schema Parity: migrations in `supabase/migrations/` must match root `schema.sql`.
      5. Input sanitization & security.
+     6. Deep Architectural Reasoning (Nemotron 550B): detects subtle race conditions, breaking interface mutations, and edge-case exceptions.
      The PR must receive a clean `Verdict: APPROVE` before merging.
    - **Qodo PR-Agent**: Runs automated review and handles on-demand `/review` and `/ask` comment commands.
    - **CodeRabbit**: Operates under `.coderabbit.yaml`. Note that under CodeRabbit's open-source plan, repositories with fewer than 10 stars or PRs targeting non-default branches (`staging`) report `SKIPPED` in GitHub Actions. To trigger a review on demand, comment `@coderabbitai review` on the PR. If CodeRabbit runs and raises findings, address valid points, reply to the thread, and resolve before merging.
