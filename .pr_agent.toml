@@ -1,0 +1,21 @@
+# Qodo PR-Agent Configuration — Reeler Production Quality Standards
+
+[pr_reviewer]
+# Extra instructions for PR review
+extra_instructions = """
+- STRICT ANTI-AI-SLOP: Reject em-dashes (—) in code, copy, and messages. Flag any robotic, boilerplate, or sycophantic copy.
+- USER-FACING COPY: Keep all Instagram bot responses concise, human, direct, and under 950 characters (single-bubble ceiling).
+- ATOMIC CAS: In reminder scheduling and choice handling, verify atomic compare-and-swap locks are strictly enforced.
+- DATABASE PARITY: Ensure in-memory test store logic behaviorally mirrors production Supabase queries (including fallback handling and null sorting).
+- SCHEMA PARITY: Verify any database schema change is mirrored in root schema.sql.
+"""
+enable_review_labels_effort = true
+require_score_review = false
+
+[pr_description]
+publish_description_as_comment = false
+add_custom_labels = false
+
+[pr_code_suggestions]
+num_code_suggestions = 3
+rank_suggestions = true
