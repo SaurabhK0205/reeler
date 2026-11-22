@@ -1314,9 +1314,10 @@ export class MetaInstagramBotService {
       const validHandle = extractPublicCreatorUsername({ username: meta.username });
       const existingCreator = metadataSeed?.creator;
       const existingHandle = extractPublicCreatorUsername(existingCreator);
-      const explicitMentionMatch = remaining.match(/@[a-zA-Z0-9._]+/) || text.match(/@[a-zA-Z0-9._]+/);
+      const explicitMentionMatch =
+        remaining.match(/(?:^|\s)@([a-zA-Z0-9._]+)/) || text.match(/(?:^|\s)@([a-zA-Z0-9._]+)/);
       const mentionHandle = explicitMentionMatch
-        ? extractCreatorQuery(explicitMentionMatch[0])
+        ? extractCreatorQuery(`@${explicitMentionMatch[1]}`)
         : null;
 
       let creator: NonNullable<typeof existingCreator>;
@@ -1495,6 +1496,11 @@ export class MetaInstagramBotService {
         }
         if (delivery) {
           delivery.stateMutated = true;
+          if (savedReel) {
+            delivery.retryState.pinnedDurationTargetReel = savedReel;
+            delivery.retryState.expectedNextReminderAt = savedReel.next_reminder_at ?? null;
+            delivery.retryState.pinnedDurationUpdatesReshare = true;
+          }
           if (delivery.opId) {
             this.markWebhookMutationCommitted(delivery.opId);
           }
@@ -1735,7 +1741,6 @@ export class MetaInstagramBotService {
         delivery.retryState.expectedNextReminderAt = effectiveDur.targetDate.toISOString();
         delivery.retryState.pinnedDurationUpdatesReshare = true;
         if (delivery.retryState.pinnedTargetedCreator) {
-          this.recordLastConfirmedAddition(senderId, targetReel.id);
           this.recordReshareInteraction(targetReel.id);
         }
         let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget, delivery.retryState.pinnedDurationUpdatesReshare);
@@ -2235,7 +2240,6 @@ export class MetaInstagramBotService {
               targetReel.creator_id = pendingCreator.id;
               targetReel.creator = pendingCreator;
             }
-            this.recordLastConfirmedAddition(senderId, targetReel.id);
             this.recordReshareInteraction(targetReel.id);
             if (delivery) {
               delivery.stateMutated = true;
