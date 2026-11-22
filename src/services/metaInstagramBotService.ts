@@ -1463,7 +1463,7 @@ export class MetaInstagramBotService {
         }
         await this.deliverReply(senderId, reply, delivery);
       } else {
-        // No time provided — wait up to 10 minutes for user choice before defaulting to 10 hours
+        // No time provided; wait up to 10 minutes for user choice before defaulting to 10 hours
         if (savedReel) this.recordShareChoice(savedReel, isAlreadyInWatchLater);
         const defaultTriggerDate = new Date(Date.now() + (10 * 60 + 10 * 3600) * 1000);
         const defaultTriggerStr = formatTargetTime(defaultTriggerDate, new Date(), senderTz);
@@ -1941,7 +1941,7 @@ export class MetaInstagramBotService {
         `🎬 Your Personal Vault Link:\n${vaultUrl}\n\n` +
         `Tap to view your saved items in your browser. No login or password required!\n\n` +
         `Tip: If opening on a PC or laptop, you can also message "code" to get a 6-digit login code.\n\n` +
-        `Note: The web library is an optional companion—you can manage reminders and searches entirely here in DMs.`;
+        `Note: The web library is an optional companion. You can manage reminders and searches entirely here in DMs.`;
       await this.deliverReply(senderId, reply, delivery);
       return;
     }

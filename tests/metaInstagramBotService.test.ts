@@ -1009,7 +1009,7 @@ test('MetaInstagramBotService isolates /p/ posts vs /reel/ reels across save, re
     });
     assert.strictEqual(sentMessages.length, 1);
     assert.ok(sentMessages[0].text.includes('No saved posts found for Creator: @reel_only_creator'));
-    assert.ok(sentMessages[0].text.includes('They do have 1 saved reel — reply "reels by @reel_only_creator"'));
+    assert.ok(sentMessages[0].text.includes('They do have 1 saved reel. Reply "reels by @reel_only_creator"'));
 
     Repository.resetMemoryStoreForTests();
   } finally {
@@ -4437,7 +4437,7 @@ test('MetaInstagramBotService distinguishes existing users from first-time users
   });
 
   assert.strictEqual(replies.length, 1);
-  assert.ok(replies[0].includes('Welcome to Reeler — Your Reels & Posts Vault!'), `Expected welcome, got: ${replies[0]}`);
+  assert.ok(replies[0].includes('Welcome to Reeler! Your Reels & Posts Vault.'), `Expected welcome, got: ${replies[0]}`);
   replies.length = 0;
 
   // 2. Active user with saved item sending unrecognized text gets concise command reminder
@@ -4473,5 +4473,5 @@ test('MetaInstagramBotService distinguishes existing users from first-time users
 
   assert.strictEqual(replies.length, 1);
   assert.ok(replies[0].includes("I didn't recognize that command"), `Expected unrecognized notice, got: ${replies[0]}`);
-  assert.ok(!replies[0].includes('Welcome to Reeler — Your Reels & Posts Vault!'), 'Active user must not receive welcome greeting');
+  assert.ok(!replies[0].includes('Welcome to Reeler! Your Reels & Posts Vault.'), 'Active user must not receive welcome greeting');
 });
