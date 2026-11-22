@@ -13,6 +13,7 @@ import { classifySavedMediaType } from '../utils/mediaType.ts';
 import { isPlaceholderCreator } from '../utils/reelMessages.ts';
 import { resolveTimeZone } from '../utils/timezone.ts';
 import { getSupabase, isSupabaseConfigured } from './client.ts';
+import { revokeTokensForSender, clearTokenRevocationsForTesting } from '../services/vaultAuthService.ts';
 
 /**
  * Error thrown when a different Instagram sender attempts to schedule or overwrite
@@ -5070,6 +5071,7 @@ export class Repository {
     Repository.activeSenderDeletions.clear();
     Repository.senderDeletionTimestamps.clear();
     Repository.senderDeletionGenerations.clear();
+    clearTokenRevocationsForTesting();
   }
 
   /**
@@ -5083,6 +5085,7 @@ export class Repository {
     const currentActive = (Repository.activeSenderDeletions.get(trimmed) || 0) + 1;
     Repository.activeSenderDeletions.set(trimmed, currentActive);
     Repository.recordSenderDeletion(trimmed);
+    revokeTokensForSender(trimmed);
 
     try {
       await Promise.all([

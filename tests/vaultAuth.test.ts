@@ -13,6 +13,7 @@ import {
   requestOtpForUsername,
   isHostedOrProductionEnvironment,
 } from '../src/services/vaultAuthService.ts';
+import { Repository } from '../src/db/repository.ts';
 
 test('VaultAuthService - generateUserVaultKey produces URL-safe deterministic keys', () => {
   const senderId = 'instagram_sender_998877';
@@ -132,7 +133,7 @@ test('VaultAuthService - vaultAuthMiddleware enforces authentication in producti
 
     // 2. Valid user key in header -> 200 next()
     let nextCalled = false;
-    const userKey = generateUserVaultKey('sender_bob');
+    const userKey = generateUserVaultKey('sender_bob', Date.now());
     const reqWithKey: any = {
       path: '/reels',
       headers: { 'x-vault-key': userKey },
@@ -152,6 +153,64 @@ test('VaultAuthService - vaultAuthMiddleware enforces authentication in producti
     if (origVaultSecret === undefined) delete process.env.VAULT_SECRET;
     else process.env.VAULT_SECRET = origVaultSecret;
   }
+});
+
+test('VaultAuthService - rejects non-timestamped legacy tokens when strict timestamping is configured', () => {
+  const origLegacy = process.env.ALLOW_LEGACY_VAULT_TOKENS;
+  const origRequire = process.env.REQUIRE_TIMESTAMPED_VAULT_TOKENS;
+  const origSecret = process.env.VAULT_SECRET;
+  process.env.VAULT_SECRET = 'test-prod-secret';
+
+  try {
+    const legacyKey = generateUserVaultKey('legacy_sender');
+    delete process.env.ALLOW_LEGACY_VAULT_TOKENS;
+    delete process.env.REQUIRE_TIMESTAMPED_VAULT_TOKENS;
+    assert.equal(verifyVaultKey(legacyKey).valid, true);
+
+    process.env.REQUIRE_TIMESTAMPED_VAULT_TOKENS = 'true';
+    assert.equal(verifyVaultKey(legacyKey).valid, false, 'Legacy non-timestamped token must fail under strict mode');
+
+    delete process.env.REQUIRE_TIMESTAMPED_VAULT_TOKENS;
+    process.env.ALLOW_LEGACY_VAULT_TOKENS = 'false';
+    assert.equal(verifyVaultKey(legacyKey).valid, false, 'Legacy non-timestamped token must fail when legacy is false');
+  } finally {
+    if (origLegacy === undefined) delete process.env.ALLOW_LEGACY_VAULT_TOKENS;
+    else process.env.ALLOW_LEGACY_VAULT_TOKENS = origLegacy;
+    if (origRequire === undefined) delete process.env.REQUIRE_TIMESTAMPED_VAULT_TOKENS;
+    else process.env.REQUIRE_TIMESTAMPED_VAULT_TOKENS = origRequire;
+    if (origSecret === undefined) delete process.env.VAULT_SECRET;
+    else process.env.VAULT_SECRET = origSecret;
+  }
+});
+
+test('VaultAuthService - revokes prior vault tokens upon user data deletion', async () => {
+  const deletedSender = 'sender_deleted_user_99';
+  const issuedAt = Date.now();
+  const timestampedKey = generateUserVaultKey(deletedSender, issuedAt);
+  const legacyKey = generateUserVaultKey(deletedSender);
+
+  // Both keys are valid prior to deletion
+  assert.equal(verifyVaultKey(timestampedKey).valid, true);
+  assert.equal(verifyVaultKey(legacyKey).valid, true);
+
+  // Small delay to ensure strictly greater timestamp for post-deletion key
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Permanently delete user data
+  await Repository.deleteUserDataForSender(deletedSender);
+
+  // Both prior keys are now revoked and rejected
+  assert.equal(verifyVaultKey(timestampedKey).valid, false, 'Prior timestamped key must be revoked post-deletion');
+  assert.equal(verifyVaultKey(legacyKey).valid, false, 'Prior legacy key must be revoked post-deletion');
+
+  // Small delay to ensure strictly greater issuance epoch for post-deletion key
+  await new Promise((r) => setTimeout(r, 15));
+
+  // Any new token issued AFTER deletion remains valid (new account creation)
+  const newPostDeletionKey = generateUserVaultKey(deletedSender, Date.now());
+  assert.equal(verifyVaultKey(newPostDeletionKey).valid, true, 'New token issued after deletion must be valid');
+
+  Repository.resetDeletionTimestampsForTesting();
 });
 
 test('VaultAuthService - isHostedOrProductionEnvironment detects staged or hosted platforms and fails closed', () => {

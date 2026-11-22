@@ -443,6 +443,41 @@ export function getAdminVaultKey(): string {
  */
 export const MAX_USER_TOKEN_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
+const revokedSenderTimestamps = new Map<string, number>();
+
+/**
+ * Revokes all existing vault tokens for a sender (e.g. upon user data deletion).
+ */
+export function revokeTokensForSender(senderId: string): void {
+  const trimmed = String(senderId || '').trim();
+  if (trimmed) {
+    revokedSenderTimestamps.set(trimmed, Date.now());
+  }
+}
+
+/**
+ * Checks whether tokens for a given sender have been revoked.
+ * Non-timestamped tokens are revoked if any revocation exists.
+ * Timestamped tokens are revoked if issued before or at the revocation timestamp.
+ */
+export function isTokenRevokedForSender(senderId: string, issuedAt?: number): boolean {
+  const trimmed = String(senderId || '').trim();
+  if (!trimmed) return false;
+  const revokedAt = revokedSenderTimestamps.get(trimmed);
+  if (!revokedAt) return false;
+  if (!issuedAt || !Number.isFinite(issuedAt)) {
+    return true;
+  }
+  return issuedAt <= revokedAt;
+}
+
+/**
+ * Resets token revocation state (for testing only).
+ */
+export function clearTokenRevocationsForTesting(): void {
+  revokedSenderTimestamps.clear();
+}
+
 /**
  * Generates a URL-safe, tamper-proof vault access key for a specific Instagram sender ID.
  * When `issuedAt` is provided, binds the issuance epoch to enforce maximum token age.
@@ -512,6 +547,9 @@ export function verifyVaultKey(key: string): { valid: boolean; session?: VaultUs
       if (issuedAt > now + 60_000 || now - issuedAt > MAX_USER_TOKEN_AGE_MS) {
         return { valid: false };
       }
+      if (isTokenRevokedForSender(senderId, issuedAt)) {
+        return { valid: false };
+      }
       const secret = getVaultSecret();
       const expectedSig = crypto
         .createHmac('sha256', secret)
@@ -529,8 +567,14 @@ export function verifyVaultKey(key: string): { valid: boolean; session?: VaultUs
 
     // 2c. Legacy non-timestamped user token: user.<senderId>.<signature>
     if (parts.length === 3 && parts[0] === 'user') {
+      if (process.env.ALLOW_LEGACY_VAULT_TOKENS === 'false' || process.env.REQUIRE_TIMESTAMPED_VAULT_TOKENS === 'true') {
+        return { valid: false };
+      }
       const [, senderId, signature] = parts;
       if (!senderId) return { valid: false };
+      if (isTokenRevokedForSender(senderId)) {
+        return { valid: false };
+      }
       const secret = getVaultSecret();
       const expectedSig = crypto.createHmac('sha256', secret).update(`user:${senderId}`).digest('hex').slice(0, 24);
       if (safeStringEqual(signature, expectedSig)) {
