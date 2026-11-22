@@ -375,22 +375,24 @@ export function formatAddedToWatchLaterCreatorBlock(
 }
 
 /**
- * Formats the "Reminder set" DM with creator attribution, clickable profile URL (when available),
+ * Formats the reminder confirmation DM with creator attribution, clickable profile URL (when available),
  * and human-readable reel or post context (never shortcodes).
  */
 export function formatReminderSetMessage(
   reel: Pick<SavedReel, 'caption' | 'creator' | 'media_type' | 'reel_url' | 'is_saved_on_instagram'>,
   durationLabel: string,
-  formattedTarget: string
+  formattedTarget: string,
+  updatesReshare = false
 ): string {
   const creatorDisplay = formatCreatorDisplayLabel(reel.creator, { includeProfileUrl: false });
   const targetText = creatorDisplay || formatHumanReelLabel(reel, 40);
-  const profileLine = formatCreatorProfileLine(reel.creator);
-  const profileBlock = profileLine ? `\n${profileLine}` : '';
+  const heading = updatesReshare
+    ? `⏰ Reminder updated for: ${durationLabel} (${formattedTarget})!\nFor: ${targetText}`
+    : `⏰ Reminder set for ${targetText}: ${durationLabel} (${formattedTarget})!`;
 
   return (
-    `⏰ Reminder set for ${targetText}: ${durationLabel} (${formattedTarget})!` +
-    `${profileBlock}\n\nReply "watched" when done.`
+    heading +
+    `\n\nReply "watched" when done.`
   );
 }
 
@@ -404,12 +406,10 @@ export function formatDefaultReminderNotice(
 ): string {
   const creatorDisplay = formatCreatorDisplayLabel(reel.creator, { includeProfileUrl: false });
   const targetText = creatorDisplay || formatHumanReelLabel(reel, 40);
-  const profileLine = formatCreatorProfileLine(reel.creator);
-  const profileBlock = profileLine ? `\n${profileLine}` : '';
 
   return (
-    `⏰ No reminder time received for ${targetText} — I've scheduled your reminder for ${defaultHours} hours from now (${targetStr}).` +
-    `${profileBlock}\n\nReply e.g. "2h" or "tomorrow 5pm" anytime to change it, or "watched" when done!`
+    `⏰ No reminder time received for ${targetText} — I've scheduled your reminder for ${defaultHours} hours from now (${targetStr}).\n\n` +
+    `Reply e.g. "2h" or "tomorrow 5pm" anytime to change it, or "watched" when done!`
   );
 }
 
@@ -439,7 +439,6 @@ export function formatCreatorSearchMessages(params: {
   const creatorRef = { username: params.username, display_name: params.displayName ?? null };
   const publicHandle = extractPublicCreatorUsername(creatorRef);
   const creatorLabel = formatCreatorDisplayLabel(creatorRef, { includeProfileUrl: false }) || 'this creator';
-  const profileLine = publicHandle ? `\n${formatCreatorProfileLine(creatorRef)}` : '';
   const rawQueryHint = String(params.username || '').trim().replace(/^@+/, '');
   const searchHint =
     publicHandle ||
@@ -477,24 +476,24 @@ export function formatCreatorSearchMessages(params: {
   if (mediaFilter === 'reel' && totalPosts > 0) {
     const postsStr = totalPosts === 1 ? '1 saved post' : `${totalPosts} saved posts`;
     notFound =
-      `🔍 No saved reels found for Creator: ${creatorLabel} yet.${profileLine}\n\n` +
+      `🔍 No saved reels found for Creator: ${creatorLabel} yet.\n\n` +
       `They do have ${postsStr} — reply "posts by ${cmdTarget}" to view ${totalPosts === 1 ? 'it' : 'them'}.`;
   } else if (mediaFilter === 'post' && totalReels > 0) {
     const reelsStr = totalReels === 1 ? '1 saved reel' : `${totalReels} saved reels`;
     notFound =
-      `🔍 No saved posts found for Creator: ${creatorLabel} yet.${profileLine}\n\n` +
+      `🔍 No saved posts found for Creator: ${creatorLabel} yet.\n\n` +
       `They do have ${reelsStr} — reply "reels by ${cmdTarget}" to view ${totalReels === 1 ? 'it' : 'them'}.`;
   } else if (mediaFilter === 'reel') {
     notFound =
-      `🔍 No saved reels found for Creator: ${creatorLabel} yet!${profileLine}\n\n` +
+      `🔍 No saved reels found for Creator: ${creatorLabel} yet!\n\n` +
       `Share any Reel link from them here to start tracking.`;
   } else if (mediaFilter === 'post') {
     notFound =
-      `🔍 No saved posts found for Creator: ${creatorLabel} yet!${profileLine}\n\n` +
+      `🔍 No saved posts found for Creator: ${creatorLabel} yet!\n\n` +
       `Share any Post link from them here to start tracking.`;
   } else {
     notFound =
-      `🔍 No saved reels or posts found for Creator: ${creatorLabel} yet!${profileLine}\n\n` +
+      `🔍 No saved reels or posts found for Creator: ${creatorLabel} yet!\n\n` +
       `Share any Reel or Post link from them here to start tracking.`;
   }
 
@@ -505,7 +504,7 @@ export function formatCreatorSearchMessages(params: {
     const postsPart = totalPosts === 1 ? '1 post' : `${totalPosts} posts`;
     const header =
       `📂 Saved Library\n` +
-      `Creator: ${creatorLabel}${profileLine}\n` +
+      `Creator: ${creatorLabel}\n` +
       `Found: ${totalItems} saved items (${reelsPart} · ${postsPart})\n\n` +
       `Reply "reels by ${cmdTarget}" or "posts by ${cmdTarget}" to filter by type.`;
 
@@ -525,7 +524,7 @@ export function formatCreatorSearchMessages(params: {
     if (remPosts > 0) remParts.push(`${remPosts} more ${remPosts === 1 ? 'post' : 'posts'}`);
     const footer =
       remParts.length > 0
-        ? `... and ${remParts.join(' & ')} from ${creatorLabel} in your library!${profileLine}\n\n` +
+        ? `... and ${remParts.join(' & ')} from ${creatorLabel} in your library!\n\n` +
           `Reply "reels by ${cmdTarget}" or "posts by ${cmdTarget}", or search "${searchHint}" on your web dashboard to see all.`
         : '';
 
@@ -539,12 +538,12 @@ export function formatCreatorSearchMessages(params: {
     const remPosts = Math.max(0, totalPosts - shownPosts);
     return {
       notFound,
-      header: `🖼️ Saved Posts\nCreator: ${creatorLabel}${profileLine}\nFound: ${countLabel}\n\n${latestLabel}`,
+      header: `🖼️ Saved Posts\nCreator: ${creatorLabel}\nFound: ${countLabel}\n\n${latestLabel}`,
       reelsSectionHeader: null,
       postsSectionHeader: null,
       footer:
         remPosts > 0
-          ? `... and ${remPosts} more ${remPosts === 1 ? 'post' : 'posts'} from ${creatorLabel} in your library!${profileLine}\n\n` +
+          ? `... and ${remPosts} more ${remPosts === 1 ? 'post' : 'posts'} from ${creatorLabel} in your library!\n\n` +
             `Search "${searchHint}" on your web dashboard to see all.`
           : '',
     };
@@ -556,12 +555,12 @@ export function formatCreatorSearchMessages(params: {
   const remReels = Math.max(0, totalReels - shownReels);
   return {
     notFound,
-    header: `🎬 Saved Reels\nCreator: ${creatorLabel}${profileLine}\nFound: ${countLabel}\n\n${latestLabel}`,
+    header: `🎬 Saved Reels\nCreator: ${creatorLabel}\nFound: ${countLabel}\n\n${latestLabel}`,
     reelsSectionHeader: null,
     postsSectionHeader: null,
     footer:
       remReels > 0
-        ? `... and ${remReels} more ${remReels === 1 ? 'reel' : 'reels'} from ${creatorLabel} in your library!${profileLine}\n\n` +
+        ? `... and ${remReels} more ${remReels === 1 ? 'reel' : 'reels'} from ${creatorLabel} in your library!\n\n` +
           `Search "${searchHint}" on your web dashboard to see all.`
         : '',
   };
@@ -601,27 +600,21 @@ export function formatWatchLaterReminderMessage(
 ): string {
   const isPost = classifySavedMediaType({ mediaType: reel.media_type, reelUrl: reel.reel_url }) === 'post';
   const isSavedOnIg = reel.is_saved_on_instagram !== false;
-  const publicHandle = extractPublicCreatorUsername(reel.creator);
   const creatorDisplay = formatCreatorDisplayLabel(reel.creator, { includeProfileUrl: false });
-  const fallbackHeader = isPost
+  const itemHeader = isPost
     ? (isSavedOnIg ? '🖼️ Saved Post' : '🖼️ Watch Later Post')
     : (isSavedOnIg ? '🎬 Saved Reel' : '🎬 Watch Later Reel');
-  const creatorHeader = creatorDisplay
-    ? `${isPost ? '🖼️' : '🎬'} ${creatorDisplay}`
-    : fallbackHeader;
+  const creatorLine = creatorDisplay ? `\nCreator: ${creatorDisplay}` : '';
   const actionLabel = isPost ? '👉 View Post:' : '👉 Watch Reel:';
   const captionSnippet = formatHumanCaptionSnippet(reel.caption, 70);
   const captionLine = captionSnippet ? `"${captionSnippet}"\n` : '';
-  const profileLine = publicHandle
-    ? `\n👤 Creator Profile: ${formatCreatorProfileUrl(publicHandle)}`
-    : '';
 
   return (
     `🔔 Watch Later Reminder!\n\n` +
-    `${creatorHeader}\n` +
+    `${itemHeader}` +
+    `${creatorLine}\n` +
     `${captionLine}` +
-    `${actionLabel} ${reel.reel_url}` +
-    `${profileLine}\n\n` +
+    `${actionLabel} ${reel.reel_url}\n\n` +
     `Reply "watched" when done, or reply e.g. "5m" or "snooze 1h" to delay!`
   );
 }

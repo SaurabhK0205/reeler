@@ -153,11 +153,9 @@ test('reelMessages - clickable creator profile URL & Reel preview priority', asy
   });
 
   const reelUrlIndex = reminderText.indexOf('https://www.instagram.com/reel/Dfi55BqRIxb/');
-  const profileUrlIndex = reminderText.indexOf('https://www.instagram.com/lookingforgame/');
   assert.ok(reelUrlIndex !== -1, 'Reminder must contain Reel URL');
-  assert.ok(profileUrlIndex !== -1, 'Reminder must contain clickable Creator Profile URL');
-  assert.ok(reelUrlIndex < profileUrlIndex, 'Reel URL MUST appear before Creator Profile URL to preserve Reel card preview');
-  assert.ok(reminderText.includes('@lookingforgame'));
+  assert.ok(!reminderText.includes('https://www.instagram.com/lookingforgame/'), 'Reminder must not contain raw profile URL to avoid duplicate preview cards');
+  assert.ok(reminderText.includes('Creator: @lookingforgame'), 'Reminder must contain clean Creator: @username for native tap support');
   assert.ok(reminderText.length <= 950, `Reminder length ${reminderText.length} exceeds safe DM limit`);
 
   const placeholderReminder = formatWatchLaterReminderMessage({
@@ -190,7 +188,7 @@ test('reelMessages - clickable creator profile URL & Reel preview priority', asy
     'today at 10:10:55 AM'
   );
   assert.ok(setReply.includes('@lookingforgame'));
-  assert.ok(setReply.includes('https://www.instagram.com/lookingforgame/'));
+  assert.ok(!setReply.includes('https://www.instagram.com/lookingforgame/'), 'Reminder set DM must omit raw profile URL');
 
   const searchCopy = formatCreatorSearchMessages({
     username: 'lookingforgame',
@@ -198,9 +196,10 @@ test('reelMessages - clickable creator profile URL & Reel preview priority', asy
     totalCount: 8,
     limit: 5,
   });
-  assert.ok(searchCopy.header.includes('https://www.instagram.com/lookingforgame/'));
-  assert.ok(searchCopy.footer.includes('https://www.instagram.com/lookingforgame/'));
-  assert.ok(searchCopy.notFound.includes('https://www.instagram.com/lookingforgame/'));
+  assert.ok(searchCopy.header.includes('Creator: @lookingforgame'));
+  assert.ok(!searchCopy.header.includes('https://www.instagram.com/lookingforgame/'), 'Search header must omit raw profile URL');
+  assert.ok(!searchCopy.footer.includes('https://www.instagram.com/lookingforgame/'), 'Search footer must omit raw profile URL');
+  assert.ok(!searchCopy.notFound.includes('https://www.instagram.com/lookingforgame/'), 'Search notFound must omit raw profile URL');
 });
 
 test('reelMessages - confirmation messages never expose shortcodes & split UTF-16 surrogates safely', async () => {
@@ -482,9 +481,9 @@ test('Repository + MetaInstagramBotService - marks most recently reminded reel i
     });
     assert.strictEqual(sentMessages.length, 4);
     assert.ok(sentMessages[3].text.includes('@lookingforgame'));
-    assert.ok(sentMessages[3].text.includes('https://www.instagram.com/lookingforgame/'));
+    assert.ok(!sentMessages[3].text.includes('https://www.instagram.com/lookingforgame/'));
 
-    // 5. Creator query DM includes clickable profile link cleanly
+    // 5. Creator query DM includes clean native @handle
     await bot.handleWebhookPayload({
       object: 'instagram',
       entry: [
@@ -499,7 +498,8 @@ test('Repository + MetaInstagramBotService - marks most recently reminded reel i
       ],
     });
     assert.ok(sentMessages.length >= 6);
-    assert.ok(sentMessages[4].text.includes('https://www.instagram.com/lookingforgame/'));
+    assert.ok(sentMessages[4].text.includes('Creator: @lookingforgame'));
+    assert.ok(!sentMessages[4].text.includes('https://www.instagram.com/lookingforgame/'));
     assert.strictEqual(sentMessages[5].text, 'https://www.instagram.com/reel/Dfi55BqRIxb/');
 
     Repository.resetMemoryStoreForTests();
@@ -868,12 +868,10 @@ test('MetaInstagramBotService isolates /p/ posts vs /reel/ reels across save, re
 
     assert.strictEqual(sentMessages.length, 3);
     const reminderText = sentMessages[2].text;
-    assert.ok(reminderText.includes('🖼️ @the_political_compass'), `Got: ${reminderText}`);
+    assert.ok(reminderText.includes('Creator: @the_political_compass'), `Got: ${reminderText}`);
     assert.ok(reminderText.includes('👉 View Post: https://www.instagram.com/p/DS1goOmjhUi/'), `Got: ${reminderText}`);
     assert.ok(!reminderText.includes('/reel/DS1goOmjhUi/'), `Must never rewrite /p/ to /reel/: ${reminderText}`);
-    const postUrlIdx = reminderText.indexOf('https://www.instagram.com/p/DS1goOmjhUi/');
-    const profileUrlIdx = reminderText.indexOf('https://www.instagram.com/the_political_compass/');
-    assert.ok(postUrlIdx > 0 && profileUrlIdx > postUrlIdx, 'Post URL must appear before creator profile URL');
+    assert.ok(!reminderText.includes('https://www.instagram.com/the_political_compass/'), 'Must not include raw profile URL');
 
     // 3. Mark watched and verify post-specific confirmation wording
     await bot.handleWebhookPayload({
@@ -1896,7 +1894,8 @@ test('MetaInstagramBotService and Repository preserve existing sender Watch Late
         },
       ],
     });
-    assert.ok(sentMessages[0]?.text.includes('Added to your Watch Later!'));
+    assert.ok(sentMessages[0]?.text.includes('Already added to your Watch Later!'));
+    assert.ok(sentMessages[0]?.text.includes('Reminder updated for: 45 minutes'));
     const reelRescheduled = await Repository.getSavedItemByShortcode('DConflictReel1', 'sender_alpha');
     assert.strictEqual(reelRescheduled?.reminder_interval_seconds, 2700);
     assert.strictEqual((await Repository.getSavedItemByShortcode('DConflictReel1', 'sender_beta'))?.reminder_interval_seconds, 7200);
@@ -2200,7 +2199,8 @@ test('Repository and MetaInstagramBotService protect unattributed active reminde
     assert.strictEqual(updatedOutsideItem?.watch_status, 'watch_later');
     assert.strictEqual(updatedOutsideItem?.instagram_sender_id, 'outside_sender_1');
     assert.strictEqual(updatedOutsideItem?.reminder_interval_seconds, 2700);
-    assert.ok(sentMessages[0]?.text.includes('Added to your Watch Later!'));
+    assert.ok(sentMessages[0]?.text.includes('Already added to your Watch Later!'));
+    assert.ok(sentMessages[0]?.text.includes('Reminder updated for: 45 minutes'));
 
     Repository.resetMemoryStoreForTests();
 
@@ -4006,4 +4006,232 @@ test('Repository.updateReminderSchedule guards recurring intervals with expected
     Repository.resetMemoryStoreForTests();
     if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
   }
+});
+
+test('MetaInstagramBotService - reshares distinguish active Watch Later items ("Already added") vs watched items re-entering Watch Later ("Added to")', async () => {
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const prevAnonKey = process.env.SUPABASE_ANON_KEY;
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  delete process.env.SUPABASE_ANON_KEY;
+
+  const originalFetch = globalThis.fetch;
+  const { Repository } = await import('../src/db/repository.ts');
+  try {
+    Repository.resetMemoryStoreForTests();
+    globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
+
+    const sentMessages: Array<{ recipientId: string; text: string }> = [];
+    const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+    bot.sendDirectMessage = async (recipientId: string, text: string) => {
+      sentMessages.push({ recipientId, text });
+      return true;
+    };
+
+    const senderId = 'sender_reshare_test';
+
+    // 1. First-time share of a Reel: enters Watch Later as a new item
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: senderId }, message: { text: 'https://www.instagram.com/reel/DReshareReel1/' } },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('🎬 Added to your Watch Later!'), `Got: ${sentMessages[0].text}`);
+    assert.ok(sentMessages[0].text.includes('When should I remind you to watch this?'));
+
+    const item1 = await Repository.getSavedItemByShortcode('DReshareReel1', senderId);
+    assert.ok(item1);
+    assert.strictEqual(item1.watch_status, 'watch_later');
+
+    // 2. Resharing the exact same Reel while it is still in Watch Later:
+    // Bot must say "Already added to your Watch Later!" and offer to set/update a reminder
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: senderId }, message: { text: 'https://www.instagram.com/reel/DReshareReel1/' } },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('🎬 Already added to your Watch Later!'), `Got: ${sentMessages[0].text}`);
+    assert.ok(sentMessages[0].text.includes('When should I remind you to watch this?'));
+
+    // Responding to the prompt with a time updates the reminder
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: senderId }, message: { text: '2h' } },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.match(sentMessages[0].text, /Reminder updated for: 2 hours/);
+
+    const item1Updated = await Repository.getSavedItemByShortcode('DReshareReel1', senderId);
+    assert.strictEqual(item1Updated?.reminder_interval_seconds, 7200);
+
+    // 3. Resharing with duration in the message directly:
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: senderId }, message: { text: 'https://www.instagram.com/reel/DReshareReel1/ 3h' } },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('🎬 Already added to your Watch Later!'), `Got: ${sentMessages[0].text}`);
+    assert.ok(sentMessages[0].text.includes('⏰ Reminder updated for: 3 hours'), `Got: ${sentMessages[0].text}`);
+
+    const item1ThreeHrs = await Repository.getSavedItemByShortcode('DReshareReel1', senderId);
+    assert.strictEqual(item1ThreeHrs?.reminder_interval_seconds, 10800);
+
+    // 4. Marking as watched: leaves Watch Later
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: senderId }, message: { text: 'watched' } },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('Marked'), `Got: ${sentMessages[0].text}`);
+    assert.ok(sentMessages[0].text.includes('watched'), `Got: ${sentMessages[0].text}`);
+
+    const item1Watched = await Repository.getSavedItemByShortcode('DReshareReel1', senderId);
+    assert.strictEqual(item1Watched?.watch_status, 'watched');
+
+    // 5. Resharing AFTER being marked watched: re-enters Watch Later as a newly added item
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: senderId }, message: { text: 'https://www.instagram.com/reel/DReshareReel1/ 30m' } },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('🎬 Added to your Watch Later!'), `Got: ${sentMessages[0].text}`);
+    assert.ok(sentMessages[0].text.includes('⏰ Reminder set for: 30 minutes'), `Got: ${sentMessages[0].text}`);
+
+    const item1ReAdded = await Repository.getSavedItemByShortcode('DReshareReel1', senderId);
+    assert.strictEqual(item1ReAdded?.watch_status, 'watch_later');
+    assert.strictEqual(item1ReAdded?.reminder_interval_seconds, 1800);
+
+    // 6. Post reshare parity:
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: senderId }, message: { text: 'https://www.instagram.com/p/DResharePost1/' } },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('🖼️ Added post to your Watch Later!'), `Got: ${sentMessages[0].text}`);
+
+    sentMessages.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [
+        {
+          messaging: [
+            { sender: { id: senderId }, message: { text: 'https://www.instagram.com/p/DResharePost1/' } },
+          ],
+        },
+      ],
+    });
+
+    assert.strictEqual(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes('🖼️ Already added to your Watch Later!'), `Got: ${sentMessages[0].text}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+    Repository.resetMemoryStoreForTests();
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    if (prevServiceKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevServiceKey;
+    if (prevAnonKey !== undefined) process.env.SUPABASE_ANON_KEY = prevAnonKey;
+  }
+});
+
+test('MetaInstagramBotService retains reshare wording after an attachment prompt flushes', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  Repository.resetMemoryStoreForTests();
+  const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 60 });
+  t.mock.method(globalThis, 'fetch', async () => new Response('', { status: 404 }));
+  t.after(() => {
+    bot.clearTimersForTesting();
+    Repository.resetMemoryStoreForTests();
+  });
+
+  const senderId = 'sender_flushed_reshare';
+  const url = 'https://www.instagram.com/reel/DFlushedReshare/';
+  const replies: string[] = [];
+  let receivePrompt: ((text: string) => void) | undefined;
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    replies.push(text);
+    receivePrompt?.(text);
+    return true;
+  };
+  const share = async () => {
+    replies.length = 0;
+    const prompt = new Promise<string>((resolve) => { receivePrompt = resolve; });
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: senderId }, message: { attachments: [{ type: 'share', payload: { url } }] } }] }],
+    });
+    assert.strictEqual(replies.length, 0);
+    t.mock.timers.tick(60);
+    const text = await prompt;
+    receivePrompt = undefined;
+    return text;
+  };
+
+  const replyWithTime = async (text: string) => {
+    replies.length = 0;
+    await bot.handleWebhookPayload({ object: 'instagram', entry: [{ messaging: [{ sender: { id: senderId }, message: { text } }] }] });
+    assert.strictEqual(replies.length, 1);
+    return replies[0];
+  };
+
+  assert.match(await share(), /🎬 Added to your Watch Later!/);
+  assert.match(await replyWithTime('30m'), /Reminder set for/);
+  assert.match(await share(), /Already added to your Watch Later!/);
+  assert.match(await replyWithTime('2h'), /Reminder updated for: 2 hours/);
+  assert.strictEqual((await Repository.getSavedItemByShortcode('DFlushedReshare', senderId))?.reminder_interval_seconds, 7200);
+  assert.match(await replyWithTime('3h'), /Reminder set for/);
 });
