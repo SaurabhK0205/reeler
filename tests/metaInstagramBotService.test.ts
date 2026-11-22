@@ -5495,5 +5495,18 @@ test('isScheduleBeyond24Hours - detects >24h durations and appends 24h window no
       replies[0].includes('Instagram limits automated DMs to 24 hours'),
       `Expected 24h window notice, got: ${replies[0]}`
     );
+
+    // Schedule reminder for untargeted duration (e.g. "in 3 days")
+    replies.length = 0;
+    await bot.handleWebhookPayload({
+      object: 'instagram',
+      entry: [{ messaging: [{ sender: { id: senderId }, message: { text: 'in 3 days' } }] }],
+    });
+    assert.strictEqual(replies.length, 1);
+    assert.ok(replies[0].includes('3 days'), `Got: ${replies[0]}`);
+    assert.ok(
+      replies[0].includes('Instagram limits automated DMs to 24 hours'),
+      `Expected 24h window notice, got: ${replies[0]}`
+    );
   });
 });

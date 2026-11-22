@@ -1756,7 +1756,14 @@ export class MetaInstagramBotService {
         if (delivery.retryState.pinnedTargetedCreator) {
           this.recordReshareInteraction(targetReel.id);
         }
-        let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget, delivery.retryState.pinnedDurationUpdatesReshare);
+        const isBeyond24 = isScheduleBeyond24Hours(effectiveDur.targetDate);
+        let reply = formatReminderSetMessage(
+          targetReel,
+          effectiveDur.label,
+          effectiveDur.formattedTarget,
+          delivery.retryState.pinnedDurationUpdatesReshare,
+          isBeyond24
+        );
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
         }
@@ -2403,7 +2410,14 @@ export class MetaInstagramBotService {
                 if (pending.opId) this.markWebhookMidCompleted(pending.opId);
               }
             }
-            let reply = formatReminderSetMessage(targetReel, customDuration.label, customDuration.formattedTarget);
+            const isBeyond24 = isScheduleBeyond24Hours(customDuration.targetDate);
+            let reply = formatReminderSetMessage(
+              targetReel,
+              customDuration.label,
+              customDuration.formattedTarget,
+              false,
+              isBeyond24
+            );
             if (senderTz === 'UTC') {
               reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <your city>" to use your local time.`;
             }
