@@ -4900,3 +4900,153 @@ test('MetaInstagramBotService prioritizes reshared item over older awaiting item
   assert.ok(freshA?.awaiting_reminder_choice_until !== null);
   assert.strictEqual(freshA?.reminder_interval_seconds, undefined);
 });
+
+test('MetaInstagramBotService - attributes unattributed Watch Later items when user sends targeted update command', async () => {
+  Repository.resetMemoryStoreForTests();
+  const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 0 });
+  const replies: string[] = [];
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    replies.push(text);
+    return true;
+  };
+
+  const senderId = 'sender_unattributed_test';
+  await Repository.setSenderTimezone(senderId, 'Asia/Kolkata');
+
+  // Create an unattributed post (e.g. from an ig_post share where public metadata was unavailable)
+  const placeholderCreator = await Repository.upsertCreator({
+    instagram_user_id: 'creator_unattributed_18120410743994731',
+    username: 'Instagram Creator',
+    display_name: 'Instagram Creator',
+  });
+
+  const post = await Repository.upsertSavedReel({
+    instagram_media_id: `dm_${senderId}_18120410743994731`,
+    shortcode: '18120410743994731',
+    reel_url: 'https://www.instagram.com/p/18120410743994731/',
+    creator_id: placeholderCreator.id,
+    caption: 'Relive the journey before you experience the epic conclusion. #DuneMovie',
+    taken_at: new Date().toISOString(),
+    first_detected_at: new Date().toISOString(),
+    save_order_rank: 1,
+    watch_status: 'watch_later',
+    instagram_sender_id: senderId,
+    media_type: 'post',
+  });
+
+  // User sends "Update @warnerbrosindia tomorrow 10 am"
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: senderId },
+            message: { text: 'Update @warnerbrosindia tomorrow 10 am' },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('⏰ Reminder updated for: Tomorrow'), `Expected confirmation, got: ${replies[0]}`);
+  assert.ok(replies[0].includes('warnerbrosindia'), `Expected attribution to @warnerbrosindia, got: ${replies[0]}`);
+
+  // Database must now have the post re-attributed to warnerbrosindia
+  const freshPost = await Repository.getSavedItemById(post!.id);
+  assert.ok(freshPost, 'Post must exist');
+  assert.strictEqual(freshPost.creator?.username, 'warnerbrosindia');
+  assert.ok(freshPost.next_reminder_at !== null);
+
+  // Subsequent creator-scoped command like "watched @warnerbrosindia" must now find and mark it watched
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: senderId },
+            message: { text: 'watched @warnerbrosindia' },
+          },
+        ],
+      },
+    ],
+  });
+  assert.strictEqual(replies.length, 1);
+  assert.ok(replies[0].includes('Marked 1 item(s) by @warnerbrosindia as watched'), `Got: ${replies[0]}`);
+  const watchedPost = await Repository.getSavedItemById(post!.id);
+  assert.strictEqual(watchedPost?.watch_status, 'watched');
+});
+
+test('MetaInstagramBotService - targeted update command flushes pending debounce share prompt', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  Repository.resetMemoryStoreForTests();
+  const bot = new MetaInstagramBotService({ shareDebounceDelayMs: 60 });
+  const replies: string[] = [];
+  bot.sendDirectMessage = async (_: string, text: string) => {
+    replies.push(text);
+    return true;
+  };
+
+  const senderId = 'sender_debounce_targeted_test';
+  await Repository.setSenderTimezone(senderId, 'Asia/Kolkata');
+
+  const creatorA = await Repository.upsertCreator({
+    instagram_user_id: 'creator_a',
+    username: 'creator_alpha',
+  });
+  const itemA = await Repository.upsertSavedReel({
+    instagram_media_id: 'dm_creator_a_1',
+    shortcode: 'ShortcodeA1',
+    reel_url: 'https://www.instagram.com/reel/ShortcodeA1/',
+    creator_id: creatorA.id,
+    taken_at: new Date().toISOString(),
+    first_detected_at: new Date().toISOString(),
+    save_order_rank: 1,
+    watch_status: 'watch_later',
+    instagram_sender_id: senderId,
+  });
+
+  // Step 1: Share a new reel with debounce active
+  t.mock.method(globalThis, 'fetch', async () => new Response('', { status: 404 }));
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: senderId },
+            message: { text: 'https://www.instagram.com/reel/ShortcodeNew/' },
+          },
+        ],
+      },
+    ],
+  });
+
+  // While debounce prompt is pending, user sends a targeted update command for creator_alpha
+  replies.length = 0;
+  await bot.handleWebhookPayload({
+    object: 'instagram',
+    entry: [
+      {
+        messaging: [
+          {
+            sender: { id: senderId },
+            message: { text: 'update @creator_alpha 2h' },
+          },
+        ],
+      },
+    ],
+  });
+
+  // The targeted update should have been processed for creator_alpha, not hijacked by the pending share
+  assert.ok(replies.some((r) => r.includes('⏰ Reminder updated for: 2 hours') && r.includes('creator_alpha')), `Replies: ${JSON.stringify(replies)}`);
+
+  const freshA = await Repository.getSavedItemById(itemA!.id);
+  assert.strictEqual(freshA?.reminder_interval_seconds, 7200);
+
+  bot.clearTimersForTesting();
+});

@@ -144,6 +144,8 @@ interface WebhookRetryState {
   pinnedCancelTargetReelId?: string;
   /** Preserves whether an inbound share was already active in Watch Later across retries. */
   pinnedIsAlreadyInWatchLater?: boolean;
+  /** Preserves targeted creator handle for creator-scoped reminder updates across retries. */
+  pinnedTargetedCreator?: string;
   /** Monotonic sequence assigned on initial reception of a timezone-set command to block stale retries. */
   timezoneCommandSeq?: number;
 }
@@ -169,6 +171,7 @@ interface PendingWebhookReply {
   otpCode?: string;
   targetReelId?: string;
   expectedAwaitingUntil?: string | null;
+  expectedNextReminderAt?: string | null;
   isStatusReply?: boolean;
 }
 
@@ -363,7 +366,8 @@ export class MetaInstagramBotService {
         undefined,
         pending.reel.id,
         pending.reel.awaiting_reminder_choice_until,
-        pending.isAlreadyInWatchLater
+        pending.isAlreadyInWatchLater,
+        pending.reel.next_reminder_at
       );
       this.scheduleWebhookRetry(pending.opId, 0, () =>
         this.dispatchWebhookMessage(
@@ -587,7 +591,8 @@ export class MetaInstagramBotService {
     otpCode?: string,
     targetReelId?: string,
     expectedAwaitingUntil?: string | null,
-    isStatusReply?: boolean
+    isStatusReply?: boolean,
+    expectedNextReminderAt?: string | null
   ): void {
     const now = Date.now();
     if (this.pendingRepliesByMid.size >= WEBHOOK_PENDING_REPLY_MAX_ENTRIES) {
@@ -608,7 +613,11 @@ export class MetaInstagramBotService {
       expiresAt: now + WEBHOOK_PENDING_REPLY_TTL_MS,
       ...(otpCode ? { otpCode } : {}),
       ...(targetReelId
-        ? { targetReelId, expectedAwaitingUntil, ...(isStatusReply ? { isStatusReply: true } : {}) }
+        ? {
+            targetReelId,
+            expectedAwaitingUntil,
+            ...(isStatusReply ? { isStatusReply: true, expectedNextReminderAt } : {}),
+          }
         : {}),
     });
   }
@@ -1002,13 +1011,14 @@ export class MetaInstagramBotService {
           if (
             !freshItem ||
             freshItem.watch_status !== 'watch_later' ||
+            (pending.isStatusReply && freshItem.next_reminder_at !== pending.expectedNextReminderAt) ||
             (!pending.isStatusReply && (
               !freshItem.awaiting_reminder_choice_until ||
               freshItem.awaiting_reminder_choice_until !== pending.expectedAwaitingUntil ||
               new Date(freshItem.awaiting_reminder_choice_until).getTime() <= Date.now()
             ))
           ) {
-            // Choice already settled, deadline expired, or item cancelled/watched; discard stale prompt replay.
+            // Choice already settled, deadline expired, status superseded, or item cancelled/watched; discard stale prompt replay.
             this.markWebhookMidCompleted(opId);
             return;
           }
@@ -1288,12 +1298,13 @@ export class MetaInstagramBotService {
       const validHandle = extractPublicCreatorUsername({ username: meta.username });
       const existingCreator = metadataSeed?.creator;
       const existingHandle = extractPublicCreatorUsername(existingCreator);
+      const mentionHandle = extractCreatorQuery(remaining) || extractCreatorQuery(text);
 
       let creator: NonNullable<typeof existingCreator>;
-      if (!validHandle && !meta.displayName && existingCreator) {
+      if (!validHandle && !meta.displayName && existingCreator && !mentionHandle) {
         creator = existingCreator;
       } else {
-        const resolvedHandle = validHandle || existingHandle;
+        const resolvedHandle = validHandle || existingHandle || mentionHandle;
         const matchesExistingHandle =
           Boolean(resolvedHandle && existingHandle && resolvedHandle.toLowerCase() === existingHandle.toLowerCase());
         const reuseExistingCreatorId = matchesExistingHandle || (!validHandle && Boolean(existingCreator));
@@ -1504,7 +1515,7 @@ export class MetaInstagramBotService {
           this.recordLastConfirmedAddition(senderId, savedReel.id);
           this.recordReshareInteraction(savedReel.id);
         }
-        const activeNextReminder = existingItem?.next_reminder_at ?? savedReel?.next_reminder_at;
+        const activeNextReminder = savedReel ? savedReel.next_reminder_at : existingItem?.next_reminder_at;
         let reply = `${addedHeading}${creatorLine}\n\n`;
         if (activeNextReminder) {
           const scheduledTimeStr = formatTargetTime(new Date(activeNextReminder), new Date(), senderTz);
@@ -1692,6 +1703,10 @@ export class MetaInstagramBotService {
           return;
         }
         delivery.stateMutated = true;
+        if (delivery.retryState.pinnedTargetedCreator) {
+          this.recordLastConfirmedAddition(senderId, targetReel.id);
+          this.recordReshareInteraction(targetReel.id);
+        }
         let reply = formatReminderSetMessage(targetReel, effectiveDur.label, effectiveDur.formattedTarget, delivery.retryState.pinnedDurationUpdatesReshare);
         if (senderTz === 'UTC') {
           reply += `\n\n💡 Tip: Times are in UTC. Reply "tz <city>" (e.g. "tz New York" or "tz IST") to set your local timezone.`;
@@ -1756,8 +1771,9 @@ export class MetaInstagramBotService {
         const targetedWatched = parseTargetedWatchedCommand(text);
         const { isCommand: isWatchedCmd } = parseWatchedStopCommand(text);
         const isCreatorQuery = Boolean(extractCreatorQuery(text));
-        if (targetedWatched || isWatchedCmd || isCreatorQuery) {
-          // Watched command, stop command, or creator search: flush prompt and fall through
+        const targetedReminderUpdate = parseTargetedReminderUpdateCommand(text, new Date(), senderTz);
+        if (targetedWatched || isWatchedCmd || isCreatorQuery || targetedReminderUpdate) {
+          // Watched command, stop command, creator search, or targeted reminder update: flush prompt and fall through
           await this.flushPendingSharePrompt(senderId);
         } else if (this.inFlightShares.has(senderId)) {
           // An active share is currently being ingested for this sender.
@@ -2145,12 +2161,17 @@ export class MetaInstagramBotService {
           targetReel = await Repository.getActiveWatchLaterReelForCreator(
             senderId,
             targetedUpdate.targetCreator,
-            { includeUnattributedFallback: isSenderAdmin }
+            {
+              includeUnattributedFallback: isSenderAdmin,
+              fallbackToUnattributedItem: true,
+              preferredReelId: this.lastConfirmedAdditionReelId.get(senderId),
+            }
           );
           if (targetReel && delivery) {
             delivery.retryState.pinnedDurationTargetReel = targetReel;
             delivery.retryState.pinnedDuration = targetedUpdate.duration;
             delivery.retryState.pinnedDurationUpdatesReshare = true;
+            delivery.retryState.pinnedTargetedCreator = targetedUpdate.targetCreator;
           }
         }
 

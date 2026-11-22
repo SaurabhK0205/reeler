@@ -185,6 +185,12 @@ const PREPOSITIONS_SET = new Set([
   'in', 'at', 'on', 'for', 'to', 'by', 'from', 'about', 'with', 'of', 'the', 'a', 'an',
 ]);
 
+const MONTH_NAMES = new Set([
+  'january', 'february', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december',
+  'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'sept', 'oct', 'nov', 'dec',
+]);
+
 function cleanCreatorCandidate(raw: string): string {
   return raw
     .trim()
@@ -209,6 +215,7 @@ function resolveTargetCreatorCandidate(rawCreator: string): { targetCreator?: st
   if (
     PREPOSITIONS_SET.has(cleaned) ||
     RESERVED_WORDS.has(cleaned) ||
+    MONTH_NAMES.has(cleaned) ||
     isDurationShortcut(cleaned) ||
     !isPlausibleInstagramHandle(cleaned)
   ) {
@@ -415,6 +422,19 @@ export function extractPublicCreatorUsername(
     return null;
   }
   return raw;
+}
+
+/**
+ * Checks whether a creator reference is an unattributed placeholder (e.g. 'Instagram Creator')
+ * or lacks a valid public Instagram username.
+ */
+export function isPlaceholderCreator(
+  creator?: Pick<Creator, 'username' | 'display_name'> | null
+): boolean {
+  if (!creator) return true;
+  const externalId = String((creator as any).instagram_user_id || '').trim();
+  if (externalId.startsWith('creator_unattributed_')) return true;
+  return !extractPublicCreatorUsername(creator);
 }
 
 /**
