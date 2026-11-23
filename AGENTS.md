@@ -88,3 +88,26 @@ Follow GRAVITAS invariants for implementation, debugging, refactoring, review, a
    - `queue`, `reminders`, and `upcoming` commands must return exclusively active future upcoming reminders (`next_reminder_at > now`). Items with null or passed reminder timestamps must never be included.
    - Reminders scheduled for >24 hours out must append the 24-hour Meta messaging window advisory.
    - Creator reschedule commands (`update @[creator] [time]`) must dynamically attribute matching unattributed feed posts (`ig_post`).
+10. **Node.js 24 Execution & Native Type Stripping**:
+   - Requires Node.js `>=24.0.0` (pinned in `package.json#engines`).
+   - Run runtime and test suites using native `--experimental-strip-types` without intermediate compilation or bundle steps.
+11. **Code Quality & Linter Invariants**:
+   - Always run `npm run lint` before committing. ESLint 10 flat configuration (`eslint.config.mjs`) must pass with 0 errors.
+   - Code formatting follows `.prettierrc.json` and `.prettierignore`. Scripts: `npm run format:check`, `npm run format`.
+   - Architectural invariants, ReDoS prevention, SQL ILIKE escaping, and security guidelines are codified in [`docs/CODING_STANDARDS.md`](./docs/CODING_STANDARDS.md).
+12. **Automated CI/CD Pipeline (`.github/workflows/ci.yml`)**:
+   - GitHub Actions CI workflow triggers on push and PR to `main` and `staging`.
+   - Requires clean execution of `npm ci`, fail-closed dependency security audit (`npm audit --audit-level=high`), `npm run lint`, and all 24 test suites (`npm test`).
+13. **CodeQL Static Application Security Testing (`.github/workflows/codeql.yml`)**:
+   - SAST analysis runs automatically on PRs and pushes to `main` and `staging`.
+   - Scoped strictly to production `src/` to prevent mock test URL false positives.
+   - Zero open security alerts must be maintained at all times.
+14. **Supply Chain Defense & Dependabot Hardening**:
+   - `.github/dependabot.yml` operates in **Security-Only mode** (`open-pull-requests-limit: 0`) targeting `staging`.
+   - Automated routine dependency bumping is disabled to prevent supply chain injection attacks and breaking major version churn (`express 4 -> 5`). Automated GitHub CVE security alerts are triaged and patched deliberately.
+15. **Commit Hygiene & Conventional Commits**:
+   - Every commit must follow Conventional Commits (`feat:`, `fix:`, `chore:`, `refactor:`, `test:`, `docs:`).
+   - Strict zero-emoji policy in commit subjects and descriptions. Imperative, concise subjects only.
+16. **Open Source Licensing & Responsible Disclosure**:
+   - Permissive open-source MIT License declared in root `LICENSE` and `package.json`.
+   - Vulnerability disclosure policy codified in `SECURITY.md`. Official releases follow Semantic Versioning (`v1.0.0`).
