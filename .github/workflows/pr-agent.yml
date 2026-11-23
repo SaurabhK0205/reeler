@@ -35,7 +35,7 @@ jobs:
 
       - name: Checkout Code
         if: steps.check_keys.outputs.has_key == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Run PR-Agent Action
         if: steps.check_keys.outputs.has_key == 'true'
