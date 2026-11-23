@@ -771,7 +771,7 @@ export class MetaInstagramBotService {
           });
           data = (await res.json()) as any;
           if (res.ok) {
-            console.log('[MetaIG] DM delivered via HUMAN_AGENT tag (%d chars)', chunk.length);
+            console.log('[MetaIG] DM delivered via HUMAN_AGENT tag');
           } else {
             console.error(
               '[MetaIG] HUMAN_AGENT tag fallback failed (requires Meta App Review approval for the Human Agent feature)'
@@ -785,7 +785,7 @@ export class MetaInstagramBotService {
           // Stop sending subsequent chunks on failure to avoid out-of-order partial messages
           break;
         } else {
-          console.log('[MetaIG] DM sent (%d chars)', chunk.length);
+          console.log('[MetaIG] DM sent successfully');
         }
       } catch (e: any) {
         console.error('[MetaIG] Error calling Meta messages API:', e.message);
