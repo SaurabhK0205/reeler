@@ -139,7 +139,7 @@ export class ReminderWorker {
 
     // 1. Initial check & loop for inbound DMs (legacy scraper only)
     if (hasScraperAuth) {
-      console.log(`[ReminderWorker] Starting DM listener for @${config.instagram.adminUsername}...`);
+      console.log('[ReminderWorker] Starting DM listener for configured admin account...');
       this.pollInboundDMs();
       this.dmInterval = setInterval(() => {
         this.pollInboundDMs().catch((err) => console.error('[ReminderWorker] DM poll error:', err.message));

@@ -32,6 +32,19 @@ export interface CancelCommand {
   invalidCreatorTarget?: string;
 }
 
+function stripTrailingPunctuation(str: string): string {
+  let s = str.trim();
+  while (s.length > 0) {
+    const last = s[s.length - 1];
+    if (last === '!' || last === '.' || last === ',' || last === ';' || last === ':' || last === '~' || last === '?') {
+      s = s.slice(0, -1).trimEnd();
+    } else {
+      break;
+    }
+  }
+  return s;
+}
+
 /**
  * Parses an inbound DM to determine if the user wants to cancel a recently added reel
  * (sent by mistake), cancel a scheduled reminder alarm, or clear a specific creator.
@@ -40,19 +53,21 @@ export function parseCancelCommand(text: string): CancelCommand | null {
   const lower = String(text || '').toLowerCase().trim();
   if (!lower) return null;
 
+  const normalized = stripTrailingPunctuation(lower).replace(/\s+/g, ' ');
+
   // Explicit bulk commands like "cancel reminders" or "stop reminders" or "cancel all" belong to bulk watch/stop
-  if (/^(?:cancel|stop|clear)\s+(?:all|everything|reminders)[!.]*$/i.test(lower)) {
+  if (/^(?:cancel|stop|clear) (?:all|everything|reminders)$/i.test(normalized)) {
     return null;
   }
 
   // 1. Scoped or single cancel reminder:
   // First, check if user explicitly targeted a creator with "for": e.g. "cancel reminder for @ann", "stop reminders for @ann please"
-  const targetedReminderMatch = lower.match(
-    /^(?:cancel|stop|remove|no)\s+reminders?\s+for\s+(.+?)[!.]*$/i
+  const targetedReminderMatch = normalized.match(
+    /^(?:cancel|stop|remove|no) reminders? for ([^\s].*)$/i
   );
   if (targetedReminderMatch) {
     const rawArg = targetedReminderMatch[1].trim();
-    const cleaned = rawArg.replace(/[.!?,;:]+$/, '');
+    const cleaned = stripTrailingPunctuation(rawArg);
     const targetCreator = extractCreatorQuery(cleaned);
     if (!targetCreator) {
       return {
@@ -69,13 +84,13 @@ export function parseCancelCommand(text: string): CancelCommand | null {
   }
 
   // Next, check single cancel reminder without "for": e.g. "cancel reminder", "stop reminder @ann", "no reminder"
-  const reminderMatch = lower.match(
-    /^(?:cancel|stop|remove|no)\s+reminders?(?:\s+(.+?))?[!.]*$/i
+  const reminderMatch = normalized.match(
+    /^(?:cancel|stop|remove|no) reminders?(?: ([^\s].*))?$/i
   );
   if (reminderMatch) {
     const rawArg = reminderMatch[1]?.trim();
     if (rawArg) {
-      const cleaned = rawArg.replace(/[.!?,;:~]+$/, '').trim();
+      const cleaned = stripTrailingPunctuation(rawArg);
       const targetCreator = extractCreatorQuery(cleaned);
       if (!targetCreator) {
         return {
@@ -98,11 +113,11 @@ export function parseCancelCommand(text: string): CancelCommand | null {
   }
 
   // 2. Clear / remove / cancel by creator: e.g. "clear @ykittois", "clear ykittois", "remove @ann", "delete ann"
-  const clearMatch = lower.match(
-    /^(?:clear|remove|delete|cancel)\s+(@?(?:\[|<)?[a-z0-9._]{1,30}(?:\]|>)?)[,.!?:;~]*$/i
+  const clearMatch = normalized.match(
+    /^(?:clear|remove|delete|cancel) (@?(?:\[|<)?[a-z0-9._]{1,30}(?:\]|>)?)$/i
   );
   if (clearMatch) {
-    const rawArg = clearMatch[1].trim().replace(/[.!?,;:~]+$/, '');
+    const rawArg = stripTrailingPunctuation(clearMatch[1].trim());
     if (!/^(?:all|everything|reminders|that|it|reel|post|addition|my|data|account)$/i.test(rawArg)) {
       const targetCreator = extractCreatorQuery(rawArg);
       if (targetCreator) {
@@ -123,7 +138,7 @@ export function parseCancelCommand(text: string): CancelCommand | null {
   }
 
   // 3. Cancel / Undo addition (e.g. sent by mistake): e.g. "cancel", "undo", "remove", "delete", "cancel that", "undo that", "remove that"
-  if (/^(?:cancel|undo|remove|delete)(?:\s+(?:that|it|reel|post|addition))?[!.]*$/i.test(lower)) {
+  if (/^(?:cancel|undo|remove|delete)(?: (?:that|it|reel|post|addition))?$/i.test(normalized)) {
     return {
       isCancelAddition: true,
       isCancelReminder: false,
@@ -146,13 +161,15 @@ export function parseTargetedWatchedCommand(text: string): TargetedWatchedComman
   const lower = String(text || '').toLowerCase().trim();
   if (!lower) return null;
 
-  const match = lower.match(
-    /^(?:watched|done|seen|finish|finished|mark)\s+(.+?)(?:\s+as\s+watched)?[!.]*$/i
+  const normalized = stripTrailingPunctuation(lower).replace(/\s+/g, ' ');
+
+  const match = normalized.match(
+    /^(?:watched|done|seen|finish|finished|mark) ([^\s].*?)(?: as watched)?$/i
   );
   if (!match) return null;
 
   const rawArg = match[1].trim();
-  const cleaned = rawArg.replace(/[.!?,;:~]+$/, '').trim();
+  const cleaned = stripTrailingPunctuation(rawArg);
 
   // Bulk targets and conversational/temporal modifiers belong to parseWatchedStopCommand
   if (/^(?:all|everything|reminders|posts?|reels?|now|already|today|pls|please|that|it|them|this)$/i.test(cleaned)) {
@@ -192,12 +209,11 @@ const MONTH_NAMES = new Set([
 ]);
 
 function cleanCreatorCandidate(raw: string): string {
-  return raw
-    .trim()
-    .replace(/^[@<(\[]+/, '')
-    .replace(/[>)\]]+$/, '')
-    .trim()
-    .toLowerCase();
+  let cleaned = raw.trim().replace(/^[@<(\[]+/, '');
+  while (cleaned.endsWith('>') || cleaned.endsWith(')') || cleaned.endsWith(']')) {
+    cleaned = cleaned.slice(0, -1);
+  }
+  return cleaned.trim().toLowerCase();
 }
 
 function resolveTargetCreatorCandidate(rawCreator: string): { targetCreator?: string; invalidCreatorTarget?: string } | null {
@@ -237,10 +253,12 @@ export function parseTargetedReminderUpdateCommand(
   const lower = String(text || '').toLowerCase().trim();
   if (!lower) return null;
 
+  const normalized = stripTrailingPunctuation(lower).replace(/\s+/g, ' ');
+
   // Pattern 1 (Duration first, creator after):
   // e.g. "snooze 1h for @creator", "remind in 2h for @creator", "remind me in 2h about @creator", "reschedule 2h for @creator"
-  const p1 = lower.match(
-    /^(?:remind(?:\s+me)?|snooze|update(?:\s+reminders?)?|reschedule(?:\s+reminders?)?)\s+(.+?)\s+(?:for|about|of|on)\s+(@?\S+)$/i
+  const p1 = normalized.match(
+    /^(?:remind(?: me)?|snooze|update(?: reminders?)?|reschedule(?: reminders?)?) ([^\s].*?) (?:for|about|of|on) (@?\S+)$/i
   );
   if (p1) {
     const rawDur = p1[1].trim();
@@ -260,12 +278,12 @@ export function parseTargetedReminderUpdateCommand(
 
   // Pattern 2 (Creator first, duration after):
   // e.g. "remind @creator in 2h", "update reminder for @creator to 2h", "snooze @creator 1h", "reschedule @creator tomorrow"
-  const p2 = lower.match(
-    /^(?:remind(?:\s+me)?(?:\s+(?:about|for|of))?|update(?:\s+reminders?(?:\s+(?:for|of|on))?)?|change(?:\s+reminders?(?:\s+(?:for|of|on))?)?|snooze(?:\s+reminders?(?:\s+(?:for|of|on))?)?|reschedule(?:\s+reminders?(?:\s+(?:for|of|on))?)?)\s+(@?\S+)\s+(?:(?:to|in|at|for)\s+)?(.+)$/i
+  const p2 = normalized.match(
+    /^(?:remind(?: me)?(?: (?:about|for|of))?|update(?: reminders?)?(?: (?:for|of|on))?|change(?: reminders?)?(?: (?:for|of|on))?|snooze(?: reminders?)?(?: (?:for|of|on))?|reschedule(?: reminders?)?(?: (?:for|of|on))?) (@?\S+)(?: (?:to|in|at|for))? ([^\s].*)$/i
   );
   if (p2) {
     const rawCreator = p2[1].trim();
-    const rawDur = p2[2].trim().replace(/[.!?,;:~]+$/, '');
+    const rawDur = stripTrailingPunctuation(p2[2]);
     const candidate = resolveTargetCreatorCandidate(rawCreator);
     if (candidate) {
       if (candidate.invalidCreatorTarget) {
@@ -290,17 +308,34 @@ export function isGreetingOrHelpMessage(text: string): boolean {
   if (!trimmed || trimmed.startsWith('@')) return false;
 
   const lower = trimmed.toLowerCase();
-  const cleaned = lower.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '');
+  let cleaned = lower;
+  while (cleaned.length > 0 && !/[a-z0-9]/.test(cleaned[0])) {
+    cleaned = cleaned.slice(1);
+  }
+  while (cleaned.length > 0 && !/[a-z0-9]/.test(cleaned[cleaned.length - 1])) {
+    cleaned = cleaned.slice(0, -1);
+  }
   if (!cleaned) return false;
+  cleaned = cleaned.replace(/\s+/g, ' ');
 
-  if (
-    /^(?:hi|hello|hey|heya|yo|sup|wassup|what'?s\s+up|howdy|hola|greetings|gm|gn)[!.]*$/i.test(cleaned) ||
-    /^(?:hi|hello|hey|yo|sup|what'?s\s+up)\s+(?:bot|there|reeler|bro|dude|man|homie|mate|friend|pal|buddy)[!.]*$/i.test(cleaned) ||
-    /^(?:bro|dude|homie|pal|buddy)[!.]*$/i.test(cleaned) ||
-    /^(?:help|commands?|menu|start|info|instructions?|guide|options?)[!.]*$/i.test(cleaned) ||
-    /^(?:how\s+to\s+use|what\s+can\s+you\s+do|what\s+do\s+you\s+do|how\s+does\s+this\s+work|how\s+it\s+works)[!.]*$/i.test(cleaned)
-  ) {
+  const greetings = new Set([
+    'hi', 'hello', 'hey', 'heya', 'yo', 'sup', 'wassup', "what's up", 'whats up', 'howdy', 'hola', 'greetings', 'gm', 'gn',
+    'bro', 'dude', 'homie', 'pal', 'buddy', 'help', 'command', 'commands', 'menu', 'start', 'info',
+    'instruction', 'instructions', 'guide', 'option', 'options',
+    'how to use', 'what can you do', 'what do you do', 'how does this work', 'how it works'
+  ]);
+
+  if (greetings.has(cleaned)) {
     return true;
+  }
+
+  const parts = cleaned.split(' ');
+  if (parts.length === 2) {
+    const greetingWords = new Set(['hi', 'hello', 'hey', 'yo', 'sup', "what's up", 'whats up']);
+    const targets = new Set(['bot', 'there', 'reeler', 'bro', 'dude', 'man', 'homie', 'mate', 'friend', 'pal', 'buddy']);
+    if (greetingWords.has(parts[0]) && targets.has(parts[1])) {
+      return true;
+    }
   }
   return false;
 }

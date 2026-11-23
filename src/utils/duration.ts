@@ -319,7 +319,7 @@ export function parseDuration(
   }
 
   // Match textual dates like "12th nov", "12 november", "nov 12", "november 15th"
-  const datePattern = /(?:(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)|([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?)(?:\s+(\d{4}))?/i;
+  const datePattern = /(?:(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,9})|([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?)(?:\s+(\d{4}))?/i;
   const dateMatch = text.match(datePattern);
   if (dateMatch) {
     const rawDay = dateMatch[1] || dateMatch[4];
