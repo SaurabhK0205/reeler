@@ -1,7 +1,6 @@
 import crypto from 'node:crypto';
 import { generateUserVaultKey, getAdminVaultKey, createOtp, isOtpActive, OtpCapacityError, isHostedOrProductionEnvironment } from './vaultAuthService.ts';
 import { safeStringEqual } from '../middleware/security.ts';
-import { loadConfig } from '../config.ts';
 import { Repository, SenderReminderConflictError, SenderDeletionBarrierError } from '../db/repository.ts';
 import { fetchReelMetadata } from './reelMetadataResolver.ts';
 import { parseDuration, formatTargetTime, isSameInstant } from '../utils/duration.ts';
@@ -1724,7 +1723,7 @@ export class MetaInstagramBotService {
         );
         if (!applied) {
           // A newer reminder schedule or watch-status change already updated this Reel before this retry ran.
-          let reply = `${promptInfo.addedHeading}${promptInfo.creatorLine}\n\nℹ️ Your reel was saved to Watch Later, but its reminder schedule was updated by a newer command.`;
+          const reply = `${promptInfo.addedHeading}${promptInfo.creatorLine}\n\nℹ️ Your reel was saved to Watch Later, but its reminder schedule was updated by a newer command.`;
           await this.deliverReply(senderId, reply, delivery);
           return;
         }
@@ -1826,13 +1825,8 @@ export class MetaInstagramBotService {
             if (delivery) delivery.retryState.pinnedCancelTargetReelId = targetReelId;
           }
 
-          let cancelled: Awaited<ReturnType<typeof Repository.cancelRecentAdditionForSender>>;
-          try {
-            cancelled = await Repository.cancelRecentAdditionForSender(senderId, { targetReelId });
-          } catch (cancelErr) {
-            // Cancellation write failed; keep prompt and timer active across retries
-            throw cancelErr;
-          }
+          // Cancellation write may fail if DB is unavailable; keep prompt and timer active across retries
+          const cancelled = await Repository.cancelRecentAdditionForSender(senderId, { targetReelId });
 
           if (cancelled && this.pendingSharePrompts.get(senderId)?.reel.id === cancelled.cancelledReel.id) {
             const currentPending = this.pendingSharePrompts.get(senderId)!;
@@ -1871,7 +1865,7 @@ export class MetaInstagramBotService {
           // Not a recognized command; now evaluate whether text is a duration expression
           const parsedDur = parseDuration(text, new Date(), senderTz);
           if (parsedDur) {
-            let targetReel = pending.reel;
+            const targetReel = pending.reel;
             if (delivery) {
               delivery.retryState.pinnedDeferredSharePrompt = {
                 reel: pending.reel,
@@ -1905,7 +1899,7 @@ export class MetaInstagramBotService {
               this.pendingSharePrompts.delete(senderId);
             }
             if (!applied) {
-              let reply = `${pending.addedHeading}${pending.creatorLine}\n\nℹ️ Your reel was saved to Watch Later, but its reminder schedule was updated by a newer command.`;
+              const reply = `${pending.addedHeading}${pending.creatorLine}\n\nℹ️ Your reel was saved to Watch Later, but its reminder schedule was updated by a newer command.`;
               await this.deliverReply(senderId, reply, delivery);
               return;
             }
