@@ -1,13 +1,17 @@
 version: 2
 updates:
+  # npm dependencies: security-only (routine version bumps disabled; security updates enabled)
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 10
+    target-branch: "staging"
+    open-pull-requests-limit: 0
 
+  # GitHub Actions: security-only (routine version bumps disabled; security updates enabled)
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+    target-branch: "staging"
+    open-pull-requests-limit: 0
