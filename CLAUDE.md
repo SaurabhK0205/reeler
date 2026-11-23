@@ -1,8 +1,8 @@
 # REELER (Instagram Saved Reels Tracker & Reminder OS) — CLAUDE.md
 
-Stack: Node.js (v22+ with native `--experimental-strip-types`) + Express.js + Supabase (PostgreSQL) + Meta Graph API (Instagram Messaging Webhooks) + Render
+Stack: Node.js (v24+ with native `--experimental-strip-types`) + Express.js + Supabase (PostgreSQL) + Meta Graph API (Instagram Messaging Webhooks) + Render
 Repository: SaurabhK0205/reeler
-Last updated: November 18, 2026
+Last updated: November 23, 2026
 
 ---
 
@@ -54,6 +54,9 @@ Last updated: November 18, 2026
      6. Resolve every review thread using GitHub GraphQL `resolveReviewThread` after verifying the fix, or after posting the evidence-based explanation for an invalid finding or false positive.
    - **Incremental Re-Checks Must Complete (CRITICAL)**: Whenever a fix commit is pushed to address review feedback, CodeRabbit automatically triggers an incremental re-review (indicated by the `review in progress` state in its PR comment). You **MUST NEVER merge while a re-check or incremental review is running**. You must wait for the re-check to finish completely—confirming that the in-progress state is cleared, the final review report is posted, all pre-merge checks pass, and zero new findings or open threads remain. Only merge when re-checking is 100% complete and everything is positive.
    - **NO tight polling loops**: Never run tight sleep loops polling GitHub or CodeRabbit status.
+8. **Commit Message Invariant & Zero-Emoji Policy**:
+   - Every commit must follow Conventional Commits (`feat:`, `fix:`, `chore:`, `refactor:`, `test:`, `docs:`).
+   - Strict zero-emoji policy in commit subjects and descriptions. Imperative, concise subjects only.
 
 ---
 
@@ -68,10 +71,9 @@ Before writing any code or executing commands:
 2. **Environment & Secrets Check**: Run `git status` to ensure `.env` and local credentials remain untracked.
 3. **Running Tasks Check**: Check if the Node server (port 3000) and Cloudflare tunnel are active before restarting them.
 4. **Before Pushing**:
-   - Run syntax check: `node --check` or test-run with native TypeScript:
-     ```bash
-     node --experimental-strip-types --env-file-if-exists=.env src/server.ts
-     ```
+   - Run linter: `npm run lint` (ESLint 10 with TypeScript must pass with 0 errors).
+   - Run security audit: `npm audit --audit-level=high` (must find 0 vulnerabilities).
+   - Run test suite: `npm test` (all 24 test suites must pass).
    - Verify `git diff --cached` contains ZERO secrets, tokens, or `.env` entries.
 
 ---
@@ -231,3 +233,29 @@ For implementation, debugging, refactoring, review, and migrations:
 * **Modifying files in `/Users/thismac/rea/`**.
 * **Committing frontend changes (`public/`) without running at minimum `/impeccable critique`, `/impeccable polish`, and `/impeccable harden`**.
 * **Claiming a task or fix is verified without post-edit command/test evidence (per GRAVITAS)**.
+* **Committing or pushing changes without verifying `npm run lint` exits with 0 errors**.
+* **Introducing high or critical dependency vulnerabilities (`npm audit --audit-level=high`)**.
+* **Introducing new CodeQL static analysis security alerts (0 open alerts must be maintained)**.
+* **Adding emojis to commit subjects or commit messages (strict zero-emoji policy)**.
+* **Re-enabling automated routine Dependabot PR version bumping without explicit maintainer security authorization**.
+
+---
+
+## 10. Automated CI/CD, SAST & Code Quality Pipelines
+
+1. **Continuous Integration (`.github/workflows/ci.yml`)**:
+   - Triggers automatically on push and pull requests targeting `main` and `staging`.
+   - Node.js 24 environment with automated npm caching.
+   - Enforces fail-closed security audit (`npm audit --audit-level=high`), linter verification (`npm run lint`), and full test suite execution (`npm test`).
+2. **Static Application Security Testing (`.github/workflows/codeql.yml`)**:
+   - Scoped to production `src/` directory.
+   - Runs on all PRs and pushes to `main`/`staging`.
+   - Zero open security alerts maintained at all times.
+3. **Supply Chain Defense (`.github/dependabot.yml`)**:
+   - Configured in **Security-Only mode** (`open-pull-requests-limit: 0`) targeting `staging`.
+   - Prevents automated supply chain attack vectors and major breaking dependency churn while preserving automated GitHub CVE alerts.
+4. **Code Quality & Coding Standards**:
+   - ESLint 10 with TypeScript flat configuration (`eslint.config.mjs`).
+   - Prettier configuration (`.prettierrc.json`, `.prettierignore`).
+   - Architectural and security standards codified in [`docs/CODING_STANDARDS.md`](./docs/CODING_STANDARDS.md).
+   - Permissive open-source MIT License (`LICENSE`) and responsible disclosure policy (`SECURITY.md`).
