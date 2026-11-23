@@ -13,7 +13,7 @@
     "test": "node --experimental-strip-types tests/archiveImportService.test.ts && node --experimental-strip-types tests/metaInstagramBotService.test.ts && node --experimental-strip-types tests/adaptivePlayer.test.ts && node --experimental-strip-types tests/vaultAuth.test.ts && node --experimental-strip-types tests/compliancePages.test.ts && node --experimental-strip-types tests/durationTimezone.test.ts && node --experimental-strip-types tests/securityIdempotency.test.ts"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.48.1",
+    "@supabase/supabase-js": "^2.119.2",
     "express": "^4.21.2"
   },
   "devDependencies": {
