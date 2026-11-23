@@ -130,7 +130,7 @@ export function parseDuration(
   if (!rawText) return null;
   const safeZone = getEffectiveTimeZone(timeZone);
 
-  let text = rawText
+  const text = rawText
     .toLowerCase()
     .trim()
     .replace(/^(?:remind\s+(?:me\s+)?(?:in\s+|at\s+|on\s+)?|snooze\s+(?:for\s+|in\s+)?|reschedule\s+(?:for\s+|in\s+|to\s+)?|set\s+reminder\s+(?:for\s+)?|in\s+|on\s+|at\s+)/i, '')
@@ -181,7 +181,7 @@ export function parseDuration(
   // 2. Tomorrow / Tonight / Today
   if (text.includes('tomorrow') || text.includes('tonight') || text.includes('today')) {
     const parsedTime = parseTimePart(text);
-    let targetParts: { year: number; month: number; day: number; hour: number; minute: number; second: number } = {
+    const targetParts: { year: number; month: number; day: number; hour: number; minute: number; second: number } = {
       year: nowParts.year,
       month: nowParts.month,
       day: nowParts.day,
@@ -272,8 +272,8 @@ export function parseDuration(
   const numDateMatch = text.match(/\b(?:(\d{4})[-/](\d{1,2})[-/](\d{1,2})|(\d{1,2})[-/](\d{1,2})(?:[-/](\d{4}))?)\b/);
   if (numDateMatch) {
     let year = nowParts.year;
-    let month = nowParts.month;
-    let day = nowParts.day;
+    let month: number;
+    let day: number;
 
     if (numDateMatch[1]) {
       year = parseInt(numDateMatch[1], 10);
@@ -329,7 +329,7 @@ export function parseDuration(
     if (rawDay && rawMonth && MONTH_MAP[rawMonth] !== undefined) {
       const day = parseInt(rawDay, 10);
       const month = MONTH_MAP[rawMonth];
-      let year = rawYear ? parseInt(rawYear, 10) : nowParts.year;
+      const year = rawYear ? parseInt(rawYear, 10) : nowParts.year;
 
       const parsedTime = parseTimePart(text.replace(dateMatch[0], ''));
       let target = zonedDateTimeToUtc({
