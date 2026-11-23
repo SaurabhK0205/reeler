@@ -11,6 +11,7 @@ import type {
 } from '../types.ts';
 import { classifySavedMediaType } from '../utils/mediaType.ts';
 import { isPlaceholderCreator } from '../utils/reelMessages.ts';
+import { randomBytes } from 'node:crypto';
 import { resolveTimeZone } from '../utils/timezone.ts';
 import { getSupabase, isSupabaseConfigured } from './client.ts';
 import { revokeTokensForSender, clearTokenRevocationsForTesting } from '../services/vaultAuthService.ts';
@@ -282,7 +283,7 @@ class InMemoryStore {
     });
 
     const newReel: SavedReel = {
-      id: `reel_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      id: `reel_${Date.now()}_${randomBytes(4).toString('hex')}`,
       instagram_media_id: data.instagram_media_id,
       shortcode: data.shortcode,
       reel_url: data.reel_url,
@@ -838,7 +839,7 @@ export function sanitizePostgrestSearchTerm(raw: string): { text: string; handle
   const cleaned = String(raw || '')
     .trim()
     .replace(/[,()\\"*]/g, ' ')
-    .replace(/[%_]/g, '\\$&')
+    .replace(/[\\%_]/g, '\\$&')
     .replace(/\s+/g, ' ')
     .trim();
   const handle = cleaned.replace(/^@+/, '').trim();
@@ -2590,7 +2591,7 @@ export class Repository {
       const { data: creators, error: cErr } = await supabase
         .from('creators')
         .select('id, username')
-        .ilike('username', targetCreator.replace(/[_%]/g, '\\$&'));
+        .ilike('username', targetCreator.replace(/[\\_%]/g, '\\$&'));
       if (cErr) throw new Error(`Failed to resolve creator: ${cErr.message}`);
       creatorIds = (creators || [])
         .filter((c: any) => String(c.username || '').toLowerCase() === targetCreator)
@@ -2760,7 +2761,7 @@ export class Repository {
       const { data: creators, error: cErr } = await supabase
         .from('creators')
         .select('id, username')
-        .ilike('username', targetCreator.replace(/[_%]/g, '\\$&'));
+        .ilike('username', targetCreator.replace(/[\\_%]/g, '\\$&'));
       if (cErr) throw new Error(`Failed to resolve creator: ${cErr.message}`);
       creatorIds = (creators || [])
         .filter((c: any) => String(c.username || '').toLowerCase() === targetCreator)
@@ -2935,12 +2936,13 @@ export class Repository {
     }
   ): Promise<SavedReel | null> {
     const trimmedSender = String(senderId || '').trim();
-    const handle = String(creatorHandle || '')
+    let handle = String(creatorHandle || '')
       .trim()
-      .replace(/^[@<(\[]+/, '')
-      .replace(/[>)\]]+$/, '')
-      .trim()
-      .toLowerCase();
+      .replace(/^[@<(\[]+/, '');
+    while (handle.endsWith('>') || handle.endsWith(')') || handle.endsWith(']')) {
+      handle = handle.slice(0, -1);
+    }
+    handle = handle.trim().toLowerCase();
     const allowUnattributedFallback = Boolean(options?.includeUnattributedFallback);
     if ((!trimmedSender && !allowUnattributedFallback) || !handle) return null;
 
@@ -3003,7 +3005,7 @@ export class Repository {
     const { data: creatorRows, error: cErr } = await supabase
       .from('creators')
       .select('id, username, display_name')
-      .ilike('username', handle.replace(/[_%]/g, '\\$&'));
+      .ilike('username', handle.replace(/[\\_%]/g, '\\$&'));
     if (cErr) {
       throw new Error(`Failed to find creator for handle ${handle}: ${cErr.message}`);
     }
@@ -3233,7 +3235,7 @@ export class Repository {
       const { data: creators, error: cErr } = await supabase
         .from('creators')
         .select('id, username')
-        .ilike('username', handle.replace(/[_%]/g, '\\$&'));
+        .ilike('username', handle.replace(/[\\_%]/g, '\\$&'));
       if (cErr) {
         throw new Error(`Failed to resolve creator for clear: ${cErr.message}`);
       }
@@ -3508,7 +3510,7 @@ export class Repository {
     const { data: creators, error: cErr } = await supabase
       .from('creators')
       .select('id, username')
-      .ilike('username', handle.replace(/[_%]/g, '\\$&'));
+      .ilike('username', handle.replace(/[\\_%]/g, '\\$&'));
     if (cErr) throw new Error(`Failed to resolve creator: ${cErr.message}`);
     const creatorIds = (creators || [])
       .filter((c: any) => String(c.username || '').toLowerCase() === handle)
@@ -3622,7 +3624,7 @@ export class Repository {
     const { data: creators, error: cErr } = await supabase
       .from('creators')
       .select('id, username')
-      .ilike('username', handle.replace(/[_%]/g, '\\$&'));
+      .ilike('username', handle.replace(/[\\_%]/g, '\\$&'));
     if (cErr) {
       throw new Error(`Failed to resolve creator for watch: ${cErr.message}`);
     }

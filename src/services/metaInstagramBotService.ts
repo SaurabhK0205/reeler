@@ -648,7 +648,7 @@ export class MetaInstagramBotService {
     const timer = setTimeout(() => {
       this.scheduledRetries.delete(retryKey);
       task().catch((err) => {
-        console.error(`[MetaIG] Scheduled webhook retry failed for ${retryKey}:`, err);
+        console.error('[MetaIG] Scheduled webhook retry failed for %s:', retryKey, err);
       });
     }, delayMs);
     timer.unref();
@@ -758,7 +758,8 @@ export class MetaInstagramBotService {
         // If standard delivery failed because the 24h window closed, attempt fallback with HUMAN_AGENT tag
         if (!res.ok && !initialTag && allowFallback && isMetaMessagingWindowError(data)) {
           console.warn(
-            `[MetaIG] 24-hour messaging window closed for ${recipientId}. Attempting fallback with HUMAN_AGENT tag...`
+            '[MetaIG] 24-hour messaging window closed for %s. Attempting fallback with HUMAN_AGENT tag...',
+            recipientId
           );
           const fallbackPayload = {
             recipient: { id: recipientId },
@@ -773,13 +774,7 @@ export class MetaInstagramBotService {
           });
           data = (await res.json()) as any;
           if (res.ok) {
-            if (isHostedOrProductionEnvironment()) {
-              console.log(`[MetaIG] DM delivered to ${recipientId} via HUMAN_AGENT tag (${chunk.length} chars)`);
-            } else {
-              console.log(
-                `[MetaIG] DM delivered to ${recipientId} via HUMAN_AGENT tag: "${chunk.slice(0, 40)}..."`
-              );
-            }
+            console.log('[MetaIG] DM delivered to %s via HUMAN_AGENT tag (%d chars)', recipientId, chunk.length);
           } else {
             console.error(
               `[MetaIG] HUMAN_AGENT tag fallback failed (requires Meta App Review approval for the Human Agent feature):`,
@@ -794,11 +789,7 @@ export class MetaInstagramBotService {
           // Stop sending subsequent chunks on failure to avoid out-of-order partial messages
           break;
         } else {
-          if (isHostedOrProductionEnvironment()) {
-            console.log(`[MetaIG] DM sent to ${recipientId} (${chunk.length} chars)`);
-          } else {
-            console.log(`[MetaIG] DM sent to ${recipientId}: "${chunk.slice(0, 40)}..."`);
-          }
+          console.log('[MetaIG] DM sent to %s (%d chars)', recipientId, chunk.length);
         }
       } catch (e: any) {
         console.error('[MetaIG] Error calling Meta messages API:', e.message);
@@ -1159,7 +1150,7 @@ export class MetaInstagramBotService {
         shouldScheduleRetry = true;
       }
     } catch (error) {
-      console.error(`[MetaIG] Failed to process ${sourceLabel} event for sender ${senderId}:`, error);
+      console.error('[MetaIG] Failed to process %s event for sender %s:', sourceLabel, senderId, error);
       // The route already sent 200 before dispatch; schedule a bounded internal retry after releasing claim.
       shouldScheduleRetry = true;
     } finally {
@@ -2155,7 +2146,7 @@ export class MetaInstagramBotService {
           `Permanently removed ${deletedCount} saved item(s) and cleared your user records from our systems.`;
         await this.deliverReply(senderId, reply, delivery);
       } catch (error) {
-        console.error(`[MetaIG] Data deletion failed for sender ${senderId}:`, error);
+        console.error('[MetaIG] Data deletion failed for sender %s:', senderId, error);
         await this.deliverReply(
           senderId,
           `⚠️ We encountered an issue processing your data deletion request. Please try again or email saurabhk0205@gmail.com for manual assistance.`,
@@ -2225,7 +2216,7 @@ export class MetaInstagramBotService {
     }
 
     // 2d. Timezone set command (e.g. "tz IST", "tz America/New_York", "tz London", "timezone +5:30")
-    const tzSetMatch = text.match(/^(?:tz|timezone|set\s+tz|set\s+timezone)\s+(.+)$/i);
+    const tzSetMatch = text.trim().replace(/\s+/g, ' ').match(/^(?:tz|timezone|set (?:tz|timezone))\s+(.+)$/i);
     if (tzSetMatch) {
       const rawInput = tzSetMatch[1].trim();
       const cmdSeq =

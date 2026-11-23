@@ -38,11 +38,11 @@ function decodeHtmlAttribute(value) {
     .replace(/&#064;/g, '@')
     .replace(/&#x40;/g, '@')
     .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(Number(dec)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&amp;/g, '&');
 }
 
 function isAllowedInstagramUrl(parsed, expectedShortcode) {
