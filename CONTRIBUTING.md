@@ -10,7 +10,7 @@ Thank you for your interest in contributing to Reeler. This document outlines ou
 
 ### Workflow
 1. Branch off `staging`.
-2. Implement changes and add automated unit tests in `tests/`.
+2. Implement changes and add automated unit tests in `tests/`. When adding new test files, include them in the `package.json` `test` script so `npm test` executes them.
 3. Verify that `npm test` passes with zero failures.
 4. Submit a Pull Request targeting `staging`.
 5. Ensure all automated AI code reviews (Gemini Code Auditor, NVIDIA Nemotron 550B, Qodo PR-Agent, and CodeRabbit) pass.

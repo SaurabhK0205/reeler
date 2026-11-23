@@ -2,6 +2,7 @@
   "name": "instagram-saved-reels",
   "version": "1.0.0",
   "description": "Intelligent Saved Reels Tracker, Filter & Discovery Dashboard for Instagram",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "start": "node --experimental-strip-types --env-file-if-exists=.env src/server.ts",
