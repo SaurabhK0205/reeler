@@ -757,10 +757,7 @@ export class MetaInstagramBotService {
 
         // If standard delivery failed because the 24h window closed, attempt fallback with HUMAN_AGENT tag
         if (!res.ok && !initialTag && allowFallback && isMetaMessagingWindowError(data)) {
-          console.warn(
-            '[MetaIG] 24-hour messaging window closed for %s. Attempting fallback with HUMAN_AGENT tag...',
-            recipientId
-          );
+          console.warn('[MetaIG] 24-hour messaging window closed. Attempting fallback with HUMAN_AGENT tag...');
           const fallbackPayload = {
             recipient: { id: recipientId },
             message: { text: chunk },
@@ -774,22 +771,21 @@ export class MetaInstagramBotService {
           });
           data = (await res.json()) as any;
           if (res.ok) {
-            console.log('[MetaIG] DM delivered to %s via HUMAN_AGENT tag (%d chars)', recipientId, chunk.length);
+            console.log('[MetaIG] DM delivered via HUMAN_AGENT tag (%d chars)', chunk.length);
           } else {
             console.error(
-              `[MetaIG] HUMAN_AGENT tag fallback failed (requires Meta App Review approval for the Human Agent feature):`,
-              data
+              '[MetaIG] HUMAN_AGENT tag fallback failed (requires Meta App Review approval for the Human Agent feature)'
             );
           }
         }
 
         if (!res.ok) {
-          console.error('[MetaIG] Failed to send DM:', data);
+          console.error('[MetaIG] Failed to send DM (status %d)', res.status);
           allSuccess = false;
           // Stop sending subsequent chunks on failure to avoid out-of-order partial messages
           break;
         } else {
-          console.log('[MetaIG] DM sent to %s (%d chars)', recipientId, chunk.length);
+          console.log('[MetaIG] DM sent (%d chars)', chunk.length);
         }
       } catch (e: any) {
         console.error('[MetaIG] Error calling Meta messages API:', e.message);
@@ -2216,9 +2212,19 @@ export class MetaInstagramBotService {
     }
 
     // 2d. Timezone set command (e.g. "tz IST", "tz America/New_York", "tz London", "timezone +5:30")
-    const tzSetMatch = text.trim().replace(/\s+/g, ' ').match(/^(?:tz|timezone|set (?:tz|timezone))\s+(.+)$/i);
-    if (tzSetMatch) {
-      const rawInput = tzSetMatch[1].trim();
+    let rawInput: string | null = null;
+    const lowerTrimmed = text.trim().toLowerCase();
+    if (lowerTrimmed.startsWith('tz ')) {
+      rawInput = text.trim().slice(3).trim();
+    } else if (lowerTrimmed.startsWith('timezone ')) {
+      rawInput = text.trim().slice(9).trim();
+    } else if (lowerTrimmed.startsWith('set tz ')) {
+      rawInput = text.trim().slice(7).trim();
+    } else if (lowerTrimmed.startsWith('set timezone ')) {
+      rawInput = text.trim().slice(13).trim();
+    }
+
+    if (rawInput) {
       const cmdSeq =
         delivery?.retryState.timezoneCommandSeq ?? ++this.timezoneCommandSeq;
       if (delivery && delivery.retryState.timezoneCommandSeq === undefined) {
