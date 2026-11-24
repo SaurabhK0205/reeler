@@ -9,11 +9,11 @@ Reeler pairs an Instagram DM bot (`@er_reel_er`) with a private web vault ([reel
 > [!NOTE]
 > **Meta App Review & Early Access Status**
 > 
-> Right now, Reeler's Instagram bot (`@er_reel_er`) and messaging permissions are undergoing official **Meta App Review**. As soon as the app gets approved, I will post an update and open access up for everyone!
+> Reeler's Instagram bot (`@er_reel_er`) and messaging permissions are currently undergoing official Meta App Review. Public access will unlock as soon as Meta completes review approval.
 > 
-> For now, feel free to look around, check out the repo, test running it locally, and share suggestions or open an issue. I'm completely open to any feedback, ideas, or contributions.
+> Feel free to explore the repository, run it locally, and submit feedback or suggestions via issues.
 > 
-> *(Curious note: The bot is somehow already working for some people even though they were never added to my Meta developers or testers list! I honestly don't know how Meta's routing is letting them through, but if you DM `@er_reel_er` and it responds, enjoy early access. If it doesn't reply yet, full public access will unlock the moment Meta finishes the review).*
+> *Early Access Note: Meta's sandbox environment currently delivers bot responses to select accounts outside the tester list. If `@er_reel_er` responds to your DM, you have early access. Otherwise, full public access unlocks immediately upon Meta review approval.*
 
 ---
 
