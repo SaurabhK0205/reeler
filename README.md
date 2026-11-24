@@ -6,6 +6,15 @@ Inspired by Michael De Santa's line in GTA V (*"You forget a thousand things eve
 
 Reeler pairs an Instagram DM bot (`@er_reel_er`) with a private web vault ([reeler-staging.onrender.com](https://reeler-staging.onrender.com)). Share a Reel or Post to the bot, tell it when to remind you, and browse everything you have saved in one searchable place without giving up your Instagram password.
 
+> [!NOTE]
+> **Meta App Review & Early Access Status**
+> 
+> Right now, Reeler's Instagram bot (`@er_reel_er`) and messaging permissions are undergoing official **Meta App Review**. As soon as our public scopes are approved, we will announce it and open access up for everyone!
+> 
+> In the meantime, feel free to look around, explore the codebase, test running it locally, and share suggestions or open an issue. All feedback and ideas are welcome.
+> 
+> *(Curious note: The bot is somehow already responding for some people even though they were never added to our Meta developers or testers list! We are not quite sure how Meta's routing is letting them through, but if you DM `@er_reel_er` and it answers, enjoy early access. If it doesn't reply yet, full public access will unlock the moment Meta approves our review).*
+
 ---
 
 ## How It Works
