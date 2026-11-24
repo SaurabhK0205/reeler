@@ -91,12 +91,12 @@ npm start
 Open `http://localhost:3000`. Once Supabase is configured in `.env`, you can run `npm run seed` before `npm start` to populate sample items.
 
 ### 3. Available scripts
-- `npm start` — Run the server (`src/server.ts`)
-- `npm run dev` — Run the server in watch mode (`--watch`)
-- `npm test` — Run all 7 regression test suites (24 tests covering archive import, Meta bot webhooks, adaptive player, vault auth, compliance pages, duration/timezone, and security/idempotency)
-- `npm run import` — Import an Instagram `saved_posts.json` export from the CLI
-- `npm run recover-posts` — Repair legacy `/reel/` URLs that are actually `/p/` posts
-- `npm run seed` — Populate sample data into a configured Supabase database
+- `npm start`: Run the server (`src/server.ts`)
+- `npm run dev`: Run the server in watch mode (`--watch`)
+- `npm test`: Run all 7 regression test suites (24 tests covering archive import, Meta bot webhooks, adaptive player, vault auth, compliance pages, duration/timezone, and security/idempotency)
+- `npm run import`: Import an Instagram `saved_posts.json` export from the CLI
+- `npm run recover-posts`: Repair legacy `/reel/` URLs that are actually `/p/` posts
+- `npm run seed`: Populate sample data into a configured Supabase database
 
 ---
 
@@ -152,7 +152,7 @@ Run `npm test` before committing. All 24 test suites / 64 tests must pass cleanl
 - Zero-dependency Node.js script (`scripts/gemini-pr-review.mjs`) executing on every PR event (`opened`, `reopened`, `ready_for_review`, `synchronize`).
 - **Dynamic Model Discovery**: Queries Google AI Studio's Model API (`https://generativelanguage.googleapis.com/v1beta/models`) to automatically detect active models (`gemini-flash-lite-latest`, `gemini-2.0-flash`, `gemini-2.5-flash`), with 15-second request timeouts and fallback resilience.
 - **Strict Invariant Audits**:
-  - `Anti-AI-slop`: Enforces direct, natural copy (<950 characters single-bubble limit) and rejects em-dashes (`—`) or decorative punctuation.
+  - `Anti-AI-slop`: Enforces direct, natural copy (<950 characters single-bubble limit) and rejects em-dashes or decorative punctuation.
   - `Concurrency & CAS`: Verifies atomic Compare-And-Swap locks on all state transitions (reminders, choices).
   - `Store Parity`: Asserts that `InMemoryStore` logic in tests is behaviorally identical to Supabase PostgREST queries in production.
   - `Schema Parity`: Verifies that any database change in `supabase/migrations/` is synchronized in root `schema.sql`.
