@@ -191,7 +191,31 @@ Whenever you modify anything under `public/` (HTML, CSS, or JS) or any user-faci
 
 ---
 
-## 7. Engineering Reliability — GRAVITAS Workflow (MANDATORY)
+## 7. Frontend Craft & Anti-Slop Design: Hallmark Skill (MANDATORY FOR UI WORK)
+
+**Setup (once per environment):** Hallmark is installed globally at `~/.agents/skills/hallmark` (or symlinked under `.agents/skills/hallmark`, gitignored).
+
+Whenever creating new frontend pages, designing components, or performing post-approval UI redesigns under `public/`:
+1. **The Floor (Anti-AI-Slop Invariants):**
+   - Strictly tokenized colors and fonts at `:root`. No raw hex codes or untokenized inline values in `public/style.css`.
+   - Never `transition: all`. Animate `transform` and `opacity` only (zero layout thrashing).
+   - Enforce `overflow-x: clip` on both `html` and `body` to prevent horizontal jitter on mobile Safari.
+   - Every interactive control must provide an instant `:focus-visible` ring (via `outline`, not `border`).
+   - Every animation must respect `@media (prefers-reduced-motion: reduce)`.
+   - Zero generic AI design cliches: no purple-to-blue SaaS gradients, no cards inside cards, and no decorative status dots.
+2. **Automated Sloplint Quality Pass:**
+   Before committing any frontend redesign or layout overhaul, execute Hallmark's static UI linter:
+   ```bash
+   node ~/.agents/skills/hallmark/scripts/sloplint.mjs public/index.html --scope app --tier floor
+   ```
+   All `FAIL` findings must be resolved or explicitly justified before pushing to `staging`.
+3. **Post-Approval UI Redesigns (`/hallmark redesign`):**
+   - Active UI redesigns remain paused during active Meta App Review to protect live staging test stability.
+   - Once Meta App Review is approved, Hallmark's theme and redesign passes will drive the visual redesign and the shareable "Reeler Wrapped" visual cards (Milestone 5).
+
+---
+
+## 8. Engineering Reliability: GRAVITAS Workflow (MANDATORY)
 
 **Setup (once per environment):** Install the GRAVITAS skill via `npx skills add udaysharmadev/Gravitas --skill gravitas --agent antigravity --yes` (or `--agent claude-code` for Claude Code; see [udaysharmadev/Gravitas](https://github.com/udaysharmadev/Gravitas)) and reload your coding tool. Keep project-local symlinks under `.agents/skills/` or `.claude/skills/` (both gitignored).
 
@@ -204,7 +228,7 @@ For implementation, debugging, refactoring, review, and migrations:
 
 ---
 
-## 8. Security & Boundary Rules
+## 9. Security & Boundary Rules
 
 1. **NEVER commit `.env` or credentials:**
    - Strictly exclude `.env`, `.env.*`, `token.json`, `credentials.json`, `*.pem`, `*.key`.
@@ -217,7 +241,7 @@ For implementation, debugging, refactoring, review, and migrations:
 
 ---
 
-## 9. BLOCK Violations (NEVER generate code or execute actions that do this)
+## 10. BLOCK Violations (NEVER generate code or execute actions that do this)
 
 * **Direct push to `main` or `staging` branch** (strictly forbidden).
 * **Committing code directly onto `main` or `staging`** instead of a topic branch.
@@ -241,7 +265,7 @@ For implementation, debugging, refactoring, review, and migrations:
 
 ---
 
-## 10. Automated CI/CD, SAST & Code Quality Pipelines
+## 11. Automated CI/CD, SAST & Code Quality Pipelines
 
 1. **Continuous Integration (`.github/workflows/ci.yml`)**:
    - Triggers automatically on push and pull requests targeting `main` and `staging`.
