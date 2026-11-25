@@ -215,7 +215,21 @@ Whenever creating new frontend pages, designing components, or performing post-a
 
 ---
 
-## 8. Engineering Reliability: GRAVITAS Workflow (MANDATORY)
+## 8. Product UI Illustrations & Bento Grids: Benji Taylor's Stageshow Skill
+
+**Setup (once per environment):** Stageshow is installed at `~/.agents/skills/stageshow` (from `benjitaylor/skills`, symlinked under `.agents/skills/stageshow`).
+
+Whenever creating marketing illustrations, feature teaser cards, bento grids, or animated walkthrough demos of Reeler:
+1. **Core Philosophy:**
+   - Miniature product UI that reads as the real product, simplified to what the viewer needs, framed with intent.
+   - Real words only on what the story is about, placeholder lines for the rest, and zero decorative AI fluff (no sparkles, fake graphs, or made-up logos).
+2. **Post-Approval Marketing & Bento Grids:**
+   - Use Stageshow to build interactive feature cards for the landing page and bento grid demonstrations of Reeler's Vault, bot reminders, and Spotify-style Wrapped cards.
+   - Pre-merge rehearsals (`node scripts/film.mjs`) must verify frame stability, quiet hierarchy, and reduced-motion fallback before shipping.
+
+---
+
+## 9. Engineering Reliability: GRAVITAS Workflow (MANDATORY)
 
 **Setup (once per environment):** Install the GRAVITAS skill via `npx skills add udaysharmadev/Gravitas --skill gravitas --agent antigravity --yes` (or `--agent claude-code` for Claude Code; see [udaysharmadev/Gravitas](https://github.com/udaysharmadev/Gravitas)) and reload your coding tool. Keep project-local symlinks under `.agents/skills/` or `.claude/skills/` (both gitignored).
 
@@ -228,7 +242,7 @@ For implementation, debugging, refactoring, review, and migrations:
 
 ---
 
-## 9. Security & Boundary Rules
+## 10. Security & Boundary Rules
 
 1. **NEVER commit `.env` or credentials:**
    - Strictly exclude `.env`, `.env.*`, `token.json`, `credentials.json`, `*.pem`, `*.key`.
@@ -241,7 +255,7 @@ For implementation, debugging, refactoring, review, and migrations:
 
 ---
 
-## 10. BLOCK Violations (NEVER generate code or execute actions that do this)
+## 11. BLOCK Violations (NEVER generate code or execute actions that do this)
 
 * **Direct push to `main` or `staging` branch** (strictly forbidden).
 * **Committing code directly onto `main` or `staging`** instead of a topic branch.
@@ -265,7 +279,7 @@ For implementation, debugging, refactoring, review, and migrations:
 
 ---
 
-## 11. Automated CI/CD, SAST & Code Quality Pipelines
+## 12. Automated CI/CD, SAST & Code Quality Pipelines
 
 1. **Continuous Integration (`.github/workflows/ci.yml`)**:
    - Triggers automatically on push and pull requests targeting `main` and `staging`.
