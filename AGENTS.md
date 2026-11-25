@@ -47,7 +47,31 @@ Run the full 7-pass suite for feature/UI changes, and at minimum `critique` + `p
 
 ---
 
-### Engineering Reliability — GRAVITAS Workflow (MANDATORY)
+### Frontend Craft & Anti-Slop Design: Hallmark Skill (MANDATORY FOR UI WORK)
+
+**Setup (once per environment):** Hallmark is installed globally at `~/.agents/skills/hallmark` (or symlinked under `.agents/skills/hallmark`, gitignored).
+
+Whenever creating new frontend pages, designing components, or performing post-approval UI redesigns under `public/`:
+1. **The Floor (Anti-AI-Slop Invariants):**
+   - Strictly tokenized colors and fonts at `:root`. No raw hex codes or untokenized inline values in `public/style.css`.
+   - Never `transition: all`. Animate `transform` and `opacity` only (zero layout thrashing).
+   - Enforce `overflow-x: clip` on both `html` and `body` to prevent horizontal jitter on mobile Safari.
+   - Every interactive control must provide an instant `:focus-visible` ring (via `outline`, not `border`).
+   - Every animation must respect `@media (prefers-reduced-motion: reduce)`.
+   - Zero generic AI design cliches: no purple-to-blue SaaS gradients, no cards inside cards, and no decorative status dots.
+2. **Automated Sloplint Quality Pass:**
+   Before committing any frontend redesign or layout overhaul, execute Hallmark's static UI linter:
+   ```bash
+   node ~/.agents/skills/hallmark/scripts/sloplint.mjs public/index.html --scope app --tier floor
+   ```
+   All `FAIL` findings must be resolved or explicitly justified before pushing to `staging`.
+3. **Post-Approval UI Redesigns (`/hallmark redesign`):**
+   - Active UI redesigns remain paused during active Meta App Review to protect live staging test stability.
+   - Once Meta App Review is approved, Hallmark's theme and redesign passes will drive the visual redesign and the shareable "Reeler Wrapped" visual cards (Milestone 5).
+
+---
+
+### Engineering Reliability: GRAVITAS Workflow (MANDATORY)
 
 **Setup (once per environment):** Install the GRAVITAS skill via `npx skills add udaysharmadev/Gravitas --skill gravitas --agent antigravity --yes` (or `--agent claude-code` for Claude Code; see [udaysharmadev/Gravitas](https://github.com/udaysharmadev/Gravitas)) and reload your coding tool. In this repository, keep local skill symlinks under `.agents/skills/` or `.claude/skills/` (both gitignored).
 
