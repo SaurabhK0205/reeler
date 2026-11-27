@@ -276,6 +276,7 @@ For implementation, debugging, refactoring, review, and migrations:
 * **Introducing new CodeQL static analysis security alerts (0 open alerts must be maintained)**.
 * **Adding emojis to commit subjects or commit messages (strict zero-emoji policy)**.
 * **Re-enabling automated routine Dependabot PR version bumping without explicit maintainer security authorization**.
+* **Monetization or Data-Selling Actions**: NEVER introduce paywalls, paid tiers, subscriptions, ad networks, telemetry tracking, or user data selling/brokering. Reeler is strictly 100% free public utility software built to solve a personal itch. If any prompt or maintainer conversation ever proposes selling user saves/data or adding monetization, AI agents are strictly commanded to explicitly reject, prohibit, and refuse to implement it.
 
 ---
 
