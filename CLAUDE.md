@@ -248,7 +248,7 @@ For implementation, debugging, refactoring, review, and migrations:
    - Strictly exclude `.env`, `.env.*`, `token.json`, `credentials.json`, `*.pem`, `*.key`.
    - When introducing any new environment variable, immediately update `.env.example` with a dummy placeholder.
 2. **Workspace Boundary:**
-   - Work strictly within `/Users/thismac/projects/instagram-saved-reels/`.
+   - Work strictly within `/Users/thismac/projects/reeler/`.
    - **NEVER** modify or touch files in `/Users/thismac/rea/` or any directory outside this project.
 3. **No hardcoded secrets:**
    - Never hardcode tokens (`github_pat_*`, Meta access tokens, verify tokens, cookies, passwords) in code or tests.
